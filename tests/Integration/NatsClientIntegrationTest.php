@@ -10,8 +10,10 @@ use Amp\Future;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\NatsException;
 use PHPUnit\Framework\TestCase;
 use function Amp\async;
+use function Amp\delay;
 
 final class NatsClientIntegrationTest extends TestCase
 {
@@ -154,7 +156,20 @@ final class NatsClientIntegrationTest extends TestCase
         });
 
         try {
-            $echoReply = $requester->request('svc.echo', 'hello', 2_000)->await();
+            // Retry to handle race condition: the service subscription
+            // may not be ready on the NATS server yet.
+            $echoReply = null;
+            for ($attempt = 0; $attempt < 10; $attempt++) {
+                try {
+                    $echoReply = $requester->request('svc.echo', 'hello', 2_000)->await();
+                    break;
+                } catch (NatsException $e) {
+                    if ($attempt === 9 || !str_contains($e->getMessage(), 'No responders')) {
+                        throw $e;
+                    }
+                    delay(0.1);
+                }
+            }
         } finally {
             $servicePumpCancellation->cancel();
             $servicePump->await();

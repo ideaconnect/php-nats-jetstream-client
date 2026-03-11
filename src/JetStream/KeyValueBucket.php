@@ -211,10 +211,11 @@ final class KeyValueBucket
     public function getAll(): Future
     {
         return async(function (): array {
-            $status = $this->getStatus()->await();
+            // Request stream info with subjects filter to get per-subject counts.
+            $streamInfo = $this->requestStreamInfoWithSubjects();
 
             /** @var array<string,int> $subjects */
-            $subjects = $status['subjects'];
+            $subjects = $streamInfo['subjects'];
             if ($subjects === []) {
                 return [];
             }
@@ -307,6 +308,29 @@ final class KeyValueBucket
     private function subjectForKey(string $key): string
     {
         return $this->subjectPrefix() . $key;
+    }
+
+    /**
+     * Requests stream info with subjects filter to get per-subject counts.
+     *
+     * @return array{subjects: array<string,int>}
+     */
+    private function requestStreamInfoWithSubjects(): array
+    {
+        $subject = JetStreamApi::STREAM_INFO_PREFIX . $this->streamName();
+        $payload = json_encode(['subjects_filter' => $this->subjectPrefix() . '>'], JSON_THROW_ON_ERROR);
+        $message = $this->client->request($subject, $payload)->await();
+
+        /** @var array<string,mixed> $data */
+        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
+
+        /** @var array<string,mixed> $state */
+        $state = is_array($data['state'] ?? null) ? $data['state'] : [];
+
+        /** @var array<string,int> $subjects */
+        $subjects = is_array($state['subjects'] ?? null) ? $state['subjects'] : [];
+
+        return ['subjects' => $subjects];
     }
 
     /**
