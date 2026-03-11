@@ -788,4 +788,152 @@ final class NatsConnectionTest extends TestCase
 
         $connection->request('svc.missing', 'hello', 500)->await();
     }
+
+    // ─── Subject Validation ─────────────────────────────────────────────
+
+    public function testPublishRejectsEmptySubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Subject must not be empty');
+        $connection->publish('', 'data')->await();
+    }
+
+    public function testPublishRejectsSubjectWithWhitespace(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Subject must not contain whitespace');
+        $connection->publish("foo bar", 'data')->await();
+    }
+
+    public function testPublishRejectsWildcardSubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Wildcards are not allowed in publish subjects');
+        $connection->publish('foo.*', 'data')->await();
+    }
+
+    public function testPublishRejectsEmptyTokenInSubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Subject must not contain empty tokens');
+        $connection->publish('foo..bar', 'data')->await();
+    }
+
+    public function testPublishRejectsFullWildcardToken(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Wildcards are not allowed in publish subjects');
+        $connection->publish('foo.>', 'data')->await();
+    }
+
+    public function testSubscribeAcceptsWildcardSubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $sid = $connection->subscribe('foo.*', function () {})->await();
+        self::assertSame(1, $sid);
+
+        $sid2 = $connection->subscribe('bar.>', function () {})->await();
+        self::assertSame(2, $sid2);
+    }
+
+    public function testSubscribeRejectsGreaterThanNotInLastToken(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Wildcard ">" must be the last token');
+        $connection->subscribe('>.foo', function () {})->await();
+    }
+
+    public function testSubscribeRejectsPartialWildcardToken(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Wildcards must occupy an entire token');
+        $connection->subscribe('foo.ba*', function () {})->await();
+    }
 }

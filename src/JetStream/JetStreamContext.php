@@ -74,6 +74,10 @@ final class JetStreamContext
     public function createStream(string $name, array $subjects, array $options = []): Future
     {
         return async(function () use ($name, $subjects, $options): StreamInfo {
+            if ($subjects === []) {
+                throw new JetStreamException('Stream subjects must not be empty');
+            }
+
             $payload = array_merge($options, [
                 'name' => $name,
                 'subjects' => $subjects,
@@ -121,12 +125,16 @@ final class JetStreamContext
     public function createConsumer(string $stream, string $consumer, ?string $filterSubject = null): Future
     {
         return async(function () use ($stream, $consumer, $filterSubject): ConsumerInfo {
+            if ($filterSubject === '') {
+                throw new JetStreamException('Consumer filter subject must not be empty (use null to omit)');
+            }
+
             $config = [
                 'durable_name' => $consumer,
                 'ack_policy' => 'explicit',
             ];
 
-            if ($filterSubject !== null && $filterSubject !== '') {
+            if ($filterSubject !== null) {
                 $config['filter_subject'] = $filterSubject;
             }
 
@@ -529,8 +537,12 @@ final class JetStreamContext
         $json = json_encode($jsonBody, JSON_THROW_ON_ERROR);
         $message = $this->client->request($subject, $json)->await();
 
-        /** @var array<string,mixed> $data */
-        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
+        try {
+            /** @var array<string,mixed> $data */
+            $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
+        } catch (\JsonException $e) {
+            throw new JetStreamException('Malformed JetStream API response: ' . $e->getMessage(), 0, $e);
+        }
 
         /** @var array<string,mixed>|null $error */
         $error = is_array($data['error'] ?? null) ? $data['error'] : null;

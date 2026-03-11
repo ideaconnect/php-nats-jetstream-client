@@ -221,4 +221,53 @@ final class KeyValueBucketTest extends TestCase
 
         self::assertSame(['email' => 'b@example.com'], $all);
     }
+
+    // ─── Key Validation ─────────────────────────────────────────────
+
+    public function testPutAcceptsKeyWithDotsColonsSlashes(): void
+    {
+        $putAck = '{"stream":"KV_cfg","seq":1,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $ack = $client->jetStream()->keyValue('cfg')->put('config/v2:main.yaml', 'data')->await();
+        self::assertSame(1, $ack->seq);
+    }
+
+    public function testPutRejectsKeyWithWildcard(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid KV key');
+        $client->jetStream()->keyValue('cfg')->put('foo*bar', 'data')->await();
+    }
+
+    public function testPutRejectsKeyWithTab(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid KV key');
+        $client->jetStream()->keyValue('cfg')->put("foo\tbar", 'data')->await();
+    }
 }

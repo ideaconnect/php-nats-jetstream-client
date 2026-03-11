@@ -405,7 +405,7 @@ final class KeyValueBucket
      */
     private function assertValidKey(string $key): void
     {
-        if ($key === '' || str_contains($key, ' ') || str_contains($key, '*') || str_contains($key, '>')) {
+        if ($key === '' || preg_match('/[\s*>]/', $key)) {
             throw new JetStreamException('Invalid KV key');
         }
     }

@@ -275,4 +275,55 @@ final class ObjectStoreBucketTest extends TestCase
         self::assertSame(4, $status['last_sequence']);
         self::assertSame(4, $status['messages']);
     }
+
+    // ─── Name Validation ─────────────────────────────────────────────
+
+    public function testPutAcceptsNameWithDotsColonsSlashes(): void
+    {
+        $chunkAck = '{"stream":"OBJ_assets","seq":1,"duplicate":false}';
+        $metaAck = '{"stream":"OBJ_assets","seq":2,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($chunkAck), $chunkAck),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($metaAck), $metaAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $info = $client->jetStream()->objectStore('assets')->put('images/logo:v2.png', 'data')->await();
+        self::assertSame('images/logo:v2.png', $info->name);
+    }
+
+    public function testPutRejectsNameWithWildcard(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid object name');
+        $client->jetStream()->objectStore('assets')->put('img*', 'data')->await();
+    }
+
+    public function testPutRejectsNameWithTab(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid object name');
+        $client->jetStream()->objectStore('assets')->put("img\there", 'data')->await();
+    }
 }

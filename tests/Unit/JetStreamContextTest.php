@@ -558,4 +558,54 @@ final class JetStreamContextTest extends TestCase
         self::assertStringContainsString('"deliver_subject":"deliver.ephemeral"', $transport->writes[3]);
         self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);
     }
+
+    // ─── Input Validation ─────────────────────────────────────────────
+
+    public function testCreateStreamRejectsEmptySubjects(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Stream subjects must not be empty');
+        $client->jetStream()->createStream('test', [])->await();
+    }
+
+    public function testCreateConsumerRejectsEmptyFilterSubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Consumer filter subject must not be empty');
+        $client->jetStream()->createConsumer('ORDERS', 'c1', '')->await();
+    }
+
+    public function testRequestJsonWrapsJsonException(): void
+    {
+        $malformedPayload = 'NOT_JSON{';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($malformedPayload), $malformedPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Malformed JetStream API response');
+        $client->jetStream()->accountInfo()->await();
+    }
 }

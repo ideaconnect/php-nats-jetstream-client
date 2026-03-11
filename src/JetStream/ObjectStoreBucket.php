@@ -405,7 +405,7 @@ final class ObjectStoreBucket
      */
     private function assertValidName(string $name): void
     {
-        if ($name === '' || str_contains($name, ' ') || str_contains($name, '*') || str_contains($name, '>')) {
+        if ($name === '' || preg_match('/[\s*>]/', $name)) {
             throw new JetStreamException('Invalid object name');
         }
     }

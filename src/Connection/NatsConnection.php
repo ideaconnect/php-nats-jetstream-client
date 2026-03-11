@@ -124,6 +124,7 @@ final class NatsConnection
                 throw new ConnectionException('Connection is not open');
             }
 
+            $this->validateSubject($subject);
             $this->enforceMaxPayload(strlen($payload));
 
             try {
@@ -152,6 +153,7 @@ final class NatsConnection
                 throw new ConnectionException('Connection is not open');
             }
 
+            $this->validateSubject($subject);
             $headerBytes = strlen(NatsHeaders::toWireBlock($headers));
             $this->enforceMaxPayload($headerBytes + strlen($payload));
 
@@ -177,6 +179,7 @@ final class NatsConnection
                 throw new ConnectionException('Connection is not open');
             }
 
+            $this->validateSubject($subject, allowWildcards: true);
             $sid = $this->nextSid++;
             $this->subscriptions[$sid] = $handler;
             $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
@@ -259,6 +262,8 @@ final class NatsConnection
     ): Future
     {
         return async(function () use ($subject, $payload, $timeoutMs, $cancellation): NatsMessage {
+            $this->validateSubject($subject);
+
             return $this->requestInternal($subject, $payload, null, $timeoutMs, $cancellation);
         });
     }
@@ -278,6 +283,8 @@ final class NatsConnection
         ?Cancellation $cancellation = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $timeoutMs, $cancellation): NatsMessage {
+            $this->validateSubject($subject);
+
             return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation);
         });
     }
@@ -759,6 +766,46 @@ final class NatsConnection
         if ($this->pingTimerId !== null) {
             EventLoop::cancel($this->pingTimerId);
             $this->pingTimerId = null;
+        }
+    }
+
+    /**
+     * Validates a NATS subject string against protocol rules.
+     *
+     * @param bool $allowWildcards Whether * and > tokens are permitted (subscribe only).
+     */
+    private function validateSubject(string $subject, bool $allowWildcards = false): void
+    {
+        if ($subject === '') {
+            throw new ProtocolException('Subject must not be empty');
+        }
+
+        if (preg_match('/[\s\r\n]/', $subject)) {
+            throw new ProtocolException('Subject must not contain whitespace');
+        }
+
+        $tokens = explode('.', $subject);
+        foreach ($tokens as $i => $token) {
+            if ($token === '') {
+                throw new ProtocolException('Subject must not contain empty tokens');
+            }
+
+            if ($token === '*' || $token === '>') {
+                if (!$allowWildcards) {
+                    throw new ProtocolException('Wildcards are not allowed in publish subjects');
+                }
+
+                // ">" must be the last token.
+                if ($token === '>' && $i !== count($tokens) - 1) {
+                    throw new ProtocolException('Wildcard ">" must be the last token');
+                }
+
+                continue;
+            }
+
+            if (str_contains($token, '*') || str_contains($token, '>')) {
+                throw new ProtocolException('Wildcards must occupy an entire token');
+            }
         }
     }
 
