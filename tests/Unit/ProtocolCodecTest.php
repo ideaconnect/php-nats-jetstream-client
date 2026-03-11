@@ -41,6 +41,19 @@ final class ProtocolCodecTest extends TestCase
     }
 
     /**
+     * Verifies CONNECT encoding includes token authentication field.
+     */
+    public function testEncodeConnectContainsTokenAuthField(): void
+    {
+        $codec = new ProtocolCodec();
+        $options = new NatsOptions(token: 'token-123');
+
+        $result = $codec->encodeConnect($options);
+
+        self::assertStringContainsString('"auth_token":"token-123"', $result);
+    }
+
+    /**
      * Verifies CONNECT encoding includes JWT auth fields signed with server nonce.
      */
     public function testEncodeConnectContainsJwtAuthFields(): void

@@ -222,6 +222,78 @@ final class ObjectStoreBucket
     }
 
     /**
+     * Lists latest metadata records for objects in this bucket.
+     *
+     * @return Future<list<ObjectInfo>>
+     */
+    public function list(bool $includeDeleted = false): Future
+    {
+        return async(function () use ($includeDeleted): array {
+            $status = $this->getStatus()->await();
+            $lastSequence = (int) ($status['last_sequence'] ?? 0);
+            $latestByName = [];
+
+            for ($seq = 1; $seq <= $lastSequence; $seq++) {
+                $message = $this->requestObjectMessageBySequence($seq);
+                if ($message === null) {
+                    continue;
+                }
+
+                $subject = (string) ($message['subject'] ?? '');
+                if (!str_starts_with($subject, $this->metaPrefix())) {
+                    continue;
+                }
+
+                $metadata = $this->decodeMetadataFromApiMessage($message);
+                if ($metadata === null) {
+                    continue;
+                }
+
+                $info = ObjectInfo::fromArray($this->bucket, $metadata);
+                if ($info->name === '') {
+                    continue;
+                }
+
+                $latestByName[$info->name] = $info;
+            }
+
+            $result = [];
+            foreach ($latestByName as $info) {
+                if (!$includeDeleted && $info->deleted) {
+                    continue;
+                }
+
+                $result[] = $info;
+            }
+
+            return $result;
+        });
+    }
+
+    /**
+     * Returns object bucket status derived from stream state.
+     *
+     * @return Future<array<string,mixed>>
+     */
+    public function getStatus(): Future
+    {
+        return async(function (): array {
+            $stream = $this->jetStream->getStream($this->streamName())->await();
+            /** @var array<string,mixed> $state */
+            $state = is_array($stream->raw['state'] ?? null) ? $stream->raw['state'] : [];
+
+            return [
+                'bucket' => $this->bucket,
+                'stream' => $this->streamName(),
+                'messages' => (int) ($state['messages'] ?? 0),
+                'last_sequence' => (int) ($state['last_seq'] ?? 0),
+                'bytes' => (int) ($state['bytes'] ?? 0),
+                'subjects' => is_array($state['subjects'] ?? null) ? $state['subjects'] : [],
+            ];
+        });
+    }
+
+    /**
      * Returns Object Store stream name.
      */
     public function streamName(): string
@@ -274,6 +346,58 @@ final class ObjectStoreBucket
         }
 
         return $data;
+    }
+
+    /**
+     * @return array<string,mixed>|null
+     */
+    private function requestObjectMessageBySequence(int $sequence): ?array
+    {
+        $subject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
+        $payload = json_encode(['seq' => $sequence], JSON_THROW_ON_ERROR);
+        $message = $this->client->request($subject, $payload)->await();
+
+        /** @var array<string,mixed> $data */
+        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
+
+        /** @var array<string,mixed>|null $error */
+        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
+        if ($error !== null) {
+            $code = (int) ($error['code'] ?? 0);
+            if ($code === 404) {
+                return null;
+            }
+
+            $description = (string) ($error['description'] ?? 'JetStream API error');
+            throw new JetStreamException($description, $code);
+        }
+
+        /** @var array<string,mixed>|null $payloadMessage */
+        $payloadMessage = is_array($data['message'] ?? null) ? $data['message'] : null;
+
+        return $payloadMessage;
+    }
+
+    /**
+     * @param array<string,mixed> $message
+     * @return array<string,mixed>|null
+     */
+    private function decodeMetadataFromApiMessage(array $message): ?array
+    {
+        $encodedData = (string) ($message['data'] ?? '');
+        if ($encodedData === '') {
+            return null;
+        }
+
+        $decoded = base64_decode($encodedData, true);
+        if ($decoded === false || $decoded === '') {
+            return null;
+        }
+
+        /** @var array<string,mixed>|null $metadata */
+        $metadata = json_decode($decoded, true);
+
+        return is_array($metadata) ? $metadata : null;
     }
 
     /**

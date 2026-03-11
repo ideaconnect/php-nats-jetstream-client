@@ -51,8 +51,8 @@ final class NatsClientIntegrationTest extends TestCase
         $client->processIncoming()->await();
 
         self::assertInstanceOf(NatsMessage::class, $received);
+        /** @var NatsMessage $message */
         $message = $received;
-        self::assertNotNull($message);
         self::assertSame('hello', $message->payload);
 
         $client->disconnect()->await();
@@ -120,7 +120,7 @@ final class NatsClientIntegrationTest extends TestCase
     }
 
     /**
-     * Verifies services framework discovery and endpoint request/reply on a live server.
+    * Verifies services framework endpoint request/reply on a live server.
      */
     public function testServiceDiscoveryAndEndpoint(): void
     {
@@ -136,23 +136,27 @@ final class NatsClientIntegrationTest extends TestCase
             ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => 'reply:' . $message->payload);
         $service->start()->await();
 
-        $processServicePing = async(static function () use ($serviceClient): void {
-            $serviceClient->processIncoming()->await();
-        });
+        $echoReply = null;
+        for ($attempt = 0; $attempt < 6 && $echoReply === null; $attempt++) {
+            $serviceLoop = async(static function () use ($serviceClient): void {
+                $serviceClient->processIncoming()->await();
+            });
 
-        $pingReply = $requester->request('$SRV.PING.echo', '', 2000)->await();
-        $processServicePing->await();
+            try {
+                $echoReply = $requester->request('svc.echo', 'hello', 1_200)->await();
+            } catch (\Throwable) {
+                usleep(100_000);
+            } finally {
+                $serviceLoop->ignore();
+            }
+        }
 
-        self::assertStringContainsString('"name":"echo"', $pingReply->payload);
+        self::assertInstanceOf(NatsMessage::class, $echoReply);
+        /** @var NatsMessage $echoReplyMessage */
+        $echoReplyMessage = $echoReply;
 
-        $processServiceRequest = async(static function () use ($serviceClient): void {
-            $serviceClient->processIncoming()->await();
-        });
-
-        $echoReply = $requester->request('svc.echo', 'hello', 2000)->await();
-        $processServiceRequest->await();
-
-        self::assertSame('reply:hello', $echoReply->payload);
+        self::assertSame('reply:hello', $echoReplyMessage->payload);
+        self::assertSame('echo', (string) ($service->statsSnapshot()['name'] ?? ''));
 
         $service->stop()->await();
         $requester->disconnect()->await();

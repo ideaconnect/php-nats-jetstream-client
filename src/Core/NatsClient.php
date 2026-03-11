@@ -28,7 +28,7 @@ final class NatsClient
     ) {
         $this->connection = new NatsConnection(
             options: $options,
-            transport: $transport ?? new AmpSocketTransport(),
+            transport: $transport ?? new AmpSocketTransport($options),
         );
     }
 

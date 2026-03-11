@@ -72,6 +72,27 @@ final class KeyValueBucket
     }
 
     /**
+     * Updates a key only when expected last revision matches.
+     *
+     * @return Future<PubAck>
+     */
+    public function update(string $key, string $value, int $expectedRevision): Future
+    {
+        return async(function () use ($key, $value, $expectedRevision): PubAck {
+            $this->assertValidKey($key);
+            if ($expectedRevision <= 0) {
+                throw new JetStreamException('Expected revision must be greater than zero');
+            }
+
+            return $this->publishWithHeadersAck(
+                $this->subjectForKey($key),
+                $value,
+                ['Nats-Expected-Last-Subject-Sequence' => (string) $expectedRevision],
+            )->await();
+        });
+    }
+
+    /**
      * Marks a key as deleted.
      *
      * @return Future<PubAck>
@@ -85,6 +106,24 @@ final class KeyValueBucket
                 $this->subjectForKey($key),
                 '',
                 ['KV-Operation' => 'DEL'],
+            )->await();
+        });
+    }
+
+    /**
+     * Purges key history and writes a purge marker.
+     *
+     * @return Future<PubAck>
+     */
+    public function purge(string $key): Future
+    {
+        return async(function () use ($key): PubAck {
+            $this->assertValidKey($key);
+
+            return $this->publishWithHeadersAck(
+                $this->subjectForKey($key),
+                '',
+                ['KV-Operation' => 'PURGE', 'Nats-Rollup' => 'sub'],
             )->await();
         });
     }
@@ -116,7 +155,8 @@ final class KeyValueBucket
             }
 
             $data = (string) ($message['data'] ?? '');
-            $decoded = $data === '' ? '' : (string) base64_decode($data, true);
+            $decodedRaw = $data === '' ? '' : base64_decode($data, true);
+            $decoded = $decodedRaw === false ? $data : $decodedRaw;
             $headers = $this->decodeHeadersFromApiMessage($message);
             $operation = strtoupper((string) ($headers['KV-Operation'] ?? 'PUT'));
 
@@ -158,6 +198,72 @@ final class KeyValueBucket
                     revision: null,
                 ));
             })->await();
+        });
+    }
+
+    /**
+     * Returns latest values for all keys currently present in bucket.
+     *
+     * @return Future<array<string,string>>
+     */
+    public function getAll(): Future
+    {
+        return async(function (): array {
+            $status = $this->getStatus()->await();
+            $lastSequence = (int) ($status['last_sequence'] ?? 0);
+            $latest = [];
+
+            for ($seq = 1; $seq <= $lastSequence; $seq++) {
+                $message = $this->requestKvMessageBySequence($seq);
+                if ($message === null) {
+                    continue;
+                }
+
+                $subject = (string) ($message['subject'] ?? '');
+                $key = $this->keyFromSubject($subject);
+                if ($key === null || $key === '') {
+                    continue;
+                }
+
+                $headers = $this->decodeHeadersFromApiMessage($message);
+                $operation = strtoupper((string) ($headers['KV-Operation'] ?? 'PUT'));
+
+                if ($operation === 'DEL' || $operation === 'PURGE') {
+                    unset($latest[$key]);
+                    continue;
+                }
+
+                $encoded = (string) ($message['data'] ?? '');
+                $decodedRaw = $encoded === '' ? '' : base64_decode($encoded, true);
+                $decoded = $decodedRaw === false ? $encoded : $decodedRaw;
+
+                $latest[$key] = $decoded;
+            }
+
+            return $latest;
+        });
+    }
+
+    /**
+     * Returns bucket status derived from stream state.
+     *
+     * @return Future<array<string,mixed>>
+     */
+    public function getStatus(): Future
+    {
+        return async(function (): array {
+            $stream = $this->jetStream->getStream($this->streamName())->await();
+            /** @var array<string,mixed> $state */
+            $state = is_array($stream->raw['state'] ?? null) ? $stream->raw['state'] : [];
+
+            return [
+                'bucket' => $this->bucket,
+                'stream' => $this->streamName(),
+                'messages' => (int) ($state['messages'] ?? 0),
+                'last_sequence' => (int) ($state['last_seq'] ?? 0),
+                'bytes' => (int) ($state['bytes'] ?? 0),
+                'subjects' => is_array($state['subjects'] ?? null) ? $state['subjects'] : [],
+            ];
         });
     }
 
@@ -206,6 +312,36 @@ final class KeyValueBucket
         }
 
         return $data;
+    }
+
+    /**
+     * @return array<string,mixed>|null
+     */
+    private function requestKvMessageBySequence(int $sequence): ?array
+    {
+        $subject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
+        $payload = json_encode(['seq' => $sequence], JSON_THROW_ON_ERROR);
+        $message = $this->client->request($subject, $payload)->await();
+
+        /** @var array<string,mixed> $data */
+        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
+
+        /** @var array<string,mixed>|null $error */
+        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
+        if ($error !== null) {
+            $code = (int) ($error['code'] ?? 0);
+            if ($code === 404) {
+                return null;
+            }
+
+            $description = (string) ($error['description'] ?? 'JetStream API error');
+            throw new JetStreamException($description, $code);
+        }
+
+        /** @var array<string,mixed>|null $payloadMessage */
+        $payloadMessage = is_array($data['message'] ?? null) ? $data['message'] : null;
+
+        return $payloadMessage;
     }
 
     /**

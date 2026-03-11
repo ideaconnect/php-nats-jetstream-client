@@ -19,7 +19,7 @@ Implemented functionality includes:
 - JetStream push consumers with heartbeat/flow-control handling
 - JetStream publish ACK
 - Scheduled publish (`@at` support)
-- KeyValue API slice (bucket lifecycle, put/get/delete, watch)
+- KeyValue API (bucket lifecycle, put/get/update/delete/purge, watch, getAll/status)
 - Server authorization methods: token, username/password, JWT + nonce signer
 
 Current scheduling note: scheduled messages are implemented with NATS scheduler headers and currently accept only `@at` expressions.
@@ -27,6 +27,22 @@ Current scheduling note: scheduled messages are implemented with NATS scheduler 
 Use `Idct\\Nats\\JetStream\\Schedule::at(...)` or `Schedule::atTimestamp(...)` to generate valid `@at` expressions.
 
 ## Usage
+
+### Compatibility Mapping (basis-company README)
+
+This repository tracks parity against basis-company nats.php README examples.
+
+| Section | Status | Notes |
+| --- | --- | --- |
+| Connecting and Auth | matched | Basic, token, username/password, JWT nonce signing, and TLS CA/cert/key options are supported. |
+| Publish Subscribe | equivalent | Callback and queue-group patterns are supported; fetchAll-style queue API is mapped via processIncoming patterns. |
+| Request Response | matched | Request/reply with timeout and cancellation is covered. |
+| JetStream API Usage | matched | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling are covered. |
+| Microservices | matched | Service registration, discovery, endpoint handling, and grouped endpoint hierarchy are covered. |
+| Key Value Storage | matched | Core KV flows plus update/purge/getAll/status parity are covered. |
+| Object Store | matched | Bucket/object lifecycle and object listing parity are covered. |
+
+Detailed execution plan: see REGRESSION_PASS.md.
 
 ### Authentication Options
 
@@ -61,6 +77,15 @@ $jwtClient = new NatsClient(new NatsOptions(
 	jwt: 'your-jwt-token',
 	nkey: 'U...PUBLIC NKEY...',
 	nonceSigner: new DemoNonceSigner(),
+));
+
+// TLS with CA and client cert/key.
+$tlsClient = new NatsClient(new NatsOptions(
+	servers: ['tls://127.0.0.1:4222'],
+	tlsRequired: true,
+	tlsCaFile: '/path/to/ca.pem',
+	tlsCertFile: '/path/to/client-cert.pem',
+	tlsKeyFile: '/path/to/client-key.pem',
 ));
 ```
 
@@ -278,11 +303,22 @@ $kv->put('theme', 'dark')->await();
 $entry = $kv->get('theme')->await();
 echo $entry?->value . PHP_EOL;
 
+if ($entry !== null) {
+	$kv->update('theme', 'light', $entry->revision ?? 1)->await();
+}
+
+$all = $kv->getAll()->await();
+echo ($all['theme'] ?? '') . PHP_EOL;
+
+$status = $kv->getStatus()->await();
+echo $status['stream'] . PHP_EOL;
+
 $watchSid = $kv->watch(static function (KeyValueEntry $entry): void {
 	echo $entry->key . ':' . ($entry->value ?? '<deleted>') . PHP_EOL;
 }, 'theme')->await();
 
 $kv->delete('theme')->await();
+$kv->purge('theme')->await();
 $client->processIncoming()->await();
 
 $client->unsubscribe($watchSid)->await();
@@ -315,6 +351,11 @@ echo $info?->digest . PHP_EOL;
 $objectData = $store->get('logo.txt')->await();
 echo $objectData?->data . PHP_EOL;
 
+$objects = $store->list()->await();
+foreach ($objects as $object) {
+	echo $object->name . PHP_EOL;
+}
+
 $store->delete('logo.txt')->await();
 $store->deleteBucket()->await();
 $client->disconnect()->await();
@@ -339,6 +380,14 @@ $service = $serviceClient->service('echo', '1.0.0', 'Echo demo')
 		return 'reply:' . $message->payload;
 	});
 
+$service->addGroup('svc')->addGroup('v1')->addEndpoint(
+	'echo-v1',
+	'echo',
+	static function (NatsMessage $message): string {
+		return 'v1:' . $message->payload;
+	},
+);
+
 $service->start()->await();
 
 // In another client you can call discovery or endpoint subjects:
@@ -349,6 +398,98 @@ $service->start()->await();
 
 $service->stop()->await();
 $serviceClient->disconnect()->await();
+```
+
+## Configuration Option Mapping
+
+`NatsOptions` fields and defaults:
+
+| Option | Type | Default | Notes |
+| --- | --- | --- | --- |
+| `servers` | `list<string>` | `['nats://127.0.0.1:4222']` | Supports `nats://` and `tls://` endpoints. |
+| `name` | `string` | `idct-php-nats-client` | Sent in CONNECT payload. |
+| `inboxPrefix` | `string` | `_INBOX` | Prefix for generated request inbox subjects. |
+| `connectTimeoutMs` | `int` | `5000` | Transport connect timeout in milliseconds. |
+| `requestTimeoutMs` | `int` | `10000` | Default request/reply timeout. |
+| `reconnectEnabled` | `bool` | `true` | Enables reconnect flow. |
+| `maxReconnectAttempts` | `int` | `10` | Max reconnect attempts before closing. |
+| `reconnectDelayMs` | `int` | `100` | Base reconnect backoff delay. |
+| `reconnectJitterMs` | `int` | `50` | Random jitter added to reconnect delay. |
+| `pingIntervalSeconds` | `int` | `30` | Client heartbeat interval setting. |
+| `maxPingsOut` | `int` | `2` | Max outstanding pings before failure. |
+| `verbose` | `bool` | `false` | NATS verbose protocol mode. |
+| `pedantic` | `bool` | `false` | NATS pedantic protocol mode. |
+| `tlsRequired` | `bool` | `false` | Forces TLS context in transport. |
+| `tlsCaFile` | `?string` | `null` | CA bundle path for peer verification. |
+| `tlsCertFile` | `?string` | `null` | Client certificate path. |
+| `tlsKeyFile` | `?string` | `null` | Client private key path. |
+| `tlsKeyPassphrase` | `?string` | `null` | Passphrase for encrypted key file. |
+| `tlsPeerName` | `?string` | `null` | Overrides TLS peer name (SNI/verification). |
+| `tlsVerifyPeer` | `bool` | `true` | Enables certificate verification. |
+| `token` | `?string` | `null` | Token auth, encoded as `auth_token`. |
+| `username` | `?string` | `null` | Username auth field. |
+| `password` | `?string` | `null` | Password auth field. |
+| `jwt` | `?string` | `null` | JWT user credential. |
+| `nkey` | `?string` | `null` | Public NKey for JWT auth mode. |
+| `nonceSigner` | `?NonceSignerInterface` | `null` | Signs server nonce for JWT mode. |
+| `maxPendingMessagesPerSubscription` | `int` | `1024` | Slow consumer queue bound per SID. |
+| `slowConsumerPolicy` | `SlowConsumerPolicy` | `DropOldest` | One of `DropOldest`, `DropNewest`, `Error`. |
+
+## Performance Benchmark Recipe
+
+Quick local publish/request benchmark (single process):
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use Idct\Nats\Connection\NatsOptions;
+use Idct\Nats\Core\NatsClient;
+use Idct\Nats\Core\NatsMessage;
+
+$iterations = 5000;
+$subject = 'bench.echo';
+
+$server = new NatsClient(new NatsOptions());
+$client = new NatsClient(new NatsOptions());
+
+$server->connect()->await();
+$client->connect()->await();
+
+$server->subscribe($subject, static function (NatsMessage $message) use ($server): void {
+	if ($message->replyTo !== null) {
+		$server->publish($message->replyTo, 'ok')->await();
+	}
+})->await();
+
+$start = hrtime(true);
+for ($i = 0; $i < $iterations; $i++) {
+	$loop = Amp\async(static function () use ($server): void {
+		$server->processIncoming()->await();
+	});
+	$client->request($subject, 'x', 2000)->await();
+	$loop->await();
+}
+$elapsedNs = hrtime(true) - $start;
+
+$totalMs = $elapsedNs / 1_000_000;
+$rps = $iterations / max(0.001, ($elapsedNs / 1_000_000_000));
+
+echo 'iterations=' . $iterations . PHP_EOL;
+echo 'total_ms=' . number_format($totalMs, 2, '.', '') . PHP_EOL;
+echo 'req_per_sec=' . number_format($rps, 2, '.', '') . PHP_EOL;
+
+$client->disconnect()->await();
+$server->disconnect()->await();
+```
+
+Run recipe:
+
+```bash
+docker compose up -d
+php -d zend.assertions=1 path/to/benchmark.php
+docker compose down
 ```
 
 ## Development

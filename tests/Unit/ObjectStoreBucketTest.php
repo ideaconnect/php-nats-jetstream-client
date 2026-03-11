@@ -170,4 +170,109 @@ final class ObjectStoreBucketTest extends TestCase
 
         $client->jetStream()->objectStore('assets')->put('bad name', 'x')->await();
     }
+
+    /**
+     * Verifies object listing returns latest metadata and filters tombstones by default.
+     */
+    public function testListAndStatus(): void
+    {
+        $streamInfo = json_encode([
+            'config' => ['name' => 'OBJ_assets'],
+            'state' => [
+                'messages' => 4,
+                'last_seq' => 4,
+                'bytes' => 123,
+                'subjects' => [
+                    '$O.assets.M.logo.txt' => 2,
+                    '$O.assets.M.old.txt' => 1,
+                    '$O.assets.C.chunk1' => 1,
+                ],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $logoMeta = [
+            'name' => 'logo.txt',
+            'size' => 5,
+            'digest' => 'SHA-256=' . base64_encode(hash('sha256', 'hello', true)),
+            'mtime' => '2030-01-01T00:00:00Z',
+            'deleted' => false,
+            'chunk_subject' => '$O.assets.C.chunk1',
+            'metadata' => ['content-type' => 'text/plain'],
+        ];
+
+        $oldMeta = [
+            'name' => 'old.txt',
+            'size' => 0,
+            'digest' => '',
+            'mtime' => '2030-01-01T00:00:00Z',
+            'deleted' => true,
+            'chunk_subject' => '',
+            'metadata' => [],
+        ];
+
+        $seq1ChunkPayload = json_encode([
+            'message' => [
+                'subject' => '$O.assets.C.chunk1',
+                'seq' => 1,
+                'data' => base64_encode('hello'),
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $seq2LogoPayload = json_encode([
+            'message' => [
+                'subject' => '$O.assets.M.logo.txt',
+                'seq' => 2,
+                'data' => base64_encode((string) json_encode($logoMeta, JSON_THROW_ON_ERROR)),
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $seq3OldPayload = json_encode([
+            'message' => [
+                'subject' => '$O.assets.M.old.txt',
+                'seq' => 3,
+                'data' => base64_encode((string) json_encode($oldMeta, JSON_THROW_ON_ERROR)),
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $seq4LogoNewPayload = json_encode([
+            'message' => [
+                'subject' => '$O.assets.M.logo.txt',
+                'seq' => 4,
+                'data' => base64_encode((string) json_encode($logoMeta, JSON_THROW_ON_ERROR)),
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($seq1ChunkPayload), $seq1ChunkPayload),
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($seq2LogoPayload), $seq2LogoPayload),
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($seq3OldPayload), $seq3OldPayload),
+            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($seq4LogoNewPayload), $seq4LogoNewPayload),
+            sprintf("MSG _INBOX.f 6 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
+            sprintf("MSG _INBOX.g 7 %d\r\n%s\r\n", strlen($seq1ChunkPayload), $seq1ChunkPayload),
+            sprintf("MSG _INBOX.h 8 %d\r\n%s\r\n", strlen($seq2LogoPayload), $seq2LogoPayload),
+            sprintf("MSG _INBOX.i 9 %d\r\n%s\r\n", strlen($seq3OldPayload), $seq3OldPayload),
+            sprintf("MSG _INBOX.j 10 %d\r\n%s\r\n", strlen($seq4LogoNewPayload), $seq4LogoNewPayload),
+            sprintf("MSG _INBOX.k 11 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $bucket = $client->jetStream()->objectStore('assets');
+        $activeObjects = $bucket->list()->await();
+        $allObjects = $bucket->list(includeDeleted: true)->await();
+        $status = $bucket->getStatus()->await();
+
+        self::assertCount(1, $activeObjects);
+        self::assertSame('logo.txt', $activeObjects[0]->name);
+        self::assertFalse($activeObjects[0]->deleted);
+
+        self::assertCount(2, $allObjects);
+        self::assertSame('OBJ_assets', $status['stream']);
+        self::assertSame(4, $status['last_sequence']);
+        self::assertSame(4, $status['messages']);
+    }
 }

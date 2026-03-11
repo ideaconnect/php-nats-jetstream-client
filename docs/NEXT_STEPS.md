@@ -16,5 +16,6 @@
 - [x] JetStream Object Store API: bucket/object operations with streaming and metadata tests.
 - [x] JetStream Services API: service registration/discovery/request handling primitives.
 - [x] Parser robustness expansion: malformed/fragmented property-style tests.
-- [ ] CI expansion: split fast unit/static pipeline and dockerized integration pipeline for push/PR.
+- [x] CI expansion: split fast unit/static pipeline and dockerized integration pipeline for push/PR.
 - [x] Server authorization methods: JWT, password.
+- [x] README regression pass vs basis-company/nats.php examples: parity matrix, equivalent mappings, and regression tests per section.

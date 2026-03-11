@@ -52,6 +52,14 @@ final class Service
     }
 
     /**
+     * Creates grouped endpoint builder with subject prefix.
+     */
+    public function addGroup(string $name): ServiceGroup
+    {
+        return new ServiceGroup($this, $name);
+    }
+
+    /**
      * Starts discovery and endpoint subscriptions.
      *
      * @return Future<void>

@@ -361,6 +361,46 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies KV update/purge/getAll/getStatus parity operations against live JetStream.
+     */
+    public function testJetStreamKeyValueAdvancedParityOperations(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $bucket = 'adv' . strtolower(bin2hex(random_bytes(2)));
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue($bucket);
+        $kv->create()->await();
+
+        $kv->put('username', 'alice')->await();
+        $entry = $kv->get('username')->await();
+        self::assertNotNull($entry);
+
+        $updated = $kv->update('username', 'bob', $entry->revision ?? 0)->await();
+        self::assertGreaterThanOrEqual(2, $updated->seq);
+
+        $kv->put('email', 'a@example.com')->await();
+        $allBeforePurge = $kv->getAll()->await();
+        self::assertSame('bob', $allBeforePurge['username'] ?? null);
+        self::assertSame('a@example.com', $allBeforePurge['email'] ?? null);
+
+        $kv->purge('username')->await();
+        $allAfterPurge = $kv->getAll()->await();
+        self::assertArrayNotHasKey('username', $allAfterPurge);
+        self::assertSame('a@example.com', $allAfterPurge['email'] ?? null);
+
+        $status = $kv->getStatus()->await();
+        self::assertSame($bucket, $status['bucket']);
+        self::assertSame('KV_' . $bucket, $status['stream']);
+        self::assertGreaterThanOrEqual(1, (int) $status['messages']);
+
+        $kv->deleteBucket()->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies Object Store bucket lifecycle with put/get/info/delete operations.
      */
     public function testJetStreamObjectStoreLifecycle(): void
@@ -386,6 +426,11 @@ final class JetStreamIntegrationTest extends TestCase
         $objectData = $store->get('logo.txt')->await();
         self::assertNotNull($objectData);
         self::assertSame('hello-object', $objectData->data);
+
+        $listed = $store->list()->await();
+        self::assertCount(1, $listed);
+        self::assertSame('logo.txt', $listed[0]->name);
+        self::assertFalse($listed[0]->deleted);
 
         $deleted = $store->delete('logo.txt')->await();
         self::assertTrue($deleted->deleted);

@@ -121,4 +121,37 @@ final class ServiceTest extends TestCase
         self::assertStringContainsString("UNSUB 1\r\n", $writes);
         self::assertStringContainsString("UNSUB 10\r\n", $writes);
     }
+
+    /**
+     * Verifies grouped hierarchy API prefixes endpoint subjects correctly.
+     */
+    public function testGroupedEndpointHierarchy(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.v1.echo 10 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0');
+        $service->addGroup('svc')->addGroup('v1')->addEndpoint(
+            'echo-v1',
+            'echo',
+            static fn (NatsMessage $message): string => 'v1:' . $message->payload,
+        );
+
+        $service->start()->await();
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('SUB svc.v1.echo 10' . "\r\n", $writes);
+        self::assertStringContainsString('PUB _INBOX.req', $writes);
+        self::assertStringContainsString('v1:hello', $writes);
+
+        $stats = $service->statsSnapshot();
+        self::assertSame('svc.v1.echo', $stats['endpoints'][0]['subject'] ?? null);
+    }
 }
