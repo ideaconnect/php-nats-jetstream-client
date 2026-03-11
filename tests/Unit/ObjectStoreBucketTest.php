@@ -375,4 +375,47 @@ final class ObjectStoreBucketTest extends TestCase
         self::assertSame(3, $info->chunks);
         self::assertSame(300000, $info->size);
     }
+
+    public function testGetThrowsOnDigestMismatch(): void
+    {
+        $correctData = 'hello world';
+        $corruptedData = 'CORRUPTED!!';
+        $digest = 'SHA-256=' . base64_encode(hash('sha256', $correctData, true));
+        $chunkSubject = '$O.assets.C.deadbeef';
+
+        $metadata = json_encode([
+            'name' => 'doc.txt',
+            'size' => strlen($correctData),
+            'chunks' => 1,
+            'digest' => $digest,
+            'mtime' => '2026-01-01T00:00:00Z',
+            'deleted' => false,
+            'chunk_subject' => $chunkSubject,
+            'metadata' => [],
+        ], JSON_THROW_ON_ERROR);
+
+        $metaResponse = json_encode([
+            'message' => ['data' => base64_encode($metadata), 'subject' => '$O.assets.M.doc.txt'],
+        ], JSON_THROW_ON_ERROR);
+
+        // Return corrupted chunk data instead of correct data.
+        $chunkResponse = json_encode([
+            'message' => ['data' => base64_encode($corruptedData), 'subject' => $chunkSubject],
+        ], JSON_THROW_ON_ERROR);
+
+        // info() request subscribes SID 1, get chunk request subscribes SID 2
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($metaResponse), $metaResponse),
+            sprintf("MSG _INBOX.any 2 %d\r\n%s\r\n", strlen($chunkResponse), $chunkResponse),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Object digest mismatch');
+        $client->jetStream()->objectStore('assets')->get('doc.txt')->await();
+    }
 }

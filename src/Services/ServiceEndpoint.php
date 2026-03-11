@@ -13,6 +13,8 @@ final class ServiceEndpoint
         public readonly string $name,
         public readonly string $subject,
         public readonly ?string $queueGroup,
+        /** @var array<string,mixed>|null */
+        public readonly ?array $schema = null,
         public int $requests = 0,
         public int $errors = 0,
     ) {

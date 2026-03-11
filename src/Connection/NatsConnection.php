@@ -113,6 +113,39 @@ final class NatsConnection
     }
 
     /**
+     * Gracefully drains all subscriptions, flushes pending messages, then closes.
+     *
+     * @return Future<void>
+     */
+    public function drain(): Future
+    {
+        return async(function (): void {
+            if ($this->state !== ConnectionState::Open) {
+                throw new ConnectionException('Connection is not open');
+            }
+
+            $this->state = ConnectionState::Draining;
+            $this->cancelPingTimer();
+
+            // Send UNSUB for all active subscriptions so no new messages arrive.
+            foreach (array_keys($this->subscriptionMeta) as $sid) {
+                $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
+            }
+
+            // Drain any remaining buffered messages to callbacks.
+            $this->drainAllPending();
+
+            // Clear subscription state.
+            $this->subscriptions = [];
+            $this->subscriptionMeta = [];
+            $this->pendingMessages = [];
+
+            $this->transport->close()->await();
+            $this->state = ConnectionState::Closed;
+        });
+    }
+
+    /**
      * Publishes payload bytes to the given subject.
      *
      * @return Future<void>
@@ -493,14 +526,16 @@ final class NatsConnection
     }
 
     /**
-     * Computes reconnect delay including optional jitter.
+     * Computes reconnect delay with exponential backoff, capped at reconnectMaxDelayMs.
      */
     private function backoffDelayMs(int $attempt): int
     {
-        $base = max(1, $this->options->reconnectDelayMs) * $attempt;
+        $base = max(1, $this->options->reconnectDelayMs);
+        $exponential = (int) ($base * (2 ** ($attempt - 1)));
+        $capped = min($exponential, max($base, $this->options->reconnectMaxDelayMs));
         $jitter = $this->options->reconnectJitterMs > 0 ? random_int(0, $this->options->reconnectJitterMs) : 0;
 
-        return $base + $jitter;
+        return $capped + $jitter;
     }
 
     /**

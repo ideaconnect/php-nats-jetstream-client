@@ -42,9 +42,12 @@ final class Service
      *
     * @param callable(NatsMessage):(string|array<string,mixed>|null) $handler
      */
-    public function addEndpoint(string $name, string $subject, callable $handler, ?string $queueGroup = null): self
+    /**
+     * @param array<string,mixed>|null $schema Optional JSON Schema for the endpoint.
+     */
+    public function addEndpoint(string $name, string $subject, callable $handler, ?string $queueGroup = null, ?array $schema = null): self
     {
-        $endpoint = new ServiceEndpoint($name, $subject, $queueGroup);
+        $endpoint = new ServiceEndpoint($name, $subject, $queueGroup, $schema);
         $this->endpoints[$subject] = $endpoint;
         $this->handlers[$subject] = $handler;
 
@@ -171,6 +174,9 @@ final class Service
                 '$SRV.STATS',
                 '$SRV.STATS.' . $this->name,
                 '$SRV.STATS.' . $this->name . '.' . $this->id,
+                '$SRV.SCHEMA',
+                '$SRV.SCHEMA.' . $this->name,
+                '$SRV.SCHEMA.' . $this->name . '.' . $this->id,
             ];
 
             foreach ($subjects as $subject) {
@@ -193,16 +199,35 @@ final class Service
      */
     private function discoveryPayloadForSubject(string $subject): array
     {
-        if (str_starts_with($subject, '$SRV.STATS')) {
-            return $this->statsSnapshot();
-        }
-
         $base = [
             'name' => $this->name,
             'id' => $this->id,
             'version' => $this->version,
             'metadata' => $this->metadata,
         ];
+
+        if (str_starts_with($subject, '$SRV.SCHEMA')) {
+            $endpoints = [];
+            foreach ($this->endpoints as $endpoint) {
+                $entry = [
+                    'name' => $endpoint->name,
+                    'subject' => $endpoint->subject,
+                ];
+                if ($endpoint->schema !== null) {
+                    $entry['schema'] = $endpoint->schema;
+                }
+                $endpoints[] = $entry;
+            }
+
+            return [
+                'type' => 'io.nats.micro.v1.schema_response',
+                'endpoints' => $endpoints,
+            ] + $base;
+        }
+
+        if (str_starts_with($subject, '$SRV.STATS')) {
+            return $this->statsSnapshot();
+        }
 
         if (str_starts_with($subject, '$SRV.INFO')) {
             $endpoints = [];

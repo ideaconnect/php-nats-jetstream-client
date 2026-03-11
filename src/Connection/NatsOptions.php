@@ -25,6 +25,7 @@ final class NatsOptions
         * @param bool $reconnectEnabled Enables automatic reconnect attempts after transport failures.
         * @param int $maxReconnectAttempts Maximum reconnect attempts before closing; use 0 to disable retries.
         * @param int $reconnectDelayMs Base reconnect delay in milliseconds.
+        * @param int $reconnectMaxDelayMs Maximum reconnect delay in milliseconds (caps exponential backoff).
         * @param int $reconnectJitterMs Random jitter in milliseconds added to reconnect delay.
      */
     public function __construct(
@@ -36,6 +37,7 @@ final class NatsOptions
         public readonly bool $reconnectEnabled = true,
         public readonly int $maxReconnectAttempts = 10,
         public readonly int $reconnectDelayMs = 100,
+        public readonly int $reconnectMaxDelayMs = 10_000,
         public readonly int $reconnectJitterMs = 50,
         public readonly int $pingIntervalSeconds = 30,
         public readonly int $maxPingsOut = 2,

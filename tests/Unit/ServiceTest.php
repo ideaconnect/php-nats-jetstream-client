@@ -82,7 +82,7 @@ final class ServiceTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
-            "MSG svc.echo 10 _INBOX.req 5\r\nhello\r\n",
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -119,7 +119,7 @@ final class ServiceTest extends TestCase
 
         $writes = implode('', $transport->writes);
         self::assertStringContainsString("UNSUB 1\r\n", $writes);
-        self::assertStringContainsString("UNSUB 10\r\n", $writes);
+        self::assertStringContainsString("UNSUB 13\r\n", $writes);
     }
 
     /**
@@ -130,7 +130,7 @@ final class ServiceTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
-            "MSG svc.v1.echo 10 _INBOX.req 5\r\nhello\r\n",
+            "MSG svc.v1.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -147,11 +147,40 @@ final class ServiceTest extends TestCase
         $client->processIncoming()->await();
 
         $writes = implode('', $transport->writes);
-        self::assertStringContainsString('SUB svc.v1.echo 10' . "\r\n", $writes);
+        self::assertStringContainsString('SUB svc.v1.echo 13' . "\r\n", $writes);
         self::assertStringContainsString('PUB _INBOX.req', $writes);
         self::assertStringContainsString('v1:hello', $writes);
 
         $stats = $service->statsSnapshot();
         self::assertSame('svc.v1.echo', $stats['endpoints'][0]['subject'] ?? null);
+    }
+
+    /**
+     * Verifies SCHEMA discovery subscriptions and responses include endpoint schemas.
+     */
+    public function testSchemaDiscoveryResponse(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG \$SRV.SCHEMA.echo 11 _INBOX.schema 0\r\n\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $schema = ['type' => 'object', 'properties' => ['msg' => ['type' => 'string']]];
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => $message->payload, schema: $schema);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('SUB $SRV.SCHEMA 10' . "\r\n", $writes);
+        self::assertStringContainsString('PUB _INBOX.schema', $writes);
+        self::assertStringContainsString('io.nats.micro.v1.schema_response', $writes);
+        self::assertStringContainsString('"schema":', $writes);
     }
 }

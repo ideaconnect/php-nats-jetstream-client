@@ -15,14 +15,13 @@ final class ServiceGroup
     }
 
     /**
-     * Registers endpoint within this group subject prefix.
-     *
      * @param callable(NatsMessage):(string|array<string,mixed>|null) $handler
+     * @param array<string,mixed>|null $schema
      */
-    public function addEndpoint(string $name, string $subject, callable $handler, ?string $queueGroup = null): self
+    public function addEndpoint(string $name, string $subject, callable $handler, ?string $queueGroup = null, ?array $schema = null): self
     {
         $fullSubject = $this->joinSubject($this->prefix, $subject);
-        $this->service->addEndpoint($name, $fullSubject, $handler, $queueGroup);
+        $this->service->addEndpoint($name, $fullSubject, $handler, $queueGroup, $schema);
 
         return $this;
     }

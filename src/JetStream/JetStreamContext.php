@@ -237,8 +237,7 @@ final class JetStreamContext
         array $options = [],
     ): Future {
         return async(function () use ($stream, $deliverSubject, $filterSubject, $options): ConsumerInfo {
-            $config = array_merge($options, [
-                'ack_policy' => 'explicit',
+            $config = array_merge(['ack_policy' => 'explicit'], $options, [
                 'deliver_subject' => $deliverSubject,
             ]);
 
@@ -315,6 +314,53 @@ final class JetStreamContext
     }
 
     /**
+     * Creates an ordered ephemeral push consumer with automatic recreation on sequence gaps.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @return Future<int>
+     */
+    public function subscribeOrderedConsumer(
+        string $stream,
+        callable $handler,
+        ?string $filterSubject = null,
+    ): Future {
+        return async(function () use ($stream, $handler, $filterSubject): int {
+            $deliver = Inbox::generate('_INBOX.JS.ORD');
+            $expectedSeq = 1;
+
+            $consumerOptions = [
+                'flow_control' => true,
+                'idle_heartbeat' => '5s',
+                'ack_policy' => 'none',
+                'max_deliver' => 1,
+                'mem_storage' => true,
+            ];
+
+            $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+
+            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedSeq, $stream, $deliver, $filterSubject, $consumerOptions): void {
+                if ($this->handlePushControlMessage($message)->await()) {
+                    return;
+                }
+
+                // Extract stream sequence from reply subject metadata.
+                $seq = $this->extractStreamSequence($message);
+
+                if ($seq !== null && $seq !== $expectedSeq) {
+                    // Sequence gap: recreate the consumer starting from expected sequence.
+                    $consumerOptions['opt_start_seq'] = $expectedSeq;
+                    $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+
+                    return;
+                }
+
+                $expectedSeq++;
+                $handler($message);
+            })->await();
+        });
+    }
+
+    /**
      * Retrieves consumer metadata by stream and durable name.
      *
      * @return Future<ConsumerInfo>
@@ -339,6 +385,37 @@ final class JetStreamContext
             $response = $this->requestJson(JetStreamApi::CONSUMER_DELETE_PREFIX . $stream . '.' . $consumer, []);
 
             return (bool) ($response['success'] ?? false);
+        });
+    }
+
+    /**
+     * Pauses a consumer until a specified time.
+     *
+     * @param string $pauseUntil ISO 8601 timestamp (e.g. '2026-03-12T00:00:00Z').
+     * @return Future<array<string,mixed>>
+     */
+    public function pauseConsumer(string $stream, string $consumer, string $pauseUntil): Future
+    {
+        return async(function () use ($stream, $consumer, $pauseUntil): array {
+            return $this->requestJson(
+                JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
+                ['pause_until' => $pauseUntil],
+            );
+        });
+    }
+
+    /**
+     * Resumes a paused consumer immediately.
+     *
+     * @return Future<array<string,mixed>>
+     */
+    public function resumeConsumer(string $stream, string $consumer): Future
+    {
+        return async(function () use ($stream, $consumer): array {
+            return $this->requestJson(
+                JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
+                [],
+            );
         });
     }
 
@@ -611,5 +688,27 @@ final class JetStreamContext
         }
 
         return $data;
+    }
+
+    /**
+     * Extracts the stream sequence number from a JetStream reply subject.
+     *
+     * Reply subjects follow the pattern: $JS.ACK.{stream}.{consumer}.{delivered}.{sseq}.{cseq}.{tm}.{pending}
+     */
+    private function extractStreamSequence(NatsMessage $message): ?int
+    {
+        if ($message->replyTo === null) {
+            return null;
+        }
+
+        $parts = explode('.', $message->replyTo);
+        // Token index 5 is the stream sequence in the ACK reply subject.
+        if (count($parts) < 6) {
+            return null;
+        }
+
+        $seq = filter_var($parts[5], FILTER_VALIDATE_INT);
+
+        return $seq !== false ? $seq : null;
     }
 }

@@ -9,6 +9,7 @@ use DateTimeZone;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
+use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\JetStream\JetStreamContext;
@@ -17,6 +18,11 @@ use PHPUnit\Framework\TestCase;
 
 final class JetStreamContextTest extends TestCase
 {
+    private function jsOkResponse(string $json): string
+    {
+        return sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($json), $json);
+    }
+
     /**
      * Verifies accountInfo() returns parsed account metrics.
      */
@@ -699,5 +705,82 @@ final class JetStreamContextTest extends TestCase
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Pull fetch batch must be greater than zero');
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 0)->await();
+    }
+
+    // ─── Consumer Pause/Resume ──────────────────────────────────────────
+
+    public function testPauseConsumerSendsCorrectPayload(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse('{"paused":true,"pause_until":"2026-12-01T00:00:00Z"}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $result = $client->jetStream()->pauseConsumer('ORDERS', 'PROC', '2026-12-01T00:00:00Z')->await();
+
+        self::assertTrue($result['paused'] ?? false);
+
+        $written = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.CONSUMER.PAUSE.ORDERS.PROC', $written);
+        self::assertStringContainsString('"pause_until":"2026-12-01T00:00:00Z"', $written);
+    }
+
+    public function testResumeConsumerSendsEmptyBody(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse('{"paused":false}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $result = $client->jetStream()->resumeConsumer('ORDERS', 'PROC')->await();
+
+        self::assertFalse($result['paused'] ?? true);
+
+        $written = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.CONSUMER.PAUSE.ORDERS.PROC', $written);
+    }
+
+    // ─── Ordered Consumer ───────────────────────────────────────────────
+
+    public function testSubscribeOrderedConsumerSendsCorrectConfig(): void
+    {
+        $consumerCreateResponse = json_encode([
+            'stream_name' => 'ORDERS',
+            'name' => 'ephemeral_ordered',
+            'config' => [
+                'ack_policy' => 'none',
+                'flow_control' => true,
+                'idle_heartbeat' => 5000000000,
+                'mem_storage' => true,
+                'max_deliver' => 1,
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse($consumerCreateResponse),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->subscribeOrderedConsumer('ORDERS', function (NatsMessage $msg): void {
+        })->await();
+
+        $written = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS', $written);
+        self::assertStringContainsString('"flow_control":true', $written);
+        self::assertStringContainsString('"idle_heartbeat":"5s"', $written);
+        self::assertStringContainsString('"ack_policy":"none"', $written);
+        self::assertStringContainsString('"mem_storage":true', $written);
     }
 }

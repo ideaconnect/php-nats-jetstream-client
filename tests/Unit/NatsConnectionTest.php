@@ -936,4 +936,94 @@ final class NatsConnectionTest extends TestCase
         $this->expectExceptionMessage('Wildcards must occupy an entire token');
         $connection->subscribe('foo.ba*', function () {})->await();
     }
+
+    // ─── Drain ──────────────────────────────────────────────────────────
+
+    public function testDrainUnsuscsribesAllAndCloses(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->subscribe('foo', function () {})->await();
+        $connection->subscribe('bar', function () {})->await();
+
+        $connection->drain()->await();
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertTrue($transport->closed);
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString("UNSUB 1\r\n", $writes);
+        self::assertStringContainsString("UNSUB 2\r\n", $writes);
+    }
+
+    public function testDrainRequiresOpenConnection(): void
+    {
+        $transport = new FakeTransport();
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Connection is not open');
+        $connection->drain()->await();
+    }
+
+    public function testDrainDeliversBufferedMessagesBeforeClosing(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG events 1 5\r\nhello\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('events', static function (NatsMessage $msg) use (&$received): void {
+            $received[] = $msg->payload;
+        })->await();
+
+        // Process the MSG frame to buffer it.
+        $connection->processIncoming()->await();
+
+        // Drain should deliver buffered messages then close.
+        $connection->drain()->await();
+
+        self::assertSame(['hello'], $received);
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    // ─── Exponential Backoff ────────────────────────────────────────────
+
+    public function testBackoffDelayIsExponential(): void
+    {
+        // Use reflection to test private backoffDelayMs method.
+        $transport = new FakeTransport();
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 100, reconnectMaxDelayMs: 5000, reconnectJitterMs: 0),
+            $transport,
+        );
+
+        $method = new \ReflectionMethod($connection, 'backoffDelayMs');
+
+        self::assertSame(100, $method->invoke($connection, 1));   // 100 * 2^0 = 100
+        self::assertSame(200, $method->invoke($connection, 2));   // 100 * 2^1 = 200
+        self::assertSame(400, $method->invoke($connection, 3));   // 100 * 2^2 = 400
+        self::assertSame(800, $method->invoke($connection, 4));   // 100 * 2^3 = 800
+        self::assertSame(1600, $method->invoke($connection, 5));  // 100 * 2^4 = 1600
+        self::assertSame(3200, $method->invoke($connection, 6));  // 100 * 2^5 = 3200
+        self::assertSame(5000, $method->invoke($connection, 7));  // 100 * 2^6 = 6400 → capped at 5000
+        self::assertSame(5000, $method->invoke($connection, 10)); // capped
+    }
 }
