@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Idct\Nats\Tests\Integration;
 
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Future;
 use Idct\Nats\Connection\NatsOptions;
 use Idct\Nats\Core\NatsClient;
@@ -136,19 +138,26 @@ final class NatsClientIntegrationTest extends TestCase
             ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => 'reply:' . $message->payload);
         $service->start()->await();
 
-        $echoReply = null;
-        for ($attempt = 0; $attempt < 6 && $echoReply === null; $attempt++) {
-            $serviceLoop = async(static function () use ($serviceClient): void {
-                $serviceClient->processIncoming()->await();
-            });
+        $servicePumpCancellation = new DeferredCancellation();
+        $servicePump = async(static function () use ($serviceClient, $servicePumpCancellation): void {
+            $cancellation = $servicePumpCancellation->getCancellation();
 
-            try {
-                $echoReply = $requester->request('svc.echo', 'hello', 1_200)->await();
-            } catch (\Throwable) {
-                usleep(100_000);
-            } finally {
-                $serviceLoop->ignore();
+            while (!$cancellation->isRequested()) {
+                try {
+                    $serviceClient->processIncoming()->await($cancellation);
+                } catch (CancelledException) {
+                    break;
+                } catch (\Throwable) {
+                    usleep(20_000);
+                }
             }
+        });
+
+        try {
+            $echoReply = $requester->request('svc.echo', 'hello', 2_000)->await();
+        } finally {
+            $servicePumpCancellation->cancel();
+            $servicePump->await();
         }
 
         self::assertInstanceOf(NatsMessage::class, $echoReply);

@@ -260,7 +260,7 @@ final class KeyValueBucket
                 'bucket' => $this->bucket,
                 'stream' => $this->streamName(),
                 'messages' => (int) ($state['messages'] ?? 0),
-                'last_sequence' => (int) ($state['last_seq'] ?? 0),
+                'last_sequence' => (int) ($state['last_seq'] ?? ($state['messages'] ?? 0)),
                 'bytes' => (int) ($state['bytes'] ?? 0),
                 'subjects' => is_array($state['subjects'] ?? null) ? $state['subjects'] : [],
             ];
