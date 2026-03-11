@@ -13,7 +13,7 @@ final class ProtocolCodec
     /**
      * Builds the CONNECT frame payload for the initial client handshake.
      */
-    public function encodeConnect(NatsOptions $options): string
+    public function encodeConnect(NatsOptions $options, ?string $serverNonce = null): string
     {
         $payload = [
             'lang' => 'php',
@@ -35,6 +35,24 @@ final class ProtocolCodec
 
         if ($options->password !== null) {
             $payload['pass'] = $options->password;
+        }
+
+        if ($options->jwt !== null) {
+            $payload['jwt'] = $options->jwt;
+
+            if ($options->nonceSigner === null) {
+                throw new ProtocolException('JWT authentication requires a nonce signer');
+            }
+
+            if ($serverNonce === null || $serverNonce === '') {
+                throw new ProtocolException('JWT authentication requires server nonce from INFO');
+            }
+
+            $payload['sig'] = $options->nonceSigner->sign($serverNonce);
+
+            if ($options->nkey !== null && $options->nkey !== '') {
+                $payload['nkey'] = $options->nkey;
+            }
         }
 
         return sprintf("CONNECT %s\r\n", json_encode($payload, JSON_THROW_ON_ERROR));

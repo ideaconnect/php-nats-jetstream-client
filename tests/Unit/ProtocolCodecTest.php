@@ -5,7 +5,9 @@ declare(strict_types=1);
 namespace Idct\Nats\Tests\Unit;
 
 use Idct\Nats\Connection\NatsOptions;
+use Idct\Nats\Exception\ProtocolException;
 use Idct\Nats\Protocol\ProtocolCodec;
+use Idct\Nats\Tests\Support\FixedNonceSigner;
 use PHPUnit\Framework\TestCase;
 
 final class ProtocolCodecTest extends TestCase
@@ -22,6 +24,50 @@ final class ProtocolCodecTest extends TestCase
 
         self::assertStringStartsWith('CONNECT ', $result);
         self::assertStringContainsString('"name":"test-client"', $result);
+    }
+
+    /**
+     * Verifies CONNECT encoding includes username/password fields.
+     */
+    public function testEncodeConnectContainsPasswordAuthFields(): void
+    {
+        $codec = new ProtocolCodec();
+        $options = new NatsOptions(username: 'alice', password: 's3cr3t');
+
+        $result = $codec->encodeConnect($options);
+
+        self::assertStringContainsString('"user":"alice"', $result);
+        self::assertStringContainsString('"pass":"s3cr3t"', $result);
+    }
+
+    /**
+     * Verifies CONNECT encoding includes JWT auth fields signed with server nonce.
+     */
+    public function testEncodeConnectContainsJwtAuthFields(): void
+    {
+        $codec = new ProtocolCodec();
+        $options = new NatsOptions(
+            jwt: 'jwt-token-value',
+            nkey: 'UABC123',
+            nonceSigner: new FixedNonceSigner('sig:'),
+        );
+
+        $result = $codec->encodeConnect($options, 'nonce-1');
+
+        self::assertStringContainsString('"jwt":"jwt-token-value"', $result);
+        self::assertStringContainsString('"nkey":"UABC123"', $result);
+        self::assertStringContainsString('"sig":"sig:nonce-1"', $result);
+    }
+
+    /**
+     * Verifies JWT auth requires a nonce signer and server nonce.
+     */
+    public function testEncodeConnectJwtRequiresSignerAndNonce(): void
+    {
+        $codec = new ProtocolCodec();
+
+        $this->expectException(ProtocolException::class);
+        $codec->encodeConnect(new NatsOptions(jwt: 'jwt-token-value'), 'nonce-1');
     }
 
     /**

@@ -15,6 +15,7 @@ use Idct\Nats\Exception\ConnectionException;
 use Idct\Nats\Exception\TimeoutException;
 use Idct\Nats\Tests\Support\FlakyTransport;
 use Idct\Nats\Tests\Support\FakeTransport;
+use Idct\Nats\Tests\Support\FixedNonceSigner;
 use PHPUnit\Framework\TestCase;
 
 final class NatsConnectionTest extends TestCase
@@ -104,6 +105,28 @@ final class NatsConnectionTest extends TestCase
         $this->expectExceptionMessage('Server error during connect');
 
         $connection->connect()->await();
+    }
+
+    /**
+     * Verifies JWT auth signs the server nonce from INFO in CONNECT payload.
+     */
+    public function testConnectIncludesJwtSignatureFromInfoNonce(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true,"nonce":"n-123"}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(jwt: 'jwt-token', nkey: 'UABC123', nonceSigner: new FixedNonceSigner('sig:')),
+            $transport,
+        );
+
+        $connection->connect()->await();
+
+        self::assertStringContainsString('"jwt":"jwt-token"', $transport->writes[0]);
+        self::assertStringContainsString('"sig":"sig:n-123"', $transport->writes[0]);
+        self::assertStringContainsString('"nkey":"UABC123"', $transport->writes[0]);
     }
 
     /**

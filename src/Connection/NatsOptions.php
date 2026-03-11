@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Idct\Nats\Connection;
 
+use Idct\Nats\Auth\NonceSignerInterface;
+
 enum SlowConsumerPolicy: string
 {
     /** Drop the oldest queued message and keep newer arrivals. */
@@ -43,6 +45,9 @@ final class NatsOptions
         public readonly ?string $token = null,
         public readonly ?string $username = null,
         public readonly ?string $password = null,
+        public readonly ?string $jwt = null,
+        public readonly ?string $nkey = null,
+        public readonly ?NonceSignerInterface $nonceSigner = null,
         public readonly int $maxPendingMessagesPerSubscription = 1_024,
         public readonly SlowConsumerPolicy $slowConsumerPolicy = SlowConsumerPolicy::DropOldest,
     ) {

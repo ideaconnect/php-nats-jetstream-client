@@ -118,4 +118,44 @@ final class NatsClientIntegrationTest extends TestCase
         self::assertNotNull($client->serverInfo());
         $client->disconnect()->await();
     }
+
+    /**
+     * Verifies services framework discovery and endpoint request/reply on a live server.
+     */
+    public function testServiceDiscoveryAndEndpoint(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $serviceClient = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $requester = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+
+        $serviceClient->connect()->await();
+        $requester->connect()->await();
+
+        $service = $serviceClient->service('echo', '1.0.0', 'Echo demo')
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => 'reply:' . $message->payload);
+        $service->start()->await();
+
+        $processServicePing = async(static function () use ($serviceClient): void {
+            $serviceClient->processIncoming()->await();
+        });
+
+        $pingReply = $requester->request('$SRV.PING.echo', '', 2000)->await();
+        $processServicePing->await();
+
+        self::assertStringContainsString('"name":"echo"', $pingReply->payload);
+
+        $processServiceRequest = async(static function () use ($serviceClient): void {
+            $serviceClient->processIncoming()->await();
+        });
+
+        $echoReply = $requester->request('svc.echo', 'hello', 2000)->await();
+        $processServiceRequest->await();
+
+        self::assertSame('reply:hello', $echoReply->payload);
+
+        $service->stop()->await();
+        $requester->disconnect()->await();
+        $serviceClient->disconnect()->await();
+    }
 }

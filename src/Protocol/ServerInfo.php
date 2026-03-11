@@ -16,6 +16,7 @@ final class ServerInfo
         public readonly bool $jetStreamEnabled,
         public readonly int $maxPayload,
         public readonly bool $headersSupported,
+        public readonly ?string $nonce = null,
     ) {
     }
 
@@ -33,6 +34,7 @@ final class ServerInfo
             jetStreamEnabled: (bool) ($payload['jetstream'] ?? false),
             maxPayload: (int) ($payload['max_payload'] ?? 0),
             headersSupported: (bool) ($payload['headers'] ?? false),
+            nonce: isset($payload['nonce']) ? (string) $payload['nonce'] : null,
         );
     }
 }

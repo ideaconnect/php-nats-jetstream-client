@@ -365,7 +365,7 @@ final class NatsConnection
 
         $this->serverInfo = $this->awaitServerInfo();
 
-        $this->transport->write($this->codec->encodeConnect($this->options))->await();
+        $this->transport->write($this->codec->encodeConnect($this->options, $this->serverInfo->nonce))->await();
         $this->transport->write($this->codec->encodePing())->await();
 
         $this->awaitInitialPong();

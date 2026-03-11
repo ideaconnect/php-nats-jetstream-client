@@ -10,6 +10,7 @@ use Idct\Nats\Connection\NatsConnection;
 use Idct\Nats\Connection\NatsOptions;
 use Idct\Nats\JetStream\JetStreamContext;
 use Idct\Nats\Protocol\ServerInfo;
+use Idct\Nats\Services\Service;
 use Idct\Nats\Transport\AmpSocketTransport;
 use Idct\Nats\Transport\TransportInterface;
 
@@ -158,5 +159,15 @@ final class NatsClient
         }
 
         return $this->jetStreamContext;
+    }
+
+    /**
+     * Creates a services-framework runtime bound to this client.
+     *
+     * @param array<string,string> $metadata
+     */
+    public function service(string $name, string $version, ?string $description = null, array $metadata = []): Service
+    {
+        return new Service($this, $name, $version, $description, $metadata);
     }
 }

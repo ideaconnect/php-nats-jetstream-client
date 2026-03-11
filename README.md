@@ -20,12 +20,49 @@ Implemented functionality includes:
 - JetStream publish ACK
 - Scheduled publish (`@at` support)
 - KeyValue API slice (bucket lifecycle, put/get/delete, watch)
+- Server authorization methods: token, username/password, JWT + nonce signer
 
 Current scheduling note: scheduled messages are implemented with NATS scheduler headers and currently accept only `@at` expressions.
 
 Use `Idct\\Nats\\JetStream\\Schedule::at(...)` or `Schedule::atTimestamp(...)` to generate valid `@at` expressions.
 
 ## Usage
+
+### Authentication Options
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use Idct\Nats\Connection\NatsOptions;
+use Idct\Nats\Core\NatsClient;
+use Idct\Nats\Auth\NonceSignerInterface;
+
+// Username/password.
+$passwordClient = new NatsClient(new NatsOptions(
+	servers: ['nats://127.0.0.1:4222'],
+	username: 'alice',
+	password: 's3cr3t',
+));
+
+// JWT + nonce signature.
+final class DemoNonceSigner implements NonceSignerInterface
+{
+	public function sign(string $nonce): string
+	{
+		// Replace with real JWT nonce signing implementation.
+		return base64_encode(hash('sha256', $nonce, true));
+	}
+}
+
+$jwtClient = new NatsClient(new NatsOptions(
+	servers: ['nats://127.0.0.1:4222'],
+	jwt: 'your-jwt-token',
+	nkey: 'U...PUBLIC NKEY...',
+	nonceSigner: new DemoNonceSigner(),
+));
+```
 
 ### Connect and Publish/Subscribe
 
@@ -281,6 +318,37 @@ echo $objectData?->data . PHP_EOL;
 $store->delete('logo.txt')->await();
 $store->deleteBucket()->await();
 $client->disconnect()->await();
+```
+
+### Services Framework
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use Idct\Nats\Connection\NatsOptions;
+use Idct\Nats\Core\NatsClient;
+use Idct\Nats\Core\NatsMessage;
+
+$serviceClient = new NatsClient(new NatsOptions());
+$serviceClient->connect()->await();
+
+$service = $serviceClient->service('echo', '1.0.0', 'Echo demo')
+	->addEndpoint('echo', 'svc.echo', static function (NatsMessage $message): string {
+		return 'reply:' . $message->payload;
+	});
+
+$service->start()->await();
+
+// In another client you can call discovery or endpoint subjects:
+// - $SRV.PING.echo
+// - $SRV.INFO.echo
+// - $SRV.STATS.echo
+// - svc.echo
+
+$service->stop()->await();
+$serviceClient->disconnect()->await();
 ```
 
 ## Development
