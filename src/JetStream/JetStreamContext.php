@@ -326,19 +326,20 @@ final class JetStreamContext
     ): Future {
         return async(function () use ($stream, $handler, $filterSubject): int {
             $deliver = Inbox::generate('_INBOX.JS.ORD');
-            $expectedSeq = 1;
+            $expectedSeq = null;
 
             $consumerOptions = [
                 'flow_control' => true,
-                'idle_heartbeat' => '5s',
+                'idle_heartbeat' => 5_000_000_000,
                 'ack_policy' => 'none',
                 'max_deliver' => 1,
                 'mem_storage' => true,
             ];
 
-            $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+            $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+            $consumerName = $consumer->name;
 
-            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedSeq, $stream, $deliver, $filterSubject, $consumerOptions): void {
+            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedSeq, $stream, $deliver, $filterSubject, &$consumerOptions, &$consumerName): void {
                 if ($this->handlePushControlMessage($message)->await()) {
                     return;
                 }
@@ -346,15 +347,26 @@ final class JetStreamContext
                 // Extract stream sequence from reply subject metadata.
                 $seq = $this->extractStreamSequence($message);
 
-                if ($seq !== null && $seq !== $expectedSeq) {
+                if ($seq !== null && $expectedSeq !== null && $seq !== $expectedSeq) {
                     // Sequence gap: recreate the consumer starting from expected sequence.
                     $consumerOptions['opt_start_seq'] = $expectedSeq;
-                    $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+
+                    try {
+                        $this->deleteConsumer($stream, $consumerName)->await();
+                    } catch (JetStreamException) {
+                        // Best-effort cleanup for ephemeral consumers that may already be gone.
+                    }
+
+                    $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+                    $consumerName = $consumer->name;
 
                     return;
                 }
 
-                $expectedSeq++;
+                if ($seq !== null) {
+                    $expectedSeq = $seq + 1;
+                }
+
                 $handler($message);
             })->await();
         });
@@ -525,8 +537,22 @@ final class JetStreamContext
 
             $inbox = Inbox::generate('_INBOX.JS.FETCH');
             $messages = [];
+            $terminalStatus = null;
 
-            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages): void {
+            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages, &$terminalStatus): void {
+                $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
+                $status = (int) ($headers['Status'] ?? 0);
+
+                if ($status === 100) {
+                    return;
+                }
+
+                if ($status >= 400) {
+                    $terminalStatus = $status;
+
+                    return;
+                }
+
                 $messages[] = $msg;
             })->await();
 
@@ -534,7 +560,7 @@ final class JetStreamContext
                 $this->client->publish($subject, $json, $inbox)->await();
 
                 $deadline = microtime(true) + ($expiresMs + 1000) / 1000;
-                while (count($messages) < $batch && microtime(true) < $deadline) {
+                while (count($messages) < $batch && $terminalStatus === null && microtime(true) < $deadline) {
                     $this->client->processIncoming()->await();
                 }
             } finally {

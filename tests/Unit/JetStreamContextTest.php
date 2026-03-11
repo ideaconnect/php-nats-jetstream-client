@@ -707,6 +707,28 @@ final class JetStreamContextTest extends TestCase
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 0)->await();
     }
 
+    public function testFetchBatchIgnoresTerminalStatusFrames(): void
+    {
+        $msg1 = '{"event":"first"}';
+        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\nDescription: No Messages\r\n\r\n";
+        $headerBytes = strlen($statusHeaders);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg1), $msg1),
+            sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 2, 2500)->await();
+
+        self::assertCount(1, $messages);
+        self::assertSame('{"event":"first"}', $messages[0]->payload);
+    }
+
     // ─── Consumer Pause/Resume ──────────────────────────────────────────
 
     public function testPauseConsumerSendsCorrectPayload(): void
@@ -779,7 +801,7 @@ final class JetStreamContextTest extends TestCase
         $written = implode('', $transport->writes);
         self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS', $written);
         self::assertStringContainsString('"flow_control":true', $written);
-        self::assertStringContainsString('"idle_heartbeat":"5s"', $written);
+        self::assertStringContainsString('"idle_heartbeat":5000000000', $written);
         self::assertStringContainsString('"ack_policy":"none"', $written);
         self::assertStringContainsString('"mem_storage":true', $written);
     }

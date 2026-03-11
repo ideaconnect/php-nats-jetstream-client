@@ -41,13 +41,13 @@ This repository tracks parity against basis-company nats.php README examples.
 
 | Section | Status | Notes |
 | --- | --- | --- |
-| Connecting and Auth | matched | Basic, token, username/password, JWT nonce signing, and TLS CA/cert/key options are supported. |
-| Publish Subscribe | equivalent | Callback and queue-group patterns are supported; fetchAll-style queue API is mapped via processIncoming patterns. |
-| Request Response | matched | Request/reply with timeout and cancellation is covered. |
-| JetStream API Usage | matched | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling are covered. |
-| Microservices | matched | Service registration, discovery, endpoint handling, and grouped endpoint hierarchy are covered. |
-| Key Value Storage | matched | Core KV flows plus update/purge/getAll/status parity are covered. |
-| Object Store | matched | Bucket/object lifecycle and object listing parity are covered. |
+| Connecting and Auth | workflow parity | Basic, token, username/password, JWT nonce signing, and TLS CA/cert/key options are supported. |
+| Publish Subscribe | workflow parity | Callback and queue-group patterns are supported; basis-company's queue fetch API is approximated via callback subscriptions plus `processIncoming()`. |
+| Request Response | workflow parity | Awaited request/reply with timeout and cancellation is covered, but the API shape differs from basis-company's `dispatch()` and callback request helpers. |
+| JetStream API Usage | partial parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, and ordered-consumer helpers are covered, but the configuration surface is simpler. |
+| Microservices | partial parity | Service registration, discovery, endpoint handling, grouped hierarchy, and SCHEMA discovery are covered with a slimmer stats/handler model. |
+| Key Value Storage | workflow parity | Core KV flows plus update/purge/getAll/status parity are covered. |
+| Object Store | extended | Bucket/object lifecycle, object listing, chunked uploads, and digest verification are covered. |
 
 Detailed execution plan: see REGRESSION_PASS.md.
 
@@ -61,6 +61,12 @@ declare(strict_types=1);
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Auth\NonceSignerInterface;
+
+// Token auth.
+$tokenClient = new NatsClient(new NatsOptions(
+	servers: ['nats://127.0.0.1:4222'],
+	token: 's3cr3t-token',
+));
 
 // Username/password.
 $passwordClient = new NatsClient(new NatsOptions(
@@ -141,6 +147,34 @@ echo $reply->payload . PHP_EOL;
 $client->disconnect()->await();
 ```
 
+### Headers and Server Info
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$client->publishWithHeaders('events.orders', '{"id":123}', [
+	'Nats-Msg-Id' => 'orders-123',
+	'Content-Type' => 'application/json',
+])->await();
+
+$reply = $client->requestWithHeaders('svc.echo', 'hello', [
+	'X-Request-Id' => 'req-123',
+], 2000)->await();
+
+echo $reply->payload . PHP_EOL;
+echo $client->serverInfo()?->serverName . PHP_EOL;
+
+$client->disconnect()->await();
+```
+
 ### JetStream Stream and Durable Consumer
 
 ```php
@@ -160,6 +194,36 @@ $js->createConsumer('ORDERS', 'PROC', 'orders.created')->await();
 
 $ack = $js->publish('orders.created', '{"id":123}')->await();
 echo $ack->stream . ':' . $ack->seq . PHP_EOL;
+
+$js->deleteConsumer('ORDERS', 'PROC')->await();
+$js->deleteStream('ORDERS')->await();
+$client->disconnect()->await();
+```
+
+### JetStream Stream Update and Consumer Info
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('ORDERS', ['orders.created'])->await();
+$js->updateStream('ORDERS', [
+	'subjects' => ['orders.created', 'orders.updated'],
+])->await();
+
+$js->createConsumer('ORDERS', 'PROC', 'orders.created')->await();
+$consumerInfo = $js->getConsumer('ORDERS', 'PROC')->await();
+
+echo $consumerInfo->streamName . PHP_EOL;
+echo $consumerInfo->name . PHP_EOL;
 
 $js->deleteConsumer('ORDERS', 'PROC')->await();
 $js->deleteStream('ORDERS')->await();
@@ -364,6 +428,34 @@ foreach ($objects as $object) {
 }
 
 $store->delete('logo.txt')->await();
+$store->deleteBucket()->await();
+$client->disconnect()->await();
+```
+
+### Object Store Streaming to Callback
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$store = $client->jetStream()->objectStore('assets');
+$store->create()->await();
+$store->put('logo.txt', 'hello-object')->await();
+
+$info = $store->getToCallback('logo.txt', static function (string $chunk): void {
+	echo $chunk;
+})->await();
+
+echo PHP_EOL;
+echo $info?->name . PHP_EOL;
+
 $store->deleteBucket()->await();
 $client->disconnect()->await();
 ```

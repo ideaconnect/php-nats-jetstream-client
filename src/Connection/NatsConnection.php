@@ -43,6 +43,7 @@ final class NatsConnection
     private array $pendingMessages = [];
     private int $outstandingPings = 0;
     private ?string $pingTimerId = null;
+    private bool $drainFlushPending = false;
 
     /**
      * Creates a connection runtime with transport and protocol dependencies.
@@ -132,6 +133,17 @@ final class NatsConnection
                 $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
             }
 
+            // Flush in-flight deliveries already emitted by the server before closing.
+            $this->drainFlushPending = true;
+            $this->transport->write($this->codec->encodePing())->await();
+
+            while ($this->drainFlushPending) {
+                $frames = $this->processIncoming()->await();
+                if ($frames === 0) {
+                    break;
+                }
+            }
+
             // Drain any remaining buffered messages to callbacks.
             $this->drainAllPending();
 
@@ -139,6 +151,7 @@ final class NatsConnection
             $this->subscriptions = [];
             $this->subscriptionMeta = [];
             $this->pendingMessages = [];
+            $this->drainFlushPending = false;
 
             $this->transport->close()->await();
             $this->state = ConnectionState::Closed;
@@ -236,10 +249,8 @@ final class NatsConnection
                 throw new ConnectionException('Connection is not open');
             }
 
-            unset($this->subscriptions[$sid]);
-            unset($this->subscriptionMeta[$sid]);
-            unset($this->pendingMessages[$sid]);
             $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+            $this->dropSubscriptionState($sid);
         });
     }
 
@@ -251,7 +262,7 @@ final class NatsConnection
     public function processIncoming(): Future
     {
         return async(function (): int {
-            if ($this->state !== ConnectionState::Open) {
+            if ($this->state !== ConnectionState::Open && $this->state !== ConnectionState::Draining) {
                 throw new ConnectionException('Connection is not open');
             }
 
@@ -399,7 +410,7 @@ final class NatsConnection
 
             return $response;
         } finally {
-            $this->unsubscribe($sid)->await();
+            $this->cleanupRequestSubscription($sid);
         }
     }
 
@@ -643,6 +654,7 @@ final class NatsConnection
 
         if ($frame->type === ProtocolFrameType::Pong) {
             $this->outstandingPings = 0;
+            $this->drainFlushPending = false;
 
             return;
         }
@@ -683,8 +695,12 @@ final class NatsConnection
             return [null, $payload];
         }
 
+        if ($frame->headerBytes > strlen($payload)) {
+            throw new ProtocolException('Malformed HMSG frame: header bytes exceed payload length');
+        }
+
         // Header bytes include only the wire header block; remainder is message body.
-        $headerBytes = min($frame->headerBytes, strlen($payload));
+        $headerBytes = $frame->headerBytes;
         $headers = substr($payload, 0, $headerBytes);
         $body = substr($payload, $headerBytes);
 
@@ -864,5 +880,31 @@ final class NatsConnection
             $message = $queue->dequeue();
             $this->subscriptions[$sid]($message);
         }
+    }
+
+    private function cleanupRequestSubscription(int $sid): void
+    {
+        if (!isset($this->subscriptionMeta[$sid], $this->subscriptions[$sid], $this->pendingMessages[$sid])) {
+            return;
+        }
+
+        if ($this->state === ConnectionState::Open) {
+            try {
+                $this->unsubscribe($sid)->await();
+
+                return;
+            } catch (\Throwable) {
+                // Preserve the original request failure and fall back to local cleanup.
+            }
+        }
+
+        $this->dropSubscriptionState($sid);
+    }
+
+    private function dropSubscriptionState(int $sid): void
+    {
+        unset($this->subscriptions[$sid]);
+        unset($this->subscriptionMeta[$sid]);
+        unset($this->pendingMessages[$sid]);
     }
 }

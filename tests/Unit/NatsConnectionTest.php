@@ -944,6 +944,7 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
+            "PONG\r\n",
         ]);
 
         $connection = new NatsConnection(
@@ -963,6 +964,7 @@ final class NatsConnectionTest extends TestCase
         $writes = implode('', $transport->writes);
         self::assertStringContainsString("UNSUB 1\r\n", $writes);
         self::assertStringContainsString("UNSUB 2\r\n", $writes);
+        self::assertStringContainsString("PING\r\n", $writes);
     }
 
     public function testDrainRequiresOpenConnection(): void
@@ -981,6 +983,7 @@ final class NatsConnectionTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
             "MSG events 1 5\r\nhello\r\n",
+            "PONG\r\n",
         ]);
 
         $connection = new NatsConnection(
@@ -994,14 +997,53 @@ final class NatsConnectionTest extends TestCase
             $received[] = $msg->payload;
         })->await();
 
-        // Process the MSG frame to buffer it.
-        $connection->processIncoming()->await();
-
-        // Drain should deliver buffered messages then close.
+        // Drain should flush the in-flight delivery, then close.
         $connection->drain()->await();
 
         self::assertSame(['hello'], $received);
         self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    public function testRequestTimeoutPreservesOriginalExceptionDuringCleanup(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        try {
+            $connection->request('svc.echo', '{"x":1}', 5)->await();
+            self::fail('Expected timeout');
+        } catch (TimeoutException $e) {
+            self::assertStringContainsString('Request timed out', $e->getMessage());
+        }
+
+        self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+    }
+
+    public function testMalformedHmsgRejectsInvalidHeaderBoundary(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "HMSG updates 1 20 10\r\n1234567890\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (NatsMessage $message): void {
+        })->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Malformed HMSG frame');
+
+        $connection->processIncoming()->await();
     }
 
     // ─── Exponential Backoff ────────────────────────────────────────────

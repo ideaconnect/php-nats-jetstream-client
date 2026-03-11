@@ -285,6 +285,51 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies ordered consumer delivery still works when the first matching message is not stream sequence 1.
+     */
+    public function testJetStreamOrderedConsumerWithFilteredSubjectAfterPriorMessages(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subjectPrefix = 'it.' . strtolower($stream);
+        $nonMatchingSubject = $subjectPrefix . '.other';
+        $matchingSubject = $subjectPrefix . '.match';
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subjectPrefix . '.>'])->await();
+
+        // Advance the stream sequence with a non-matching subject first.
+        $js->publish($nonMatchingSubject, '{"event":"other"}')->await();
+
+        $received = [];
+        $sid = $js->subscribeOrderedConsumer(
+            $stream,
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+            $matchingSubject,
+        )->await();
+
+        $js->publish($matchingSubject, '{"event":"ordered"}')->await();
+
+        $deadline = microtime(true) + 4.0;
+        while ($received === [] && microtime(true) < $deadline) {
+            $client->processIncoming()->await();
+            usleep(100_000);
+        }
+
+        self::assertSame(['{"event":"ordered"}'], $received);
+
+        $client->unsubscribe($sid)->await();
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies ephemeral pull consumer can fetch and ACK a live message.
      */
     public function testJetStreamEphemeralPullConsumerFetchAndAck(): void
