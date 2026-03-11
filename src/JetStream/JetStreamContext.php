@@ -90,6 +90,23 @@ final class JetStreamContext
     }
 
     /**
+     * Updates an existing stream configuration.
+     *
+     * @param array<string,mixed> $config Full stream config to apply.
+     * @return Future<StreamInfo>
+     */
+    public function updateStream(string $name, array $config): Future
+    {
+        return async(function () use ($name, $config): StreamInfo {
+            $payload = array_merge($config, ['name' => $name]);
+
+            $response = $this->requestJson(JetStreamApi::STREAM_UPDATE_PREFIX . $name, $payload);
+
+            return StreamInfo::fromArray($response);
+        });
+    }
+
+    /**
      * Retrieves stream metadata by name.
      *
      * @return Future<StreamInfo>
@@ -120,19 +137,20 @@ final class JetStreamContext
     /**
      * Creates or updates a durable consumer for a stream.
      *
+     * @param array<string,mixed> $options Additional consumer config fields (max_deliver, ack_wait, etc.).
      * @return Future<ConsumerInfo>
      */
-    public function createConsumer(string $stream, string $consumer, ?string $filterSubject = null): Future
+    public function createConsumer(string $stream, string $consumer, ?string $filterSubject = null, array $options = []): Future
     {
-        return async(function () use ($stream, $consumer, $filterSubject): ConsumerInfo {
+        return async(function () use ($stream, $consumer, $filterSubject, $options): ConsumerInfo {
             if ($filterSubject === '') {
                 throw new JetStreamException('Consumer filter subject must not be empty (use null to omit)');
             }
 
-            $config = [
+            $config = array_merge($options, [
                 'durable_name' => $consumer,
                 'ack_policy' => 'explicit',
-            ];
+            ]);
 
             if ($filterSubject !== null) {
                 $config['filter_subject'] = $filterSubject;
@@ -398,19 +416,59 @@ final class JetStreamContext
     public function fetchNext(string $stream, string $consumer, int $expiresMs = 3000): Future
     {
         return async(function () use ($stream, $consumer, $expiresMs): NatsMessage {
+            $messages = $this->fetchBatch($stream, $consumer, 1, $expiresMs)->await();
+
+            return $messages[0];
+        });
+    }
+
+    /**
+     * Fetches a batch of messages for a pull consumer.
+     *
+     * @return Future<list<NatsMessage>>
+     */
+    public function fetchBatch(string $stream, string $consumer, int $batch, int $expiresMs = 3000): Future
+    {
+        return async(function () use ($stream, $consumer, $batch, $expiresMs): array {
             if ($expiresMs <= 0) {
                 throw new JetStreamException('Pull fetch expiresMs must be greater than zero');
             }
 
+            if ($batch <= 0) {
+                throw new JetStreamException('Pull fetch batch must be greater than zero');
+            }
+
             $payload = [
-                'batch' => 1,
+                'batch' => $batch,
                 'expires' => $expiresMs * 1_000_000,
             ];
 
             $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
             $json = json_encode($payload, JSON_THROW_ON_ERROR);
 
-            return $this->client->request($subject, $json, $expiresMs + 1000)->await();
+            $inbox = Inbox::generate('_INBOX.JS.FETCH');
+            $messages = [];
+
+            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages): void {
+                $messages[] = $msg;
+            })->await();
+
+            try {
+                $this->client->publish($subject, $json, $inbox)->await();
+
+                $deadline = microtime(true) + ($expiresMs + 1000) / 1000;
+                while (count($messages) < $batch && microtime(true) < $deadline) {
+                    $this->client->processIncoming()->await();
+                }
+            } finally {
+                $this->client->unsubscribe($sid)->await();
+            }
+
+            if ($messages === []) {
+                throw new JetStreamException('No messages received within timeout');
+            }
+
+            return $messages;
         });
     }
 

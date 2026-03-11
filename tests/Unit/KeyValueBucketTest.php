@@ -197,21 +197,19 @@ final class KeyValueBucketTest extends TestCase
      */
     public function testGetAll(): void
     {
-        $streamInfo = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":4,"bytes":256}}';
-        $m1 = sprintf('{"message":{"subject":"$KV.cfg.username","seq":1,"data":"%s"}}', base64_encode('alice'));
-        $m2 = sprintf('{"message":{"subject":"$KV.cfg.email","seq":2,"data":"%s"}}', base64_encode('a@example.com'));
+        $streamInfo = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":4,"bytes":256,"subjects":{"$KV.cfg.username":2,"$KV.cfg.email":2}}}';
         $purgeHeaders = base64_encode("NATS/1.0\r\nKV-Operation:PURGE\r\n\r\n");
-        $m3 = sprintf('{"message":{"subject":"$KV.cfg.username","seq":3,"data":"","hdrs":"%s"}}', $purgeHeaders);
-        $m4 = sprintf('{"message":{"subject":"$KV.cfg.email","seq":4,"data":"%s"}}', base64_encode('b@example.com'));
+        // last_by_subj for username → purged
+        $mUsername = sprintf('{"message":{"subject":"$KV.cfg.username","seq":3,"data":"","hdrs":"%s"}}', $purgeHeaders);
+        // last_by_subj for email → latest value
+        $mEmail = sprintf('{"message":{"subject":"$KV.cfg.email","seq":4,"data":"%s"}}', base64_encode('b@example.com'));
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($m1), $m1),
-            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($m2), $m2),
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($m3), $m3),
-            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($m4), $m4),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($mUsername), $mUsername),
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($mEmail), $mEmail),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -269,5 +267,36 @@ final class KeyValueBucketTest extends TestCase
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Invalid KV key');
         $client->jetStream()->keyValue('cfg')->put("foo\tbar", 'data')->await();
+    }
+
+    // ─── KV Options Mapping ─────────────────────────────────────────
+
+    public function testCreateWithSemanticOptions(): void
+    {
+        $createPayload = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('cfg')->create([
+            'history' => 5,
+            'ttl' => 86400000000000,
+            'max_value_size' => 1024,
+            'storage' => 'memory',
+            'num_replicas' => 3,
+        ])->await();
+
+        $written = $transport->writes[3];
+        self::assertStringContainsString('"max_msgs_per_subject":5', $written);
+        self::assertStringContainsString('"max_age":86400000000000', $written);
+        self::assertStringContainsString('"max_msg_size":1024', $written);
+        self::assertStringContainsString('"storage":"memory"', $written);
+        self::assertStringContainsString('"num_replicas":3', $written);
     }
 }

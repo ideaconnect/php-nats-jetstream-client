@@ -39,10 +39,12 @@ final class KeyValueBucket
                 'allow_rollup_hdrs' => true,
             ];
 
+            $mapped = $this->mapKvOptions($options);
+
             return $this->jetStream->createStream(
                 $this->streamName(),
                 [$this->subjectPrefix() . '>'],
-                array_merge($defaults, $options),
+                array_merge($defaults, $mapped),
             )->await();
         });
     }
@@ -210,18 +212,35 @@ final class KeyValueBucket
     {
         return async(function (): array {
             $status = $this->getStatus()->await();
-            $lastSequence = (int) ($status['last_sequence'] ?? 0);
+
+            /** @var array<string,int> $subjects */
+            $subjects = $status['subjects'];
+            if ($subjects === []) {
+                return [];
+            }
+
             $latest = [];
 
-            for ($seq = 1; $seq <= $lastSequence; $seq++) {
-                $message = $this->requestKvMessageBySequence($seq);
-                if ($message === null) {
+            // Use direct API `last_by_subj` per known subject for O(keys) lookups.
+            foreach (array_keys($subjects) as $subject) {
+                $key = $this->keyFromSubject((string) $subject);
+                if ($key === null || $key === '') {
                     continue;
                 }
 
-                $subject = (string) ($message['subject'] ?? '');
-                $key = $this->keyFromSubject($subject);
-                if ($key === null || $key === '') {
+                try {
+                    $response = $this->requestKvMessage($key);
+                } catch (JetStreamException $e) {
+                    if ($e->getCode() === 404) {
+                        continue;
+                    }
+
+                    throw $e;
+                }
+
+                /** @var array<string,mixed>|null $message */
+                $message = is_array($response['message'] ?? null) ? $response['message'] : null;
+                if ($message === null) {
                     continue;
                 }
 
@@ -229,7 +248,6 @@ final class KeyValueBucket
                 $operation = strtoupper((string) ($headers['KV-Operation'] ?? 'PUT'));
 
                 if ($operation === 'DEL' || $operation === 'PURGE') {
-                    unset($latest[$key]);
                     continue;
                 }
 
@@ -315,36 +333,6 @@ final class KeyValueBucket
     }
 
     /**
-     * @return array<string,mixed>|null
-     */
-    private function requestKvMessageBySequence(int $sequence): ?array
-    {
-        $subject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
-        $payload = json_encode(['seq' => $sequence], JSON_THROW_ON_ERROR);
-        $message = $this->client->request($subject, $payload)->await();
-
-        /** @var array<string,mixed> $data */
-        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
-
-        /** @var array<string,mixed>|null $error */
-        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-        if ($error !== null) {
-            $code = (int) ($error['code'] ?? 0);
-            if ($code === 404) {
-                return null;
-            }
-
-            $description = (string) ($error['description'] ?? 'JetStream API error');
-            throw new JetStreamException($description, $code);
-        }
-
-        /** @var array<string,mixed>|null $payloadMessage */
-        $payloadMessage = is_array($data['message'] ?? null) ? $data['message'] : null;
-
-        return $payloadMessage;
-    }
-
-    /**
      * @param array<string,mixed> $message
      * @return array<string,string>
      */
@@ -398,6 +386,32 @@ final class KeyValueBucket
 
             return PubAck::fromArray($data);
         });
+    }
+
+    /**
+     * Maps semantic KV options to underlying stream configuration fields.
+     *
+     * @param array<string,mixed> $options
+     * @return array<string,mixed>
+     */
+    private function mapKvOptions(array $options): array
+    {
+        $mapped = [];
+
+        foreach ($options as $key => $value) {
+            $mapped[match ($key) {
+                'history' => 'max_msgs_per_subject',
+                'ttl' => 'max_age',
+                'max_value_size' => 'max_msg_size',
+                'storage' => 'storage',
+                'num_replicas' => 'num_replicas',
+                'description' => 'description',
+                'max_bytes' => 'max_bytes',
+                default => $key,
+            }] = $value;
+        }
+
+        return $mapped;
     }
 
     /**

@@ -608,4 +608,96 @@ final class JetStreamContextTest extends TestCase
         $this->expectExceptionMessage('Malformed JetStream API response');
         $client->jetStream()->accountInfo()->await();
     }
+
+    // ─── Phase 3: Feature Gaps ────────────────────────────────────────
+
+    public function testUpdateStream(): void
+    {
+        $responsePayload = '{"config":{"name":"ORDERS","subjects":["orders.>","events.>"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($responsePayload), $responsePayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $updated = $client->jetStream()->updateStream('ORDERS', [
+            'subjects' => ['orders.>', 'events.>'],
+        ])->await();
+
+        self::assertSame('ORDERS', $updated->name);
+        self::assertSame(['orders.>', 'events.>'], $updated->subjects);
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[3]);
+    }
+
+    public function testCreateConsumerWithOptions(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","max_deliver":5}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $consumer = $client->jetStream()->createConsumer('ORDERS', 'PROC', 'orders.*', [
+            'max_deliver' => 5,
+            'ack_wait' => 30_000_000_000,
+            'max_ack_pending' => 100,
+        ])->await();
+
+        self::assertSame('PROC', $consumer->name);
+        $written = $transport->writes[3];
+        self::assertStringContainsString('"max_deliver":5', $written);
+        self::assertStringContainsString('"ack_wait":30000000000', $written);
+        self::assertStringContainsString('"max_ack_pending":100', $written);
+        self::assertStringContainsString('"filter_subject":"orders.*"', $written);
+    }
+
+    public function testFetchBatch(): void
+    {
+        $msg1 = '{"event":"first"}';
+        $msg2 = '{"event":"second"}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg1), $msg1),
+            sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg2), $msg2),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 2, 2500)->await();
+
+        self::assertCount(2, $messages);
+        self::assertSame('{"event":"first"}', $messages[0]->payload);
+        self::assertSame('{"event":"second"}', $messages[1]->payload);
+
+        $written = $transport->writes[3];
+        self::assertStringContainsString('"batch":2', $written);
+        self::assertStringContainsString('"expires":2500000000', $written);
+    }
+
+    public function testFetchBatchRejectsInvalidBatch(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Pull fetch batch must be greater than zero');
+        $client->jetStream()->fetchBatch('ORDERS', 'PROC', 0)->await();
+    }
 }

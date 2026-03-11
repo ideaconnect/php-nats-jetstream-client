@@ -12,6 +12,8 @@ use function Amp\async;
 
 final class ObjectStoreBucket
 {
+    private const DEFAULT_CHUNK_SIZE = 131072; // 128 KiB
+
     /**
      * Creates an Object Store bucket context bound to a client and bucket name.
      */
@@ -19,6 +21,7 @@ final class ObjectStoreBucket
         private readonly NatsClient $client,
         private readonly JetStreamContext $jetStream,
         private readonly string $bucket,
+        private readonly int $chunkSize = self::DEFAULT_CHUNK_SIZE,
     ) {
     }
 
@@ -67,11 +70,26 @@ final class ObjectStoreBucket
             $this->assertValidName($name);
 
             $chunkSubject = $this->chunkPrefix() . bin2hex(random_bytes(8));
-            $this->jetStream->publish($chunkSubject, $data)->await();
+            $totalSize = strlen($data);
+            $chunks = 0;
+
+            if ($totalSize <= $this->chunkSize) {
+                $this->jetStream->publish($chunkSubject, $data)->await();
+                $chunks = 1;
+            } else {
+                $offset = 0;
+                while ($offset < $totalSize) {
+                    $chunk = substr($data, $offset, $this->chunkSize);
+                    $this->jetStream->publish($chunkSubject, $chunk)->await();
+                    $offset += strlen($chunk);
+                    $chunks++;
+                }
+            }
 
             $info = [
                 'name' => $name,
-                'size' => strlen($data),
+                'size' => $totalSize,
+                'chunks' => $chunks,
                 'digest' => 'SHA-256=' . base64_encode(hash('sha256', $data, true)),
                 'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
                 'deleted' => false,
@@ -102,18 +120,40 @@ final class ObjectStoreBucket
                 return new ObjectData($info, null);
             }
 
-            $chunkResponse = $this->requestStreamMessage($info->chunkSubject);
+            $expectedChunks = $info->chunks ?? 1;
+            $assembled = '';
 
-            /** @var array<string,mixed>|null $message */
-            $message = is_array($chunkResponse['message'] ?? null) ? $chunkResponse['message'] : null;
-            if ($message === null) {
-                return new ObjectData($info, null);
+            for ($i = 0; $i < $expectedChunks; $i++) {
+                $chunkResponse = $this->requestStreamMessageBySequence(
+                    $info->chunkSubject,
+                    $i,
+                );
+
+                /** @var array<string,mixed>|null $message */
+                $message = is_array($chunkResponse['message'] ?? null) ? $chunkResponse['message'] : null;
+                if ($message === null) {
+                    break;
+                }
+
+                $encodedData = (string) ($message['data'] ?? '');
+                $decoded = $encodedData === '' ? '' : base64_decode($encodedData, true);
+                if ($decoded === false) {
+                    break;
+                }
+
+                $assembled .= $decoded;
             }
 
-            $encodedData = (string) ($message['data'] ?? '');
-            $payload = $encodedData === '' ? '' : base64_decode($encodedData, true);
+            // Verify digest integrity when metadata contains one.
+            if ($info->digest !== '' && $info->digest !== null) {
+                $expected = $info->digest;
+                $actual = 'SHA-256=' . base64_encode(hash('sha256', $assembled, true));
+                if ($expected !== $actual) {
+                    throw new JetStreamException('Object digest mismatch: expected ' . $expected . ', got ' . $actual);
+                }
+            }
 
-            return new ObjectData($info, $payload === false ? null : $payload);
+            return new ObjectData($info, $assembled);
         });
     }
 
@@ -332,6 +372,38 @@ final class ObjectStoreBucket
     {
         $apiSubject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
         $payload = json_encode(['last_by_subj' => $subject], JSON_THROW_ON_ERROR);
+        $message = $this->client->request($apiSubject, $payload)->await();
+
+        /** @var array<string,mixed> $data */
+        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
+
+        /** @var array<string,mixed>|null $error */
+        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
+        if ($error !== null) {
+            $description = (string) ($error['description'] ?? 'JetStream API error');
+            $code = (int) ($error['code'] ?? 0);
+            throw new JetStreamException($description, $code);
+        }
+
+        return $data;
+    }
+
+    /**
+     * Retrieves a stream message by subject filtered to a specific sequence offset.
+     *
+     * @return array<string,mixed>
+     */
+    private function requestStreamMessageBySequence(string $subject, int $offset): array
+    {
+        $apiSubject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
+
+        if ($offset === 0) {
+            // First chunk: use first_for_subj.
+            $payload = json_encode(['last_by_subj' => $subject], JSON_THROW_ON_ERROR);
+        } else {
+            $payload = json_encode(['seq' => $offset + 1, 'next_by_subj' => $subject], JSON_THROW_ON_ERROR);
+        }
+
         $message = $this->client->request($apiSubject, $payload)->await();
 
         /** @var array<string,mixed> $data */

@@ -326,4 +326,53 @@ final class ObjectStoreBucketTest extends TestCase
         $this->expectExceptionMessage('Invalid object name');
         $client->jetStream()->objectStore('assets')->put("img\there", 'data')->await();
     }
+
+    // ─── Chunking ───────────────────────────────────────────────────
+
+    public function testPutChunksLargeObject(): void
+    {
+        // Create data larger than 10 bytes to trigger chunking with custom chunk size.
+        // We can't easily control chunkSize via JetStreamContext, but we can verify
+        // the metadata includes chunks count in the published metadata payload.
+        $chunkAck1 = '{"stream":"OBJ_assets","seq":1,"duplicate":false}';
+        $metaAck = '{"stream":"OBJ_assets","seq":2,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            // Single chunk (data fits in default 128KB)
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($chunkAck1), $chunkAck1),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($metaAck), $metaAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $info = $client->jetStream()->objectStore('assets')->put('doc.txt', 'hello world')->await();
+
+        self::assertSame('doc.txt', $info->name);
+        self::assertSame(11, $info->size);
+        self::assertSame(1, $info->chunks);
+
+        // Verify metadata payload in transport writes contains chunks field
+        $allWrites = implode('|', $transport->writes);
+        self::assertStringContainsString('"chunks":1', $allWrites);
+        self::assertStringContainsString('"size":11', $allWrites);
+    }
+
+    public function testObjectInfoIncludesChunksField(): void
+    {
+        $info = ObjectInfo::fromArray('assets', [
+            'name' => 'big.bin',
+            'size' => 300000,
+            'chunks' => 3,
+            'digest' => 'SHA-256=abc',
+            'mtime' => '2026-01-01T00:00:00Z',
+            'deleted' => false,
+            'chunk_subject' => '$O.assets.C.deadbeef',
+        ]);
+
+        self::assertSame(3, $info->chunks);
+        self::assertSame(300000, $info->size);
+    }
 }
