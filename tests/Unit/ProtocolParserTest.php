@@ -199,4 +199,60 @@ final class ProtocolParserTest extends TestCase
 
         return $chunks;
     }
+
+    // ─── Max Frame Size Limit ───────────────────────────────────────────
+
+    /**
+     * Verifies parser rejects MSG frames that exceed the configured max frame size.
+     */
+    public function testRejectsMsgFrameExceedingMaxSize(): void
+    {
+        $parser = new ProtocolParser(maxFrameSize: 10);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('MSG frame payload size exceeds limit');
+
+        $parser->push("MSG subject 1 20\r\n" . str_repeat('x', 20) . "\r\n");
+    }
+
+    /**
+     * Verifies parser rejects HMSG frames that exceed the configured max frame size.
+     */
+    public function testRejectsHmsgFrameExceedingMaxSize(): void
+    {
+        $parser = new ProtocolParser(maxFrameSize: 10);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('HMSG frame payload size exceeds limit');
+
+        $parser->push("HMSG subject 1 5 20\r\n" . str_repeat('x', 20) . "\r\n");
+    }
+
+    /**
+     * Verifies parser allows MSG frames within the configured max frame size.
+     */
+    public function testAcceptsMsgFrameWithinMaxSize(): void
+    {
+        $parser = new ProtocolParser(maxFrameSize: 100);
+
+        $frames = $parser->push("MSG subject 1 5\r\nhello\r\n");
+
+        self::assertCount(1, $frames);
+        self::assertSame('hello', $frames[0]->payload);
+    }
+
+    /**
+     * Verifies parser uses default 8 MiB max frame size.
+     */
+    public function testDefaultMaxFrameSizeAllowsLargePayloads(): void
+    {
+        $parser = new ProtocolParser();
+        $payload = str_repeat('x', 1024);
+
+        $frames = $parser->push("MSG subject 1 1024\r\n{$payload}\r\n");
+
+        self::assertCount(1, $frames);
+        self::assertNotNull($frames[0]->payload);
+        self::assertSame(1024, strlen($frames[0]->payload));
+    }
 }

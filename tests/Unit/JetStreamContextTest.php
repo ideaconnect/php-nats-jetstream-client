@@ -805,4 +805,121 @@ final class JetStreamContextTest extends TestCase
         self::assertStringContainsString('"ack_policy":"none"', $written);
         self::assertStringContainsString('"mem_storage":true', $written);
     }
+
+    // ─── Stream Purge / List / Consumer List / Direct Get ────────────────
+
+    public function testPurgeStream(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse('{"purged":42}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $result = $client->jetStream()->purgeStream('ORDERS')->await();
+
+        self::assertSame(42, $result['purged']);
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.ORDERS', implode('', $transport->writes));
+    }
+
+    public function testPurgeStreamWithSubjectFilter(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse('{"purged":10}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $result = $client->jetStream()->purgeStream('ORDERS', ['filter' => 'orders.old'])->await();
+
+        self::assertSame(10, $result['purged']);
+        self::assertStringContainsString('"filter":"orders.old"', implode('', $transport->writes));
+    }
+
+    public function testListStreams(): void
+    {
+        $listPayload = json_encode([
+            'streams' => [
+                ['config' => ['name' => 'ORDERS', 'subjects' => ['orders.>']]],
+                ['config' => ['name' => 'EVENTS', 'subjects' => ['events.>']]],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse($listPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $streams = $client->jetStream()->listStreams()->await();
+
+        self::assertCount(2, $streams);
+        self::assertSame('ORDERS', $streams[0]->name);
+        self::assertSame('EVENTS', $streams[1]->name);
+        self::assertStringContainsString('$JS.API.STREAM.LIST', implode('', $transport->writes));
+    }
+
+    public function testListConsumers(): void
+    {
+        $listPayload = json_encode([
+            'consumers' => [
+                ['stream_name' => 'ORDERS', 'name' => 'A', 'config' => ['durable_name' => 'A']],
+                ['stream_name' => 'ORDERS', 'name' => 'B', 'config' => ['durable_name' => 'B', 'deliver_subject' => 'push']],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse($listPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $consumers = $client->jetStream()->listConsumers('ORDERS')->await();
+
+        self::assertCount(2, $consumers);
+        self::assertSame('A', $consumers[0]->name);
+        self::assertFalse($consumers[0]->push);
+        self::assertSame('B', $consumers[1]->name);
+        self::assertTrue($consumers[1]->push);
+        self::assertStringContainsString('$JS.API.CONSUMER.LIST.ORDERS', implode('', $transport->writes));
+    }
+
+    public function testGetStreamMessage(): void
+    {
+        $msgPayload = json_encode([
+            'message' => [
+                'subject' => 'orders.created',
+                'data' => base64_encode('{"id":1}'),
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse($msgPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $message = $client->jetStream()->getStreamMessage('ORDERS', 1)->await();
+
+        self::assertSame('orders.created', $message->subject);
+        self::assertSame('{"id":1}', $message->payload);
+        $written = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.MSG.GET.ORDERS', $written);
+        self::assertStringContainsString('"seq":1', $written);
+    }
 }

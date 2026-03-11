@@ -31,6 +31,10 @@ final class AmpSocketTransport implements TransportInterface
             $context = (new ConnectContext())->withConnectTimeout($timeoutMs / 1000);
             $context = $this->withTlsContext($context, $dsn);
             $this->socket = connect($dsn, $context);
+
+            if ($this->options->tlsHandshakeFirst) {
+                $this->socket->setupTls();
+            }
         });
     }
 

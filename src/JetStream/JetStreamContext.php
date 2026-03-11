@@ -27,6 +27,14 @@ final class JetStreamContext
     }
 
     /**
+     * Returns a fluent pull-consumer iterator builder.
+     */
+    public function pullConsumer(string $stream, string $consumer): PullConsumerIterator
+    {
+        return new PullConsumerIterator($this, $stream, $consumer);
+    }
+
+    /**
      * Retrieves account-wide JetStream metrics and limits.
      *
      * @return Future<AccountInfo>
@@ -131,6 +139,83 @@ final class JetStreamContext
             $response = $this->requestJson(JetStreamApi::STREAM_DELETE_PREFIX . $name, []);
 
             return (bool) ($response['success'] ?? false);
+        });
+    }
+
+    /**
+     * Purges all messages from a stream, optionally filtering by subject or sequence.
+     *
+     * @param array<string,mixed> $options Optional filter: set 'filter' for subject, 'seq' for up-to sequence.
+     * @return Future<array{purged: int}>
+     */
+    public function purgeStream(string $name, array $options = []): Future
+    {
+        return async(function () use ($name, $options): array {
+            $response = $this->requestJson(JetStreamApi::STREAM_PURGE_PREFIX . $name, $options);
+
+            return ['purged' => (int) ($response['purged'] ?? 0)];
+        });
+    }
+
+    /**
+     * Lists all streams (with optional subject filter).
+     *
+     * @param array<string,mixed> $options Optional: 'subject' filter.
+     * @return Future<list<StreamInfo>>
+     */
+    public function listStreams(array $options = []): Future
+    {
+        return async(function () use ($options): array {
+            $response = $this->requestJson(JetStreamApi::STREAM_LIST, $options);
+            /** @var list<array<string,mixed>> $streams */
+            $streams = is_array($response['streams'] ?? null) ? $response['streams'] : [];
+
+            return array_map(static fn (array $s): StreamInfo => StreamInfo::fromArray($s), $streams);
+        });
+    }
+
+    /**
+     * Lists all consumers for a stream.
+     *
+     * @return Future<list<ConsumerInfo>>
+     */
+    public function listConsumers(string $stream): Future
+    {
+        return async(function () use ($stream): array {
+            $response = $this->requestJson(JetStreamApi::CONSUMER_LIST_PREFIX . $stream, []);
+            /** @var list<array<string,mixed>> $consumers */
+            $consumers = is_array($response['consumers'] ?? null) ? $response['consumers'] : [];
+
+            return array_map(static fn (array $c): ConsumerInfo => ConsumerInfo::fromArray($c), $consumers);
+        });
+    }
+
+    /**
+     * Fetches a message from a stream by sequence number.
+     *
+     * @return Future<NatsMessage>
+     */
+    public function getStreamMessage(string $stream, int $seq): Future
+    {
+        return async(function () use ($stream, $seq): NatsMessage {
+            $response = $this->requestJson(
+                JetStreamApi::STREAM_MSG_GET_PREFIX . $stream,
+                ['seq' => $seq],
+            );
+
+            /** @var array<string,mixed> $msg */
+            $msg = is_array($response['message'] ?? null) ? $response['message'] : [];
+
+            $payload = isset($msg['data']) && is_string($msg['data'])
+                ? base64_decode($msg['data'], true) ?: ''
+                : '';
+
+            return new NatsMessage(
+                subject: (string) ($msg['subject'] ?? ''),
+                sid: 0,
+                replyTo: null,
+                payload: $payload,
+            );
         });
     }
 

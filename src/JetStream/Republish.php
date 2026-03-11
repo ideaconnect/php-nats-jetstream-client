@@ -1,0 +1,63 @@
+<?php
+
+declare(strict_types=1);
+
+namespace IDCT\NATS\JetStream;
+
+/**
+ * Configures stream republish rules.
+ *
+ * Usage:
+ *   $js->createStream('ORDERS', ['orders.>'], [
+ *       'republish' => Republish::create('orders.>', 'copy.orders.>')->headersOnly()->toArray(),
+ *   ]);
+ */
+final class Republish
+{
+    private bool $headersOnly = false;
+
+    private function __construct(
+        private readonly string $src,
+        private readonly string $dest,
+    ) {
+    }
+
+    /**
+     * Creates a republish rule mapping a source subject filter to a destination subject.
+     */
+    public static function create(string $src, string $dest): self
+    {
+        return new self($src, $dest);
+    }
+
+    /**
+     * Only republish headers (strip payload).
+     *
+     * @return $this
+     */
+    public function headersOnly(bool $headersOnly = true): self
+    {
+        $this->headersOnly = $headersOnly;
+
+        return $this;
+    }
+
+    /**
+     * Serializes to the NATS JetStream API republish configuration array.
+     *
+     * @return array<string, mixed>
+     */
+    public function toArray(): array
+    {
+        $result = [
+            'src' => $this->src,
+            'dest' => $this->dest,
+        ];
+
+        if ($this->headersOnly) {
+            $result['headers_only'] = true;
+        }
+
+        return $result;
+    }
+}

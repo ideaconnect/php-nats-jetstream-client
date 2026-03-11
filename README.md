@@ -16,18 +16,28 @@ Implemented functionality includes:
 - `max_payload` enforcement and `no_responders` negotiation
 - Subject validation against NATS naming rules
 - JetStream account info
-- JetStream stream CRUD (create, update, get, delete)
-- JetStream consumer CRUD (durable + ephemeral, pull + push)
+- JetStream stream CRUD (create, update, get, delete, purge, list)
+- JetStream consumer CRUD (durable + ephemeral, pull + push, list)
 - JetStream pull consumers (fetch next, fetch batch, ACK/NAK/TERM/WPI, delayed NAK)
 - JetStream push consumers with heartbeat/flow-control handling
-- JetStream ordered consumers with automatic sequence tracking
+- JetStream ordered consumers with automatic sequence tracking and gap recovery
 - JetStream consumer pause/resume
 - JetStream publish ACK
+- JetStream direct message get from stream
 - Scheduled publish (`@at` support)
 - KeyValue API (bucket lifecycle with history/TTL/storage options, put/get/update/delete/purge, watch, getAll/status)
 - ObjectStore API (bucket lifecycle, put/get/delete/list/watch, chunked uploads, SHA-256 digest verification)
 - Microservices framework (service registration, PING/INFO/STATS/SCHEMA discovery, grouped endpoints)
-- Server authorization methods: token, username/password, JWT + nonce signer
+- Server authorization methods: token, username/password, JWT + nonce signer, credentials file parser
+- Standalone NKey authentication (Ed25519 challenge signing without JWT)
+- `no_echo` CONNECT option
+- `tlsHandshakeFirst` TLS option
+- Typed JetStream configuration enums (RetentionPolicy, StorageBackend, DiscardPolicy, DeliverPolicy, AckPolicy, ReplayPolicy)
+- Max frame size limit in protocol parser (DoS protection)
+- Queue-based polling subscribe API (`SubscriptionQueue` with `fetch()`, `next()`, `fetchAll()`)
+- Pull-consumer batching/iteration chain API (`PullConsumerIterator` with `setBatching()`, `setIterations()`, `handle()`)
+- Stream mirroring and sourcing configuration helpers (`StreamSource`)
+- Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
 
 Current scheduling note: scheduled messages are implemented with NATS scheduler headers and currently accept only `@at` expressions.
 
@@ -41,10 +51,10 @@ This repository tracks parity against basis-company nats.php README examples.
 
 | Section | Status | Notes |
 | --- | --- | --- |
-| Connecting and Auth | workflow parity | Basic, token, username/password, JWT nonce signing, and TLS CA/cert/key options are supported. |
-| Publish Subscribe | workflow parity | Callback and queue-group patterns are supported; basis-company's queue fetch API is approximated via callback subscriptions plus `processIncoming()`. |
+| Connecting and Auth | workflow parity | Basic, token, username/password, JWT nonce signing, credentials file, and TLS CA/cert/key options are supported. |
+| Publish Subscribe | workflow parity | Callback, queue-group, and polling queue (`SubscriptionQueue` with `fetch()`/`next()`/`fetchAll()`) patterns are supported. |
 | Request Response | workflow parity | Awaited request/reply with timeout and cancellation is covered, but the API shape differs from basis-company's `dispatch()` and callback request helpers. |
-| JetStream API Usage | partial parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, and ordered-consumer helpers are covered, but the configuration surface is simpler. |
+| JetStream API Usage | workflow parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, ordered-consumer helpers, batching/iteration chain API, stream mirroring/sourcing, republish/subject-transform helpers, and typed enums are covered. |
 | Microservices | partial parity | Service registration, discovery, endpoint handling, grouped hierarchy, and SCHEMA discovery are covered with a slimmer stats/handler model. |
 | Key Value Storage | workflow parity | Core KV flows plus update/purge/getAll/status parity are covered. |
 | Object Store | extended | Bucket/object lifecycle, object listing, chunked uploads, and digest verification are covered. |
@@ -251,6 +261,99 @@ $js->publish('orders.created', '{"id":123}')->await();
 $message = $js->fetchNext('ORDERS', 'PULL', 3000)->await();
 $js->ack($message)->await();
 
+$client->disconnect()->await();
+```
+
+### JetStream Pull Consumer (NAK, Delayed NAK, TERM, In-Progress)
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('JOBS', ['jobs.>'])->await();
+$js->createConsumer('JOBS', 'WORKER', 'jobs.>')->await();
+$js->publish('jobs.process', '{"task":"rebuild"}')->await();
+
+$message = $js->fetchNext('JOBS', 'WORKER', 3000)->await();
+
+// Signal work-in-progress to extend the ack deadline.
+$js->inProgress($message)->await();
+
+// NAK: redeliver the message immediately.
+$js->nak($message)->await();
+
+// NAK with delay: redeliver after 5 seconds.
+// $js->nakWithDelay($message, 5000)->await();
+
+// TERM: terminate delivery, do not redeliver.
+// $js->term($message)->await();
+
+$js->deleteConsumer('JOBS', 'WORKER')->await();
+$js->deleteStream('JOBS')->await();
+$client->disconnect()->await();
+```
+
+### Queue Group Subscribe
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+// Subscribe with a queue group for load-balanced delivery across workers.
+$sid = $client->subscribe('tasks.process', static function (NatsMessage $message): void {
+	echo 'Worker received: ' . $message->payload . PHP_EOL;
+}, queue: 'workers')->await();
+
+$client->publish('tasks.process', '{"job":"build"}')->await();
+$client->processIncoming()->await();
+
+$client->unsubscribe($sid)->await();
+$client->disconnect()->await();
+```
+
+### Polling Subscribe (SubscriptionQueue)
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+// subscribeQueue() returns a SubscriptionQueue for polling-style consumption.
+$queue = $client->subscribeQueue('events.>', queue: 'workers')->await();
+$queue->setTimeout(5.0);
+
+// Non-blocking fetch — returns null if nothing available.
+$msg = $queue->fetch();
+
+// Blocking fetch — waits up to the configured timeout.
+$msg = $queue->next();
+
+// Batch fetch — collects up to 10 messages within the timeout window.
+$messages = $queue->fetchAll(limit: 10);
+
+$client->unsubscribe($queue->sid)->await();
 $client->disconnect()->await();
 ```
 
@@ -646,6 +749,310 @@ $js->deleteStream('LOGS')->await();
 $client->disconnect()->await();
 ```
 
+### Stream Purge and List
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('LOGS', ['logs.>'])->await();
+$js->publish('logs.app', 'entry 1')->await();
+$js->publish('logs.app', 'entry 2')->await();
+
+// Purge all messages from the stream.
+$result = $js->purgeStream('LOGS')->await();
+echo 'Purged: ' . $result['purged'] . PHP_EOL;
+
+// Purge by subject filter.
+// $js->purgeStream('LOGS', ['filter' => 'logs.app'])->await();
+
+// List all streams.
+$streams = $js->listStreams()->await();
+foreach ($streams as $stream) {
+	echo $stream->name . PHP_EOL;
+}
+
+$js->deleteStream('LOGS')->await();
+$client->disconnect()->await();
+```
+
+### Consumer List
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('ORDERS', ['orders.>'])->await();
+$js->createConsumer('ORDERS', 'PROC_A', 'orders.created')->await();
+$js->createConsumer('ORDERS', 'PROC_B', 'orders.updated')->await();
+
+$consumers = $js->listConsumers('ORDERS')->await();
+foreach ($consumers as $consumer) {
+	echo $consumer->name . ' (push=' . ($consumer->push ? 'yes' : 'no') . ')' . PHP_EOL;
+}
+
+$js->deleteConsumer('ORDERS', 'PROC_A')->await();
+$js->deleteConsumer('ORDERS', 'PROC_B')->await();
+$js->deleteStream('ORDERS')->await();
+$client->disconnect()->await();
+```
+
+### Stream Message Direct Get
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('EVENTS', ['events.>'])->await();
+$js->publish('events.order', '{"id":1}')->await();
+
+// Fetch message by stream sequence number.
+$message = $js->getStreamMessage('EVENTS', 1)->await();
+echo $message->payload . PHP_EOL;
+
+$js->deleteStream('EVENTS')->await();
+$client->disconnect()->await();
+```
+
+### Credentials File Authentication
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Auth\CredentialsParser;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+// Parse a .creds file to extract JWT and NKey seed.
+$creds = CredentialsParser::fromFile('/path/to/user.creds');
+
+$client = new NatsClient(new NatsOptions(
+	servers: ['nats://127.0.0.1:4222'],
+	jwt: $creds['jwt'],
+	nkey: $creds['nkeySeed'],
+	// Provide a nonce signer that uses the NKey seed for Ed25519 signing.
+	nonceSigner: new YourNonceSigner($creds['nkeySeed']),
+));
+```
+
+### Typed Stream Configuration
+
+Stream and consumer configuration supports typed enums for type-safe options:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\RetentionPolicy;
+use IDCT\NATS\JetStream\StorageBackend;
+use IDCT\NATS\JetStream\DiscardPolicy;
+use IDCT\NATS\JetStream\DeliverPolicy;
+use IDCT\NATS\JetStream\AckPolicy;
+use IDCT\NATS\JetStream\ReplayPolicy;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+
+// Create stream with typed configuration.
+$js->createStream('ORDERS', ['orders.>'], [
+	'retention' => RetentionPolicy::WorkQueue->value,
+	'storage' => StorageBackend::Memory->value,
+	'discard' => DiscardPolicy::Old->value,
+	'max_msgs' => 100_000,
+	'max_bytes' => 50 * 1024 * 1024,
+	'max_age' => 86_400_000_000_000,  // 24h in nanoseconds
+	'num_replicas' => 1,
+	'duplicate_window' => 120_000_000_000,  // 2 min in nanoseconds
+])->await();
+
+// Create consumer with typed configuration.
+$js->createConsumer('ORDERS', 'PROC', 'orders.created', [
+	'deliver_policy' => DeliverPolicy::New->value,
+	'ack_policy' => AckPolicy::Explicit->value,
+	'replay_policy' => ReplayPolicy::Instant->value,
+	'max_deliver' => 5,
+	'max_ack_pending' => 1000,
+	'ack_wait' => 30_000_000_000,  // 30s in nanoseconds
+])->await();
+
+$js->deleteConsumer('ORDERS', 'PROC')->await();
+$js->deleteStream('ORDERS')->await();
+$client->disconnect()->await();
+```
+
+### Pull Consumer Batching/Iteration
+
+The fluent `PullConsumerIterator` wraps `fetchBatch()` with configurable batch size, iterations, and a handler callback:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\JetStream\JetStreamContext;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+
+// Process messages in batches of 10, up to 5 iterations.
+$totalProcessed = $js->pullConsumer('ORDERS', 'PROC')
+	->setBatching(10)
+	->setExpiresMs(5000)
+	->setIterations(5)
+	->handle(function (NatsMessage $msg, JetStreamContext $js): void {
+		echo 'Processing: ' . $msg->payload . PHP_EOL;
+		$js->ack($msg)->await();
+	})->await();
+
+echo "Processed {$totalProcessed} messages total." . PHP_EOL;
+
+$client->disconnect()->await();
+```
+
+### Stream Mirroring and Sourcing
+
+Use `StreamSource` to configure stream mirrors and aggregated sources:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\StreamSource;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+
+// Create a mirror of an origin stream.
+$js->createStream('ORDERS_MIRROR', [], [
+	'mirror' => StreamSource::mirror('ORDERS')->toArray(),
+])->await();
+
+// Create an aggregate stream from multiple sources.
+$js->createStream('ALL_EVENTS', ['events.>'], [
+	'sources' => [
+		StreamSource::source('ORDERS')->filterSubject('orders.>')->toArray(),
+		StreamSource::source('PAYMENTS')->startSeq(100)->toArray(),
+	],
+])->await();
+
+// Cross-cluster source with external API reference.
+$js->createStream('REMOTE_MIRROR', [], [
+	'mirror' => StreamSource::mirror('ORIGIN')
+		->external('$JS.hub.API', '_DELIVER.hub')
+		->toArray(),
+])->await();
+
+$client->disconnect()->await();
+```
+
+### Republish and Subject Transform
+
+Configure republish rules and subject transforms on streams:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\Republish;
+use IDCT\NATS\JetStream\SubjectTransform;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+
+// Republish all order messages to a monitoring subject.
+$js->createStream('ORDERS', ['orders.>'], [
+	'republish' => Republish::create('orders.>', 'monitor.orders.>')->toArray(),
+])->await();
+
+// Republish headers only (strip payload) for lightweight notifications.
+$js->createStream('EVENTS', ['events.>'], [
+	'republish' => Republish::create('events.>', 'notify.events.>')->headersOnly()->toArray(),
+])->await();
+
+// Apply a subject transform to remap subjects on ingest.
+$js->createStream('MAPPED', ['raw.>'], [
+	'subject_transform' => SubjectTransform::create('raw.>', 'processed.>')->toArray(),
+])->await();
+
+$client->disconnect()->await();
+```
+
+## Behavior Notes
+
+### `processIncoming()`
+
+`processIncoming()` reads a single transport chunk, parses all complete frames from it, and dispatches them to subscription callbacks. It is **non-blocking** — if no data is available, it returns immediately with a frame count of `0`. Call it in a loop to process multiple messages:
+
+```php
+// Process all available messages for up to 1 second.
+$deadline = microtime(true) + 1.0;
+while (microtime(true) < $deadline) {
+	$frames = $client->processIncoming()->await();
+	if ($frames === 0) {
+		break;
+	}
+}
+```
+
+### Reconnect Behavior
+
+When a connection drops and `reconnectEnabled` is `true`:
+
+1. **Exponential backoff**: delay is computed as `reconnectDelayMs * 2^(attempt - 1)`, capped at `reconnectMaxDelayMs`, with random jitter up to `reconnectJitterMs`.
+2. **Server rotation**: the client cycles through configured servers in order.
+3. **Subscription replay**: all active subscriptions are replayed (SUB commands resent) after reconnect.
+4. **Published messages during reconnect are lost**: there is no outbound buffer for in-flight publishes. Only subscriptions are restored.
+
+### Ordered Consumer Gap Recovery
+
+`subscribeOrderedConsumer()` automatically detects stream sequence gaps in delivered messages. When a gap is detected, the consumer is transparently deleted and recreated starting from the expected sequence. The user callback is not invoked for gap messages.
+
 ## Configuration Option Mapping
 
 `NatsOptions` fields and defaults:
@@ -666,7 +1073,9 @@ $client->disconnect()->await();
 | `maxPingsOut` | `int` | `2` | Max outstanding pings before failure. |
 | `verbose` | `bool` | `false` | NATS verbose protocol mode. |
 | `pedantic` | `bool` | `false` | NATS pedantic protocol mode. |
+| `noEcho` | `bool` | `false` | Suppresses server echo of own published messages. |
 | `tlsRequired` | `bool` | `false` | Forces TLS context in transport. |
+| `tlsHandshakeFirst` | `bool` | `false` | Performs TLS handshake immediately after connecting, before server INFO. |
 | `tlsCaFile` | `?string` | `null` | CA bundle path for peer verification. |
 | `tlsCertFile` | `?string` | `null` | Client certificate path. |
 | `tlsKeyFile` | `?string` | `null` | Client private key path. |

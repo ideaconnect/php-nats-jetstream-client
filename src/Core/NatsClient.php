@@ -13,6 +13,7 @@ use IDCT\NATS\Protocol\ServerInfo;
 use IDCT\NATS\Services\Service;
 use IDCT\NATS\Transport\AmpSocketTransport;
 use IDCT\NATS\Transport\TransportInterface;
+use function Amp\async;
 
 final class NatsClient
 {
@@ -96,6 +97,29 @@ final class NatsClient
     public function subscribe(string $subject, callable $handler, ?string $queue = null): Future
     {
         return $this->connection->subscribe($subject, $handler, $queue);
+    }
+
+    /**
+     * Subscribes and returns a SubscriptionQueue for polling-style message consumption.
+     *
+     * @return Future<SubscriptionQueue>
+     */
+    public function subscribeQueue(string $subject, ?string $queue = null): Future
+    {
+        return async(function () use ($subject, $queue): SubscriptionQueue {
+            /** @var SubscriptionQueue|null $subscriptionQueue */
+            $subscriptionQueue = null;
+            $sid = $this->connection->subscribe(
+                $subject,
+                static function (NatsMessage $msg) use (&$subscriptionQueue): void {
+                    $subscriptionQueue?->enqueue($msg);
+                },
+                $queue,
+            )->await();
+            $subscriptionQueue = new SubscriptionQueue($this, $sid);
+
+            return $subscriptionQueue;
+        });
     }
 
     /**

@@ -10,6 +10,17 @@ final class ProtocolParser
 {
     private string $buffer = '';
 
+    /** Maximum total frame size (headers + payload) accepted from the server. */
+    private int $maxFrameSize;
+
+    /**
+     * @param int $maxFrameSize Maximum frame payload size in bytes (default: 8 MiB).
+     */
+    public function __construct(int $maxFrameSize = 8 * 1024 * 1024)
+    {
+        $this->maxFrameSize = $maxFrameSize;
+    }
+
     /**
      * Appends a raw socket chunk and emits all complete frames currently available.
      *
@@ -115,6 +126,10 @@ final class ProtocolParser
         $replyTo = count($parts) === 5 ? $parts[3] : null;
         $size = (int) $parts[count($parts) - 1];
 
+        if ($size > $this->maxFrameSize) {
+            throw new ProtocolException('MSG frame payload size exceeds limit: ' . $size);
+        }
+
         $required = $payloadOffset + $size + 2;
         if ($bufferLength < $required) {
             return [new ProtocolFrame(type: ProtocolFrameType::Msg), 0];
@@ -161,6 +176,10 @@ final class ProtocolParser
             $replyTo = null;
             $headerBytes = (int) $parts[3];
             $totalBytes = (int) $parts[4];
+        }
+
+        if ($totalBytes > $this->maxFrameSize) {
+            throw new ProtocolException('HMSG frame payload size exceeds limit: ' . $totalBytes);
         }
 
         $required = $payloadOffset + $totalBytes + 2;

@@ -23,6 +23,7 @@ final class ProtocolCodec
             'pedantic' => $options->pedantic,
             'headers' => true,
             'no_responders' => true,
+            'echo' => !$options->noEcho,
             'name' => $options->name,
         ];
 
@@ -54,6 +55,19 @@ final class ProtocolCodec
             if ($options->nkey !== null && $options->nkey !== '') {
                 $payload['nkey'] = $options->nkey;
             }
+        } elseif ($options->nkey !== null && $options->nkey !== '') {
+            // Standalone NKey authentication (Ed25519 challenge-response without JWT).
+            $payload['nkey'] = $options->nkey;
+
+            if ($options->nonceSigner === null) {
+                throw new ProtocolException('NKey authentication requires a nonce signer');
+            }
+
+            if ($serverNonce === null || $serverNonce === '') {
+                throw new ProtocolException('NKey authentication requires server nonce from INFO');
+            }
+
+            $payload['sig'] = $options->nonceSigner->sign($serverNonce);
         }
 
         return sprintf("CONNECT %s\r\n", json_encode($payload, JSON_THROW_ON_ERROR));
