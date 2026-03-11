@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Exception;
+namespace IDCT\NATS\Exception;
 
 use RuntimeException;
 

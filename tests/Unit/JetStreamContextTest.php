@@ -2,17 +2,17 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
 use DateTimeImmutable;
 use DateTimeZone;
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsHeaders;
-use Idct\Nats\Exception\JetStreamException;
-use Idct\Nats\JetStream\Schedule;
-use Idct\Nats\JetStream\JetStreamContext;
-use Idct\Nats\Tests\Support\FakeTransport;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsHeaders;
+use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Schedule;
+use IDCT\NATS\JetStream\JetStreamContext;
+use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
 final class JetStreamContextTest extends TestCase
@@ -362,7 +362,7 @@ final class JetStreamContextTest extends TestCase
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('JetStream delayed NAK requires delayMs greater than zero');
 
-        $message = new \Idct\Nats\Core\NatsMessage('orders.created', 1, 'reply.ack', '{"event":"created"}');
+        $message = new \IDCT\NATS\Core\NatsMessage('orders.created', 1, 'reply.ack', '{"event":"created"}');
         $client->jetStream()->nakWithDelay($message, 0)->await();
     }
 
@@ -382,7 +382,7 @@ final class JetStreamContextTest extends TestCase
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('JetStream ACK requires a reply subject on the delivered message');
 
-        $message = new \Idct\Nats\Core\NatsMessage('orders.created', 1, null, '{"event":"created"}');
+        $message = new \IDCT\NATS\Core\NatsMessage('orders.created', 1, null, '{"event":"created"}');
         $client->jetStream()->ack($message)->await();
     }
 
@@ -441,7 +441,7 @@ final class JetStreamContextTest extends TestCase
         $client->jetStream()->subscribePushConsumer(
             'ORDERS',
             'PROC',
-            static function (\Idct\Nats\Core\NatsMessage $message) use (&$received): void {
+            static function (\IDCT\NATS\Core\NatsMessage $message) use (&$received): void {
                 $received = $message;
             },
             'deliver.proc',
@@ -452,7 +452,7 @@ final class JetStreamContextTest extends TestCase
         $client->processIncoming()->await();
 
         self::assertStringContainsString("PUB fc.reply 0\r\n\r\n", implode('', $transport->writes));
-        self::assertInstanceOf(\Idct\Nats\Core\NatsMessage::class, $received);
+        self::assertInstanceOf(\IDCT\NATS\Core\NatsMessage::class, $received);
         self::assertSame('hello', $received->payload);
     }
 
@@ -544,7 +544,7 @@ final class JetStreamContextTest extends TestCase
         $received = null;
         $client->jetStream()->subscribeEphemeralPushConsumer(
             'ORDERS',
-            static function (\Idct\Nats\Core\NatsMessage $message) use (&$received): void {
+            static function (\IDCT\NATS\Core\NatsMessage $message) use (&$received): void {
                 $received = $message;
             },
             'deliver.ephemeral',
@@ -553,7 +553,7 @@ final class JetStreamContextTest extends TestCase
 
         $client->processIncoming()->await();
 
-        self::assertInstanceOf(\Idct\Nats\Core\NatsMessage::class, $received);
+        self::assertInstanceOf(\IDCT\NATS\Core\NatsMessage::class, $received);
         self::assertSame('hello', $received->payload);
         self::assertStringContainsString('"deliver_subject":"deliver.ephemeral"', $transport->writes[3]);
         self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);

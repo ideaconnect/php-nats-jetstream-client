@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Protocol;
+namespace IDCT\NATS\Protocol;
 
-use Idct\Nats\Exception\ProtocolException;
+use IDCT\NATS\Exception\ProtocolException;
 
 final class ProtocolParser
 {

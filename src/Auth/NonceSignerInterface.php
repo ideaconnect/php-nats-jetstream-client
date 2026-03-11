@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Auth;
+namespace IDCT\NATS\Auth;
 
 interface NonceSignerInterface
 {

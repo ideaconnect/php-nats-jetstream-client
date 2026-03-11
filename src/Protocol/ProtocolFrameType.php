@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Protocol;
+namespace IDCT\NATS\Protocol;
 
 enum ProtocolFrameType: string
 {

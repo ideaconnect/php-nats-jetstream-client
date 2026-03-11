@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Transport;
+namespace IDCT\NATS\Transport;
 
 use Amp\Future;
 

@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Services;
+namespace IDCT\NATS\Services;
 
 use Amp\Future;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 use function Amp\async;
 
 final class Service

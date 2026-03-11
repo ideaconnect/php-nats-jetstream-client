@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Protocol;
+namespace IDCT\NATS\Protocol;
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsHeaders;
-use Idct\Nats\Exception\ProtocolException;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsHeaders;
+use IDCT\NATS\Exception\ProtocolException;
 
 final class ProtocolCodec
 {

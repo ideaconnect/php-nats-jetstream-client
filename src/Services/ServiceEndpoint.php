@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Services;
+namespace IDCT\NATS\Services;
 
 final class ServiceEndpoint
 {

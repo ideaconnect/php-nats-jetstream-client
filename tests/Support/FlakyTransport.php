@@ -2,10 +2,10 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Support;
+namespace IDCT\NATS\Tests\Support;
 
 use Amp\Future;
-use Idct\Nats\Transport\TransportInterface;
+use IDCT\NATS\Transport\TransportInterface;
 use RuntimeException;
 use function Amp\async;
 

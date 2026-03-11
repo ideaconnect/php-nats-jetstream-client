@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Exception\JetStreamException;
-use Idct\Nats\JetStream\ObjectData;
-use Idct\Nats\JetStream\ObjectInfo;
-use Idct\Nats\Tests\Support\FakeTransport;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\ObjectData;
+use IDCT\NATS\JetStream\ObjectInfo;
+use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
 final class ObjectStoreBucketTest extends TestCase

@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Connection;
+namespace IDCT\NATS\Connection;
 
-use Idct\Nats\Auth\NonceSignerInterface;
+use IDCT\NATS\Auth\NonceSignerInterface;
 
 enum SlowConsumerPolicy: string
 {

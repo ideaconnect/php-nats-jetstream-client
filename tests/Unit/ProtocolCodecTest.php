@@ -2,12 +2,12 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Exception\ProtocolException;
-use Idct\Nats\Protocol\ProtocolCodec;
-use Idct\Nats\Tests\Support\FixedNonceSigner;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Exception\ProtocolException;
+use IDCT\NATS\Protocol\ProtocolCodec;
+use IDCT\NATS\Tests\Support\FixedNonceSigner;
 use PHPUnit\Framework\TestCase;
 
 final class ProtocolCodecTest extends TestCase

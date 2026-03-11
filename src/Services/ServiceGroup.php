@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Services;
+namespace IDCT\NATS\Services;
 
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Core\NatsMessage;
 
 final class ServiceGroup
 {

@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Transport;
+namespace IDCT\NATS\Transport;
 
 use Amp\Future;
 use Amp\Socket\Certificate;
 use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
 use Amp\Socket\Socket;
-use Idct\Nats\Connection\NatsOptions;
+use IDCT\NATS\Connection\NatsOptions;
 use function Amp\async;
 use function Amp\Socket\connect;
 

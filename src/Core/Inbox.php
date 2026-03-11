@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Core;
+namespace IDCT\NATS\Core;
 
 final class Inbox
 {

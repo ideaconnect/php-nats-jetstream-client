@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Integration;
+namespace IDCT\NATS\Tests\Integration;
 
 trait IntegrationTestBootstrap
 {

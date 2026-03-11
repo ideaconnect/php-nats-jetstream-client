@@ -2,13 +2,13 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\JetStream;
+namespace IDCT\NATS\JetStream;
 
 use Amp\Future;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsHeaders;
-use Idct\Nats\Core\NatsMessage;
-use Idct\Nats\Exception\JetStreamException;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsHeaders;
+use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\JetStreamException;
 use function Amp\async;
 
 final class KeyValueBucket

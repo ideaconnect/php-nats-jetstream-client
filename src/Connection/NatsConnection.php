@@ -2,23 +2,23 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Connection;
+namespace IDCT\NATS\Connection;
 
 use Amp\Future;
 use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\CompositeCancellation;
 use Amp\TimeoutCancellation;
-use Idct\Nats\Core\Inbox;
-use Idct\Nats\Core\NatsMessage;
-use Idct\Nats\Exception\TimeoutException;
-use Idct\Nats\Exception\ConnectionException;
-use Idct\Nats\Protocol\ProtocolCodec;
-use Idct\Nats\Protocol\ProtocolFrame;
-use Idct\Nats\Protocol\ProtocolFrameType;
-use Idct\Nats\Protocol\ProtocolParser;
-use Idct\Nats\Protocol\ServerInfo;
-use Idct\Nats\Transport\TransportInterface;
+use IDCT\NATS\Core\Inbox;
+use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Protocol\ProtocolCodec;
+use IDCT\NATS\Protocol\ProtocolFrame;
+use IDCT\NATS\Protocol\ProtocolFrameType;
+use IDCT\NATS\Protocol\ProtocolParser;
+use IDCT\NATS\Protocol\ServerInfo;
+use IDCT\NATS\Transport\TransportInterface;
 use SplQueue;
 use function Amp\async;
 use function Amp\delay;

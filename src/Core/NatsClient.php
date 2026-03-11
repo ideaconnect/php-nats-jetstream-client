@@ -2,17 +2,17 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Core;
+namespace IDCT\NATS\Core;
 
 use Amp\Cancellation;
 use Amp\Future;
-use Idct\Nats\Connection\NatsConnection;
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\JetStream\JetStreamContext;
-use Idct\Nats\Protocol\ServerInfo;
-use Idct\Nats\Services\Service;
-use Idct\Nats\Transport\AmpSocketTransport;
-use Idct\Nats\Transport\TransportInterface;
+use IDCT\NATS\Connection\NatsConnection;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\JetStream\JetStreamContext;
+use IDCT\NATS\Protocol\ServerInfo;
+use IDCT\NATS\Services\Service;
+use IDCT\NATS\Transport\AmpSocketTransport;
+use IDCT\NATS\Transport\TransportInterface;
 
 final class NatsClient
 {

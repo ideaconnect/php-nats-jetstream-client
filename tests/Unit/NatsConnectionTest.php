@@ -2,20 +2,20 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
-use Idct\Nats\Connection\ConnectionState;
-use Idct\Nats\Connection\NatsConnection;
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Connection\SlowConsumerPolicy;
-use Idct\Nats\Core\NatsMessage;
-use Idct\Nats\Exception\ConnectionException;
-use Idct\Nats\Exception\TimeoutException;
-use Idct\Nats\Tests\Support\FlakyTransport;
-use Idct\Nats\Tests\Support\FakeTransport;
-use Idct\Nats\Tests\Support\FixedNonceSigner;
+use IDCT\NATS\Connection\ConnectionState;
+use IDCT\NATS\Connection\NatsConnection;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Connection\SlowConsumerPolicy;
+use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Tests\Support\FlakyTransport;
+use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\FixedNonceSigner;
 use PHPUnit\Framework\TestCase;
 
 final class NatsConnectionTest extends TestCase

@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\JetStream;
+namespace IDCT\NATS\JetStream;
 
 final class ConsumerInfo
 {

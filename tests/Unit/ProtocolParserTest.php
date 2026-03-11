@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
-use Idct\Nats\Exception\ProtocolException;
-use Idct\Nats\Protocol\ProtocolFrameType;
-use Idct\Nats\Protocol\ProtocolParser;
+use IDCT\NATS\Exception\ProtocolException;
+use IDCT\NATS\Protocol\ProtocolFrameType;
+use IDCT\NATS\Protocol\ProtocolParser;
 use PHPUnit\Framework\TestCase;
 
 final class ProtocolParserTest extends TestCase

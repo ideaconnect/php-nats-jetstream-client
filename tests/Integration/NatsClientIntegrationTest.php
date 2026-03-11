@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Integration;
+namespace IDCT\NATS\Tests\Integration;
 
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\Future;
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 use PHPUnit\Framework\TestCase;
 use function Amp\async;
 

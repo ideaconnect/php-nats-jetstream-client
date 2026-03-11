@@ -2,9 +2,9 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Support;
+namespace IDCT\NATS\Tests\Support;
 
-use Idct\Nats\Auth\NonceSignerInterface;
+use IDCT\NATS\Auth\NonceSignerInterface;
 
 final class FixedNonceSigner implements NonceSignerInterface
 {

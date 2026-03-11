@@ -24,7 +24,7 @@ Implemented functionality includes:
 
 Current scheduling note: scheduled messages are implemented with NATS scheduler headers and currently accept only `@at` expressions.
 
-Use `Idct\\Nats\\JetStream\\Schedule::at(...)` or `Schedule::atTimestamp(...)` to generate valid `@at` expressions.
+Use `IDCT\\NATS\\JetStream\\Schedule::at(...)` or `Schedule::atTimestamp(...)` to generate valid `@at` expressions.
 
 ## Usage
 
@@ -51,9 +51,9 @@ Detailed execution plan: see REGRESSION_PASS.md.
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Auth\NonceSignerInterface;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Auth\NonceSignerInterface;
 
 // Username/password.
 $passwordClient = new NatsClient(new NatsOptions(
@@ -96,9 +96,9 @@ $tlsClient = new NatsClient(new NatsOptions(
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 
 $client = new NatsClient(new NatsOptions(servers: ['nats://127.0.0.1:4222']));
 $client->connect()->await();
@@ -122,8 +122,8 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -141,8 +141,8 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -166,8 +166,8 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -190,9 +190,9 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -226,9 +226,9 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -261,9 +261,9 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\JetStream\Schedule;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\Schedule;
 use DateTimeImmutable;
 
 $client = new NatsClient(new NatsOptions(servers: ['nats://127.0.0.1:4222']));
@@ -289,9 +289,9 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\JetStream\KeyValueEntry;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\KeyValueEntry;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -333,8 +333,8 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -368,9 +368,9 @@ $client->disconnect()->await();
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 
 $serviceClient = new NatsClient(new NatsOptions());
 $serviceClient->connect()->await();
@@ -444,9 +444,9 @@ Quick local publish/request benchmark (single process):
 
 declare(strict_types=1);
 
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 
 $iterations = 5000;
 $subject = 'bench.echo';

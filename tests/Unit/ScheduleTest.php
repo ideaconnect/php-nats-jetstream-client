@@ -2,11 +2,11 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
 use DateTimeImmutable;
 use DateTimeZone;
-use Idct\Nats\JetStream\Schedule;
+use IDCT\NATS\JetStream\Schedule;
 use PHPUnit\Framework\TestCase;
 
 final class ScheduleTest extends TestCase

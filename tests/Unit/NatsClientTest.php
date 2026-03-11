@@ -2,14 +2,14 @@
 
 declare(strict_types=1);
 
-namespace Idct\Nats\Tests\Unit;
+namespace IDCT\NATS\Tests\Unit;
 
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
-use Idct\Nats\Connection\NatsOptions;
-use Idct\Nats\Core\NatsClient;
-use Idct\Nats\Core\NatsMessage;
-use Idct\Nats\Tests\Support\FakeTransport;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
 final class NatsClientTest extends TestCase
