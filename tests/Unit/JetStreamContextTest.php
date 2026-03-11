@@ -8,6 +8,7 @@ use DateTimeImmutable;
 use DateTimeZone;
 use Idct\Nats\Connection\NatsOptions;
 use Idct\Nats\Core\NatsClient;
+use Idct\Nats\Core\NatsHeaders;
 use Idct\Nats\Exception\JetStreamException;
 use Idct\Nats\JetStream\Schedule;
 use Idct\Nats\JetStream\JetStreamContext;
@@ -101,6 +102,21 @@ final class JetStreamContextTest extends TestCase
 
         self::assertInstanceOf(JetStreamContext::class, $a);
         self::assertSame($a, $b);
+    }
+
+    /**
+     * Verifies object store context is cached per bucket.
+     */
+    public function testObjectStoreContextIsCachedPerBucket(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+
+        $a = $client->jetStream()->objectStore('assets');
+        $b = $client->jetStream()->objectStore('assets');
+        $c = $client->jetStream()->objectStore('other');
+
+        self::assertSame($a, $b);
+        self::assertNotSame($a, $c);
     }
 
     /**
@@ -246,5 +262,300 @@ final class JetStreamContextTest extends TestCase
         } finally {
             self::assertCount(2, $transport->writes);
         }
+    }
+
+    /**
+     * Verifies pull consumer fetch uses MSG.NEXT endpoint and returns message payload.
+     */
+    public function testFetchNext(): void
+    {
+        $deliveryPayload = '{"event":"created"}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($deliveryPayload), $deliveryPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $message = $client->jetStream()->fetchNext('ORDERS', 'PROC', 2500)->await();
+
+        self::assertSame('{"event":"created"}', $message->payload);
+        self::assertStringStartsWith('PUB $JS.API.CONSUMER.MSG.NEXT.ORDERS.PROC _INBOX.', $transport->writes[3]);
+        self::assertStringContainsString('"expires":2500000000', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies pull fetch rejects invalid expiration values.
+     */
+    public function testFetchNextRejectsInvalidExpiresMs(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Pull fetch expiresMs must be greater than zero');
+
+        $client->jetStream()->fetchNext('ORDERS', 'PROC', 0)->await();
+    }
+
+    /**
+     * Verifies ACK helpers publish expected protocol tokens to reply subject.
+     */
+    public function testAckHelpersPublishProtocolTokens(): void
+    {
+        $deliveryPayload = '{"event":"created"}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 reply.ack %d\r\n%s\r\n", strlen($deliveryPayload), $deliveryPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $message = $client->request('$JS.API.CONSUMER.MSG.NEXT.ORDERS.PROC', '{}')->await();
+
+        $js = $client->jetStream();
+        $js->ack($message)->await();
+        $js->nak($message)->await();
+        $js->nakWithDelay($message, 1500)->await();
+        $js->term($message)->await();
+        $js->inProgress($message)->await();
+
+        $ackWrites = array_slice($transport->writes, -5);
+
+        self::assertCount(5, $ackWrites);
+        self::assertStringStartsWith('PUB reply.ack 4', $ackWrites[0]);
+        self::assertStringStartsWith('PUB reply.ack 4', $ackWrites[1]);
+        self::assertStringStartsWith('PUB reply.ack ', $ackWrites[2]);
+        self::assertStringStartsWith('PUB reply.ack 5', $ackWrites[3]);
+        self::assertStringStartsWith('PUB reply.ack 4', $ackWrites[4]);
+        self::assertStringContainsString("\r\n+ACK\r\n", $ackWrites[0]);
+        self::assertStringContainsString("\r\n-NAK\r\n", $ackWrites[1]);
+        self::assertStringContainsString("\r\n-NAK {\"delay\":1500000000}\r\n", $ackWrites[2]);
+        self::assertStringContainsString("\r\n+TERM\r\n", $ackWrites[3]);
+        self::assertStringContainsString("\r\n+WPI\r\n", $ackWrites[4]);
+    }
+
+    /**
+     * Verifies delayed NAK rejects invalid delay values.
+     */
+    public function testNakWithDelayRejectsInvalidDelay(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('JetStream delayed NAK requires delayMs greater than zero');
+
+        $message = new \Idct\Nats\Core\NatsMessage('orders.created', 1, 'reply.ack', '{"event":"created"}');
+        $client->jetStream()->nakWithDelay($message, 0)->await();
+    }
+
+    /**
+     * Verifies ACK helpers fail fast for messages without reply subject.
+     */
+    public function testAckRequiresReplySubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('JetStream ACK requires a reply subject on the delivered message');
+
+        $message = new \Idct\Nats\Core\NatsMessage('orders.created', 1, null, '{"event":"created"}');
+        $client->jetStream()->ack($message)->await();
+    }
+
+    /**
+     * Verifies push consumer creation sets deliver subject in consumer config.
+     */
+    public function testCreatePushConsumer(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","deliver_subject":"deliver.proc"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $created = $client->jetStream()->createPushConsumer('ORDERS', 'PROC', 'deliver.proc', 'orders.*')->await();
+
+        self::assertSame('PROC', $created->name);
+        self::assertTrue($created->push);
+        self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS.PROC', $transport->writes[3]);
+        self::assertStringContainsString('"deliver_subject":"deliver.proc"', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies push subscription auto-responds to flow-control and forwards payload deliveries.
+     */
+    public function testSubscribePushConsumerHandlesFlowControl(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","deliver_subject":"deliver.proc"}}';
+        $flowHeaders = NatsHeaders::toWireBlock([
+            'Status' => '100',
+            'Description' => 'FlowControl Request',
+        ]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+            sprintf(
+                "HMSG deliver.proc 2 fc.reply %d %d\r\n%s\r\n",
+                strlen($flowHeaders),
+                strlen($flowHeaders),
+                $flowHeaders,
+            ),
+            "MSG deliver.proc 2 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $received = null;
+        $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'PROC',
+            static function (\Idct\Nats\Core\NatsMessage $message) use (&$received): void {
+                $received = $message;
+            },
+            'deliver.proc',
+            'orders.*',
+        )->await();
+
+        $client->processIncoming()->await();
+        $client->processIncoming()->await();
+
+        self::assertStringContainsString("PUB fc.reply 0\r\n\r\n", implode('', $transport->writes));
+        self::assertInstanceOf(\Idct\Nats\Core\NatsMessage::class, $received);
+        self::assertSame('hello', $received->payload);
+    }
+
+    /**
+     * Verifies heartbeat control messages are ignored and not forwarded to user handlers.
+     */
+    public function testSubscribePushConsumerIgnoresHeartbeat(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","deliver_subject":"deliver.proc"}}';
+        $heartbeatHeaders = NatsHeaders::toWireBlock([
+            'Status' => '100',
+            'Description' => 'Idle Heartbeat',
+        ]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+            sprintf(
+                "HMSG deliver.proc 2 hb.reply %d %d\r\n%s\r\n",
+                strlen($heartbeatHeaders),
+                strlen($heartbeatHeaders),
+                $heartbeatHeaders,
+            ),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $handled = false;
+        $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'PROC',
+            static function () use (&$handled): void {
+                $handled = true;
+            },
+            'deliver.proc',
+            'orders.*',
+        )->await();
+
+        $client->processIncoming()->await();
+
+        self::assertFalse($handled);
+        self::assertStringNotContainsString('PUB hb.reply 0', implode('', $transport->writes));
+    }
+
+    /**
+     * Verifies ephemeral pull consumer creation uses stream-level create endpoint.
+     */
+    public function testCreateEphemeralConsumer(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"E1","config":{"ack_policy":"explicit"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $consumer = $client->jetStream()->createEphemeralConsumer('ORDERS', 'orders.*')->await();
+
+        self::assertSame('E1', $consumer->name);
+        self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS', $transport->writes[3]);
+        self::assertStringNotContainsString('$JS.API.CONSUMER.CREATE.ORDERS.', $transport->writes[3]);
+        self::assertStringContainsString('"filter_subject":"orders.*"', $transport->writes[3]);
+        self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies ephemeral push subscription helper creates consumer and receives payload.
+     */
+    public function testSubscribeEphemeralPushConsumer(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"E_PUSH","config":{"deliver_subject":"deliver.ephemeral"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+            "MSG deliver.ephemeral 2 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $received = null;
+        $client->jetStream()->subscribeEphemeralPushConsumer(
+            'ORDERS',
+            static function (\Idct\Nats\Core\NatsMessage $message) use (&$received): void {
+                $received = $message;
+            },
+            'deliver.ephemeral',
+            'orders.*',
+        )->await();
+
+        $client->processIncoming()->await();
+
+        self::assertInstanceOf(\Idct\Nats\Core\NatsMessage::class, $received);
+        self::assertSame('hello', $received->payload);
+        self::assertStringContainsString('"deliver_subject":"deliver.ephemeral"', $transport->writes[3]);
+        self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);
     }
 }

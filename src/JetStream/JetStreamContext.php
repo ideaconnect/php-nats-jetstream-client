@@ -5,12 +5,20 @@ declare(strict_types=1);
 namespace Idct\Nats\JetStream;
 
 use Amp\Future;
+use Idct\Nats\Core\Inbox;
+use Idct\Nats\Core\NatsHeaders;
+use Idct\Nats\Core\NatsMessage;
 use Idct\Nats\Core\NatsClient;
 use Idct\Nats\Exception\JetStreamException;
 use function Amp\async;
 
 final class JetStreamContext
 {
+    /** @var array<string,KeyValueBucket> */
+    private array $kvBuckets = [];
+    /** @var array<string,ObjectStoreBucket> */
+    private array $objectBuckets = [];
+
     /**
      * Creates a JetStream API context bound to a NATS client.
      */
@@ -30,6 +38,30 @@ final class JetStreamContext
 
             return AccountInfo::fromArray($payload);
         });
+    }
+
+    /**
+     * Returns a KeyValue bucket context.
+     */
+    public function keyValue(string $bucket): KeyValueBucket
+    {
+        if (!isset($this->kvBuckets[$bucket])) {
+            $this->kvBuckets[$bucket] = new KeyValueBucket($this->client, $this, $bucket);
+        }
+
+        return $this->kvBuckets[$bucket];
+    }
+
+    /**
+     * Returns an Object Store bucket context.
+     */
+    public function objectStore(string $bucket): ObjectStoreBucket
+    {
+        if (!isset($this->objectBuckets[$bucket])) {
+            $this->objectBuckets[$bucket] = new ObjectStoreBucket($this->client, $this, $bucket);
+        }
+
+        return $this->objectBuckets[$bucket];
     }
 
     /**
@@ -104,6 +136,155 @@ final class JetStreamContext
             );
 
             return ConsumerInfo::fromArray($response);
+        });
+    }
+
+    /**
+     * Creates an ephemeral pull consumer.
+     *
+     * @param array<string,mixed> $options Additional consumer config fields.
+     * @return Future<ConsumerInfo>
+     */
+    public function createEphemeralConsumer(string $stream, ?string $filterSubject = null, array $options = []): Future
+    {
+        return async(function () use ($stream, $filterSubject, $options): ConsumerInfo {
+            $config = array_merge($options, [
+                'ack_policy' => 'explicit',
+            ]);
+
+            if ($filterSubject !== null && $filterSubject !== '') {
+                $config['filter_subject'] = $filterSubject;
+            }
+
+            $response = $this->requestJson(
+                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream,
+                ['stream_name' => $stream, 'config' => $config],
+            );
+
+            return ConsumerInfo::fromArray($response);
+        });
+    }
+
+    /**
+     * Creates or updates a durable push consumer.
+     *
+     * @param array<string,mixed> $options Additional consumer config fields.
+     * @return Future<ConsumerInfo>
+     */
+    public function createPushConsumer(
+        string $stream,
+        string $consumer,
+        string $deliverSubject,
+        ?string $filterSubject = null,
+        array $options = [],
+    ): Future {
+        return async(function () use ($stream, $consumer, $deliverSubject, $filterSubject, $options): ConsumerInfo {
+            $config = array_merge($options, [
+                'durable_name' => $consumer,
+                'ack_policy' => 'explicit',
+                'deliver_subject' => $deliverSubject,
+            ]);
+
+            if ($filterSubject !== null && $filterSubject !== '') {
+                $config['filter_subject'] = $filterSubject;
+            }
+
+            $response = $this->requestJson(
+                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
+                ['stream_name' => $stream, 'config' => $config],
+            );
+
+            return ConsumerInfo::fromArray($response);
+        });
+    }
+
+    /**
+     * Creates an ephemeral push consumer.
+     *
+     * @param array<string,mixed> $options Additional consumer config fields.
+     * @return Future<ConsumerInfo>
+     */
+    public function createEphemeralPushConsumer(
+        string $stream,
+        string $deliverSubject,
+        ?string $filterSubject = null,
+        array $options = [],
+    ): Future {
+        return async(function () use ($stream, $deliverSubject, $filterSubject, $options): ConsumerInfo {
+            $config = array_merge($options, [
+                'ack_policy' => 'explicit',
+                'deliver_subject' => $deliverSubject,
+            ]);
+
+            if ($filterSubject !== null && $filterSubject !== '') {
+                $config['filter_subject'] = $filterSubject;
+            }
+
+            $response = $this->requestJson(
+                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream,
+                ['stream_name' => $stream, 'config' => $config],
+            );
+
+            return ConsumerInfo::fromArray($response);
+        });
+    }
+
+    /**
+     * Creates a durable push consumer and subscribes with JetStream control-frame handling.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @param array<string,mixed> $consumerOptions Additional consumer config fields.
+     * @return Future<int>
+     */
+    public function subscribePushConsumer(
+        string $stream,
+        string $consumer,
+        callable $handler,
+        ?string $deliverSubject = null,
+        ?string $filterSubject = null,
+        array $consumerOptions = [],
+    ): Future {
+        return async(function () use ($stream, $consumer, $handler, $deliverSubject, $filterSubject, $consumerOptions): int {
+            $deliver = $deliverSubject ?? Inbox::generate('_INBOX.JS.PUSH');
+
+            $this->createPushConsumer($stream, $consumer, $deliver, $filterSubject, $consumerOptions)->await();
+
+            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler): void {
+                if ($this->handlePushControlMessage($message)->await()) {
+                    return;
+                }
+
+                $handler($message);
+            })->await();
+        });
+    }
+
+    /**
+     * Creates an ephemeral push consumer and subscribes with JetStream control-frame handling.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @param array<string,mixed> $consumerOptions Additional consumer config fields.
+     * @return Future<int>
+     */
+    public function subscribeEphemeralPushConsumer(
+        string $stream,
+        callable $handler,
+        ?string $deliverSubject = null,
+        ?string $filterSubject = null,
+        array $consumerOptions = [],
+    ): Future {
+        return async(function () use ($stream, $handler, $deliverSubject, $filterSubject, $consumerOptions): int {
+            $deliver = $deliverSubject ?? Inbox::generate('_INBOX.JS.PUSH');
+
+            $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+
+            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler): void {
+                if ($this->handlePushControlMessage($message)->await()) {
+                    return;
+                }
+
+                $handler($message);
+            })->await();
         });
     }
 
@@ -202,6 +383,87 @@ final class JetStreamContext
     }
 
     /**
+     * Fetches the next message for a pull consumer.
+     *
+     * @return Future<NatsMessage>
+     */
+    public function fetchNext(string $stream, string $consumer, int $expiresMs = 3000): Future
+    {
+        return async(function () use ($stream, $consumer, $expiresMs): NatsMessage {
+            if ($expiresMs <= 0) {
+                throw new JetStreamException('Pull fetch expiresMs must be greater than zero');
+            }
+
+            $payload = [
+                'batch' => 1,
+                'expires' => $expiresMs * 1_000_000,
+            ];
+
+            $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
+            $json = json_encode($payload, JSON_THROW_ON_ERROR);
+
+            return $this->client->request($subject, $json, $expiresMs + 1000)->await();
+        });
+    }
+
+    /**
+     * Sends a JetStream explicit ACK for a previously delivered message.
+     *
+     * @return Future<void>
+     */
+    public function ack(NatsMessage $message): Future
+    {
+        return $this->publishAckToken($message, '+ACK');
+    }
+
+    /**
+     * Sends a JetStream NAK for a previously delivered message.
+     *
+     * @return Future<void>
+     */
+    public function nak(NatsMessage $message): Future
+    {
+        return $this->publishAckToken($message, '-NAK');
+    }
+
+    /**
+     * Sends a JetStream delayed NAK for a previously delivered message.
+     *
+     * @return Future<void>
+     */
+    public function nakWithDelay(NatsMessage $message, int $delayMs): Future
+    {
+        return async(function () use ($message, $delayMs): void {
+            if ($delayMs <= 0) {
+                throw new JetStreamException('JetStream delayed NAK requires delayMs greater than zero');
+            }
+
+            $payload = sprintf('-NAK {"delay":%d}', $delayMs * 1_000_000);
+            $this->publishAckToken($message, $payload)->await();
+        });
+    }
+
+    /**
+     * Sends a JetStream terminal ACK for a previously delivered message.
+     *
+     * @return Future<void>
+     */
+    public function term(NatsMessage $message): Future
+    {
+        return $this->publishAckToken($message, '+TERM');
+    }
+
+    /**
+     * Sends a JetStream work-in-progress signal for a previously delivered message.
+     *
+     * @return Future<void>
+     */
+    public function inProgress(NatsMessage $message): Future
+    {
+        return $this->publishAckToken($message, '+WPI');
+    }
+
+    /**
      * Validates the schedule expression format supported by current server behavior.
      */
     private function assertSupportedSchedulePattern(string $schedule): void
@@ -210,6 +472,49 @@ final class JetStreamContext
         if (!preg_match('/^@at\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/', $schedule)) {
             throw new JetStreamException('Only @at schedule expressions are currently supported');
         }
+    }
+
+    /**
+     * Publishes an ACK protocol token to a message reply subject.
+     *
+     * @return Future<void>
+     */
+    private function publishAckToken(NatsMessage $message, string $token): Future
+    {
+        return async(function () use ($message, $token): void {
+            if ($message->replyTo === null || $message->replyTo === '') {
+                throw new JetStreamException('JetStream ACK requires a reply subject on the delivered message');
+            }
+
+            $this->client->publish($message->replyTo, $token)->await();
+        });
+    }
+
+    /**
+     * Handles JetStream push-control messages (heartbeat/flow-control).
+     *
+     * @return Future<bool> True when the message is a control message and was handled.
+     */
+    private function handlePushControlMessage(NatsMessage $message): Future
+    {
+        return async(function () use ($message): bool {
+            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+            $status = (int) ($headers['Status'] ?? 0);
+
+            if ($status !== 100) {
+                return false;
+            }
+
+            $description = strtolower((string) ($headers['Description'] ?? ''));
+            $isFlowControl = str_contains($description, 'flow') || array_key_exists('Nats-Consumer-Stalled', $headers);
+
+            if ($isFlowControl && $message->replyTo !== null && $message->replyTo !== '') {
+                $this->client->publish($message->replyTo, '')->await();
+            }
+
+            // Status 100 control messages are not user payload deliveries.
+            return true;
+        });
     }
 
     /**
