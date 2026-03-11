@@ -8,18 +8,25 @@ This project is in active development.
 
 Implemented functionality includes:
 
-- Core NATS connect/disconnect
+- Core NATS connect/disconnect with graceful drain
 - Publish and subscribe
 - Request/reply with timeout and cancellation
-- Reconnect with server rotation and subscription replay
+- Reconnect with exponential backoff, server rotation, and subscription replay
+- Ping/pong heartbeat with `maxPingsOut` detection
+- `max_payload` enforcement and `no_responders` negotiation
+- Subject validation against NATS naming rules
 - JetStream account info
-- JetStream stream CRUD
-- JetStream consumer CRUD (durable + ephemeral)
-- JetStream pull consumers (fetch next, ACK/NAK/TERM/WPI, delayed NAK)
+- JetStream stream CRUD (create, update, get, delete)
+- JetStream consumer CRUD (durable + ephemeral, pull + push)
+- JetStream pull consumers (fetch next, fetch batch, ACK/NAK/TERM/WPI, delayed NAK)
 - JetStream push consumers with heartbeat/flow-control handling
+- JetStream ordered consumers with automatic sequence tracking
+- JetStream consumer pause/resume
 - JetStream publish ACK
 - Scheduled publish (`@at` support)
-- KeyValue API (bucket lifecycle, put/get/update/delete/purge, watch, getAll/status)
+- KeyValue API (bucket lifecycle with history/TTL/storage options, put/get/update/delete/purge, watch, getAll/status)
+- ObjectStore API (bucket lifecycle, put/get/delete/list/watch, chunked uploads, SHA-256 digest verification)
+- Microservices framework (service registration, PING/INFO/STATS/SCHEMA discovery, grouped endpoints)
 - Server authorization methods: token, username/password, JWT + nonce signer
 
 Current scheduling note: scheduled messages are implemented with NATS scheduler headers and currently accept only `@at` expressions.
@@ -394,10 +401,157 @@ $service->start()->await();
 // - $SRV.PING.echo
 // - $SRV.INFO.echo
 // - $SRV.STATS.echo
+// - $SRV.SCHEMA.echo
 // - svc.echo
 
 $service->stop()->await();
 $serviceClient->disconnect()->await();
+```
+
+### Services: SCHEMA Discovery
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$service = $client->service('calc', '1.0.0', 'Calculator')
+	->addEndpoint('add', 'calc.add', static function (NatsMessage $message): string {
+		return 'result';
+	}, schema: ['request' => 'int a, int b', 'response' => 'int sum']);
+
+$service->start()->await();
+
+// Another client can discover the schema:
+// $reply = $client->request('$SRV.SCHEMA.calc', '')->await();
+// The response includes endpoint schemas in the JSON payload.
+
+$service->stop()->await();
+$client->disconnect()->await();
+```
+
+### Graceful Drain
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$client->subscribe('events.>', static function (NatsMessage $message): void {
+	echo $message->payload . PHP_EOL;
+})->await();
+
+// Gracefully drain: unsubscribes all SIDs, delivers pending messages, then closes.
+$client->drain()->await();
+```
+
+### Ordered Consumer
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('EVENTS', ['events.>'])->await();
+
+// Ordered consumer: ephemeral push consumer with flow control,
+// idle heartbeat, and ack_policy=none for ordered delivery.
+$sid = $js->subscribeOrderedConsumer(
+	stream: 'EVENTS',
+	handler: static function (NatsMessage $message): void {
+		echo $message->payload . PHP_EOL;
+	},
+	filterSubject: 'events.>',
+)->await();
+
+$js->publish('events.order', '{"id":1}')->await();
+$client->processIncoming()->await();
+
+$client->unsubscribe($sid)->await();
+$js->deleteStream('EVENTS')->await();
+$client->disconnect()->await();
+```
+
+### Consumer Pause/Resume
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('ORDERS', ['orders.>'])->await();
+$js->createConsumer('ORDERS', 'PROC', 'orders.created')->await();
+
+// Pause the consumer until a specific time (ISO 8601 format).
+$js->pauseConsumer('ORDERS', 'PROC', '2026-03-12T00:00:00Z')->await();
+
+// Resume the consumer immediately.
+$js->resumeConsumer('ORDERS', 'PROC')->await();
+
+$js->deleteConsumer('ORDERS', 'PROC')->await();
+$js->deleteStream('ORDERS')->await();
+$client->disconnect()->await();
+```
+
+### Fetch Batch
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('LOGS', ['logs.>'])->await();
+$js->createConsumer('LOGS', 'BATCH', 'logs.>')->await();
+
+for ($i = 0; $i < 5; $i++) {
+	$js->publish('logs.app', "log entry $i")->await();
+}
+
+// Fetch up to 5 messages in one batch.
+$messages = $js->fetchBatch('LOGS', 'BATCH', batch: 5, expiresMs: 3000)->await();
+foreach ($messages as $message) {
+	$js->ack($message)->await();
+}
+
+$js->deleteConsumer('LOGS', 'BATCH')->await();
+$js->deleteStream('LOGS')->await();
+$client->disconnect()->await();
 ```
 
 ## Configuration Option Mapping
@@ -414,6 +568,7 @@ $serviceClient->disconnect()->await();
 | `reconnectEnabled` | `bool` | `true` | Enables reconnect flow. |
 | `maxReconnectAttempts` | `int` | `10` | Max reconnect attempts before closing. |
 | `reconnectDelayMs` | `int` | `100` | Base reconnect backoff delay. |
+| `reconnectMaxDelayMs` | `int` | `10000` | Maximum reconnect delay (caps exponential backoff). |
 | `reconnectJitterMs` | `int` | `50` | Random jitter added to reconnect delay. |
 | `pingIntervalSeconds` | `int` | `30` | Client heartbeat interval setting. |
 | `maxPingsOut` | `int` | `2` | Max outstanding pings before failure. |
@@ -514,9 +669,10 @@ Optional environment variable:
 
 ## Current Test Baseline
 
-- Unit tests cover protocol encoding/parsing, handshake/state transitions, subscriptions, backpressure policies, request/reply flows, and reconnect/server-rotation behavior.
-- Unit tests also cover JetStream account info, stream and consumer CRUD, publish acknowledgments, and API error mapping.
-- Integration tests cover live connect/disconnect, publish-subscribe roundtrip, request-reply, connection rotation fallback, and JetStream stream/consumer lifecycle with publish-ack flow.
+- Unit tests cover protocol encoding/parsing, handshake/state transitions, subscriptions, backpressure policies, request/reply flows, reconnect/server-rotation behavior, and exponential backoff.
+- Unit tests also cover JetStream account info, stream and consumer CRUD, publish acknowledgments, API error mapping, fetch batch, ordered consumers, consumer pause/resume, KV bucket options, ObjectStore chunking and digest verification.
+- Unit tests cover microservices framework including PING/INFO/STATS/SCHEMA discovery and grouped endpoint hierarchy.
+- Integration tests cover live connect/disconnect, publish-subscribe roundtrip, request-reply, connection rotation fallback, JetStream stream/consumer lifecycle with publish-ack flow, KV operations, ObjectStore operations, and service discovery.
 - Static analysis runs with PHPStan level 8.
 
 ## Roadmap

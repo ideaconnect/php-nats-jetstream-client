@@ -53,6 +53,16 @@ final class NatsClient
     }
 
     /**
+     * Gracefully drains all subscriptions, flushes pending messages, and closes.
+     *
+     * @return Future<void>
+     */
+    public function drain(): Future
+    {
+        return $this->connection->drain();
+    }
+
+    /**
      * Publishes a payload to a subject.
      *
      * @return Future<void>
