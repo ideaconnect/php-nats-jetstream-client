@@ -1,0 +1,7 @@
+services:
+  nats:
+    image: nats:2.12-alpine
+    command: ["-js", "-m", "8222", "-DV"]
+    ports:
+      - "14222:4222"
+      - "18222:8222"

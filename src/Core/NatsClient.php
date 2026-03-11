@@ -1,0 +1,162 @@
+<?php
+
+declare(strict_types=1);
+
+namespace Idct\Nats\Core;
+
+use Amp\Cancellation;
+use Amp\Future;
+use Idct\Nats\Connection\NatsConnection;
+use Idct\Nats\Connection\NatsOptions;
+use Idct\Nats\JetStream\JetStreamContext;
+use Idct\Nats\Protocol\ServerInfo;
+use Idct\Nats\Transport\AmpSocketTransport;
+use Idct\Nats\Transport\TransportInterface;
+
+final class NatsClient
+{
+    private readonly NatsConnection $connection;
+    private ?JetStreamContext $jetStreamContext = null;
+
+    /**
+     * Creates a high-level client facade over the connection runtime.
+     */
+    public function __construct(
+        NatsOptions $options = new NatsOptions(),
+        ?TransportInterface $transport = null,
+    ) {
+        $this->connection = new NatsConnection(
+            options: $options,
+            transport: $transport ?? new AmpSocketTransport(),
+        );
+    }
+
+    /**
+     * Opens a connection to the configured NATS server.
+     *
+     * @return Future<void>
+     */
+    public function connect(): Future
+    {
+        return $this->connection->connect();
+    }
+
+    /**
+     * Closes the active connection and releases underlying transport resources.
+     *
+     * @return Future<void>
+     */
+    public function disconnect(): Future
+    {
+        return $this->connection->disconnect();
+    }
+
+    /**
+     * Publishes a payload to a subject.
+     *
+     * @return Future<void>
+     */
+    public function publish(string $subject, string $payload, ?string $replyTo = null): Future
+    {
+        return $this->connection->publish($subject, $payload, $replyTo);
+    }
+
+    /**
+     * Publishes a payload with NATS headers to a subject.
+     *
+     * @param array<string,string> $headers
+     * @return Future<void>
+     */
+    public function publishWithHeaders(
+        string $subject,
+        string $payload,
+        array $headers,
+        ?string $replyTo = null,
+    ): Future {
+        return $this->connection->publishWithHeaders($subject, $payload, $headers, $replyTo);
+    }
+
+    /**
+     * Registers a subscription handler and returns its SID.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @return Future<int>
+     */
+    public function subscribe(string $subject, callable $handler, ?string $queue = null): Future
+    {
+        return $this->connection->subscribe($subject, $handler, $queue);
+    }
+
+    /**
+     * Removes a subscription by SID.
+     *
+     * @return Future<void>
+     */
+    public function unsubscribe(int $sid, ?int $maxMessages = null): Future
+    {
+        return $this->connection->unsubscribe($sid, $maxMessages);
+    }
+
+    /**
+     * Processes a single incoming transport chunk and dispatches parsed frames.
+     *
+     * @return Future<int>
+     */
+    public function processIncoming(): Future
+    {
+        return $this->connection->processIncoming();
+    }
+
+    /**
+     * Sends a request and resolves with the first reply message.
+     *
+     * @param Cancellation|null $cancellation Optional external cancellation token.
+     * @return Future<NatsMessage>
+     */
+    public function request(
+        string $subject,
+        string $payload,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future
+    {
+        return $this->connection->request($subject, $payload, $timeoutMs, $cancellation);
+    }
+
+    /**
+     * Sends a request with headers and resolves with the first reply message.
+     *
+     * @param array<string,string> $headers
+     * @param Cancellation|null $cancellation Optional external cancellation token.
+     * @return Future<NatsMessage>
+     */
+    public function requestWithHeaders(
+        string $subject,
+        string $payload,
+        array $headers,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future {
+        return $this->connection->requestWithHeaders($subject, $payload, $headers, $timeoutMs, $cancellation);
+    }
+
+    /**
+     * Returns server capabilities advertised during the INFO handshake.
+     */
+    public function serverInfo(): ?ServerInfo
+    {
+        return $this->connection->serverInfo();
+    }
+
+    /**
+     * Returns a JetStream API context bound to this client instance.
+     */
+    public function jetStream(): JetStreamContext
+    {
+        if ($this->jetStreamContext === null) {
+            $this->jetStreamContext = new JetStreamContext($this);
+        }
+
+        return $this->jetStreamContext;
+    }
+}
