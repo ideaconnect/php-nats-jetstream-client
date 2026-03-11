@@ -8,17 +8,22 @@ use Amp\Future;
 use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\CompositeCancellation;
+use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\ProtocolException;
+use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Protocol\ProtocolFrame;
 use IDCT\NATS\Protocol\ProtocolFrameType;
 use IDCT\NATS\Protocol\ProtocolParser;
 use IDCT\NATS\Protocol\ServerInfo;
 use IDCT\NATS\Transport\TransportInterface;
+use Revolt\EventLoop;
 use SplQueue;
 use function Amp\async;
 use function Amp\delay;
@@ -36,6 +41,8 @@ final class NatsConnection
     private array $subscriptionMeta = [];
     /** @var array<int, SplQueue<NatsMessage>> */
     private array $pendingMessages = [];
+    private int $outstandingPings = 0;
+    private ?string $pingTimerId = null;
 
     /**
      * Creates a connection runtime with transport and protocol dependencies.
@@ -99,6 +106,7 @@ final class NatsConnection
     public function disconnect(): Future
     {
         return async(function (): void {
+            $this->cancelPingTimer();
             $this->transport->close()->await();
             $this->state = ConnectionState::Closed;
         });
@@ -115,6 +123,8 @@ final class NatsConnection
             if ($this->state !== ConnectionState::Open) {
                 throw new ConnectionException('Connection is not open');
             }
+
+            $this->enforceMaxPayload(strlen($payload));
 
             try {
                 $this->transport->write($this->codec->encodePublish($subject, $payload, $replyTo))->await();
@@ -141,6 +151,9 @@ final class NatsConnection
             if ($this->state !== ConnectionState::Open) {
                 throw new ConnectionException('Connection is not open');
             }
+
+            $headerBytes = strlen(NatsHeaders::toWireBlock($headers));
+            $this->enforceMaxPayload($headerBytes + strlen($payload));
 
             try {
                 $this->transport->write($this->codec->encodeHeaderPublish($subject, $payload, $headers, $replyTo))->await();
@@ -286,10 +299,13 @@ final class NatsConnection
         }
 
         $inbox = Inbox::generate($this->options->inboxPrefix);
-        $response = null;
+        /** @var DeferredFuture<NatsMessage> $deferred */
+        $deferred = new DeferredFuture();
 
-        $sid = $this->subscribe($inbox, static function (NatsMessage $message) use (&$response): void {
-            $response = $message;
+        $sid = $this->subscribe($inbox, static function (NatsMessage $message) use ($deferred): void {
+            if (!$deferred->isComplete()) {
+                $deferred->complete($message);
+            }
         })->await();
 
         try {
@@ -303,40 +319,66 @@ final class NatsConnection
             if ($deadlineMs <= 0) {
                 throw new TimeoutException('Request timeout must be greater than zero');
             }
-            $startedAt = (int) floor(microtime(true) * 1000);
 
-            while ($response === null) {
-                $elapsed = (int) floor(microtime(true) * 1000) - $startedAt;
-                if ($elapsed >= $deadlineMs) {
-                    throw new TimeoutException('Request timed out for subject ' . $subject);
-                }
+            $timeoutCancellation = new TimeoutCancellation($deadlineMs / 1000);
+            $waitCancellation = $cancellation === null
+                ? $timeoutCancellation
+                : new CompositeCancellation($cancellation, $timeoutCancellation);
 
-                $remaining = max(1, $deadlineMs - $elapsed);
-                    $timeoutCancellation = new TimeoutCancellation($remaining / 1000);
-                $waitCancellation = $cancellation === null
-                    ? $timeoutCancellation
-                    : new CompositeCancellation($cancellation, $timeoutCancellation);
-
+            while (!$deferred->isComplete()) {
                 try {
-                    $this->processIncoming()->await($waitCancellation);
-                } catch (CancelledException $cancelledException) {
+                    $frames = $this->processIncoming()->await($waitCancellation);
+                } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
-                        throw $cancelledException;
+                        throw $e;
                     }
 
                     throw new TimeoutException('Request timed out for subject ' . $subject);
                 }
 
-                if ($response === null) {
-                    // Yield briefly when no response has arrived to avoid a tight loop.
+                // Check if the cancellation token has fired between iterations.
+                if ($waitCancellation->isRequested()) {
+                    if ($cancellation !== null && $cancellation->isRequested()) {
+                        throw new CancelledException();
+                    }
+
+                    throw new TimeoutException('Request timed out for subject ' . $subject);
+                }
+
+                if ($frames === 0) {
+                    // No data available from transport; yield to avoid a tight spin.
                     delay(0.001);
                 }
+            }
+
+            $response = $deferred->getFuture()->await();
+
+            if ($this->isNoRespondersStatus($response)) {
+                throw new NatsException('No responders for subject ' . $subject);
             }
 
             return $response;
         } finally {
             $this->unsubscribe($sid)->await();
         }
+    }
+
+    /**
+     * Checks whether a response message carries a 503 No Responders status.
+     */
+    private function isNoRespondersStatus(NatsMessage $message): bool
+    {
+        if ($message->rawHeaders === null) {
+            return false;
+        }
+
+        $firstLine = strtok($message->rawHeaders, "\r\n");
+        if ($firstLine === false) {
+            return false;
+        }
+
+        // Status line format: "NATS/1.0 503" or "NATS/1.0 503 No Responders".
+        return (bool) preg_match('/^NATS\/1\.0\s+503\b/', $firstLine);
     }
 
     /**
@@ -372,6 +414,7 @@ final class NatsConnection
         // Reset parser state after handshake to avoid carrying partial bootstrap chunks.
         $this->parser = new ProtocolParser();
         $this->state = ConnectionState::Open;
+        $this->startPingTimer();
     }
 
     /**
@@ -399,6 +442,8 @@ final class NatsConnection
             $this->state = ConnectionState::Closed;
             throw new ConnectionException('Reconnect is disabled');
         }
+
+        $this->cancelPingTimer();
 
         $maxAttempts = max(1, $this->options->maxReconnectAttempts);
         $lastError = null;
@@ -554,6 +599,12 @@ final class NatsConnection
             return;
         }
 
+        if ($frame->type === ProtocolFrameType::Pong) {
+            $this->outstandingPings = 0;
+
+            return;
+        }
+
         if ($frame->type === ProtocolFrameType::Err) {
             throw new ConnectionException('Server sent error frame: ' . ($frame->error ?? 'unknown'));
         }
@@ -630,6 +681,84 @@ final class NatsConnection
     {
         foreach (array_keys($this->pendingMessages) as $sid) {
             $this->drainPendingForSid($sid);
+        }
+    }
+
+    /**
+     * Validates that payload size does not exceed server max_payload.
+     */
+    private function enforceMaxPayload(int $totalBytes): void
+    {
+        if ($this->serverInfo === null) {
+            return;
+        }
+
+        $max = $this->serverInfo->maxPayload;
+        if ($max > 0 && $totalBytes > $max) {
+            throw new ProtocolException(sprintf(
+                'Payload size %d exceeds server max_payload of %d',
+                $totalBytes,
+                $max,
+            ));
+        }
+    }
+
+    /**
+     * Starts the periodic ping timer based on configured interval.
+     */
+    private function startPingTimer(): void
+    {
+        $this->cancelPingTimer();
+        $this->outstandingPings = 0;
+
+        $intervalSeconds = $this->options->pingIntervalSeconds;
+        if ($intervalSeconds <= 0) {
+            return;
+        }
+
+        $this->pingTimerId = EventLoop::repeat($intervalSeconds, function (): void {
+            if ($this->state !== ConnectionState::Open) {
+                $this->cancelPingTimer();
+
+                return;
+            }
+
+            $this->outstandingPings++;
+
+            if ($this->outstandingPings > $this->options->maxPingsOut) {
+                $this->cancelPingTimer();
+
+                try {
+                    $this->recoverConnection();
+                } catch (\Throwable) {
+                    $this->state = ConnectionState::Closed;
+                }
+
+                return;
+            }
+
+            try {
+                $this->transport->write($this->codec->encodePing())->await();
+            } catch (\Throwable) {
+                $this->cancelPingTimer();
+
+                try {
+                    $this->recoverConnection();
+                } catch (\Throwable) {
+                    $this->state = ConnectionState::Closed;
+                }
+            }
+        });
+    }
+
+    /**
+     * Cancels the active ping timer if running.
+     */
+    private function cancelPingTimer(): void
+    {
+        if ($this->pingTimerId !== null) {
+            EventLoop::cancel($this->pingTimerId);
+            $this->pingTimerId = null;
         }
     }
 

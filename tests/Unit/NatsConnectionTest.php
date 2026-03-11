@@ -12,11 +12,14 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Connection\SlowConsumerPolicy;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\FlakyTransport;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FixedNonceSigner;
 use PHPUnit\Framework\TestCase;
+use function Amp\delay;
 
 final class NatsConnectionTest extends TestCase
 {
@@ -562,5 +565,227 @@ final class NatsConnectionTest extends TestCase
         self::assertCount(2, $transport->connectCalls);
         self::assertStringStartsWith('tcp://127.0.0.1:4222', $transport->connectCalls[0]);
         self::assertStringStartsWith('tcp://127.0.0.2:4222', $transport->connectCalls[1]);
+    }
+
+    /**
+     * Verifies that receiving a server PONG frame does not throw and resets ping tracking.
+     */
+    public function testProcessIncomingHandlesServerPongSilently(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $frames = $connection->processIncoming()->await();
+
+        self::assertSame(1, $frames);
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * Verifies the ping timer sends PING frames at the configured interval.
+     */
+    public function testPingTimerSendsPingAtInterval(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        // Use a very short interval (1 second) and let the event loop tick.
+        $options = new NatsOptions(
+            pingIntervalSeconds: 1,
+            maxPingsOut: 3,
+            reconnectEnabled: false,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $writesBeforePing = count($transport->writes);
+
+        // Let the event loop run long enough for the timer to fire.
+        delay(1.1);
+
+        self::assertGreaterThan($writesBeforePing, count($transport->writes));
+        self::assertSame("PING\r\n", $transport->writes[$writesBeforePing]);
+
+        $connection->disconnect()->await();
+    }
+
+    /**
+     * Verifies ping timer is not started when pingIntervalSeconds is zero.
+     */
+    public function testPingTimerDisabledWhenIntervalIsZero(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $options = new NatsOptions(
+            pingIntervalSeconds: 0,
+            reconnectEnabled: false,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $writesAfterConnect = count($transport->writes);
+
+        delay(0.1);
+
+        // No additional writes (no PING sent).
+        self::assertCount($writesAfterConnect, $transport->writes);
+
+        $connection->disconnect()->await();
+    }
+
+    /**
+     * Verifies disconnect cancels the ping timer cleanly.
+     */
+    public function testDisconnectCancelsPingTimer(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $options = new NatsOptions(
+            pingIntervalSeconds: 1,
+            maxPingsOut: 2,
+            reconnectEnabled: false,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+        $connection->disconnect()->await();
+
+        $writesAfterDisconnect = count($transport->writes);
+
+        // Let event loop tick past when timer would have fired.
+        delay(1.2);
+
+        // No PING sent after disconnect.
+        self::assertCount($writesAfterDisconnect, $transport->writes);
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * Verifies publish throws when payload exceeds server max_payload.
+     */
+    public function testPublishRejectsOversizedPayload(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":64,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Payload size 65 exceeds server max_payload of 64');
+
+        $connection->publish('test.subject', str_repeat('x', 65))->await();
+    }
+
+    /**
+     * Verifies publish succeeds when payload exactly matches max_payload.
+     */
+    public function testPublishAcceptsPayloadAtExactLimit(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":64,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->publish('test.subject', str_repeat('x', 64))->await();
+
+        self::assertStringContainsString('PUB test.subject 64', $transport->writes[2]);
+    }
+
+    /**
+     * Verifies publishWithHeaders checks total (headers + payload) against max_payload.
+     */
+    public function testPublishWithHeadersRejectsOversizedTotal(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":32,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('exceeds server max_payload of 32');
+
+        $connection->publishWithHeaders('test.subject', str_repeat('x', 32), ['Key' => 'Val'])->await();
+    }
+
+    /**
+     * Verifies CONNECT payload includes no_responders flag.
+     */
+    public function testConnectPayloadIncludesNoResponders(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        self::assertStringContainsString('"no_responders":true', $transport->writes[0]);
+    }
+
+    /**
+     * Verifies request throws NatsException when server returns 503 No Responders.
+     */
+    public function testRequestThrowsOnNoRespondersStatus(): void
+    {
+        $noRespondersHeader = "NATS/1.0 503 No Responders\r\n\r\n";
+        $headerBytes = strlen($noRespondersHeader);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "HMSG _INBOX.any 1 {$headerBytes} {$headerBytes}\r\n{$noRespondersHeader}\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(NatsException::class);
+        $this->expectExceptionMessage('No responders for subject svc.missing');
+
+        $connection->request('svc.missing', 'hello', 500)->await();
     }
 }

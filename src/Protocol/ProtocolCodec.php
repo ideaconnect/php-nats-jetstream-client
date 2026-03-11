@@ -22,6 +22,7 @@ final class ProtocolCodec
             'verbose' => $options->verbose,
             'pedantic' => $options->pedantic,
             'headers' => true,
+            'no_responders' => true,
             'name' => $options->name,
         ];
 

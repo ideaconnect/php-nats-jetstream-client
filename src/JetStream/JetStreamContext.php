@@ -438,7 +438,7 @@ final class JetStreamContext
                 throw new JetStreamException('JetStream delayed NAK requires delayMs greater than zero');
             }
 
-            $payload = sprintf('-NAK {"delay":%d}', $delayMs * 1_000_000);
+            $payload = '-NAK ' . json_encode(['delay' => $delayMs * 1_000_000], JSON_THROW_ON_ERROR);
             $this->publishAckToken($message, $payload)->await();
         });
     }
