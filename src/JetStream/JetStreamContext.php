@@ -6,10 +6,17 @@ namespace IDCT\NATS\JetStream;
 
 use Amp\Future;
 use IDCT\NATS\Core\Inbox;
+use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
-use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
+use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
+use IDCT\NATS\JetStream\Models\AccountInfo;
+use IDCT\NATS\JetStream\Models\ConsumerInfo;
+use IDCT\NATS\JetStream\Models\PubAck;
+use IDCT\NATS\JetStream\Models\StreamInfo;
+use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use function Amp\async;
 
 /**
@@ -24,8 +31,8 @@ final class JetStreamContext
 
     /**
      * Creates a JetStream API context bound to a NATS client.
-      *
-      * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
+        *
+        * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
      */
     public function __construct(private readonly NatsClient $client)
     {

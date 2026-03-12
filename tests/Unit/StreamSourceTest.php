@@ -4,7 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
-use IDCT\NATS\JetStream\StreamSource;
+use IDCT\NATS\JetStream\Configuration\StreamSource;
 use PHPUnit\Framework\TestCase;
 
 final class StreamSourceTest extends TestCase

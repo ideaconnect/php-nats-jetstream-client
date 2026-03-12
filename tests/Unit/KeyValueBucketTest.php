@@ -7,7 +7,7 @@ namespace IDCT\NATS\Tests\Unit;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
-use IDCT\NATS\JetStream\KeyValueEntry;
+use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 

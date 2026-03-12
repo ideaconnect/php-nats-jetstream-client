@@ -4,8 +4,8 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
-use IDCT\NATS\JetStream\Republish;
-use IDCT\NATS\JetStream\SubjectTransform;
+use IDCT\NATS\JetStream\Configuration\Republish;
+use IDCT\NATS\JetStream\Configuration\SubjectTransform;
 use PHPUnit\Framework\TestCase;
 
 final class RepublishAndTransformTest extends TestCase

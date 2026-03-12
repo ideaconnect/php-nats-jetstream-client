@@ -466,7 +466,7 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
-use IDCT\NATS\JetStream\KeyValueEntry;
+use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -977,7 +977,7 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
-use IDCT\NATS\JetStream\StreamSource;
+use IDCT\NATS\JetStream\Configuration\StreamSource;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -1018,8 +1018,8 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
-use IDCT\NATS\JetStream\Republish;
-use IDCT\NATS\JetStream\SubjectTransform;
+use IDCT\NATS\JetStream\Configuration\Republish;
+use IDCT\NATS\JetStream\Configuration\SubjectTransform;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
