@@ -37,9 +37,18 @@ Reference:
 - Scheduled publish example: equivalent
 
 ### Microservices
+- Overall status: workflow parity achieved (API shape differs; behavior-equivalent coverage).
 - Service registration and endpoint handling: matched
 - Discovery ping/info/stats: matched
 - Grouped endpoint hierarchy: matched
+- Endpoint metrics depth (last error + processing time + averages): equivalent
+- Stats reset API: equivalent
+- Schema validation hook (opt-in) + built-in JSON adapter: equivalent
+- Handler adapter layer (callable/object/class-string): equivalent
+- Service runtime helper (`run` loop with timeout/cancellation): equivalent
+- Request lifecycle observability hooks: extended
+- Standardized service error envelope (`type/code/message/error/correlation_id`): equivalent
+- Integration coverage for stats parity fields + observer correlation metadata: matched
 
 ### Key Value Storage
 - put/get/delete/watch basics: matched

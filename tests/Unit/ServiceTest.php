@@ -4,11 +4,36 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\DeferredCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Services\BasicJsonSchemaValidator;
+use IDCT\NATS\Services\ServiceEndpointHandlerInterface;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
+use function Amp\async;
+use function Amp\delay;
+
+final class ServiceTestObjectHandler implements ServiceEndpointHandlerInterface
+{
+    public function handle(NatsMessage $message): string|array|null
+    {
+        return 'obj:' . $message->payload;
+    }
+}
+
+final class ServiceTestClassHandler implements ServiceEndpointHandlerInterface
+{
+    public function handle(NatsMessage $message): string|array|null
+    {
+        return 'class:' . $message->payload;
+    }
+}
+
+final class ServiceTestInvalidClassHandler
+{
+}
 
 final class ServiceTest extends TestCase
 {
@@ -182,5 +207,347 @@ final class ServiceTest extends TestCase
         self::assertStringContainsString('PUB _INBOX.schema', $writes);
         self::assertStringContainsString('io.nats.micro.v1.schema_response', $writes);
         self::assertStringContainsString('"schema":', $writes);
+    }
+
+    /**
+     * Verifies stats include parity-oriented endpoint metrics and stable started timestamp.
+     */
+    public function testStatsIncludeDetailedMetrics(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req1 5\r\nhello\r\n",
+            "MSG svc.echo 13 _INBOX.req2 4\r\nboom\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static function (NatsMessage $message): string {
+                usleep(1000);
+
+                if ($message->payload === 'boom') {
+                    throw new \RuntimeException('handler failed');
+                }
+
+                return $message->payload;
+            });
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+        $client->processIncoming()->await();
+
+        $stats = $service->statsSnapshot();
+        $endpoint = $stats['endpoints'][0] ?? [];
+
+        self::assertSame(2, $endpoint['num_requests'] ?? null);
+        self::assertSame(1, $endpoint['num_errors'] ?? null);
+        self::assertSame('handler failed', $endpoint['last_error'] ?? null);
+        self::assertGreaterThanOrEqual(0, $endpoint['processing_time'] ?? -1);
+        self::assertGreaterThanOrEqual(0, $endpoint['average_processing_time'] ?? -1);
+
+        $statsAgain = $service->statsSnapshot();
+        self::assertSame($stats['started'] ?? null, $statsAgain['started'] ?? null);
+    }
+
+    /**
+     * Verifies reset clears accumulated endpoint statistics.
+     */
+    public function testResetClearsStats(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req1 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => $message->payload);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+        $service->reset();
+
+        $stats = $service->statsSnapshot();
+        $endpoint = $stats['endpoints'][0] ?? [];
+
+        self::assertSame(0, $endpoint['num_requests'] ?? null);
+        self::assertSame(0, $endpoint['num_errors'] ?? null);
+        self::assertNull($endpoint['last_error'] ?? null);
+        self::assertSame(0, $endpoint['processing_time'] ?? null);
+        self::assertSame(0, $endpoint['average_processing_time'] ?? null);
+    }
+
+    /**
+     * Verifies endpoint schema validator can reject requests with a structured error response.
+     */
+    public function testRequestValidatorCanRejectRequests(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req1 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $handled = false;
+        $service = $client->service('echo', '1.0.0')
+            ->withRequestValidator(static fn (NatsMessage $message, array $schema): ?string => 'payload does not match schema')
+            ->addEndpoint('echo', 'svc.echo', static function (NatsMessage $message) use (&$handled): string {
+                $handled = true;
+
+                return $message->payload;
+            }, schema: ['type' => 'object']);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        self::assertFalse($handled);
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"code":"VALIDATION_ERROR"', $writes);
+        self::assertStringContainsString('"payload does not match schema"', $writes);
+        self::assertStringContainsString('"type":"io.nats.micro.v1.error"', $writes);
+
+        $stats = $service->statsSnapshot();
+        $endpoint = $stats['endpoints'][0] ?? [];
+        self::assertSame(1, $endpoint['num_requests'] ?? null);
+        self::assertSame(1, $endpoint['num_errors'] ?? null);
+    }
+
+    /**
+     * Verifies observers receive request lifecycle events and correlation metadata.
+     */
+    public function testObserversReceiveLifecycleEvents(): void
+    {
+        $headerPayload = "NATS/1.0\r\nX-Request-Id:req-42\r\n\r\n";
+        $bodyPayload = 'hello';
+        $merged = $headerPayload . $bodyPayload;
+        $headerBytes = strlen($headerPayload);
+        $totalBytes = strlen($merged);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $events = [];
+        $service = $client->service('echo', '1.0.0')
+            ->addObserver(static function (string $event, $endpoint, NatsMessage $message, array $context) use (&$events): void {
+                $events[] = [
+                    'event' => $event,
+                    'correlation_id' => $context['correlation_id'] ?? null,
+                    'subject' => $message->subject,
+                ];
+            })
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => $message->payload);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        self::assertSame('request_start', $events[0]['event'] ?? null);
+        self::assertSame('request_end', $events[1]['event'] ?? null);
+        self::assertSame('req-42', $events[0]['correlation_id'] ?? null);
+        self::assertSame('svc.echo', $events[0]['subject'] ?? null);
+    }
+
+    /**
+     * Verifies built-in schema validator adapter is applied through convenience API.
+     */
+    public function testWithSchemaValidatorUsesAdapter(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req1 16\r\n{\"id\":\"invalid\"}\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->withSchemaValidator(new BasicJsonSchemaValidator())
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => $message->payload, schema: [
+                'type' => 'object',
+                'required' => ['id'],
+                'properties' => [
+                    'id' => ['type' => 'integer'],
+                ],
+            ]);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"code":"VALIDATION_ERROR"', $writes);
+        self::assertStringContainsString('$.id must be integer, got string', $writes);
+        self::assertStringContainsString('"type":"io.nats.micro.v1.error"', $writes);
+    }
+
+    /**
+     * Verifies error responses carry correlation id when request headers provide one.
+     */
+    public function testErrorEnvelopeIncludesCorrelationIdFromHeaders(): void
+    {
+        $headerPayload = "NATS/1.0\r\nX-Request-Id:req-123\r\n\r\n";
+        $bodyPayload = 'hello';
+        $merged = $headerPayload . $bodyPayload;
+        $headerBytes = strlen($headerPayload);
+        $totalBytes = strlen($merged);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static function (): string {
+                throw new \RuntimeException('boom');
+            });
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"code":"HANDLER_ERROR"', $writes);
+        self::assertStringContainsString('"correlation_id":"req-123"', $writes);
+    }
+
+    /**
+     * Verifies object handler adapters implementing ServiceEndpointHandlerInterface are supported.
+     */
+    public function testEndpointAcceptsObjectHandlerAdapter(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', new ServiceTestObjectHandler());
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('obj:hello', $writes);
+    }
+
+    /**
+     * Verifies class-string handler adapters are instantiated and executed.
+     */
+    public function testEndpointAcceptsClassStringHandlerAdapter(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', ServiceTestClassHandler::class);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('class:hello', $writes);
+    }
+
+    /**
+     * Verifies invalid class-string handlers are rejected with a clear exception.
+     */
+    public function testEndpointRejectsInvalidClassStringHandlerAdapter(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must implement');
+
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', ServiceTestInvalidClassHandler::class);
+    }
+
+    /**
+     * Verifies run helper processes incoming requests and auto-stops on timeout.
+     */
+    public function testRunProcessesAndStopsOnTimeout(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => 'run:' . $message->payload);
+
+        $service->run(0.03)->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('PUB _INBOX.req', $writes);
+        self::assertStringContainsString('run:hello', $writes);
+        self::assertStringContainsString("UNSUB 1\r\n", $writes);
+    }
+
+    /**
+     * Verifies run helper can be cancelled externally and still unsubscribes service SIDs.
+     */
+    public function testRunSupportsExternalCancellation(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn (NatsMessage $message): string => $message->payload);
+
+        $cancellation = new DeferredCancellation();
+        $runner = async(static function () use ($service, $cancellation): void {
+            $service->run(cancellation: $cancellation->getCancellation())->await();
+        });
+
+        delay(0.01);
+        $cancellation->cancel();
+        $runner->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString("UNSUB 1\r\n", $writes);
+        self::assertStringContainsString("UNSUB 13\r\n", $writes);
     }
 }

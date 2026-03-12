@@ -55,7 +55,7 @@ This repository tracks parity against basis-company nats.php README examples.
 | Publish Subscribe | workflow parity | Callback, queue-group, and polling queue (`SubscriptionQueue` with `fetch()`/`next()`/`fetchAll()`) patterns are supported. |
 | Request Response | workflow parity | Awaited request/reply with timeout and cancellation is covered, but the API shape differs from basis-company's `dispatch()` and callback request helpers. |
 | JetStream API Usage | workflow parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, ordered-consumer helpers, batching/iteration chain API, stream mirroring/sourcing, republish/subject-transform helpers, and typed enums are covered. |
-| Microservices | partial parity | Service registration, discovery, endpoint handling, grouped hierarchy, and SCHEMA discovery are covered with a slimmer stats/handler model. |
+| Microservices | workflow parity | Service registration, discovery (PING/INFO/STATS/SCHEMA), grouped hierarchy, enriched endpoint stats (requests/errors/last-error/processing time), reset API, opt-in schema validation hook with built-in adapter, handler adapters (callable/object/class-string), request lifecycle observers, standardized error envelopes, and run-loop helper are covered. |
 | Key Value Storage | workflow parity | Core KV flows plus update/purge/getAll/status parity are covered. |
 | Object Store | extended | Bucket/object lifecycle, object listing, chunked uploads, and digest verification are covered. |
 
@@ -122,6 +122,7 @@ declare(strict_types=1);
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Services\BasicJsonSchemaValidator;
 
 $client = new NatsClient(new NatsOptions(servers: ['nats://127.0.0.1:4222']));
 $client->connect()->await();
@@ -582,6 +583,9 @@ $service = $serviceClient->service('echo', '1.0.0', 'Echo demo')
 		return 'reply:' . $message->payload;
 	});
 
+// Handlers can also be provided as objects implementing
+// IDCT\NATS\Services\ServiceEndpointHandlerInterface or class-string adapters.
+
 $service->addGroup('svc')->addGroup('v1')->addEndpoint(
 	'echo-v1',
 	'echo',
@@ -601,6 +605,9 @@ $service->start()->await();
 
 $service->stop()->await();
 $serviceClient->disconnect()->await();
+
+// Optional runtime helper: start + process loop + auto-stop on timeout.
+// $service->run(timeoutSeconds: 30.0)->await();
 ```
 
 ### Services: SCHEMA Discovery
@@ -618,15 +625,29 @@ $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
 
 $service = $client->service('calc', '1.0.0', 'Calculator')
+	->withSchemaValidator(new BasicJsonSchemaValidator())
+	->addObserver(static function (string $event, $endpoint, NatsMessage $message, array $context): void {
+		// Example events: request_start, request_error, request_end
+		// Example context key: correlation_id (from X-Request-Id/traceparent headers)
+	})
 	->addEndpoint('add', 'calc.add', static function (NatsMessage $message): string {
 		return 'result';
-	}, schema: ['request' => 'int a, int b', 'response' => 'int sum']);
+	}, schema: [
+		'type' => 'object',
+		'required' => ['a', 'b'],
+		'properties' => [
+			'a' => ['type' => 'integer'],
+			'b' => ['type' => 'integer'],
+		],
+	]);
 
 $service->start()->await();
 
 // Another client can discover the schema:
 // $reply = $client->request('$SRV.SCHEMA.calc', '')->await();
 // The response includes endpoint schemas in the JSON payload.
+// Invalid request payloads receive a structured envelope:
+// {"type":"io.nats.micro.v1.error","code":"VALIDATION_ERROR","message":"...","error":"...","correlation_id":"..."}
 
 $service->stop()->await();
 $client->disconnect()->await();
