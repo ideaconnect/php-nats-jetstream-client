@@ -15,6 +15,9 @@ use IDCT\NATS\Transport\AmpSocketTransport;
 use IDCT\NATS\Transport\TransportInterface;
 use function Amp\async;
 
+/**
+ * Facade client exposing high-level NATS publish/subscribe and request APIs.
+ */
 final class NatsClient
 {
     private readonly NatsConnection $connection;
@@ -22,6 +25,9 @@ final class NatsClient
 
     /**
      * Creates a high-level client facade over the connection runtime.
+     *
+     * @param NatsOptions $options Runtime options for NATS connectivity, authentication, heartbeat, and reconnect behavior.
+     * @param TransportInterface|null $transport Optional custom transport. When null, AmpSocketTransport is used.
      */
     public function __construct(
         NatsOptions $options = new NatsOptions(),

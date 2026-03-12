@@ -4,10 +4,18 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\JetStream;
 
+/**
+ * Immutable acknowledgment returned by JetStream publish APIs.
+ */
 final class PubAck
 {
     /**
      * Represents an acknowledgment for a JetStream publish request.
+     *
+     * @param string $stream Stream that accepted the publish.
+     * @param int $seq Assigned stream sequence number for the stored message.
+     * @param bool $duplicate Indicates server detected duplicate publish by message ID.
+     * @param array<string,mixed> $raw Full publish acknowledgment payload.
      */
     public function __construct(
         public readonly string $stream,

@@ -4,10 +4,17 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\JetStream;
 
+/**
+ * Immutable subset of JetStream stream metadata.
+ */
 final class StreamInfo
 {
     /**
      * Represents the selected stream metadata returned by JetStream APIs.
+     *
+     * @param string $name Stream name from stream configuration.
+     * @param list<string> $subjects Subject filters bound to the stream.
+     * @param array<string,mixed> $raw Full stream info payload returned by `$JS.API.STREAM.INFO`.
      */
     public function __construct(
         public readonly string $name,

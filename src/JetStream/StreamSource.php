@@ -27,6 +27,9 @@ final class StreamSource
     /** @var array<string,string>|null */
     private ?array $externalApi = null;
 
+    /**
+     * @param string $name Origin stream name used by mirror/source configuration.
+     */
     private function __construct(
         private readonly string $name,
     ) {

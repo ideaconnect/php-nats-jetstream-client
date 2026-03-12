@@ -15,6 +15,9 @@ use IDCT\NATS\Core\NatsMessage;
 use function Amp\async;
 use function Amp\delay;
 
+/**
+ * NATS microservice runtime implementing discovery and endpoint handling.
+ */
 final class Service
 {
     /** @var array<int, int> */
@@ -38,6 +41,10 @@ final class Service
     /**
      * Creates a service runtime bound to a NATS client.
      *
+     * @param NatsClient $client Connected NATS client used for endpoint subscriptions and replies.
+     * @param string $name Logical service name exposed in `$SRV.*` discovery responses.
+     * @param string $version Service semantic version exposed by discovery and stats endpoints.
+     * @param ?string $description Optional human-readable description returned by INFO responses.
      * @param array<string,string> $metadata
      */
     public function __construct(
@@ -137,7 +144,7 @@ final class Service
                             if ($validationError !== null) {
                                 $endpoint->errors++;
                                 $endpoint->lastError = $validationError;
-                                $endpoint->processingTimeNs += max(0, hrtime(true) - $started);
+                                $endpoint->processingTimeNs += (int) max(0, hrtime(true) - $started);
 
                                 $this->notifyObservers('request_error', $endpoint, $message, $context + [
                                     'code' => 'VALIDATION_ERROR',
@@ -174,7 +181,7 @@ final class Service
                                     : null,
                             );
                         } finally {
-                            $duration = max(0, hrtime(true) - $started);
+                            $duration = (int) max(0, hrtime(true) - $started);
                             $endpoint->processingTimeNs += $duration;
 
                             $this->notifyObservers('request_end', $endpoint, $message, $context + [

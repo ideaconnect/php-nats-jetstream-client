@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace IDCT\NATS\JetStream;
+namespace IDCT\NATS\JetStream\Enum;
 
 enum DiscardPolicy: string
 {

@@ -4,10 +4,21 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Protocol;
 
+/**
+ * Parsed server INFO payload describing capabilities and limits.
+ */
 final class ServerInfo
 {
     /**
      * Captures selected server capabilities from the INFO handshake payload.
+     *
+     * @param string $serverId Unique server identifier from INFO `server_id`.
+     * @param string $serverName Human-readable server name from INFO `server_name`.
+     * @param string $version Server version string from INFO `version`.
+     * @param bool $jetStreamEnabled Whether INFO advertises JetStream support.
+     * @param int $maxPayload Maximum accepted payload bytes (`max_payload`) for PUB/HPUB commands.
+     * @param bool $headersSupported Whether server supports NATS headers (`headers` capability).
+     * @param string|null $nonce Optional nonce challenge from INFO used for JWT/NKey signature auth.
      */
     public function __construct(
         public readonly string $serverId,

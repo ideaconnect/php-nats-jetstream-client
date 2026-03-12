@@ -18,6 +18,10 @@ final class SubscriptionQueue
     private SplQueue $messages;
     private float $timeout = 0;
 
+    /**
+     * @param NatsClient $client Client used to drive processIncoming polling while waiting for queued deliveries.
+     * @param int $sid Subscription ID backing this queue instance.
+     */
     public function __construct(
         private readonly NatsClient $client,
         public readonly int $sid,

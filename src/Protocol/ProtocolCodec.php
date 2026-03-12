@@ -8,6 +8,12 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Exception\ProtocolException;
 
+/**
+ * Encodes client-side NATS protocol commands into wire-format frames.
+ *
+ * This codec is responsible for CONNECT negotiation payloads and command line
+ * serialization used by publish/subscribe and request/reply flows.
+ */
 final class ProtocolCodec
 {
     /**

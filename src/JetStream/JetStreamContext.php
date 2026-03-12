@@ -12,6 +12,9 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use function Amp\async;
 
+/**
+ * High-level JetStream client for stream, consumer, KV, and Object Store operations.
+ */
 final class JetStreamContext
 {
     /** @var array<string,KeyValueBucket> */
@@ -21,6 +24,8 @@ final class JetStreamContext
 
     /**
      * Creates a JetStream API context bound to a NATS client.
+      *
+      * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
      */
     public function __construct(private readonly NatsClient $client)
     {

@@ -6,10 +6,10 @@ namespace IDCT\NATS\Tests\Unit;
 
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
-use IDCT\NATS\Connection\ConnectionState;
+use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
-use IDCT\NATS\Connection\SlowConsumerPolicy;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\NatsException;

@@ -10,12 +10,20 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use function Amp\async;
 
+/**
+ * Implements NATS JetStream Object Store bucket operations.
+ */
 final class ObjectStoreBucket
 {
     private const DEFAULT_CHUNK_SIZE = 131072; // 128 KiB
 
     /**
      * Creates an Object Store bucket context bound to a client and bucket name.
+     *
+     * @param NatsClient $client Connected client used for chunk publish and metadata retrieval operations.
+     * @param JetStreamContext $jetStream JetStream context used to manage backing object-store streams.
+     * @param string $bucket Object Store bucket name used to build stream and metadata/chunk subject prefixes.
+     * @param int $chunkSize Chunk size in bytes used when splitting object payloads before publishing chunk messages.
      */
     public function __construct(
         private readonly NatsClient $client,

@@ -6,6 +6,9 @@ namespace IDCT\NATS\Services;
 
 use IDCT\NATS\Core\NatsMessage;
 
+/**
+ * Minimal JSON Schema-like validator for service request payloads.
+ */
 final class BasicJsonSchemaValidator implements ServiceSchemaValidatorInterface
 {
     /**

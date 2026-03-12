@@ -11,10 +11,17 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use function Amp\async;
 
+/**
+ * Implements NATS JetStream Key-Value bucket operations.
+ */
 final class KeyValueBucket
 {
     /**
      * Creates a KV bucket context bound to a client and bucket name.
+     *
+     * @param NatsClient $client Connected client used for publish/subscribe operations behind KV APIs.
+     * @param JetStreamContext $jetStream JetStream context used for stream management and API request routing.
+     * @param string $bucket Logical bucket name. It is mapped to KV stream and subject prefixes (`KV_<bucket>`, `$KV.<bucket>.>`).
      */
     public function __construct(
         private readonly NatsClient $client,

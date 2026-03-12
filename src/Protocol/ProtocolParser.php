@@ -5,7 +5,11 @@ declare(strict_types=1);
 namespace IDCT\NATS\Protocol;
 
 use IDCT\NATS\Exception\ProtocolException;
+use IDCT\NATS\Protocol\Enum\ProtocolFrameType;
 
+/**
+ * Streaming parser for NATS protocol frames read from transport.
+ */
 final class ProtocolParser
 {
     private string $buffer = '';
@@ -14,7 +18,9 @@ final class ProtocolParser
     private int $maxFrameSize;
 
     /**
-     * @param int $maxFrameSize Maximum frame payload size in bytes (default: 8 MiB).
+     * Creates a parser for line and payload frames produced by the NATS server.
+     *
+     * @param int $maxFrameSize Maximum total MSG/HMSG bytes accepted per frame to limit memory usage.
      */
     public function __construct(int $maxFrameSize = 8 * 1024 * 1024)
     {

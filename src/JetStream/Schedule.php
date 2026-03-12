@@ -8,6 +8,9 @@ use DateTimeImmutable;
 use DateTimeInterface;
 use DateTimeZone;
 
+/**
+ * Helper for building scheduler expressions accepted by current NATS behavior.
+ */
 final class Schedule
 {
     /**

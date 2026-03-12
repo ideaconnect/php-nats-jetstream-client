@@ -6,6 +6,9 @@ namespace IDCT\NATS\Services;
 
 use IDCT\NATS\Core\NatsMessage;
 
+/**
+ * Contract for validating service requests against endpoint schemas.
+ */
 interface ServiceSchemaValidatorInterface
 {
     /**

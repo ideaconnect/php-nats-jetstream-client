@@ -6,6 +6,9 @@ namespace IDCT\NATS\Transport;
 
 use Amp\Future;
 
+/**
+ * Abstraction for asynchronous socket operations used by the NATS connection.
+ */
 interface TransportInterface
 {
     /**

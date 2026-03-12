@@ -6,8 +6,17 @@ namespace IDCT\NATS\Services;
 
 use IDCT\NATS\Core\NatsMessage;
 
+/**
+ * Subject-prefix helper for grouping related service endpoints.
+ */
 final class ServiceGroup
 {
+    /**
+     * Creates a grouped endpoint registrar using a fixed subject prefix.
+     *
+     * @param Service $service Service runtime that owns subscriptions.
+     * @param string $prefix Subject token prefix (dot-joined) applied to added endpoints.
+     */
     public function __construct(
         private readonly Service $service,
         private readonly string $prefix,

@@ -14,6 +14,10 @@ namespace IDCT\NATS\JetStream;
  */
 final class SubjectTransform
 {
+    /**
+     * @param string $src Source subject pattern to match.
+     * @param string $dest Destination subject pattern after transform.
+     */
     private function __construct(
         private readonly string $src,
         private readonly string $dest,

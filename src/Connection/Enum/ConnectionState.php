@@ -2,7 +2,7 @@
 
 declare(strict_types=1);
 
-namespace IDCT\NATS\Connection;
+namespace IDCT\NATS\Connection\Enum;
 
 enum ConnectionState: string
 {

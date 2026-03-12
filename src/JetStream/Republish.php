@@ -16,6 +16,10 @@ final class Republish
 {
     private bool $headersOnly = false;
 
+    /**
+     * @param string $src Source subject filter to match retained stream messages.
+     * @param string $dest Destination subject used when republishing matched messages.
+     */
     private function __construct(
         private readonly string $src,
         private readonly string $dest,

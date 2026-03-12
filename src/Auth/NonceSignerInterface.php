@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Auth;
 
+/**
+ * Signs server-provided nonces for NKEY/JWT authentication flows.
+ */
 interface NonceSignerInterface
 {
     /**

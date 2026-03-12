@@ -13,10 +13,16 @@ use IDCT\NATS\Connection\NatsOptions;
 use function Amp\async;
 use function Amp\Socket\connect;
 
+/**
+ * Amp-based socket transport implementation for NATS connections.
+ */
 final class AmpSocketTransport implements TransportInterface
 {
     private ?Socket $socket = null;
 
+    /**
+     * @param NatsOptions $options Client connection options controlling TLS and socket behavior.
+     */
     public function __construct(private readonly NatsOptions $options = new NatsOptions())
     {
     }

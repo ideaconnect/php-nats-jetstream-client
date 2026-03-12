@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Core;
 
+/**
+ * Utilities for parsing and serializing NATS header blocks.
+ */
 final class NatsHeaders
 {
     /**

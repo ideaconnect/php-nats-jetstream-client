@@ -4,11 +4,22 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\JetStream;
 
+/**
+ * Immutable metadata for an Object Store object revision.
+ */
 final class ObjectInfo
 {
     /**
      * Represents Object Store metadata for a single object revision.
      *
+     * @param string $bucket Object Store bucket name.
+     * @param string $name Object name/key in the bucket.
+     * @param int $size Total object size in bytes.
+     * @param int $chunks Number of chunk messages used to store object bytes.
+     * @param string $digest Server-provided content digest for integrity checks.
+     * @param string $modified RFC3339 timestamp of last object modification.
+     * @param bool $deleted Whether this metadata represents a deleted tombstone.
+     * @param string $chunkSubject Internal subject where object chunks are stored.
      * @param array<string,string> $metadata
      */
     public function __construct(

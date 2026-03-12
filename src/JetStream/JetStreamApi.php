@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\JetStream;
 
+/**
+ * Constants for JetStream API subject prefixes and helper builders.
+ */
 final class JetStreamApi
 {
     public const ACCOUNT_INFO = '$JS.API.INFO';

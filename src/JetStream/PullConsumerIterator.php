@@ -27,6 +27,11 @@ final class PullConsumerIterator
     private int $expiresMs = 3000;
     private ?int $iterations = null;
 
+    /**
+     * @param JetStreamContext $context JetStream context used to issue pull requests and ACK-related commands.
+     * @param string $stream Stream name that owns the target consumer.
+     * @param string $consumer Durable/ephemeral consumer name used for `CONSUMER.MSG.NEXT` pulls.
+     */
     public function __construct(
         private readonly JetStreamContext $context,
         private readonly string $stream,

@@ -299,7 +299,7 @@ final class ServiceTest extends TestCase
 
         $handled = false;
         $service = $client->service('echo', '1.0.0')
-            ->withRequestValidator(static fn (NatsMessage $message, array $schema): ?string => 'payload does not match schema')
+            ->withRequestValidator(static fn (NatsMessage $message, array $schema): ?string => $schema === [] ? null : 'payload does not match schema')
             ->addEndpoint('echo', 'svc.echo', static function (NatsMessage $message) use (&$handled): string {
                 $handled = true;
 
@@ -359,7 +359,7 @@ final class ServiceTest extends TestCase
         self::assertSame('request_start', $events[0]['event'] ?? null);
         self::assertSame('request_end', $events[1]['event'] ?? null);
         self::assertSame('req-42', $events[0]['correlation_id'] ?? null);
-        self::assertSame('svc.echo', $events[0]['subject'] ?? null);
+        self::assertSame('svc.echo', $events[0]['subject']);
     }
 
     /**
@@ -479,7 +479,7 @@ final class ServiceTest extends TestCase
     /**
      * Verifies invalid class-string handlers are rejected with a clear exception.
      */
-    public function testEndpointRejectsInvalidClassStringHandlerAdapter(): void
+    public function testEndpointRejectsInvalidObjectHandlerAdapter(): void
     {
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
@@ -490,10 +490,10 @@ final class ServiceTest extends TestCase
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('must implement');
+        $this->expectExceptionMessage('Unsupported service endpoint handler');
 
         $client->service('echo', '1.0.0')
-            ->addEndpoint('echo', 'svc.echo', ServiceTestInvalidClassHandler::class);
+            ->addEndpoint('echo', 'svc.echo', new ServiceTestInvalidClassHandler());
     }
 
     /**

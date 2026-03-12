@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Unit;
 
 use IDCT\NATS\Exception\ProtocolException;
-use IDCT\NATS\Protocol\ProtocolFrameType;
+use IDCT\NATS\Protocol\Enum\ProtocolFrameType;
 use IDCT\NATS\Protocol\ProtocolParser;
 use PHPUnit\Framework\TestCase;
 

@@ -10,6 +10,8 @@ use Amp\CancelledException;
 use Amp\CompositeCancellation;
 use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
+use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ProtocolException;
@@ -19,7 +21,7 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Protocol\ProtocolFrame;
-use IDCT\NATS\Protocol\ProtocolFrameType;
+use IDCT\NATS\Protocol\Enum\ProtocolFrameType;
 use IDCT\NATS\Protocol\ProtocolParser;
 use IDCT\NATS\Protocol\ServerInfo;
 use IDCT\NATS\Transport\TransportInterface;
@@ -28,6 +30,9 @@ use SplQueue;
 use function Amp\async;
 use function Amp\delay;
 
+/**
+ * Manages low-level NATS protocol connection lifecycle and frame processing.
+ */
 final class NatsConnection
 {
     private ConnectionState $state = ConnectionState::Idle;
@@ -47,6 +52,11 @@ final class NatsConnection
 
     /**
      * Creates a connection runtime with transport and protocol dependencies.
+     *
+     * @param NatsOptions $options Connection/runtime settings controlling handshake flags, auth, reconnect, heartbeat,
+     *                             TLS, request defaults, and subscription buffering policies.
+     * @param TransportInterface $transport Byte-stream transport implementation responsible for socket I/O.
+     * @param ProtocolCodec $codec Encoder used to serialize NATS wire commands (CONNECT, PUB/HPUB, SUB, UNSUB, PING/PONG).
      */
     public function __construct(
         private readonly NatsOptions $options,
