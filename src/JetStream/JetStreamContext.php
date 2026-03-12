@@ -31,8 +31,8 @@ final class JetStreamContext
 
     /**
      * Creates a JetStream API context bound to a NATS client.
-        *
-        * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
+      *
+      * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
      */
     public function __construct(private readonly NatsClient $client)
     {
