@@ -11,6 +11,28 @@ Completed in latest implementation pass:
 - J03: stream update config
 - J04: stream purge
 - J06: stream direct message get
+- S02: service discovery subjects contract
+- JPS03: push flow-control and heartbeat handling
+- JP03: fetchBatch and terminal status behaviors
+- C03: reconnect after active transport loss with subscription replay
+- C06: maxPingsOut triggers reconnect path
+- PR02: no_responders integration behavior
+- J07: stream retention/storage/discard policies
+- JC03: consumer pause/resume
+- KV05: key-value TTL/history semantics
+- OS03: object store multi-chunk retrieval
+- C04: reconnect attempts exhausted
+- C05: reconnect backoff/jitter behavior
+- J05: stream list API
+- JC02: consumer list API
+- P03: queue-group distribution semantics
+- R03: request timeout integration path
+- C07: graceful drain with in-flight deliveries
+- C10: max_payload enforcement
+- P04: wildcard subscription behavior
+- R04: request cancellation path integration
+- JPS05: ephemeral push helper delivery
+- JS02: invalid schedule expression rejection
 
 Files already updated:
 - tests/Integration/NatsClientIntegrationTest.php
@@ -19,12 +41,14 @@ Files already updated:
 
 ## Next Recommended Work Order
 Implement in this order to maximize risk reduction first:
-1. S02 - service discovery subjects contract (PING/INFO/STATS/SCHEMA)
-2. JPS03 - push flow-control and heartbeat handling
-3. JP03 - fetchBatch and terminal status behaviors
-4. C03 - reconnect after active transport loss with subscription replay
-5. C06 - maxPingsOut triggers reconnect path
-6. PR02 - no_responders integration behavior
+1. JP04 - TERM/WPI workflows
+2. JP05 - pull iterator chaining
+3. KV06 - concurrent watchers
+4. OS04 - digest mismatch path
+5. S04 - multi-endpoint dispatch
+6. S05 - grouped endpoint hierarchy
+7. S06 - service concurrent request handling
+8. PR01 - fragmented frame handling
 
 ## How To Continue (Workflow)
 1. Pick one feature ID from PLAN_TESTS.md with `Status = Planned` or `Partial`.
@@ -50,6 +74,26 @@ Run real integration scenarios when environment is enabled:
 - `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration`
 - `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testServiceDiscoverySubjectsContract`
 - `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamPushFlowControlAndHeartbeat`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamFetchBatchHandlesStatusFrames`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testReconnectAfterTransportLossReplaysSubscriptions`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testMaxPingsOutTriggersReconnect`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testNoRespondersErrorSurface`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamStreamPoliciesPersist`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamPauseAndResumeConsumer`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamKeyValueHistoryAndTtlBehavior`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamObjectStoreLargeObjectChunks`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testReconnectAttemptsExhaustedReturnsClosed`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testReconnectBackoffDelayProgression`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamListStreams`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamListConsumers`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testQueueGroupDistributesMessages`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testRequestTimeoutReturnsTimeoutError`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testDrainDuringInflightDelivery`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testOversizedPublishIsRejected`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testWildcardSubscriptionReceivesExpectedSubjects`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testRequestCancellationStopsAwait`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamEphemeralPushConsumerDelivery`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamScheduledPublishRejectsUnsupportedPatterns`
 
 Optional explicit server URL:
 - `RUN_INTEGRATION=1 NATS_URL=nats://127.0.0.1:14222 ./vendor/bin/phpunit --testsuite integration`
@@ -71,10 +115,16 @@ Batch A (services + push behavior):
 - S02, JPS03
 
 Batch B (pull + protocol semantics):
-- JP03, PR02
+- Completed: JP03, PR02
 
 Batch C (connection resilience):
-- C03, C06
+- Completed: C03, C06
 
 Batch D (remaining Phase 1/2 IDs):
-- J07, JC03, KV05, OS03
+- Completed: J07, JC03, KV05, OS03
+
+Batch E (core + listing + queue/timeout semantics):
+- Completed: C04, C05, J05, JC02, P03, R03
+
+Batch F (drain/payload/wildcard/cancellation + push/scheduling):
+- Completed: C07, C10, P04, R04, JPS05, JS02

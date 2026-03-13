@@ -37,4 +37,17 @@ final class NatsHeadersTest extends TestCase
 
         self::assertSame(['Valid' => 'value'], NatsHeaders::fromWireBlock($raw));
     }
+
+    public function testFromWireBlockParsesStatusLine(): void
+    {
+        $raw = "NATS/1.0 100 Idle Heartbeat\r\n" .
+            "Nats-Consumer-Stalled: _INBOX.123\r\n" .
+            "\r\n";
+
+        self::assertSame([
+            'Status' => '100',
+            'Description' => 'Idle Heartbeat',
+            'Nats-Consumer-Stalled' => '_INBOX.123',
+        ], NatsHeaders::fromWireBlock($raw));
+    }
 }

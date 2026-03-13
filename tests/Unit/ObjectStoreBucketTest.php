@@ -69,13 +69,8 @@ final class ObjectStoreBucketTest extends TestCase
             ],
         ], JSON_THROW_ON_ERROR);
 
-        $chunkGetPayload = json_encode([
-            'message' => [
-                'subject' => '$O.assets.C.abcd',
-                'seq' => 1,
-                'data' => base64_encode('hello'),
-            ],
-        ], JSON_THROW_ON_ERROR);
+        $ephemeralConsumerPayload = '{"stream_name":"OBJ_assets","name":"EPH1","config":{"ack_policy":"explicit","filter_subject":"$O.assets.C.abcd"}}';
+        $deleteConsumerPayload = '{"success":true}';
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
@@ -83,8 +78,10 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($chunkAck), $chunkAck),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($metaAck), $metaAck),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($metaGetPayload), $metaGetPayload),
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($chunkGetPayload), $chunkGetPayload),
-            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($metaGetPayload), $metaGetPayload),
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($ephemeralConsumerPayload), $ephemeralConsumerPayload),
+            "MSG _INBOX.JS.FETCH.a 5 5\r\nhello\r\n",
+            sprintf("MSG _INBOX.e 6 %d\r\n%s\r\n", strlen($deleteConsumerPayload), $deleteConsumerPayload),
+            sprintf("MSG _INBOX.f 7 %d\r\n%s\r\n", strlen($metaGetPayload), $metaGetPayload),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -353,16 +350,17 @@ final class ObjectStoreBucketTest extends TestCase
         ], JSON_THROW_ON_ERROR);
 
         // Return corrupted chunk data instead of correct data.
-        $chunkResponse = json_encode([
-            'message' => ['data' => base64_encode($corruptedData), 'subject' => $chunkSubject],
-        ], JSON_THROW_ON_ERROR);
+        $ephemeralConsumerPayload = '{"stream_name":"OBJ_assets","name":"EPH2","config":{"ack_policy":"explicit","filter_subject":"$O.assets.C.deadbeef"}}';
+        $deleteConsumerPayload = '{"success":true}';
 
-        // info() request subscribes SID 1, get chunk request subscribes SID 2
+        // info() request subscribes SID 1, then create ephemeral consumer + pull fetch + delete.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
             sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($metaResponse), $metaResponse),
-            sprintf("MSG _INBOX.any 2 %d\r\n%s\r\n", strlen($chunkResponse), $chunkResponse),
+            sprintf("MSG _INBOX.any 2 %d\r\n%s\r\n", strlen($ephemeralConsumerPayload), $ephemeralConsumerPayload),
+            sprintf("MSG _INBOX.JS.FETCH.a 3 %d\r\n%s\r\n", strlen($corruptedData), $corruptedData),
+            sprintf("MSG _INBOX.any 4 %d\r\n%s\r\n", strlen($deleteConsumerPayload), $deleteConsumerPayload),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -397,19 +395,16 @@ final class ObjectStoreBucketTest extends TestCase
             ],
         ], JSON_THROW_ON_ERROR);
 
-        $chunkPayload = json_encode([
-            'message' => [
-                'subject' => '$O.assets.C.cb1',
-                'seq' => 1,
-                'data' => base64_encode('hello'),
-            ],
-        ], JSON_THROW_ON_ERROR);
+        $ephemeralConsumerPayload = '{"stream_name":"OBJ_assets","name":"EPH3","config":{"ack_policy":"explicit","filter_subject":"$O.assets.C.cb1"}}';
+        $deleteConsumerPayload = '{"success":true}';
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
             'PONG',
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($metaPayload), $metaPayload),
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($chunkPayload), $chunkPayload),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ephemeralConsumerPayload), $ephemeralConsumerPayload),
+            "MSG _INBOX.JS.FETCH.a 3 5\r\nhello\r\n",
+            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($deleteConsumerPayload), $deleteConsumerPayload),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);

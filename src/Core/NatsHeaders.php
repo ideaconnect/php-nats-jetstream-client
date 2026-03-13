@@ -40,14 +40,21 @@ final class NatsHeaders
         }
 
         $lines = preg_split('/\r\n/', $rawHeaders);
-        if ($lines === false || $lines === []) {
+        if ($lines === false) {
             return [];
         }
 
-        // First line is protocol version (for example "NATS/1.0").
-        array_shift($lines);
-
         $headers = [];
+        // First line may be either "NATS/1.0" or "NATS/1.0 <status> <description>".
+        $firstLine = array_shift($lines);
+        if (preg_match('/^NATS\/1\.0\s+(\d{3})(?:\s+(.*))?$/', $firstLine, $matches) === 1) {
+            $headers['Status'] = $matches[1];
+            $description = trim((string) ($matches[2] ?? ''));
+            if ($description !== '') {
+                $headers['Description'] = $description;
+            }
+        }
+
         foreach ($lines as $line) {
             if ($line === '') {
                 break;

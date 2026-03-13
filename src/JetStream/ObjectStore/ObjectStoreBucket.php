@@ -134,29 +134,43 @@ final class ObjectStoreBucket
             $expectedChunks = $info->chunks ?? 1;
             $assembled = '';
 
-            for ($i = 0; $i < $expectedChunks; $i++) {
-                $chunkResponse = $this->requestStreamMessageBySequence(
+            $consumerName = null;
+            try {
+                $consumer = $this->jetStream->createEphemeralConsumer(
+                    $this->streamName(),
                     $info->chunkSubject,
-                    $i,
-                );
+                    ['deliver_policy' => 'all'],
+                )->await();
+                $consumerName = $consumer->name;
 
-                /** @var array<string,mixed>|null $message */
-                $message = is_array($chunkResponse['message'] ?? null) ? $chunkResponse['message'] : null;
-                if ($message === null) {
-                    break;
+                for ($i = 0; $i < $expectedChunks; $i++) {
+                    try {
+                        $message = $this->jetStream->fetchNext($this->streamName(), $consumerName, 2_000)->await();
+                    } catch (JetStreamException $e) {
+                        if (str_contains($e->getMessage(), 'No messages received within timeout')) {
+                            break;
+                        }
+
+                        throw $e;
+                    }
+
+                    $assembled .= $message->payload;
+                    if ($message->replyTo !== null && $message->replyTo !== '') {
+                        $this->jetStream->ack($message)->await();
+                    }
                 }
-
-                $encodedData = (string) ($message['data'] ?? '');
-                $decoded = $encodedData === '' ? '' : base64_decode($encodedData, true);
-                if ($decoded === false) {
-                    break;
+            } finally {
+                if ($consumerName !== null && $consumerName !== '') {
+                    try {
+                        $this->jetStream->deleteConsumer($this->streamName(), $consumerName)->await();
+                    } catch (JetStreamException) {
+                        // Best-effort ephemeral consumer cleanup.
+                    }
                 }
-
-                $assembled .= $decoded;
             }
 
             // Verify digest integrity when metadata contains one.
-            if ($info->digest !== '' && $info->digest !== null) {
+            if ($info->digest !== '') {
                 $expected = $info->digest;
                 $actual = 'SHA-256=' . base64_encode(hash('sha256', $assembled, true));
                 if ($expected !== $actual) {
@@ -383,38 +397,6 @@ final class ObjectStoreBucket
     {
         $apiSubject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
         $payload = json_encode(['last_by_subj' => $subject], JSON_THROW_ON_ERROR);
-        $message = $this->client->request($apiSubject, $payload)->await();
-
-        /** @var array<string,mixed> $data */
-        $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
-
-        /** @var array<string,mixed>|null $error */
-        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-        if ($error !== null) {
-            $description = (string) ($error['description'] ?? 'JetStream API error');
-            $code = (int) ($error['code'] ?? 0);
-            throw new JetStreamException($description, $code);
-        }
-
-        return $data;
-    }
-
-    /**
-     * Retrieves a stream message by subject filtered to a specific sequence offset.
-     *
-     * @return array<string,mixed>
-     */
-    private function requestStreamMessageBySequence(string $subject, int $offset): array
-    {
-        $apiSubject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
-
-        if ($offset === 0) {
-            // First chunk: use first_for_subj.
-            $payload = json_encode(['last_by_subj' => $subject], JSON_THROW_ON_ERROR);
-        } else {
-            $payload = json_encode(['seq' => $offset + 1, 'next_by_subj' => $subject], JSON_THROW_ON_ERROR);
-        }
-
         $message = $this->client->request($apiSubject, $payload)->await();
 
         /** @var array<string,mixed> $data */
