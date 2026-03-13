@@ -72,6 +72,90 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies stream update persists modified subject configuration.
+     */
+    public function testJetStreamUpdateStreamConfiguration(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subjectA = 'it.' . strtolower($stream) . '.a';
+        $subjectB = 'it.' . strtolower($stream) . '.b';
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subjectA])->await();
+        $updated = $js->updateStream($stream, ['subjects' => [$subjectA, $subjectB]])->await();
+        $fetched = $js->getStream($stream)->await();
+
+        self::assertSame($stream, $updated->name);
+        self::assertContains($subjectA, $updated->subjects);
+        self::assertContains($subjectB, $updated->subjects);
+        self::assertContains($subjectA, $fetched->subjects);
+        self::assertContains($subjectB, $fetched->subjects);
+
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies stream purge removes published messages.
+     */
+    public function testJetStreamPurgeStreamByFilter(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.purge';
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+
+        $js->publish($subject, '{"event":"one"}')->await();
+        $js->publish($subject, '{"event":"two"}')->await();
+
+        $purge = $js->purgeStream($stream)->await();
+        $state = $js->getStream($stream)->await()->raw['state'] ?? [];
+
+        self::assertGreaterThanOrEqual(2, $purge['purged']);
+        self::assertSame(0, (int) ($state['messages'] ?? -1));
+
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies direct stream message get returns payload by sequence.
+     */
+    public function testJetStreamGetStreamMessage(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.direct';
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $ack = $js->publish($subject, '{"event":"direct-get"}')->await();
+
+        $message = $js->getStreamMessage($stream, $ack->seq)->await();
+
+        self::assertSame($subject, $message->subject);
+        self::assertSame('{"event":"direct-get"}', $message->payload);
+
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies scheduled publish delivers a delayed message to the configured target subject.
      */
     public function testJetStreamScheduledPublish(): void

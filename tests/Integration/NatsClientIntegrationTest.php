@@ -9,6 +9,7 @@ use Amp\DeferredCancellation;
 use Amp\Future;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Services\BasicJsonSchemaValidator;
@@ -98,6 +99,121 @@ final class NatsClientIntegrationTest extends TestCase
 
         $client->disconnect()->await();
         $server->disconnect()->await();
+    }
+
+    /**
+     * Verifies publishWithHeaders preserves custom headers for subscribers.
+     */
+    public function testPublishWithHeadersRoundTrip(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $subject = 'it.headers.' . bin2hex(random_bytes(4));
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $received = null;
+        $client->subscribe($subject, static function (NatsMessage $message) use (&$received): void {
+            $received = $message;
+        })->await();
+
+        $client->publishWithHeaders($subject, 'hello', [
+            'X-Request-Id' => 'it-' . bin2hex(random_bytes(3)),
+            'Content-Type' => 'text/plain',
+        ])->await();
+
+        $deadline = microtime(true) + 2.0;
+        while ($received === null && microtime(true) < $deadline) {
+            $client->processIncoming()->await();
+            usleep(20_000);
+        }
+
+        self::assertInstanceOf(NatsMessage::class, $received);
+        /** @var NatsMessage $message */
+        $message = $received;
+        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+
+        self::assertSame('hello', $message->payload);
+        self::assertArrayHasKey('X-Request-Id', $headers);
+        self::assertSame('text/plain', $headers['Content-Type'] ?? null);
+
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies requestWithHeaders forwards custom headers to service handlers.
+     */
+    public function testRequestWithHeadersPropagatesHeaders(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $subject = 'it.req.headers.' . bin2hex(random_bytes(4));
+        $requestId = 'req-' . bin2hex(random_bytes(3));
+
+        $server = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+
+        $server->connect()->await();
+        $client->connect()->await();
+
+        $seenRequestId = null;
+        $server->subscribe($subject, static function (NatsMessage $message) use (&$seenRequestId, $server): void {
+            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+            $seenRequestId = $headers['X-Request-Id'] ?? null;
+
+            if ($message->replyTo !== null) {
+                $server->publish($message->replyTo, 'ok')->await();
+            }
+        })->await();
+
+        $serverLoop = async(static function () use ($server): void {
+            $server->processIncoming()->await();
+        });
+
+        $reply = $client->requestWithHeaders($subject, 'hello', ['X-Request-Id' => $requestId], 2000)->await();
+        $serverLoop->await();
+
+        self::assertSame('ok', $reply->payload);
+        self::assertSame($requestId, $seenRequestId);
+
+        $client->disconnect()->await();
+        $server->disconnect()->await();
+    }
+
+    /**
+     * Verifies no_echo suppresses delivery of a client's own publishes.
+     */
+    public function testNoEchoSuppressesSelfPublishedMessages(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $subject = 'it.noecho.' . bin2hex(random_bytes(4));
+        $client = new NatsClient(new NatsOptions(
+            servers: [$this->integrationServerUrl()],
+            noEcho: true,
+        ));
+        $client->connect()->await();
+
+        $received = false;
+        $client->subscribe($subject, static function (NatsMessage $message) use (&$received): void {
+            $received = true;
+        })->await();
+
+        $client->publish($subject, 'self')->await();
+
+        $deadline = microtime(true) + 0.8;
+        while (microtime(true) < $deadline) {
+            $client->processIncoming()->await();
+            if ($received) {
+                break;
+            }
+
+            delay(0.01);
+        }
+
+        self::assertFalse($received);
+
+        $client->disconnect()->await();
     }
 
     /**
