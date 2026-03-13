@@ -13,6 +13,8 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\JetStream\JetStreamContext;
+use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
+use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
@@ -126,6 +128,34 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * Verifies key-value context is cached per bucket and typed correctly.
+     */
+    public function testKeyValueContextIsCachedPerBucket(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+
+        $a = $client->jetStream()->keyValue('profiles');
+        $b = $client->jetStream()->keyValue('profiles');
+        $c = $client->jetStream()->keyValue('sessions');
+
+        self::assertInstanceOf(KeyValueBucket::class, $a);
+        self::assertSame($a, $b);
+        self::assertNotSame($a, $c);
+    }
+
+    /**
+     * Verifies pullConsumer helper returns an iterator wrapper.
+     */
+    public function testPullConsumerReturnsIterator(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+
+        $iterator = $client->jetStream()->pullConsumer('ORDERS', 'PROC');
+
+        self::assertInstanceOf(PullConsumerIterator::class, $iterator);
+    }
+
+    /**
      * Verifies consumer create/get/delete operations map expected payload fields.
      */
     public function testConsumerCrud(): void
@@ -181,6 +211,28 @@ final class JetStreamContextTest extends TestCase
         self::assertSame(42, $ack->seq);
         self::assertFalse($ack->duplicate);
         self::assertStringStartsWith('PUB orders.created _INBOX.', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies JetStream publish maps API errors to JetStreamException.
+     */
+    public function testPublishMapsApiError(): void
+    {
+        $errorPayload = '{"error":{"code":500,"description":"publish failed"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('publish failed');
+
+        $client->jetStream()->publish('orders.created', '{"id":1}')->await();
     }
 
     /**
@@ -268,6 +320,64 @@ final class JetStreamContextTest extends TestCase
         } finally {
             self::assertCount(2, $transport->writes);
         }
+    }
+
+    /**
+     * Verifies schedule publish omits TTL header when optional value is null.
+     */
+    public function testPublishScheduledOmitsTtlWhenNotProvided(): void
+    {
+        $ackPayload = '{"stream":"SCHED","seq":8,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $when = new DateTimeImmutable('2030-01-01 00:00:00', new DateTimeZone('UTC'));
+
+        $client->jetStream()->publishScheduled(
+            'schedules.orders.one',
+            'events.orders',
+            '{"event":"scheduled"}',
+            Schedule::at($when),
+            null,
+        )->await();
+
+        self::assertStringNotContainsString('Nats-Schedule-TTL', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies schedule publish maps error payloads to JetStreamException.
+     */
+    public function testPublishScheduledMapsApiError(): void
+    {
+        $errorPayload = '{"error":{"code":503,"description":"scheduler down"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $when = new DateTimeImmutable('2030-01-01 00:00:00', new DateTimeZone('UTC'));
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('scheduler down');
+
+        $client->jetStream()->publishScheduled(
+            'schedules.orders.one',
+            'events.orders',
+            '{"event":"scheduled"}',
+            Schedule::at($when),
+        )->await();
     }
 
     /**
@@ -414,6 +524,30 @@ final class JetStreamContextTest extends TestCase
         self::assertTrue($created->push);
         self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS.PROC', $transport->writes[3]);
         self::assertStringContainsString('"deliver_subject":"deliver.proc"', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies explicit ephemeral push consumer creation omits durable_name in payload.
+     */
+    public function testCreateEphemeralPushConsumer(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"EP1","config":{"deliver_subject":"deliver.ep"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $consumer = $client->jetStream()->createEphemeralPushConsumer('ORDERS', 'deliver.ep', 'orders.*')->await();
+
+        self::assertSame('EP1', $consumer->name);
+        self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS', $transport->writes[3]);
+        self::assertStringContainsString('"deliver_subject":"deliver.ep"', $transport->writes[3]);
+        self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);
     }
 
     /**
@@ -729,6 +863,48 @@ final class JetStreamContextTest extends TestCase
         self::assertSame('{"event":"first"}', $messages[0]->payload);
     }
 
+    public function testFetchBatchIgnoresStatus100ControlFrames(): void
+    {
+        $msg1 = '{"event":"first"}';
+        $controlHeaders = "NATS/1.0 100 Idle Heartbeat\r\nStatus: 100\r\nDescription: Idle Heartbeat\r\n\r\n";
+        $headerBytes = strlen($controlHeaders);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $controlHeaders),
+            sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg1), $msg1),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500)->await();
+
+        self::assertCount(1, $messages);
+        self::assertSame('{"event":"first"}', $messages[0]->payload);
+    }
+
+    public function testFetchBatchThrowsWhenNoMessagesArrive(): void
+    {
+        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\nDescription: No Messages\r\n\r\n";
+        $headerBytes = strlen($statusHeaders);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('No messages received within timeout');
+
+        $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500)->await();
+    }
+
     // ─── Consumer Pause/Resume ──────────────────────────────────────────
 
     public function testPauseConsumerSendsCorrectPayload(): void
@@ -868,6 +1044,30 @@ final class JetStreamContextTest extends TestCase
         self::assertStringContainsString('$JS.API.STREAM.LIST', implode('', $transport->writes));
     }
 
+    public function testListStreamsWithSubjectFilter(): void
+    {
+        $listPayload = json_encode([
+            'streams' => [
+                ['config' => ['name' => 'ORDERS', 'subjects' => ['orders.>']]],
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            $this->jsOkResponse($listPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $streams = $client->jetStream()->listStreams(['subject' => 'orders.>'])->await();
+
+        self::assertCount(1, $streams);
+        self::assertSame('ORDERS', $streams[0]->name);
+        self::assertStringContainsString('"subject":"orders.>"', implode('', $transport->writes));
+    }
+
     public function testListConsumers(): void
     {
         $listPayload = json_encode([
@@ -921,5 +1121,66 @@ final class JetStreamContextTest extends TestCase
         $written = implode('', $transport->writes);
         self::assertStringContainsString('$JS.API.STREAM.MSG.GET.ORDERS', $written);
         self::assertStringContainsString('"seq":1', $written);
+    }
+
+    public function testExtractStreamSequenceParsesReplySubject(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $js = $client->jetStream();
+
+        $method = new \ReflectionMethod($js, 'extractStreamSequence');
+
+        $message = new NatsMessage('s', 1, '$JS.ACK.ORDERS.CONS.1.42.2.123.0', 'x');
+        $parsed = $method->invoke($js, $message);
+
+        self::assertSame(42, $parsed);
+    }
+
+    public function testExtractStreamSequenceReturnsNullForInvalidReplySubject(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $js = $client->jetStream();
+
+        $method = new \ReflectionMethod($js, 'extractStreamSequence');
+
+        $noReply = new NatsMessage('s', 1, null, 'x');
+        $shortReply = new NatsMessage('s', 1, '$JS.ACK.short', 'x');
+        $nonInt = new NatsMessage('s', 1, '$JS.ACK.ORDERS.CONS.1.NaN.2.123.0', 'x');
+
+        self::assertNull($method->invoke($js, $noReply));
+        self::assertNull($method->invoke($js, $shortReply));
+        self::assertNull($method->invoke($js, $nonInt));
+    }
+
+    public function testHandlePushControlMessageReturnsFalseForNonControlStatus(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $js = $client->jetStream();
+
+        $method = new \ReflectionMethod($js, 'handlePushControlMessage');
+
+        $headers = NatsHeaders::toWireBlock([
+            'Status' => '404',
+            'Description' => 'No Messages',
+        ]);
+        $message = new NatsMessage('deliver', 1, null, '', $headers);
+
+        self::assertFalse($method->invoke($js, $message)->await());
+    }
+
+    public function testHandlePushControlMessageHeartbeatWithoutReplyReturnsTrue(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $js = $client->jetStream();
+
+        $method = new \ReflectionMethod($js, 'handlePushControlMessage');
+
+        $headers = NatsHeaders::toWireBlock([
+            'Status' => '100',
+            'Description' => 'Idle Heartbeat',
+        ]);
+        $message = new NatsMessage('deliver', 1, null, '', $headers);
+
+        self::assertTrue($method->invoke($js, $message)->await());
     }
 }

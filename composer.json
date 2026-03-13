@@ -28,6 +28,9 @@
     "test": "phpunit",
     "test:unit": "phpunit --testsuite unit",
     "test:integration": "phpunit --testsuite integration",
+    "coverage": "XDEBUG_MODE=coverage phpunit --coverage-text --only-summary-for-coverage-text --colors=never",
+    "coverage:html": "XDEBUG_MODE=coverage phpunit --coverage-html coverage-report --coverage-text --only-summary-for-coverage-text --colors=never",
+    "coverage:check": "bash scripts/check-coverage.sh 90",
     "stan": "phpstan analyse",
     "fix": "php-cs-fixer fix"
   },

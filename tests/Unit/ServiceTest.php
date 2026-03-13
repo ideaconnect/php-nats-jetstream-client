@@ -181,6 +181,32 @@ final class ServiceTest extends TestCase
     }
 
     /**
+     * Verifies grouping trims empty dot segments when prefixes/subjects are blank.
+     */
+    public function testGroupJoinHandlesEmptySegments(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0');
+        $service->addGroup('')->addEndpoint('root', 'echo', static fn (NatsMessage $message): string => $message->payload);
+        $service->addGroup('svc')->addEndpoint('svc-root', '', static fn (NatsMessage $message): string => $message->payload);
+
+        $subjects = array_map(
+            static fn (array $endpoint): string => (string) ($endpoint['subject'] ?? ''),
+            $service->statsSnapshot()['endpoints'] ?? [],
+        );
+
+        self::assertContains('echo', $subjects);
+        self::assertContains('svc', $subjects);
+    }
+
+    /**
      * Verifies SCHEMA discovery subscriptions and responses include endpoint schemas.
      */
     public function testSchemaDiscoveryResponse(): void

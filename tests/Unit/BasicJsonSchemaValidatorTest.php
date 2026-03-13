@@ -69,4 +69,58 @@ final class BasicJsonSchemaValidatorTest extends TestCase
 
         self::assertNull($error);
     }
+
+    public function testValidatesAdditionalPrimitiveTypes(): void
+    {
+        $validator = new BasicJsonSchemaValidator();
+
+        $boolMessage = new NatsMessage('svc.echo', 1, '_INBOX.1', 'true', null);
+        self::assertNull($validator->validate($boolMessage, ['type' => 'boolean']));
+
+        $numberMessage = new NatsMessage('svc.echo', 1, '_INBOX.1', '3.14', null);
+        self::assertNull($validator->validate($numberMessage, ['type' => 'number']));
+
+        $nullMessage = new NatsMessage('svc.echo', 1, '_INBOX.1', 'null', null);
+        self::assertNull($validator->validate($nullMessage, ['type' => 'null']));
+
+        $arrayMessage = new NatsMessage('svc.echo', 1, '_INBOX.1', '{"id":1}', null);
+        self::assertSame('$ must be array, got array', $validator->validate($arrayMessage, ['type' => 'array']));
+    }
+
+    public function testUnknownTypeIsIgnored(): void
+    {
+        $validator = new BasicJsonSchemaValidator();
+        $message = new NatsMessage('svc.echo', 1, '_INBOX.1', '{"id":7}', null);
+
+        $error = $validator->validate($message, ['type' => 'custom-type']);
+
+        self::assertNull($error);
+    }
+
+    public function testRejectsObjectTypeWhenPayloadIsNotObject(): void
+    {
+        $validator = new BasicJsonSchemaValidator();
+        $message = new NatsMessage('svc.echo', 1, '_INBOX.1', '"plain-string"', null);
+
+        $error = $validator->validate($message, ['type' => 'object']);
+
+        self::assertSame('$ must be object, got string', $error);
+    }
+
+    public function testIgnoresMalformedRequiredAndPropertiesSchemaNodes(): void
+    {
+        $validator = new BasicJsonSchemaValidator();
+        $message = new NatsMessage('svc.echo', 1, '_INBOX.1', '{"id":7}', null);
+
+        $error = $validator->validate($message, [
+            'type' => 'object',
+            'required' => 'id',
+            'properties' => [
+                'id' => 'integer',
+                1 => ['type' => 'string'],
+            ],
+        ]);
+
+        self::assertNull($error);
+    }
 }

@@ -299,4 +299,169 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringContainsString('"storage":"memory"', $written);
         self::assertStringContainsString('"num_replicas":3', $written);
     }
+
+    /**
+     * Verifies watch callback receives KV entries from subscription dispatch.
+     */
+    public function testWatchDispatchesEntries(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG \$KV.cfg.theme 1 4\r\nblue\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $seen = null;
+        $sid = $client->jetStream()->keyValue('cfg')->watch(static function (KeyValueEntry $entry) use (&$seen): void {
+            $seen = $entry;
+        })->await();
+
+        self::assertSame(1, $sid);
+        self::assertSame(1, $client->processIncoming()->await());
+        self::assertInstanceOf(KeyValueEntry::class, $seen);
+        /** @var KeyValueEntry $seenEntry */
+        $seenEntry = $seen;
+        self::assertSame('theme', $seenEntry->key);
+        self::assertSame('blue', $seenEntry->value);
+    }
+
+    /**
+     * Verifies non-404 API errors are propagated by get().
+     */
+    public function testGetPropagatesNon404ApiErrors(): void
+    {
+        $errorPayload = '{"error":{"code":500,"description":"internal error"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('internal error');
+
+        $client->jetStream()->keyValue('cfg')->get('theme')->await();
+    }
+
+    /**
+     * Verifies DEL marker headers are mapped to tombstone entry values.
+     */
+    public function testGetMapsDeleteMarkerToNullValue(): void
+    {
+        $headers = base64_encode("NATS/1.0\r\nKV-Operation:DEL\r\n\r\n");
+        $payload = sprintf(
+            '{"message":{"subject":"$KV.cfg.theme","seq":3,"data":"%s","hdrs":"%s"}}',
+            base64_encode('ignored'),
+            $headers,
+        );
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($payload), $payload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
+
+        self::assertNotNull($entry);
+        self::assertSame('DEL', $entry->operation);
+        self::assertNull($entry->value);
+    }
+
+    public function testBucketNameHelpers(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('cfg');
+        self::assertSame('KV_cfg', $kv->streamName());
+        self::assertSame('$KV.cfg.', $kv->subjectPrefix());
+    }
+
+    public function testUpdateRejectsNonPositiveExpectedRevision(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Expected revision must be greater than zero');
+        $client->jetStream()->keyValue('cfg')->update('theme', 'v', 0)->await();
+    }
+
+    public function testGetFallsBackToRawWhenDataIsNotBase64(): void
+    {
+        $payload = '{"message":{"subject":"$KV.cfg.theme","seq":6,"data":"%%%not-base64%%%"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($payload), $payload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
+
+        self::assertNotNull($entry);
+        self::assertSame('%%%not-base64%%%', $entry->value);
+    }
+
+    public function testGetStatusFallsBackLastSequenceToMessagesWhenMissing(): void
+    {
+        $streamInfo = '{"config":{"name":"KV_cfg"},"state":{"messages":11,"bytes":128}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $status = $client->jetStream()->keyValue('cfg')->getStatus()->await();
+
+        self::assertSame(11, $status['messages']);
+        self::assertSame(11, $status['last_sequence']);
+    }
+
+    public function testDeletePropagatesApiError(): void
+    {
+        $errorPayload = '{"error":{"code":500,"description":"delete failed"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('delete failed');
+
+        $client->jetStream()->keyValue('cfg')->delete('theme')->await();
+    }
 }

@@ -18,8 +18,10 @@ use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\FlakyTransport;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FixedNonceSigner;
+use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 use function Amp\delay;
+use function Amp\async;
 
 final class NatsConnectionTest extends TestCase
 {
@@ -206,8 +208,8 @@ final class NatsConnectionTest extends TestCase
 
         self::assertSame(1, $frames);
         self::assertInstanceOf(NatsMessage::class, $received);
+        /** @var NatsMessage $receivedMessage */
         $receivedMessage = $received;
-        self::assertNotNull($receivedMessage);
         self::assertSame('updates', $receivedMessage->subject);
         self::assertSame('hello', $receivedMessage->payload);
     }
@@ -238,8 +240,8 @@ final class NatsConnectionTest extends TestCase
         $connection->processIncoming()->await();
 
         self::assertInstanceOf(NatsMessage::class, $received);
+        /** @var NatsMessage $receivedMessage */
         $receivedMessage = $received;
-        self::assertNotNull($receivedMessage);
         self::assertSame($headerPayload, $receivedMessage->rawHeaders);
         self::assertSame($bodyPayload, $receivedMessage->payload);
     }
@@ -680,6 +682,31 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * Verifies ping timer marks connection closed when max outstanding pings is exceeded and reconnect fails.
+     */
+    public function testPingTimerClosesWhenMaxPingsExceededAndReconnectFails(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 1,
+                maxPingsOut: 0,
+                reconnectEnabled: false,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        delay(1.1);
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
      * Verifies publish throws when payload exceeds server max_payload.
      */
     public function testPublishRejectsOversizedPayload(): void
@@ -939,7 +966,7 @@ final class NatsConnectionTest extends TestCase
 
     // ─── Drain ──────────────────────────────────────────────────────────
 
-    public function testDrainUnsuscsribesAllAndCloses(): void
+    public function testDrainUnsubscribesAllAndCloses(): void
     {
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
@@ -1067,5 +1094,398 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(3200, $method->invoke($connection, 6));  // 100 * 2^5 = 3200
         self::assertSame(5000, $method->invoke($connection, 7));  // 100 * 2^6 = 6400 → capped at 5000
         self::assertSame(5000, $method->invoke($connection, 10)); // capped
+    }
+
+    /**
+     * Verifies requestWithHeaders uses HPUB and returns first reply message.
+     */
+    public function testRequestWithHeadersReturnsReply(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG _INBOX.any 1 2\r\nok\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $reply = $connection->requestWithHeaders('svc.echo', 'hi', ['X-Test' => '1'], 100)->await();
+
+        self::assertSame('ok', $reply->payload);
+        self::assertStringStartsWith('HPUB svc.echo _INBOX.', $transport->writes[3]);
+        self::assertStringContainsString('X-Test:1', $transport->writes[3]);
+    }
+
+    public function testProcessIncomingRequiresOpenConnection(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Connection is not open');
+        $connection->processIncoming()->await();
+    }
+
+    public function testUnsubscribeRequiresOpenConnection(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Connection is not open');
+        $connection->unsubscribe(1)->await();
+    }
+
+    public function testPublishWithHeadersRequiresOpenConnection(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Connection is not open');
+        $connection->publishWithHeaders('orders.created', '{}', ['X' => '1'])->await();
+    }
+
+    public function testProcessIncomingThrowsOnErrFrame(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "-ERR 'Permissions Violation'\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Server sent error frame');
+        $connection->processIncoming()->await();
+    }
+
+    public function testConnectUsesDefaultServerWhenListEmpty(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(servers: []), $transport);
+        $connection->connect()->await();
+
+        self::assertSame('tcp://127.0.0.1:4222|5000', $transport->connectCalls[0]);
+    }
+
+    public function testSubscribeRejectsEmbeddedWildcardToken(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Wildcards must occupy an entire token');
+        $connection->subscribe('orders.a*', static function (NatsMessage $message): void {
+        })->await();
+    }
+
+    public function testPublishRecoversAndRetriesAfterWriteFailure(): void
+    {
+        $transport = new class () implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            /** @var list<string> */
+            public array $writes = [];
+
+            private int $connected = 0;
+            private bool $failNextPub = true;
+            /** @var array<int, list<string>> */
+            private array $queues = [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+            ];
+
+            public function connect(string $dsn, int $timeoutMs): \Amp\Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connected++;
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+                });
+            }
+
+            public function write(string $bytes): \Amp\Future
+            {
+                return async(function () use ($bytes): void {
+                    if ($this->failNextPub && str_starts_with($bytes, 'PUB orders.created ')) {
+                        $this->failNextPub = false;
+                        throw new \RuntimeException('write failed');
+                    }
+
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(): \Amp\Future
+            {
+                return async(function (): string {
+                    $index = max(0, $this->connected - 1);
+
+                    return array_shift($this->queues[$index]) ?? '';
+                });
+            }
+
+            public function close(): \Amp\Future
+            {
+                return async(static function (): void {
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->publish('orders.created', '{"id":1}')->await();
+
+        self::assertCount(2, $transport->connectCalls);
+        self::assertStringContainsString('PUB orders.created ', implode('', $transport->writes));
+    }
+
+    public function testPublishWithHeadersRecoversAndRetriesAfterWriteFailure(): void
+    {
+        $transport = new class () implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            /** @var list<string> */
+            public array $writes = [];
+
+            private int $connected = 0;
+            private bool $failNextHpub = true;
+            /** @var array<int, list<string>> */
+            private array $queues = [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+            ];
+
+            public function connect(string $dsn, int $timeoutMs): \Amp\Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connected++;
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+                });
+            }
+
+            public function write(string $bytes): \Amp\Future
+            {
+                return async(function () use ($bytes): void {
+                    if ($this->failNextHpub && str_starts_with($bytes, 'HPUB orders.created ')) {
+                        $this->failNextHpub = false;
+                        throw new \RuntimeException('write failed');
+                    }
+
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(): \Amp\Future
+            {
+                return async(function (): string {
+                    $index = max(0, $this->connected - 1);
+
+                    return array_shift($this->queues[$index]) ?? '';
+                });
+            }
+
+            public function close(): \Amp\Future
+            {
+                return async(static function (): void {
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->publishWithHeaders('orders.created', '{"id":1}', ['X-Test' => '1'])->await();
+
+        self::assertCount(2, $transport->connectCalls);
+        self::assertStringContainsString('HPUB orders.created ', implode('', $transport->writes));
+    }
+
+    public function testPingTimerReconnectsWhenMaxOutstandingPingsExceeded(): void
+    {
+        $transport = new class () implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            /** @var list<string> */
+            public array $writes = [];
+
+            private int $connected = 0;
+            /** @var array<int, list<string>> */
+            private array $queues = [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+            ];
+
+            public function connect(string $dsn, int $timeoutMs): \Amp\Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connected++;
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+                });
+            }
+
+            public function write(string $bytes): \Amp\Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(): \Amp\Future
+            {
+                return async(function (): string {
+                    $index = max(0, $this->connected - 1);
+
+                    return array_shift($this->queues[$index]) ?? '';
+                });
+            }
+
+            public function close(): \Amp\Future
+            {
+                return async(static function (): void {
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 1,
+                maxPingsOut: 0,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        delay(1.1);
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+
+        $connection->disconnect()->await();
+    }
+
+    public function testPingTimerWriteFailureReconnectsWhenEnabled(): void
+    {
+        $transport = new class () implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+
+            private int $connected = 0;
+            private bool $failFirstPing = true;
+            /** @var array<int, list<string>> */
+            private array $queues = [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                ],
+            ];
+
+            public function connect(string $dsn, int $timeoutMs): \Amp\Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connected++;
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+                });
+            }
+
+            public function write(string $bytes): \Amp\Future
+            {
+                return async(function () use ($bytes): void {
+                    if ($this->failFirstPing && $bytes === "PING\r\n") {
+                        $this->failFirstPing = false;
+                        throw new \RuntimeException('ping write failed');
+                    }
+                });
+            }
+
+            public function readLine(): \Amp\Future
+            {
+                return async(function (): string {
+                    $index = max(0, $this->connected - 1);
+
+                    return array_shift($this->queues[$index]) ?? '';
+                });
+            }
+
+            public function close(): \Amp\Future
+            {
+                return async(static function (): void {
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 1,
+                maxPingsOut: 3,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        delay(1.1);
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+
+        $connection->disconnect()->await();
     }
 }

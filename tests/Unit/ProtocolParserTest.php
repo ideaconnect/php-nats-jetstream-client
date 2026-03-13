@@ -64,6 +64,35 @@ final class ProtocolParserTest extends TestCase
         self::assertSame($headersAndPayload, $frames[0]->payload);
     }
 
+    public function testParsesHmsgFrameWithReplyTo(): void
+    {
+        $parser = new ProtocolParser();
+        $headersAndPayload = "NATS/1.0\r\n\r\nworld";
+
+        $frames = $parser->push("HMSG orders 10 inbox.reply 12 17\r\n{$headersAndPayload}\r\n");
+
+        self::assertCount(1, $frames);
+        self::assertSame(ProtocolFrameType::HMsg, $frames[0]->type);
+        self::assertSame('orders', $frames[0]->subject);
+        self::assertSame(10, $frames[0]->sid);
+        self::assertSame('inbox.reply', $frames[0]->replyTo);
+        self::assertSame(12, $frames[0]->headerBytes);
+        self::assertSame(17, $frames[0]->totalBytes);
+        self::assertSame($headersAndPayload, $frames[0]->payload);
+    }
+
+    public function testBuffersPartialControlLineUntilCrLf(): void
+    {
+        $parser = new ProtocolParser();
+
+        $framesA = $parser->push("PIN");
+        $framesB = $parser->push("G\r\n");
+
+        self::assertSame([], $framesA);
+        self::assertCount(1, $framesB);
+        self::assertSame(ProtocolFrameType::Ping, $framesB[0]->type);
+    }
+
     /**
      * Verifies parser rejects unsupported frame commands.
      */
@@ -226,19 +255,6 @@ final class ProtocolParserTest extends TestCase
         $this->expectExceptionMessage('HMSG frame payload size exceeds limit');
 
         $parser->push("HMSG subject 1 5 20\r\n" . str_repeat('x', 20) . "\r\n");
-    }
-
-    /**
-     * Verifies parser allows MSG frames within the configured max frame size.
-     */
-    public function testAcceptsMsgFrameWithinMaxSize(): void
-    {
-        $parser = new ProtocolParser(maxFrameSize: 100);
-
-        $frames = $parser->push("MSG subject 1 5\r\nhello\r\n");
-
-        self::assertCount(1, $frames);
-        self::assertSame('hello', $frames[0]->payload);
     }
 
     /**

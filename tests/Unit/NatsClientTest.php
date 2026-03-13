@@ -9,6 +9,7 @@ use Amp\DeferredCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Services\Service;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
@@ -104,5 +105,59 @@ final class NatsClientTest extends TestCase
 
         $this->expectException(CancelledException::class);
         $client->request('svc.echo', '{"x":1}', 1_000, $deferredCancellation->getCancellation())->await();
+    }
+
+    /**
+     * Verifies facade delegates header-aware publish/request variants.
+     */
+    public function testClientPublishWithHeadersAndRequestWithHeaders(): void
+    {
+        $replyPayload = '{"ok":true}';
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($replyPayload), $replyPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $client->publishWithHeaders('orders.created', '{"id":1}', ['X-Test' => '1'])->await();
+        $reply = $client->requestWithHeaders('svc.echo', '{"x":1}', ['X-Correlation-Id' => 'abc'], 50)->await();
+
+        self::assertSame('{"ok":true}', $reply->payload);
+        self::assertStringStartsWith('HPUB orders.created ', $transport->writes[2]);
+        self::assertStringContainsString('X-Test:1', $transport->writes[2]);
+        self::assertStringStartsWith('HPUB svc.echo _INBOX.', $transport->writes[4]);
+        self::assertStringContainsString('X-Correlation-Id:abc', $transport->writes[4]);
+    }
+
+    /**
+     * Verifies facade service factory and lifecycle delegates (drain/disconnect).
+     */
+    public function testClientServiceFactoryDisconnectAndDrain(): void
+    {
+        $transportA = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            'PONG',
+        ]);
+
+        $clientA = new NatsClient(new NatsOptions(), $transportA);
+        $clientA->connect()->await();
+        $service = $clientA->service('orders', '1.0.0', 'Order API', ['team' => 'core']);
+        self::assertInstanceOf(Service::class, $service);
+
+        $sid = $clientA->subscribe('events', static function (NatsMessage $message): void {
+        })->await();
+        self::assertSame(1, $sid);
+
+        $clientA->drain()->await();
+        self::assertTrue($transportA->closed);
+
+        $transportB = new FakeTransport();
+        $clientB = new NatsClient(new NatsOptions(), $transportB);
+        $clientB->disconnect()->await();
+        self::assertTrue($transportB->closed);
     }
 }
