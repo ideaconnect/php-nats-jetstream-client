@@ -120,7 +120,6 @@ final class AmpSocketTransportTest extends TestCase
     private function invokeWithTlsContext(AmpSocketTransport $transport, ConnectContext $context, string $dsn): ConnectContext
     {
         $method = new \ReflectionMethod(AmpSocketTransport::class, 'withTlsContext');
-        $method->setAccessible(true);
 
         /** @var ConnectContext $result */
         $result = $method->invoke($transport, $context, $dsn);
@@ -131,7 +130,6 @@ final class AmpSocketTransportTest extends TestCase
     private function invokeNormalizeSocketUri(AmpSocketTransport $transport, string $dsn): string
     {
         $method = new \ReflectionMethod(AmpSocketTransport::class, 'normalizeSocketUri');
-        $method->setAccessible(true);
 
         /** @var string $result */
         $result = $method->invoke($transport, $dsn);

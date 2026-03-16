@@ -3,6 +3,21 @@ set -euo pipefail
 
 threshold="${1:-90}"
 
+if ! command -v grep >/dev/null 2>&1; then
+  echo "Missing required command: grep" >&2
+  exit 1
+fi
+
+if ! command -v sed >/dev/null 2>&1; then
+  echo "Missing required command: sed" >&2
+  exit 1
+fi
+
+if ! command -v awk >/dev/null 2>&1; then
+  echo "Missing required command: awk" >&2
+  exit 1
+fi
+
 if ! [[ "$threshold" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
   echo "Invalid threshold: $threshold"
   exit 2
@@ -15,7 +30,7 @@ output="$(vendor/bin/phpunit --coverage-text --only-summary-for-coverage-text --
 
 echo "$output"
 
-lines="$(printf '%s\n' "$output" | rg '^\s*Lines:\s*[0-9]+\.[0-9]+%')"
+lines="$(printf '%s\n' "$output" | grep -E '^\s*Lines:\s*[0-9]+\.[0-9]+%')"
 if [[ -z "$lines" ]]; then
   echo "Could not parse line coverage from PHPUnit output"
   exit 2

@@ -26,9 +26,34 @@ jobs:
       - run: composer stan
       - run: composer test:unit
 
-  integration:
+  fixture-drift:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+      - uses: ramsey/composer-install@v3
+      - run: composer fixture:jwt:check
+
+  coverage:
     runs-on: ubuntu-latest
     needs: fast-quality
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          extensions: sockets, xdebug
+      - uses: ramsey/composer-install@v3
+      - run: composer coverage:check
+
+  integration:
+    runs-on: ubuntu-latest
+    needs:
+      - fast-quality
+      - fixture-drift
+      - coverage
     strategy:
       matrix:
         php: ["8.2", "8.5"]
@@ -39,23 +64,27 @@ jobs:
           php-version: ${{ matrix.php }}
           extensions: sockets
       - uses: ramsey/composer-install@v3
-      - name: Check JWT fixture drift
-        if: matrix.php == '8.5'
-        run: composer fixture:jwt:check
       - name: Start NATS Docker Compose
         run: docker compose up -d
+      - name: Wait for NATS services
+        run: bash scripts/wait-for-nats-services.sh
       - name: Run integration tests
         env:
           RUN_INTEGRATION: "1"
           NATS_URL: nats://127.0.0.1:14222
         run: composer test:integration
+      - name: Dump NATS Docker Compose logs
+        if: failure()
+        run: docker compose logs --no-color
       - name: Stop NATS Docker Compose
         if: always()
         run: docker compose down
 
   integration-soak:
     runs-on: ubuntu-latest
-    needs: fast-quality
+    needs:
+      - fast-quality
+      - fixture-drift
     if: github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v6
@@ -64,12 +93,15 @@ jobs:
           php-version: "8.5"
           extensions: sockets
       - uses: ramsey/composer-install@v3
-      - name: Check JWT fixture drift
-        run: composer fixture:jwt:check
       - name: Start NATS Docker Compose
         run: docker compose up -d
+      - name: Wait for NATS services
+        run: bash scripts/wait-for-nats-services.sh
       - name: Run repeated integration soak
         run: bash scripts/repeat-integration.sh "${{ github.event.inputs.integration-repeat-count || '2' }}"
+      - name: Dump NATS Docker Compose logs
+        if: failure()
+        run: docker compose logs --no-color
       - name: Stop NATS Docker Compose
         if: always()
         run: docker compose down

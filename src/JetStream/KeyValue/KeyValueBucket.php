@@ -168,8 +168,7 @@ final class KeyValueBucket
             }
 
             $data = (string) ($message['data'] ?? '');
-            $decodedRaw = $data === '' ? '' : base64_decode($data, true);
-            $decoded = $decodedRaw === false ? $data : $decodedRaw;
+            $decoded = $this->decodeApiMessageData($data, $key);
             $headers = $this->decodeHeadersFromApiMessage($message);
             $operation = strtoupper((string) ($headers['KV-Operation'] ?? 'PUT'));
 
@@ -264,8 +263,7 @@ final class KeyValueBucket
                 }
 
                 $encoded = (string) ($message['data'] ?? '');
-                $decodedRaw = $encoded === '' ? '' : base64_decode($encoded, true);
-                $decoded = $decodedRaw === false ? $encoded : $decodedRaw;
+                $decoded = $this->decodeApiMessageData($encoded, $key);
 
                 $latest[$key] = $decoded;
             }
@@ -384,6 +382,20 @@ final class KeyValueBucket
         }
 
         return NatsHeaders::fromWireBlock($rawHeaders);
+    }
+
+    private function decodeApiMessageData(string $encoded, string $key): string
+    {
+        if ($encoded === '') {
+            return '';
+        }
+
+        $decoded = base64_decode($encoded, true);
+        if ($decoded === false) {
+            throw new JetStreamException('Malformed KV payload for key ' . $key);
+        }
+
+        return $decoded;
     }
 
     /**

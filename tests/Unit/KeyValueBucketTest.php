@@ -408,7 +408,7 @@ final class KeyValueBucketTest extends TestCase
         $client->jetStream()->keyValue('cfg')->update('theme', 'v', 0)->await();
     }
 
-    public function testGetFallsBackToRawWhenDataIsNotBase64(): void
+    public function testGetRejectsMalformedBase64Payload(): void
     {
         $payload = '{"message":{"subject":"$KV.cfg.theme","seq":6,"data":"%%%not-base64%%%"}}';
 
@@ -421,10 +421,31 @@ final class KeyValueBucketTest extends TestCase
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
-        $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Malformed KV payload for key theme');
 
-        self::assertNotNull($entry);
-        self::assertSame('%%%not-base64%%%', $entry->value);
+        $client->jetStream()->keyValue('cfg')->get('theme')->await();
+    }
+
+    public function testGetAllRejectsMalformedBase64Payload(): void
+    {
+        $streamInfo = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":1,"bytes":64,"subjects":{"$KV.cfg.theme":1}}}';
+        $message = '{"message":{"subject":"$KV.cfg.theme","seq":6,"data":"%%%not-base64%%%"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($message), $message),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Malformed KV payload for key theme');
+
+        $client->jetStream()->keyValue('cfg')->getAll()->await();
     }
 
     public function testGetStatusFallsBackLastSequenceToMessagesWhenMissing(): void

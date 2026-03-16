@@ -113,13 +113,4 @@ Ensure every user-facing feature is covered by at least one integration scenario
 ## Acceptance Criteria
 - Every feature row in the matrix is either Covered or has an explicit Planned integration scenario.
 - New implementation work should update this file status from Planned to Covered when merged.
-
-## Checkpoint (March 13, 2026)
-- Implemented and marked Covered in this execution cycle:
-1. `P02` Header publish round trip
-2. `R02` Header propagation in requestWithHeaders
-3. `C08` no_echo option
-4. `J03` Stream update config
-5. `J04` Stream purge
-6. `J06` Stream direct message get
 - Integration suite currently includes these scenarios but skips unless `RUN_INTEGRATION=1` is set.
