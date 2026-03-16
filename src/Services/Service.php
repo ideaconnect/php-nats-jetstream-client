@@ -251,7 +251,7 @@ final class Service
                     } catch (CancelledException) {
                         break;
                     } catch (\Throwable) {
-                        usleep(20_000);
+                        delay(0.02);
                     }
                 }
             } finally {

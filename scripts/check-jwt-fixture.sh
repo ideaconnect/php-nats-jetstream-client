@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Regenerates JWT auth fixtures and fails if committed artifacts drift.
+#
+# Usage:
+#   bash scripts/check-jwt-fixture.sh
+
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

@@ -38,11 +38,7 @@ final class BasicJsonSchemaValidator implements ServiceSchemaValidatorInterface
             }
         }
 
-        if (($schema['type'] ?? null) === 'object') {
-            if (!is_array($value)) {
-                return sprintf('%s must be an object', $path);
-            }
-
+        if (($schema['type'] ?? null) === 'object' && is_array($value)) {
             $required = $schema['required'] ?? [];
             if (is_array($required)) {
                 foreach ($required as $property) {

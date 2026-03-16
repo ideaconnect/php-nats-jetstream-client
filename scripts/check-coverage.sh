@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Verifies PHPUnit line coverage stays above a required threshold.
+#
+# Usage:
+#   bash scripts/check-coverage.sh [threshold]
+
 set -euo pipefail
 
 threshold="${1:-90}"

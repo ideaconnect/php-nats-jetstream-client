@@ -132,8 +132,8 @@ final class ProtocolParser
         $replyTo = count($parts) === 5 ? $parts[3] : null;
         $size = (int) $parts[count($parts) - 1];
 
-        if ($size > $this->maxFrameSize) {
-            throw new ProtocolException('MSG frame payload size exceeds limit: ' . $size);
+        if ($size < 0 || $size > $this->maxFrameSize) {
+            throw new ProtocolException('MSG frame payload size is invalid: ' . $size);
         }
 
         $required = $payloadOffset + $size + 2;
@@ -184,8 +184,8 @@ final class ProtocolParser
             $totalBytes = (int) $parts[4];
         }
 
-        if ($totalBytes > $this->maxFrameSize) {
-            throw new ProtocolException('HMSG frame payload size exceeds limit: ' . $totalBytes);
+        if ($totalBytes < 0 || $totalBytes > $this->maxFrameSize) {
+            throw new ProtocolException('HMSG frame payload size is invalid: ' . $totalBytes);
         }
 
         $required = $payloadOffset + $totalBytes + 2;

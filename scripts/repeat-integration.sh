@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Repeats the integration suite to catch flaky behavior over multiple runs.
+#
+# Usage:
+#   bash scripts/repeat-integration.sh [iterations]
+
 set -euo pipefail
 
 iterations="${1:-3}"

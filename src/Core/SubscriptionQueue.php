@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IDCT\NATS\Core;
 
 use SplQueue;
+use function Amp\delay;
 
 /**
  * A queue-based subscription that collects messages for polling access.
@@ -79,13 +80,16 @@ final class SubscriptionQueue
 
         $deadline = $this->timeout > 0 ? microtime(true) + $this->timeout : PHP_FLOAT_MAX;
 
-        while ($this->messages->count() === 0 && microtime(true) < $deadline) {
-            $frames = $this->client->processIncoming()->await();
-            if ($frames === 0 && $this->messages->count() === 0) {
-                // Small delay to avoid tight spin.
-                usleep(1000);
+        do {
+            $this->client->processIncoming()->await();
+
+            if ($this->messages->count() > 0) {
+                break;
             }
-        }
+
+            // Nothing arrived — yield briefly to avoid a tight spin.
+            delay(0.001);
+        } while (microtime(true) < $deadline);
 
         return $this->messages->count() > 0 ? $this->messages->dequeue() : null;
     }
@@ -102,7 +106,7 @@ final class SubscriptionQueue
     public function fetchAll(?int $limit = null): array
     {
         $collected = [];
-        $deadline = $this->timeout > 0 ? microtime(true) + $this->timeout : microtime(true) + 0.1;
+        $deadline = $this->timeout > 0 ? microtime(true) + $this->timeout : PHP_FLOAT_MAX;
 
         while (($limit === null || count($collected) < $limit) && microtime(true) < $deadline) {
             // Drain already queued messages first.

@@ -36,7 +36,7 @@ final class AmpSocketTransport implements TransportInterface
     {
         return async(function () use ($dsn, $timeoutMs): void {
             // Amp expects timeout in seconds, while options use milliseconds.
-            $context = (new ConnectContext())->withConnectTimeout($timeoutMs / 1000);
+            $context = (new ConnectContext())->withConnectTimeout(max(1, $timeoutMs) / 1000);
             $context = $this->withTlsContext($context, $dsn);
             $this->socket = connect($this->normalizeSocketUri($dsn), $context);
 

@@ -239,7 +239,7 @@ final class ProtocolParserTest extends TestCase
         $parser = new ProtocolParser(maxFrameSize: 10);
 
         $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessage('MSG frame payload size exceeds limit');
+        $this->expectExceptionMessage('MSG frame payload size is invalid');
 
         $parser->push("MSG subject 1 20\r\n" . str_repeat('x', 20) . "\r\n");
     }
@@ -252,7 +252,7 @@ final class ProtocolParserTest extends TestCase
         $parser = new ProtocolParser(maxFrameSize: 10);
 
         $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessage('HMSG frame payload size exceeds limit');
+        $this->expectExceptionMessage('HMSG frame payload size is invalid');
 
         $parser->push("HMSG subject 1 5 20\r\n" . str_repeat('x', 20) . "\r\n");
     }

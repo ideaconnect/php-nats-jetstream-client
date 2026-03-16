@@ -147,7 +147,7 @@ final class ObjectStoreBucket
                     try {
                         $message = $this->jetStream->fetchNext($this->streamName(), $consumerName, 2_000)->await();
                     } catch (JetStreamException $e) {
-                        if (str_contains($e->getMessage(), 'No messages received within timeout')) {
+                        if ($e->getCode() === 408) {
                             break;
                         }
 

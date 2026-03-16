@@ -19,6 +19,11 @@ final class NatsHeaders
         $lines = ['NATS/1.0'];
 
         foreach ($headers as $name => $value) {
+            $name = (string) $name;
+            if (preg_match('/[\r\n]/', $name) || preg_match('/[\r\n]/', $value)) {
+                throw new \InvalidArgumentException('Header names and values must not contain CR or LF characters');
+            }
+
             // Use compact "key:value" form because some server-side header parsers
             // do not trim leading spaces from values.
             $lines[] = $name . ':' . $value;

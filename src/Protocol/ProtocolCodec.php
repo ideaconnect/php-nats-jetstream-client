@@ -100,7 +100,7 @@ final class ProtocolCodec
      */
     public function encodeSubscribe(string $subject, int $sid, ?string $queue = null): string
     {
-        return $queue === null
+        return ($queue === null)
             ? sprintf("SUB %s %d\r\n", $subject, $sid)
             : sprintf("SUB %s %s %d\r\n", $subject, $queue, $sid);
     }
@@ -110,7 +110,7 @@ final class ProtocolCodec
      */
     public function encodeUnsubscribe(int $sid, ?int $maxMessages = null): string
     {
-        return $maxMessages === null
+        return ($maxMessages === null)
             ? sprintf("UNSUB %d\r\n", $sid)
             : sprintf("UNSUB %d %d\r\n", $sid, $maxMessages);
     }

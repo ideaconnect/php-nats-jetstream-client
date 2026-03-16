@@ -433,8 +433,8 @@ final class NatsConnection
             return false;
         }
 
-        $firstLine = strtok($message->rawHeaders, "\r\n");
-        if ($firstLine === false) {
+        $firstLine = explode("\r\n", $message->rawHeaders, 2)[0];
+        if ($firstLine === '') {
             return false;
         }
 

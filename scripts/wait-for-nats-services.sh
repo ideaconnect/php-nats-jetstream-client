@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Waits until all Docker Compose NATS fixture services expose healthy varz endpoints.
+#
+# Usage:
+#   bash scripts/wait-for-nats-services.sh
+
 set -euo pipefail
 
 if ! command -v curl >/dev/null 2>&1; then

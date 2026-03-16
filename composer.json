@@ -28,6 +28,7 @@
     "test": "phpunit",
     "test:unit": "phpunit --testsuite unit",
     "test:integration": "phpunit --testsuite integration",
+    "test:e2e": "bash scripts/run-tests-e2e.sh",
     "test:integration:repeat": "bash scripts/repeat-integration.sh 3",
     "fixture:jwt": "bash scripts/regenerate-jwt-fixture.sh",
     "fixture:jwt:check": "bash scripts/check-jwt-fixture.sh",

@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# Rebuilds JWT/NKey fixture artifacts used by JWT integration tests.
+#
+# Usage:
+#   bash scripts/regenerate-jwt-fixture.sh
+
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

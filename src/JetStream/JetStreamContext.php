@@ -450,6 +450,11 @@ final class JetStreamContext
                     $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
                     $consumerName = $consumer->name;
 
+                    // Advance past the gap to prevent infinite recreation loops
+                    // when the requested sequence has been pruned from the stream.
+                    $expectedSeq = $seq + 1;
+                    $handler($message);
+
                     return;
                 }
 
@@ -669,7 +674,7 @@ final class JetStreamContext
                     );
                 }
 
-                throw new JetStreamException('No messages received within timeout');
+                throw new JetStreamException('No messages received within timeout', 408);
             }
 
             return $messages;
@@ -866,6 +871,6 @@ final class JetStreamContext
 
         $seq = filter_var($parts[5], FILTER_VALIDATE_INT);
 
-        return $seq !== false ? $seq : null;
+        return ($seq !== false) ? $seq : null;
     }
 }
