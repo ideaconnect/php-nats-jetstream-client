@@ -219,6 +219,45 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->invokePrivate($connection, 'awaitInitialPong');
     }
 
+    public function testAwaitServerInfoAllowsMoreThanEightPollsBeforeInfoArrives(): void
+    {
+        $queue = array_merge(
+            array_fill(0, 12, ''),
+            ['INFO {"server_id":"S9","server_name":"n9","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}'],
+        );
+
+        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport($queue));
+
+        $info = $this->invokePrivate($connection, 'awaitServerInfo');
+
+        self::assertSame('S9', $info->serverId);
+    }
+
+    public function testAwaitInitialPongAllowsMoreThanEightPollsBeforePongArrives(): void
+    {
+        $queue = array_merge(array_fill(0, 12, '+OK'), ['PONG']);
+
+        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport($queue));
+
+        $this->invokePrivate($connection, 'awaitInitialPong');
+
+        self::assertTrue(true);
+    }
+
+    public function testAwaitServerInfoRespondsToPingBeforeInfo(): void
+    {
+        $transport = new FakeTransport([
+            'PING',
+            'INFO {"server_id":"S4","server_name":"n4","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+        ]);
+        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), $transport);
+
+        $info = $this->invokePrivate($connection, 'awaitServerInfo');
+
+        self::assertSame('S4', $info->serverId);
+        self::assertSame("PONG\r\n", $transport->writes[0] ?? null);
+    }
+
     public function testAwaitServerInfoParsesInfoLine(): void
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport([
@@ -273,6 +312,33 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Server sent error frame');
         $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(type: ProtocolFrameType::Err, error: 'boom'));
+    }
+
+    public function testHandleFrameInfoUpdatesServerInfo(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(
+            type: ProtocolFrameType::Info,
+            infoPayload: '{"server_id":"S2","server_name":"n2","version":"2.12.1","jetstream":true,"max_payload":2048,"headers":true}',
+        ));
+
+        $serverInfo = $connection->serverInfo();
+        self::assertInstanceOf(ServerInfo::class, $serverInfo);
+        self::assertSame('S2', $serverInfo->serverId);
+        self::assertSame(2048, $serverInfo->maxPayload);
+    }
+
+    public function testHandleFrameRecoverableErrDoesNotThrow(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(
+            type: ProtocolFrameType::Err,
+            error: "'Permissions Violation for Publish to updates'",
+        ));
+
+        self::assertTrue(true);
     }
 
     public function testHandleFrameIgnoresUnknownSubscriptionSid(): void
@@ -361,7 +427,7 @@ final class NatsConnectionInternalsTest extends TestCase
                 });
             }
 
-            public function readLine(): \Amp\Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
             {
                 return async(static function (): string {
                     return '';
@@ -443,7 +509,7 @@ final class NatsConnectionInternalsTest extends TestCase
                 });
             }
 
-            public function readLine(): \Amp\Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
             {
                 return async(static function (): string {
                     return '';

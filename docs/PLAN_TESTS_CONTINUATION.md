@@ -33,6 +33,20 @@ Completed in latest implementation pass:
 - R04: request cancellation path integration
 - JPS05: ephemeral push helper delivery
 - JS02: invalid schedule expression rejection
+- JP04: TERM/WPI pull-consumer workflows
+- JP05: pull-consumer iterator batching
+- KV06: concurrent key-value watchers
+- OS04: object store digest mismatch path
+- S04: service multi-endpoint dispatch
+- S05: service grouped endpoint hierarchy
+- S06: service concurrent request handling
+- PR01: fragmented frame handling end-to-end
+- PR03: slow-consumer policy behavior
+- C09: tlsHandshakeFirst workflow
+- A01: token auth success/failure
+- A02: username/password auth success/failure
+- A03: JWT nonce auth integration
+- A04: standalone NKey auth integration
 
 Files already updated:
 - tests/Integration/NatsClientIntegrationTest.php
@@ -41,14 +55,9 @@ Files already updated:
 
 ## Next Recommended Work Order
 Implement in this order to maximize risk reduction first:
-1. JP04 - TERM/WPI workflows
-2. JP05 - pull iterator chaining
-3. KV06 - concurrent watchers
-4. OS04 - digest mismatch path
-5. S04 - multi-endpoint dispatch
-6. S05 - grouped endpoint hierarchy
-7. S06 - service concurrent request handling
-8. PR01 - fragmented frame handling
+1. Capture any flaky integration behavior over repeated local compose-backed runs and manual CI soak runs
+2. Consider documenting a minimal external JWT resolver setup for teams not using the committed local fixture
+3. Decide whether the manual CI soak should become scheduled or stay operator-triggered only
 
 ## How To Continue (Workflow)
 1. Pick one feature ID from PLAN_TESTS.md with `Status = Planned` or `Partial`.
@@ -94,6 +103,15 @@ Run real integration scenarios when environment is enabled:
 - `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testRequestCancellationStopsAwait`
 - `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamEphemeralPushConsumerDelivery`
 - `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamScheduledPublishRejectsUnsupportedPatterns`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamTermAndInProgressTokens`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamPullIteratorBatching`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamKeyValueConcurrentWatchers`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testJetStreamObjectStoreDigestMismatch`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testServiceMultipleEndpoints`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testServiceGroupedEndpointsHierarchy`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testServiceConcurrentRequests`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testFragmentedFramesStillDispatch`
+- `RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter testSlowConsumerPolicyBehavior`
 
 Optional explicit server URL:
 - `RUN_INTEGRATION=1 NATS_URL=nats://127.0.0.1:14222 ./vendor/bin/phpunit --testsuite integration`
@@ -128,3 +146,18 @@ Batch E (core + listing + queue/timeout semantics):
 
 Batch F (drain/payload/wildcard/cancellation + push/scheduling):
 - Completed: C07, C10, P04, R04, JPS05, JS02
+
+Batch G (pull token semantics + iterator batching):
+- Completed: JP04, JP05
+
+Batch H (KV/ObjectStore integrity edge cases):
+- Completed: KV06, OS04
+
+Batch I (service routing/grouping/concurrency):
+- Completed: S04, S05, S06
+
+Batch J (protocol resilience behaviors):
+- Completed: PR01, PR03
+
+Batch K (auth and TLS coverage):
+- Completed: C09, A01, A02, A03, A04

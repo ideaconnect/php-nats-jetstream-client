@@ -106,16 +106,35 @@ final class AmpSocketTransportTest extends TestCase
         $transport->connect('invalid-dsn', 50)->await();
     }
 
+    /**
+     * Verifies tls:// URIs are rewritten to tcp:// for Amp while preserving TLS semantics.
+     */
+    public function testNormalizeSocketUriRewritesTlsScheme(): void
+    {
+        $transport = new AmpSocketTransport();
+
+        self::assertSame('tcp://example.org:4443', $this->invokeNormalizeSocketUri($transport, 'tls://example.org:4443'));
+        self::assertSame('tcp://example.org:4222', $this->invokeNormalizeSocketUri($transport, 'tcp://example.org:4222'));
+    }
+
     private function invokeWithTlsContext(AmpSocketTransport $transport, ConnectContext $context, string $dsn): ConnectContext
     {
-        $invoke = \Closure::bind(
-            static fn (AmpSocketTransport $instance, ConnectContext $ctx, string $serverDsn): ConnectContext => $instance->withTlsContext($ctx, $serverDsn),
-            null,
-            AmpSocketTransport::class,
-        );
+        $method = new \ReflectionMethod(AmpSocketTransport::class, 'withTlsContext');
+        $method->setAccessible(true);
 
         /** @var ConnectContext $result */
-        $result = $invoke($transport, $context, $dsn);
+        $result = $method->invoke($transport, $context, $dsn);
+
+        return $result;
+    }
+
+    private function invokeNormalizeSocketUri(AmpSocketTransport $transport, string $dsn): string
+    {
+        $method = new \ReflectionMethod(AmpSocketTransport::class, 'normalizeSocketUri');
+        $method->setAccessible(true);
+
+        /** @var string $result */
+        $result = $method->invoke($transport, $dsn);
 
         return $result;
     }

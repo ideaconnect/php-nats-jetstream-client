@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Transport;
 
+use Amp\Cancellation;
 use Amp\Future;
 
 /**
@@ -30,7 +31,7 @@ interface TransportInterface
      *
      * @return Future<string>
      */
-    public function readLine(): Future;
+    public function readLine(?Cancellation $cancellation = null): Future;
 
     /**
      * Closes the transport and underlying resources.

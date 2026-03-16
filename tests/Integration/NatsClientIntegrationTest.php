@@ -7,6 +7,8 @@ namespace IDCT\NATS\Tests\Integration;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\Future;
+use IDCT\NATS\Auth\NkeySeedSigner;
+use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -16,6 +18,7 @@ use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Services\BasicJsonSchemaValidator;
+use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FlakyTransport;
 use PHPUnit\Framework\TestCase;
 use function Amp\async;
@@ -556,6 +559,536 @@ final class NatsClientIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies service dispatches correctly across multiple registered endpoints.
+     */
+    public function testServiceMultipleEndpoints(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $suffix = bin2hex(random_bytes(3));
+        $subjectAlpha = 'svc.' . $suffix . '.alpha';
+        $subjectBeta = 'svc.' . $suffix . '.beta';
+
+        $serviceClient = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $requester = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+
+        $serviceClient->connect()->await();
+        $requester->connect()->await();
+
+        $service = $serviceClient->service('multi-' . $suffix, '1.0.0', 'Multi endpoint')
+            ->addEndpoint('alpha', $subjectAlpha, static fn (NatsMessage $message): string => 'alpha:' . $message->payload)
+            ->addEndpoint('beta', $subjectBeta, static fn (NatsMessage $message): string => 'beta:' . $message->payload);
+        $service->start()->await();
+
+        $servicePumpCancellation = new DeferredCancellation();
+        $servicePump = async(static function () use ($serviceClient, $servicePumpCancellation): void {
+            $cancellation = $servicePumpCancellation->getCancellation();
+
+            while (!$cancellation->isRequested()) {
+                try {
+                    $serviceClient->processIncoming()->await($cancellation);
+                } catch (CancelledException) {
+                    break;
+                } catch (\Throwable) {
+                    usleep(20_000);
+                }
+            }
+        });
+
+        try {
+            $replyAlpha = null;
+            $replyBeta = null;
+
+            for ($attempt = 0; $attempt < 10; $attempt++) {
+                try {
+                    $replyAlpha = $requester->request($subjectAlpha, 'one', 2_000)->await();
+                    $replyBeta = $requester->request($subjectBeta, 'two', 2_000)->await();
+                    break;
+                } catch (NatsException $e) {
+                    if ($attempt === 9 || !str_contains($e->getMessage(), 'No responders')) {
+                        throw $e;
+                    }
+
+                    delay(0.1);
+                }
+            }
+        } finally {
+            $servicePumpCancellation->cancel();
+            $servicePump->await();
+        }
+
+        self::assertInstanceOf(NatsMessage::class, $replyAlpha);
+        self::assertInstanceOf(NatsMessage::class, $replyBeta);
+        self::assertSame('alpha:one', $replyAlpha->payload);
+        self::assertSame('beta:two', $replyBeta->payload);
+
+        $stats = $service->statsSnapshot();
+        self::assertCount(2, $stats['endpoints']);
+
+        $service->stop()->await();
+        $requester->disconnect()->await();
+        $serviceClient->disconnect()->await();
+    }
+
+    /**
+     * Verifies grouped service endpoints use hierarchical subject prefixes.
+     */
+    public function testServiceGroupedEndpointsHierarchy(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $suffix = bin2hex(random_bytes(3));
+        $subjectV1 = 'svc.' . $suffix . '.v1.echo';
+        $subjectV2 = 'svc.' . $suffix . '.v2.echo';
+
+        $serviceClient = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $requester = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+
+        $serviceClient->connect()->await();
+        $requester->connect()->await();
+
+        $service = $serviceClient->service('grouped-' . $suffix, '1.0.0', 'Grouped endpoints');
+        $root = $service->addGroup('svc.' . $suffix);
+        $root->addGroup('v1')->addEndpoint('echo-v1', 'echo', static fn (NatsMessage $message): string => 'v1:' . $message->payload);
+        $root->addGroup('v2')->addEndpoint('echo-v2', 'echo', static fn (NatsMessage $message): string => 'v2:' . $message->payload);
+        $service->start()->await();
+
+        $servicePumpCancellation = new DeferredCancellation();
+        $servicePump = async(static function () use ($serviceClient, $servicePumpCancellation): void {
+            $cancellation = $servicePumpCancellation->getCancellation();
+
+            while (!$cancellation->isRequested()) {
+                try {
+                    $serviceClient->processIncoming()->await($cancellation);
+                } catch (CancelledException) {
+                    break;
+                } catch (\Throwable) {
+                    usleep(20_000);
+                }
+            }
+        });
+
+        try {
+            $replyV1 = null;
+            $replyV2 = null;
+
+            for ($attempt = 0; $attempt < 10; $attempt++) {
+                try {
+                    $replyV1 = $requester->request($subjectV1, 'hello', 2_000)->await();
+                    $replyV2 = $requester->request($subjectV2, 'hello', 2_000)->await();
+                    break;
+                } catch (NatsException $e) {
+                    if ($attempt === 9 || !str_contains($e->getMessage(), 'No responders')) {
+                        throw $e;
+                    }
+
+                    delay(0.1);
+                }
+            }
+        } finally {
+            $servicePumpCancellation->cancel();
+            $servicePump->await();
+        }
+
+        self::assertInstanceOf(NatsMessage::class, $replyV1);
+        self::assertInstanceOf(NatsMessage::class, $replyV2);
+        self::assertSame('v1:hello', $replyV1->payload);
+        self::assertSame('v2:hello', $replyV2->payload);
+
+        $subjects = array_map(
+            static fn (array $endpoint): string => (string) ($endpoint['subject'] ?? ''),
+            $service->statsSnapshot()['endpoints'] ?? [],
+        );
+        self::assertContains($subjectV1, $subjects);
+        self::assertContains($subjectV2, $subjects);
+
+        $service->stop()->await();
+        $requester->disconnect()->await();
+        $serviceClient->disconnect()->await();
+    }
+
+    /**
+     * Verifies service handles multiple concurrent requests from different clients.
+     */
+    public function testServiceConcurrentRequests(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $suffix = bin2hex(random_bytes(3));
+        $subject = 'svc.' . $suffix . '.concurrent';
+        $requestCount = 8;
+
+        $serviceClient = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $serviceClient->connect()->await();
+
+        $service = $serviceClient->service('conc-' . $suffix, '1.0.0', 'Concurrent service')
+            ->addEndpoint('concurrent', $subject, static function (NatsMessage $message): string {
+                usleep(25_000);
+
+                return 'ok:' . $message->payload;
+            });
+        $service->start()->await();
+
+        $servicePumpCancellation = new DeferredCancellation();
+        $servicePump = async(static function () use ($serviceClient, $servicePumpCancellation): void {
+            $cancellation = $servicePumpCancellation->getCancellation();
+
+            while (!$cancellation->isRequested()) {
+                try {
+                    $serviceClient->processIncoming()->await($cancellation);
+                } catch (CancelledException) {
+                    break;
+                } catch (\Throwable) {
+                    usleep(20_000);
+                }
+            }
+        });
+
+        $requesters = [];
+        for ($i = 0; $i < $requestCount; $i++) {
+            $requester = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+            $requester->connect()->await();
+            $requesters[] = $requester;
+        }
+
+        try {
+            $futures = [];
+            foreach ($requesters as $idx => $requester) {
+                $futures[] = async(static function () use ($requester, $subject, $idx): string {
+                    $reply = $requester->request($subject, (string) $idx, 2_000)->await();
+
+                    return $reply->payload;
+                });
+            }
+
+            $results = array_map(static fn ($future): string => $future->await(), $futures);
+        } finally {
+            foreach ($requesters as $requester) {
+                $requester->disconnect()->await();
+            }
+
+            $servicePumpCancellation->cancel();
+            $servicePump->await();
+        }
+
+        sort($results);
+        $expected = [];
+        for ($i = 0; $i < $requestCount; $i++) {
+            $expected[] = 'ok:' . $i;
+        }
+        sort($expected);
+
+        self::assertSame($expected, $results);
+
+        $stats = $service->statsSnapshot();
+        $endpoint = $stats['endpoints'][0] ?? [];
+        self::assertSame($requestCount, $endpoint['num_requests'] ?? null);
+
+        $service->stop()->await();
+        $serviceClient->disconnect()->await();
+    }
+
+    /**
+     * Verifies fragmented wire chunks are reassembled and dispatched to subscribers.
+     */
+    public function testFragmentedFramesStillDispatch(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG updates 1 5\r\nhe",
+            "llo\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // First chunk is incomplete; second chunk completes message payload/frame.
+        self::assertSame(0, $client->processIncoming()->await());
+        self::assertSame(1, $client->processIncoming()->await());
+        self::assertSame(['hello'], $received);
+
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies slow-consumer error policy surfaces queue overflow through client API.
+     */
+    public function testSlowConsumerPolicyBehavior(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "MSG updates 1 5\r\nfirst\r\nMSG updates 1 6\r\nsecond\r\n",
+        ]);
+
+        $options = new NatsOptions(
+            maxPendingMessagesPerSubscription: 1,
+            slowConsumerPolicy: SlowConsumerPolicy::Error,
+        );
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $client->subscribe('updates', static function (NatsMessage $message): void {
+            // Intentionally no-op: overflow is driven by pending queue constraints.
+        })->await();
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Subscription queue overflow');
+        $client->processIncoming()->await();
+    }
+
+    /**
+     * Verifies tlsHandshakeFirst workflow against a TLS-enabled integration endpoint.
+     */
+    public function testTlsHandshakeFirstConnection(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $url = $this->integrationTlsServerUrl();
+        $caFile = $this->integrationTlsCaFile();
+        $certFile = $this->integrationTlsCertFile();
+        $keyFile = $this->integrationTlsKeyFile();
+
+        if ($caFile === null || $certFile === null || $keyFile === null) {
+            $this->markTestSkipped('Set TLS env vars or generate local TLS fixtures to run the TLS handshake-first integration test.');
+        }
+
+        $client = new NatsClient(new NatsOptions(
+            servers: [$url],
+            tlsRequired: true,
+            tlsHandshakeFirst: true,
+            tlsCaFile: $caFile,
+            tlsCertFile: $certFile,
+            tlsKeyFile: $keyFile,
+            tlsVerifyPeer: (getenv('NATS_TLS_SKIP_VERIFY') !== '1'),
+        ));
+
+        $client->connect()->await();
+        self::assertNotNull($client->serverInfo());
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies the TLS fixture rejects clients that do not present the required certificate.
+     */
+    public function testTlsConnectionFailsWithoutClientCertificate(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $url = $this->integrationTlsServerUrl();
+        $caFile = $this->integrationTlsCaFile();
+
+        if ($caFile === null) {
+            $this->markTestSkipped('Set NATS_TLS_CA_FILE or generate local TLS fixtures to run the TLS client-certificate failure test.');
+        }
+
+        $client = new NatsClient(new NatsOptions(
+            servers: [$url],
+            tlsRequired: true,
+            tlsHandshakeFirst: true,
+            tlsCaFile: $caFile,
+            tlsVerifyPeer: true,
+            reconnectEnabled: false,
+        ));
+
+        $this->expectException(ConnectionException::class);
+        $client->connect()->await();
+    }
+
+    /**
+     * Verifies strict TLS peer validation fails when the client trusts the wrong CA.
+     */
+    public function testTlsConnectionFailsWithWrongCa(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        if (getenv('NATS_TLS_SKIP_VERIFY') === '1') {
+            $this->markTestSkipped('Strict TLS verification failure test is disabled when NATS_TLS_SKIP_VERIFY=1.');
+        }
+
+        $url = $this->integrationTlsServerUrl();
+        $certFile = $this->integrationTlsCertFile();
+        $keyFile = $this->integrationTlsKeyFile();
+        $wrongCaFile = $this->repoRoot() . '/build/tls/server-cert.pem';
+
+        if ($certFile === null || $keyFile === null || !is_file($wrongCaFile)) {
+            $this->markTestSkipped('Generate local TLS fixtures to run the TLS wrong-CA failure test.');
+        }
+
+        $client = new NatsClient(new NatsOptions(
+            servers: [$url],
+            tlsRequired: true,
+            tlsHandshakeFirst: true,
+            tlsCaFile: $wrongCaFile,
+            tlsCertFile: $certFile,
+            tlsKeyFile: $keyFile,
+            tlsVerifyPeer: true,
+            reconnectEnabled: false,
+        ));
+
+        $this->expectException(ConnectionException::class);
+        $client->connect()->await();
+    }
+
+    /**
+     * Verifies strict TLS hostname validation fails when the configured peer name does not match the server certificate.
+     */
+    public function testTlsConnectionFailsWithPeerNameMismatch(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        if (getenv('NATS_TLS_SKIP_VERIFY') === '1') {
+            $this->markTestSkipped('Strict TLS verification failure test is disabled when NATS_TLS_SKIP_VERIFY=1.');
+        }
+
+        $url = $this->integrationTlsServerUrl();
+        $caFile = $this->integrationTlsCaFile();
+        $certFile = $this->integrationTlsCertFile();
+        $keyFile = $this->integrationTlsKeyFile();
+
+        if ($caFile === null || $certFile === null || $keyFile === null) {
+            $this->markTestSkipped('Generate local TLS fixtures to run the TLS peer-name mismatch test.');
+        }
+
+        $client = new NatsClient(new NatsOptions(
+            servers: [$url],
+            tlsRequired: true,
+            tlsHandshakeFirst: true,
+            tlsCaFile: $caFile,
+            tlsCertFile: $certFile,
+            tlsKeyFile: $keyFile,
+            tlsPeerName: 'mismatch.invalid.local',
+            tlsVerifyPeer: true,
+            reconnectEnabled: false,
+        ));
+
+        $this->expectException(ConnectionException::class);
+        $client->connect()->await();
+    }
+
+    /**
+     * Verifies token auth succeeds with valid token and fails with invalid token.
+     */
+    public function testTokenAuthSuccessAndFailure(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $url = $this->integrationTokenServerUrl();
+        $validToken = $this->integrationToken();
+        $invalidToken = $this->integrationInvalidToken();
+
+        $authorized = new NatsClient(new NatsOptions(
+            servers: [$url],
+            token: $validToken,
+        ));
+        $authorized->connect()->await();
+        self::assertNotNull($authorized->serverInfo());
+        $authorized->disconnect()->await();
+
+        $unauthorized = new NatsClient(new NatsOptions(
+            servers: [$url],
+            token: $invalidToken,
+            reconnectEnabled: false,
+        ));
+
+        $this->expectException(ConnectionException::class);
+        $unauthorized->connect()->await();
+    }
+
+    /**
+     * Verifies username/password auth succeeds with valid credentials and fails with invalid credentials.
+     */
+    public function testUserPasswordAuthSuccessAndFailure(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $url = $this->integrationUserPassServerUrl();
+        $username = $this->integrationUsername();
+        $password = $this->integrationPassword();
+        $badPassword = $this->integrationBadPassword();
+
+        $authorized = new NatsClient(new NatsOptions(
+            servers: [$url],
+            username: $username,
+            password: $password,
+        ));
+        $authorized->connect()->await();
+        self::assertNotNull($authorized->serverInfo());
+        $authorized->disconnect()->await();
+
+        $unauthorized = new NatsClient(new NatsOptions(
+            servers: [$url],
+            username: $username,
+            password: $badPassword,
+            reconnectEnabled: false,
+        ));
+
+        $this->expectException(ConnectionException::class);
+        $unauthorized->connect()->await();
+    }
+
+    /**
+     * Verifies JWT auth succeeds when the server nonce is signed with the matching user seed.
+     */
+    public function testJwtNonceAuthenticationFlow(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $url = $this->integrationJwtServerUrl();
+        $jwt = $this->integrationJwt();
+        $seed = $this->integrationJwtSeed();
+
+        if ($jwt === null || $seed === null) {
+            $this->markTestSkipped('Provide local build/nats/jwt fixture files or set NATS_JWT and NATS_JWT_NKEY_SEED for JWT auth integration test.');
+        }
+
+        $signer = new NkeySeedSigner($seed);
+        $client = new NatsClient(new NatsOptions(
+            servers: [$url],
+            jwt: $jwt,
+            nkey: $signer->publicKey(),
+            nonceSigner: $signer,
+        ));
+
+        $client->connect()->await();
+        self::assertNotNull($client->serverInfo());
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies standalone NKey auth succeeds when the server challenge is signed with the configured seed.
+     */
+    public function testStandaloneNkeyAuthenticationFlow(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $url = $this->integrationNkeyServerUrl();
+        $seed = $this->integrationNkeySeed();
+
+        $signer = new NkeySeedSigner($seed);
+        $client = new NatsClient(new NatsOptions(
+            servers: [$url],
+            nkey: $signer->publicKey(),
+            nonceSigner: $signer,
+        ));
+
+        $client->connect()->await();
+        self::assertNotNull($client->serverInfo());
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies request surfaces server no_responders as NatsException.
      */
     public function testNoRespondersErrorSurface(): void
@@ -713,7 +1246,7 @@ final class NatsClientIntegrationTest extends TestCase
                 });
             }
 
-            public function readLine(): Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): Future
             {
                 return async(function (): string {
                     if ($this->readQueue !== []) {
@@ -806,7 +1339,7 @@ final class NatsClientIntegrationTest extends TestCase
                 });
             }
 
-            public function readLine(): Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): Future
             {
                 return async(function (): string {
                     $index = max(0, $this->successfulConnects - 1);
@@ -972,17 +1505,15 @@ final class NatsClientIntegrationTest extends TestCase
         $subject = 'it.drain.' . bin2hex(random_bytes(4));
 
         $subscriber = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
-        $publisher = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
-
         $subscriber->connect()->await();
-        $publisher->connect()->await();
 
         $received = [];
         $subscriber->subscribe($subject, static function (NatsMessage $message) use (&$received): void {
             $received[] = $message->payload;
         })->await();
 
-        $publisher->publish($subject, 'inflight-1')->await();
+        // Publish from the same connection to avoid inter-client subscription propagation race.
+        $subscriber->publish($subject, 'inflight-1')->await();
 
         // Drain should process in-flight messages and then close cleanly.
         $subscriber->drain()->await();
@@ -995,8 +1526,6 @@ final class NatsClientIntegrationTest extends TestCase
         } catch (ConnectionException $e) {
             self::assertStringContainsString('Connection is not open', $e->getMessage());
         }
-
-        $publisher->disconnect()->await();
     }
 
     /**

@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Support;
 
+use Amp\Cancellation;
 use Amp\Future;
 use IDCT\NATS\Transport\TransportInterface;
 use function Amp\async;
@@ -50,7 +51,7 @@ final class FakeTransport implements TransportInterface
     /**
      * Returns the next queued read chunk.
      */
-    public function readLine(): Future
+    public function readLine(?Cancellation $cancellation = null): Future
     {
         return async(function (): string {
             return array_shift($this->readQueue) ?? '';

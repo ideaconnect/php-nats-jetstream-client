@@ -377,6 +377,126 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies TERM and WPI tokens influence pull-consumer redelivery workflow.
+     */
+    public function testJetStreamTermAndInProgressTokens(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.pull.termwpi';
+        $consumer = 'C_' . strtoupper(bin2hex(random_bytes(2)));
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, $consumer, $subject, [
+            'ack_wait' => 1_000_000_000,
+            'max_deliver' => 3,
+        ])->await();
+
+        // WPI should extend in-flight processing and delay redelivery.
+        $js->publish($subject, '{"event":"wpi"}')->await();
+        $first = $js->fetchNext($stream, $consumer, 4_000)->await();
+        self::assertSame('{"event":"wpi"}', $first->payload);
+
+        usleep(600_000);
+        $js->inProgress($first)->await();
+
+        try {
+            $js->fetchBatch($stream, $consumer, 1, 500)->await();
+            self::fail('Expected no immediate redelivery after WPI heartbeat.');
+        } catch (JetStreamException $e) {
+            self::assertMatchesRegularExpression('/status (404|408)|No messages received within timeout/i', $e->getMessage());
+        }
+
+        $redelivered = null;
+        $deadline = microtime(true) + 4.0;
+        while ($redelivered === null && microtime(true) < $deadline) {
+            try {
+                $redelivered = $js->fetchNext($stream, $consumer, 800)->await();
+            } catch (JetStreamException $e) {
+                if (!preg_match('/status (404|408)|No messages received within timeout/i', $e->getMessage())) {
+                    throw $e;
+                }
+            }
+        }
+
+        self::assertNotNull($redelivered);
+        self::assertSame('{"event":"wpi"}', $redelivered->payload);
+        $js->ack($redelivered)->await();
+
+        // TERM should stop further redeliveries for a message.
+        $js->publish($subject, '{"event":"term"}')->await();
+        $toTerm = $js->fetchNext($stream, $consumer, 4_000)->await();
+        self::assertSame('{"event":"term"}', $toTerm->payload);
+        $js->term($toTerm)->await();
+
+        usleep(1_300_000);
+        try {
+            $js->fetchBatch($stream, $consumer, 1, 700)->await();
+            self::fail('Expected TERM-ed message to stop redelivery.');
+        } catch (JetStreamException $e) {
+            self::assertMatchesRegularExpression('/status (404|408)|No messages received within timeout/i', $e->getMessage());
+        }
+
+        $js->deleteConsumer($stream, $consumer)->await();
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies pull-consumer iterator batching processes messages across chained pulls.
+     */
+    public function testJetStreamPullIteratorBatching(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.pull.iterator';
+        $consumer = 'C_' . strtoupper(bin2hex(random_bytes(2)));
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, $consumer, $subject)->await();
+
+        for ($i = 1; $i <= 5; $i++) {
+            $js->publish($subject, json_encode(['n' => $i], JSON_THROW_ON_ERROR))->await();
+        }
+
+        $seen = [];
+        $total = $js->pullConsumer($stream, $consumer)
+            ->setBatching(2)
+            ->setExpiresMs(700)
+            ->setIterations(4)
+            ->handle(static function (NatsMessage $message, $context) use (&$seen): void {
+                $seen[] = $message->payload;
+                if ($message->replyTo !== null && $message->replyTo !== '') {
+                    $context->ack($message)->await();
+                }
+            })->await();
+
+        sort($seen);
+        self::assertSame(5, $total);
+        self::assertSame([
+            '{"n":1}',
+            '{"n":2}',
+            '{"n":3}',
+            '{"n":4}',
+            '{"n":5}',
+        ], $seen);
+
+        $js->deleteConsumer($stream, $consumer)->await();
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies durable push helper delivers live payloads to subscribed handlers.
      */
     public function testJetStreamPushConsumerHelperDelivery(): void
@@ -414,6 +534,9 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertInstanceOf(NatsMessage::class, $received);
+        if ($received === null) {
+            self::fail('Expected durable push consumer to receive a message.');
+        }
         self::assertSame('{"event":"push"}', $received->payload);
 
         $client->unsubscribe($sid)->await();
@@ -461,6 +584,9 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertInstanceOf(NatsMessage::class, $received);
+        if ($received === null) {
+            self::fail('Expected explicit deliver push consumer to receive a message.');
+        }
         self::assertSame('{"event":"push-explicit"}', $received->payload);
 
         $client->unsubscribe($sid)->await();
@@ -507,6 +633,9 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertInstanceOf(NatsMessage::class, $received);
+        if ($received === null) {
+            self::fail('Expected ephemeral push consumer to receive a message.');
+        }
         self::assertSame('{"event":"ephemeral-push"}', $received->payload);
 
         $client->unsubscribe($sid)->await();
@@ -617,6 +746,9 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertNotNull($watched);
+        if ($watched === null) {
+            self::fail('Expected KV watch to observe the updated entry.');
+        }
         self::assertSame('theme', $watched->key);
         self::assertSame('dark', $watched->value);
 
@@ -783,7 +915,7 @@ final class JetStreamIntegrationTest extends TestCase
             $js->fetchBatch($stream, $consumer, 1, 500)->await();
             self::fail('Expected paused consumer to suppress pull delivery.');
         } catch (JetStreamException $e) {
-            self::assertStringContainsString('No messages received within timeout', $e->getMessage());
+            self::assertMatchesRegularExpression('/status (404|408)|No messages received within timeout/i', $e->getMessage());
         }
 
         $resumeResult = $js->resumeConsumer($stream, $consumer)->await();
@@ -846,6 +978,55 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies multiple KV watchers observe the same updates concurrently.
+     */
+    public function testJetStreamKeyValueConcurrentWatchers(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $bucket = 'cw' . strtolower(bin2hex(random_bytes(2)));
+        $key = 'session';
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue($bucket);
+        $kv->create()->await();
+
+        $watcherA = [];
+        $watcherB = [];
+
+        $sidA = $kv->watch(static function ($entry) use (&$watcherA): void {
+            $watcherA[] = $entry;
+        }, $key)->await();
+
+        $sidB = $kv->watch(static function ($entry) use (&$watcherB): void {
+            $watcherB[] = $entry;
+        }, $key)->await();
+
+        $kv->put($key, 'v1')->await();
+        $kv->put($key, 'v2')->await();
+
+        $deadline = microtime(true) + 5.0;
+        while ((count($watcherA) < 2 || count($watcherB) < 2) && microtime(true) < $deadline) {
+            $client->processIncoming()->await();
+            usleep(50_000);
+        }
+
+        self::assertGreaterThanOrEqual(2, count($watcherA));
+        self::assertGreaterThanOrEqual(2, count($watcherB));
+        self::assertSame('v1', $watcherA[0]->value ?? null);
+        self::assertSame('v2', $watcherA[1]->value ?? null);
+        self::assertSame('v1', $watcherB[0]->value ?? null);
+        self::assertSame('v2', $watcherB[1]->value ?? null);
+
+        $client->unsubscribe($sidA)->await();
+        $client->unsubscribe($sidB)->await();
+        $kv->deleteBucket()->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies object store retrieval correctly reconstructs multi-chunk payloads.
      */
     public function testJetStreamObjectStoreLargeObjectChunks(): void
@@ -898,6 +1079,55 @@ final class JetStreamIntegrationTest extends TestCase
         self::assertNotNull($retrieved);
         self::assertSame($payload, $retrieved->data);
         self::assertSame($stored->digest, $retrieved->info->digest);
+
+        $store->deleteBucket()->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies object retrieval fails with digest mismatch when metadata digest is corrupted.
+     */
+    public function testJetStreamObjectStoreDigestMismatch(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $bucket = 'obj' . strtolower(bin2hex(random_bytes(3)));
+        $objectName = 'digest-' . bin2hex(random_bytes(2)) . '.txt';
+        $payload = 'integrity-payload-' . bin2hex(random_bytes(12));
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $store = $js->objectStore($bucket);
+        $store->create()->await();
+
+        $stored = $store->put($objectName, $payload, ['content-type' => 'text/plain'])->await();
+        $info = $store->info($objectName)->await();
+        self::assertNotNull($info);
+
+        $corruptedDigest = 'SHA-256=' . base64_encode(hash('sha256', 'different-bytes', true));
+        self::assertNotSame($stored->digest, $corruptedDigest);
+
+        $tampered = [
+            'name' => $info->name,
+            'size' => $info->size,
+            'chunks' => $info->chunks,
+            'digest' => $corruptedDigest,
+            'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
+            'deleted' => false,
+            'chunk_subject' => $info->chunkSubject,
+            'metadata' => $info->metadata,
+        ];
+
+        $js->publish($store->metaPrefix() . $objectName, json_encode($tampered, JSON_THROW_ON_ERROR))->await();
+
+        try {
+            $store->get($objectName)->await();
+            self::fail('Expected object digest mismatch after metadata tampering.');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('Object digest mismatch', $e->getMessage());
+        }
 
         $store->deleteBucket()->await();
         $client->disconnect()->await();
@@ -1006,7 +1236,7 @@ final class JetStreamIntegrationTest extends TestCase
             $js->fetchBatch($stream, $consumer, 1, 400)->await();
             self::fail('Expected fetchBatch timeout on empty stream.');
         } catch (JetStreamException $e) {
-            self::assertStringContainsString('No messages received within timeout', $e->getMessage());
+            self::assertMatchesRegularExpression('/status (404|408)|No messages received within timeout/i', $e->getMessage());
         }
 
         $js->deleteConsumer($stream, $consumer)->await();

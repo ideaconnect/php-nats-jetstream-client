@@ -5,3 +5,50 @@ services:
     ports:
       - "14222:4222"
       - "18222:8222"
+
+  nats-token:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats/token.conf", "-DV"]
+    volumes:
+      - ./build/nats/token.conf:/etc/nats/token.conf:ro
+    ports:
+      - "14223:4222"
+      - "18223:8222"
+
+  nats-userpass:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats/userpass.conf", "-DV"]
+    volumes:
+      - ./build/nats/userpass.conf:/etc/nats/userpass.conf:ro
+    ports:
+      - "14224:4222"
+      - "18224:8222"
+
+  nats-tls:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats/tls.conf", "-DV"]
+    volumes:
+      - ./build/nats/tls.conf:/etc/nats/tls.conf:ro
+      - ./build/tls:/etc/nats-certs:ro
+    ports:
+      - "14225:4222"
+      - "18225:8222"
+
+  nats-nkey:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats/nkey.conf", "-DV"]
+    volumes:
+      - ./build/nats/nkey.conf:/etc/nats/nkey.conf:ro
+    ports:
+      - "14226:4222"
+      - "18226:8222"
+
+  nats-jwt:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats/jwt.conf", "-DV"]
+    volumes:
+      - ./build/nats/jwt.conf:/etc/nats/jwt.conf:ro
+      - ./build/nats/jwt:/etc/nats-jwt:ro
+    ports:
+      - "14227:4222"
+      - "18227:8222"

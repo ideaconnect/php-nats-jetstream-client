@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Transport;
 
+use Amp\Cancellation;
 use Amp\Future;
+use Amp\TimeoutCancellation;
 use Amp\Socket\Certificate;
 use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
@@ -36,10 +38,10 @@ final class AmpSocketTransport implements TransportInterface
             // Amp expects timeout in seconds, while options use milliseconds.
             $context = (new ConnectContext())->withConnectTimeout($timeoutMs / 1000);
             $context = $this->withTlsContext($context, $dsn);
-            $this->socket = connect($dsn, $context);
+            $this->socket = connect($this->normalizeSocketUri($dsn), $context);
 
-            if ($this->options->tlsHandshakeFirst) {
-                $this->socket->setupTls();
+            if ($context->getTlsContext() !== null) {
+                $this->socket->setupTls(new TimeoutCancellation(max(1, $timeoutMs) / 1000));
             }
         });
     }
@@ -57,10 +59,10 @@ final class AmpSocketTransport implements TransportInterface
     /**
      * Reads the next available chunk from the active socket.
      */
-    public function readLine(): Future
+    public function readLine(?Cancellation $cancellation = null): Future
     {
-        return async(function (): string {
-            $chunk = $this->socket?->read();
+        return async(function () use ($cancellation): string {
+            $chunk = $this->socket?->read($cancellation);
             return $chunk ?? '';
         });
     }
@@ -109,5 +111,17 @@ final class AmpSocketTransport implements TransportInterface
         }
 
         return $context->withTlsContext($tlsContext);
+    }
+
+    /**
+     * Rewrites supported NATS URI schemes into socket schemes accepted by Amp.
+     */
+    private function normalizeSocketUri(string $dsn): string
+    {
+        if (str_starts_with($dsn, 'tls://')) {
+            return 'tcp://' . substr($dsn, strlen('tls://'));
+        }
+
+        return $dsn;
     }
 }

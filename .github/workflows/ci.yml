@@ -3,6 +3,12 @@ name: CI
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      integration-repeat-count:
+        description: Number of repeated integration passes for the soak job
+        required: false
+        default: "2"
 
 jobs:
   fast-quality:
@@ -33,6 +39,9 @@ jobs:
           php-version: ${{ matrix.php }}
           extensions: sockets
       - uses: ramsey/composer-install@v3
+      - name: Check JWT fixture drift
+        if: matrix.php == '8.5'
+        run: composer fixture:jwt:check
       - name: Start NATS Docker Compose
         run: docker compose up -d
       - name: Run integration tests
@@ -40,6 +49,27 @@ jobs:
           RUN_INTEGRATION: "1"
           NATS_URL: nats://127.0.0.1:14222
         run: composer test:integration
+      - name: Stop NATS Docker Compose
+        if: always()
+        run: docker compose down
+
+  integration-soak:
+    runs-on: ubuntu-latest
+    needs: fast-quality
+    if: github.event_name == 'workflow_dispatch'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          extensions: sockets
+      - uses: ramsey/composer-install@v3
+      - name: Check JWT fixture drift
+        run: composer fixture:jwt:check
+      - name: Start NATS Docker Compose
+        run: docker compose up -d
+      - name: Run repeated integration soak
+        run: bash scripts/repeat-integration.sh "${{ github.event.inputs.integration-repeat-count || '2' }}"
       - name: Stop NATS Docker Compose
         if: always()
         run: docker compose down

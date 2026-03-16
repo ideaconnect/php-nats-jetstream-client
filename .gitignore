@@ -2,3 +2,4 @@
 /.phpunit.cache/
 /.idea/
 /.vscode/
+build/

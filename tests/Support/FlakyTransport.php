@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Support;
 
+use Amp\Cancellation;
 use Amp\Future;
 use IDCT\NATS\Transport\TransportInterface;
 use RuntimeException;
@@ -71,7 +72,7 @@ final class FlakyTransport implements TransportInterface
     /**
      * Reads from the queue assigned to the current successful connection.
      */
-    public function readLine(): Future
+    public function readLine(?Cancellation $cancellation = null): Future
     {
         return async(function (): string {
             if ($this->remainingReadFailures > 0) {

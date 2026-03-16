@@ -11,7 +11,7 @@ Implemented functionality includes:
 - Core NATS connect/disconnect with graceful drain
 - Publish and subscribe
 - Request/reply with timeout and cancellation
-- Reconnect with exponential backoff, server rotation, and subscription replay
+- Reconnect with exponential backoff, server rotation, validated subscription replay, and async INFO updates
 - Ping/pong heartbeat with `maxPingsOut` detection
 - `max_payload` enforcement and `no_responders` negotiation
 - Subject validation against NATS naming rules
@@ -28,7 +28,7 @@ Implemented functionality includes:
 - KeyValue API (bucket lifecycle with history/TTL/storage options, put/get/update/delete/purge, watch, getAll/status)
 - ObjectStore API (bucket lifecycle, put/get/delete/list/watch, chunked uploads, SHA-256 digest verification)
 - Microservices framework (service registration, PING/INFO/STATS/SCHEMA discovery, grouped endpoints)
-- Server authorization methods: token, username/password, JWT + nonce signer, credentials file parser
+- Server authorization methods: token, username/password, JWT + nonce signer, built-in NKey seed signer, credentials file parser
 - Standalone NKey authentication (Ed25519 challenge signing without JWT)
 - `no_echo` CONNECT option
 - `tlsHandshakeFirst` TLS option
@@ -70,7 +70,7 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
-use IDCT\NATS\Auth\NonceSignerInterface;
+use IDCT\NATS\Auth\NkeySeedSigner;
 
 // Token auth.
 $tokenClient = new NatsClient(new NatsOptions(
@@ -85,21 +85,13 @@ $passwordClient = new NatsClient(new NatsOptions(
 	password: 's3cr3t',
 ));
 
-// JWT + nonce signature.
-final class DemoNonceSigner implements NonceSignerInterface
-{
-	public function sign(string $nonce): string
-	{
-		// Replace with real JWT nonce signing implementation.
-		return base64_encode(hash('sha256', $nonce, true));
-	}
-}
+$signer = new NkeySeedSigner('SU...USER NKEY SEED...');
 
 $jwtClient = new NatsClient(new NatsOptions(
 	servers: ['nats://127.0.0.1:4222'],
 	jwt: 'your-jwt-token',
-	nkey: 'U...PUBLIC NKEY...',
-	nonceSigner: new DemoNonceSigner(),
+	nkey: $signer->publicKey(),
+	nonceSigner: $signer,
 ));
 
 // TLS with CA and client cert/key.
@@ -111,6 +103,10 @@ $tlsClient = new NatsClient(new NatsOptions(
 	tlsKeyFile: '/path/to/client-key.pem',
 ));
 ```
+
+`NkeySeedSigner` derives the public NKey from an encoded seed and emits the base64url Ed25519 nonce signature expected by NATS servers.
+
+`NkeySeedSigner` requires the PHP sodium extension because NATS NKey authentication uses Ed25519 challenge signing.
 
 ### Connect and Publish/Subscribe
 
@@ -201,6 +197,8 @@ $client->connect()->await();
 
 $js = $client->jetStream();
 $js->createStream('ORDERS', ['orders.>'])->await();
+// If you omit ack_policy, helper methods default it to explicit.
+// Pass ack_policy explicitly when you need none/all.
 $js->createConsumer('ORDERS', 'PROC', 'orders.created')->await();
 
 $ack = $js->publish('orders.created', '{"id":123}')->await();
@@ -264,6 +262,8 @@ $js->ack($message)->await();
 
 $client->disconnect()->await();
 ```
+
+When a pull request ends with a terminal JetStream status frame and no user message is delivered, `fetchNext()` / `fetchBatch()` raise `JetStreamException` with the server status code and description, for example `JetStream pull request ended with status 404: No Messages`.
 
 ### JetStream Pull Consumer (NAK, Delayed NAK, TERM, In-Progress)
 
@@ -770,6 +770,10 @@ $js->deleteStream('LOGS')->await();
 $client->disconnect()->await();
 ```
 
+Notes:
+1. A partial batch is valid. If the server delivers some messages and then ends the pull with a terminal status, the delivered messages are returned.
+2. A terminal status only becomes an exception when no user message was delivered for that pull request.
+
 ### Stream Purge and List
 
 ```php
@@ -867,18 +871,19 @@ $client->disconnect()->await();
 declare(strict_types=1);
 
 use IDCT\NATS\Auth\CredentialsParser;
+use IDCT\NATS\Auth\NkeySeedSigner;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 
 // Parse a .creds file to extract JWT and NKey seed.
 $creds = CredentialsParser::fromFile('/path/to/user.creds');
+$signer = new NkeySeedSigner($creds['nkeySeed']);
 
 $client = new NatsClient(new NatsOptions(
 	servers: ['nats://127.0.0.1:4222'],
 	jwt: $creds['jwt'],
-	nkey: $creds['nkeySeed'],
-	// Provide a nonce signer that uses the NKey seed for Ed25519 signing.
-	nonceSigner: new YourNonceSigner($creds['nkeySeed']),
+	nkey: $signer->publicKey(),
+	nonceSigner: $signer,
 ));
 ```
 
@@ -1061,6 +1066,8 @@ while (microtime(true) < $deadline) {
 }
 ```
 
+The client also applies asynchronous `INFO` updates received after connect, so `serverInfo()` can change during the lifetime of an open connection when the server advertises updated capabilities such as `max_payload` or cluster topology details.
+
 ### Reconnect Behavior
 
 When a connection drops and `reconnectEnabled` is `true`:
@@ -1068,7 +1075,12 @@ When a connection drops and `reconnectEnabled` is `true`:
 1. **Exponential backoff**: delay is computed as `reconnectDelayMs * 2^(attempt - 1)`, capped at `reconnectMaxDelayMs`, with random jitter up to `reconnectJitterMs`.
 2. **Server rotation**: the client cycles through configured servers in order.
 3. **Subscription replay**: all active subscriptions are replayed (SUB commands resent) after reconnect.
-4. **Published messages during reconnect are lost**: there is no outbound buffer for in-flight publishes. Only subscriptions are restored.
+4. **Replay validation**: reconnect does not treat replayed subscriptions as successful if the server immediately answers with a fatal `-ERR` during replay. In that case reconnect keeps retrying until a healthy server accepts the replay or attempts are exhausted.
+5. **Published messages during reconnect are lost**: there is no outbound buffer for in-flight publishes. Only subscriptions are restored.
+
+Recoverable server `-ERR` frames such as `Invalid Subject` or `Permissions Violation for Publish/Subscription to ...` do not automatically close an already-open connection. Fatal connection-level errors still do.
+
+The initial handshake is bounded by `connectTimeoutMs`, not by a fixed number of transport reads. During bootstrap the client will also answer server `PING` frames and process async `INFO` updates while waiting for the initial `PONG`.
 
 ### Ordered Consumer Gap Recovery
 
@@ -1107,8 +1119,8 @@ When a connection drops and `reconnectEnabled` is `true`:
 | `username` | `?string` | `null` | Username auth field. |
 | `password` | `?string` | `null` | Password auth field. |
 | `jwt` | `?string` | `null` | JWT user credential. |
-| `nkey` | `?string` | `null` | Public NKey for JWT auth mode. |
-| `nonceSigner` | `?NonceSignerInterface` | `null` | Signs server nonce for JWT mode. |
+| `nkey` | `?string` | `null` | Public NKey for JWT auth mode or standalone NKey challenge-response auth. |
+| `nonceSigner` | `?NonceSignerInterface` | `null` | Signs the server nonce for JWT or standalone NKey auth. |
 | `maxPendingMessagesPerSubscription` | `int` | `1024` | Slow consumer queue bound per SID. |
 | `slowConsumerPolicy` | `SlowConsumerPolicy` | `DropOldest` | One of `DropOldest`, `DropNewest`, `Error`. |
 
@@ -1185,9 +1197,110 @@ RUN_INTEGRATION=1 composer test:integration
 docker compose down
 ```
 
-Optional environment variable:
+Base integration endpoint:
 
 - `NATS_URL` (default: `nats://127.0.0.1:14222`)
+
+When you run `docker compose up -d` in this repository, additional local auth fixtures are available by default:
+
+- token auth: `nats://127.0.0.1:14223` with token `local-test-token`
+- username/password auth: `nats://127.0.0.1:14224` with `local-user` / `local-pass`
+- TLS handshake-first auth: `tls://127.0.0.1:14225` using the generated files under `build/tls/`
+- JWT auth: `nats://127.0.0.1:14227` using the generated operator/account resolver chain under `build/nats/jwt/`
+- standalone NKey auth: `nats://127.0.0.1:14226` with seed `SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY`
+
+The integration tests use those defaults automatically. Override them with environment variables when you want to target external infrastructure instead.
+
+To regenerate the committed local JWT fixture artifacts and resolver config, run:
+
+```bash
+composer fixture:jwt
+```
+
+If the local `nats-jwt` compose service is already running, the regeneration script recreates it so the server picks up the new operator/account resolver state immediately.
+
+To verify the committed JWT fixture is in sync with the regeneration script, run:
+
+```bash
+composer fixture:jwt:check
+```
+
+- `NATS_TLS_URL`: TLS-enabled server URL used by `testTlsHandshakeFirstConnection`
+- `NATS_TLS_CA_FILE`: optional CA bundle path for TLS verification
+- `NATS_TLS_CERT_FILE`: optional client certificate path for TLS/mTLS
+- `NATS_TLS_KEY_FILE`: optional client private key path for TLS/mTLS
+- `NATS_TLS_SKIP_VERIFY`: set to `1` to disable peer verification in the TLS integration test
+- `NATS_TOKEN_URL`: token-auth server URL used by `testTokenAuthSuccessAndFailure`
+- `NATS_TOKEN`: valid token for the token-auth endpoint
+- `NATS_TOKEN_INVALID`: invalid token used for the negative token-auth path
+- `NATS_USERPASS_URL`: username/password-auth server URL used by `testUserPasswordAuthSuccessAndFailure`
+- `NATS_USERNAME`: valid username for the user/password endpoint
+- `NATS_PASSWORD`: valid password for the user/password endpoint
+- `NATS_BAD_PASSWORD`: invalid password used for the negative user/password path
+- `NATS_JWT_URL`: JWT-auth server URL used by `testJwtNonceAuthenticationFlow` (default: `nats://127.0.0.1:14227`)
+- `NATS_JWT`: user JWT presented in the CONNECT payload (defaults to `build/nats/jwt/user.jwt`)
+- `NATS_JWT_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` to derive the public NKey and sign the server nonce (defaults to `build/nats/jwt/user.seed`)
+- `NATS_NKEY_URL`: standalone NKey-auth server URL used by `testStandaloneNkeyAuthenticationFlow`
+- `NATS_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` for standalone NKey challenge-response auth
+
+Example overrides for external infrastructure:
+
+```bash
+# Base server override.
+RUN_INTEGRATION=1 \
+NATS_URL=nats://demo.example.net:4222 \
+composer test:integration
+
+# Token auth override.
+RUN_INTEGRATION=1 \
+NATS_TOKEN_URL=nats://token.example.net:4222 \
+NATS_TOKEN=prod-token-value \
+NATS_TOKEN_INVALID=wrong-token \
+./vendor/bin/phpunit --testsuite integration --filter testTokenAuthSuccessAndFailure
+
+# Username/password override.
+RUN_INTEGRATION=1 \
+NATS_USERPASS_URL=nats://auth.example.net:4222 \
+NATS_USERNAME=alice \
+NATS_PASSWORD=s3cr3t \
+NATS_BAD_PASSWORD=wrong-pass \
+./vendor/bin/phpunit --testsuite integration --filter testUserPasswordAuthSuccessAndFailure
+
+# TLS override with strict verification.
+RUN_INTEGRATION=1 \
+NATS_TLS_URL=tls://tls.example.net:4222 \
+NATS_TLS_CA_FILE=/path/to/ca.pem \
+NATS_TLS_CERT_FILE=/path/to/client-cert.pem \
+NATS_TLS_KEY_FILE=/path/to/client-key.pem \
+./vendor/bin/phpunit --testsuite integration --filter 'testTlsHandshakeFirstConnection|testTlsConnectionFailsWithoutClientCertificate|testTlsConnectionFailsWithWrongCa|testTlsConnectionFailsWithPeerNameMismatch'
+
+# JWT auth override.
+RUN_INTEGRATION=1 \
+NATS_JWT_URL=nats://jwt.example.net:4222 \
+NATS_JWT="$(cat /path/to/user.jwt)" \
+NATS_JWT_NKEY_SEED="$(cat /path/to/user.seed)" \
+./vendor/bin/phpunit --testsuite integration --filter testJwtNonceAuthenticationFlow
+
+# Standalone NKey auth override.
+RUN_INTEGRATION=1 \
+NATS_NKEY_URL=nats://nkey.example.net:4222 \
+NATS_NKEY_SEED="$(cat /path/to/user.seed)" \
+./vendor/bin/phpunit --testsuite integration --filter testStandaloneNkeyAuthenticationFlow
+```
+
+Focused auth/TLS integration run:
+
+```bash
+RUN_INTEGRATION=1 ./vendor/bin/phpunit --testsuite integration --filter 'testTlsHandshakeFirstConnection|testTlsConnectionFailsWithoutClientCertificate|testTlsConnectionFailsWithWrongCa|testTlsConnectionFailsWithPeerNameMismatch|testTokenAuthSuccessAndFailure|testUserPasswordAuthSuccessAndFailure|testJwtNonceAuthenticationFlow|testStandaloneNkeyAuthenticationFlow'
+```
+
+To do a quick local flake check against the compose-backed environment, run:
+
+```bash
+composer test:integration:repeat
+```
+
+The CI workflow also exposes a manual `workflow_dispatch` soak job named `integration-soak`. When triggered from GitHub Actions, it runs `scripts/repeat-integration.sh` with a configurable repeat count on PHP 8.5.
 
 ## Current Test Baseline
 
@@ -1195,6 +1308,7 @@ Optional environment variable:
 - Unit tests also cover JetStream account info, stream and consumer CRUD, publish acknowledgments, API error mapping, fetch batch, ordered consumers, consumer pause/resume, KV bucket options, ObjectStore chunking and digest verification.
 - Unit tests cover microservices framework including PING/INFO/STATS/SCHEMA discovery and grouped endpoint hierarchy.
 - Integration tests cover live connect/disconnect, publish-subscribe roundtrip, request-reply, connection rotation fallback, JetStream stream/consumer lifecycle with publish-ack flow, KV operations, ObjectStore operations, and service discovery.
+- Integration tests also cover local token auth, username/password auth, TLS handshake-first auth including strict peer-validation, hostname mismatch, and missing-client-cert failures, resolver-backed JWT auth, and standalone NKey auth.
 - Static analysis runs with PHPStan level 8.
 
 ## Roadmap

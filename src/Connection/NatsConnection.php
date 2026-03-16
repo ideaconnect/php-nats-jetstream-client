@@ -543,6 +543,42 @@ final class NatsConnection
     {
         foreach ($this->subscriptionMeta as $sid => $meta) {
             $this->transport->write($this->codec->encodeSubscribe($meta['subject'], $sid, $meta['queue']))->await();
+            $this->drainImmediateServerFrames();
+        }
+    }
+
+    /**
+     * Polls for any immediate frames emitted by the server after a protocol write.
+     *
+     * This is primarily used during reconnect subscription replay so prompt `-ERR`
+     * responses do not leave the connection open with silently rejected subscriptions.
+     */
+    private function drainImmediateServerFrames(): void
+    {
+        $maxPolls = 16;
+        $pollTimeoutMs = 5;
+
+        for ($poll = 0; $poll < $maxPolls; $poll++) {
+            try {
+                $chunk = $this->transport->readLine(new TimeoutCancellation($pollTimeoutMs / 1000))->await();
+            } catch (CancelledException) {
+                return;
+            }
+
+            if ($chunk === '') {
+                return;
+            }
+
+            $frames = $this->parser->push($chunk);
+            foreach ($frames as $frame) {
+                if ($frame->type === ProtocolFrameType::Ok) {
+                    continue;
+                }
+
+                $this->handleFrame($frame);
+            }
+
+            $this->drainAllPending();
         }
     }
 
@@ -564,9 +600,12 @@ final class NatsConnection
      */
     private function awaitInitialPong(): void
     {
-        for ($attempt = 0; $attempt < 8; $attempt++) {
-            $chunk = $this->transport->readLine()->await();
-            if ($chunk === '') {
+        $deadline = $this->handshakeDeadline();
+        $remainingPolls = $this->handshakePollBudget();
+
+        while ($remainingPolls-- > 0 && microtime(true) < $deadline) {
+            $chunk = $this->readHandshakeChunk($deadline);
+            if ($chunk === null || $chunk === '') {
                 continue;
             }
 
@@ -580,6 +619,12 @@ final class NatsConnection
 
                 if ($line === 'PING') {
                     $this->transport->write($this->codec->encodePong())->await();
+                    continue;
+                }
+
+                if (str_starts_with($line, 'INFO ')) {
+                    $this->serverInfo = $this->codec->parseServerInfo($line);
+
                     continue;
                 }
 
@@ -604,6 +649,12 @@ final class NatsConnection
                     continue;
                 }
 
+                if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
+                    $this->serverInfo = $this->decodeServerInfoPayload($frame->infoPayload);
+
+                    continue;
+                }
+
                 if ($frame->type === ProtocolFrameType::Pong) {
                     return;
                 }
@@ -622,9 +673,12 @@ final class NatsConnection
      */
     private function awaitServerInfo(): ServerInfo
     {
-        for ($attempt = 0; $attempt < 8; $attempt++) {
-            $chunk = $this->transport->readLine()->await();
-            if ($chunk === '') {
+        $deadline = $this->handshakeDeadline();
+        $remainingPolls = $this->handshakePollBudget();
+
+        while ($remainingPolls-- > 0 && microtime(true) < $deadline) {
+            $chunk = $this->readHandshakeChunk($deadline);
+            if ($chunk === null || $chunk === '') {
                 continue;
             }
 
@@ -633,6 +687,20 @@ final class NatsConnection
                 $line = trim($chunk);
                 if (str_starts_with($line, 'INFO ')) {
                     return $this->codec->parseServerInfo($line);
+                }
+
+                if ($line === 'PING') {
+                    $this->transport->write($this->codec->encodePong())->await();
+
+                    continue;
+                }
+
+                if ($line === '' || $line === '+OK' || $line === 'PONG') {
+                    continue;
+                }
+
+                if (str_starts_with($line, '-ERR')) {
+                    throw new ConnectionException('Server error during connect: ' . $line);
                 }
 
                 continue;
@@ -645,10 +713,57 @@ final class NatsConnection
 
                     return ServerInfo::fromInfoPayload($data);
                 }
+
+                if ($frame->type === ProtocolFrameType::Ping) {
+                    $this->transport->write($this->codec->encodePong())->await();
+
+                    continue;
+                }
+
+                if ($frame->type === ProtocolFrameType::Err) {
+                    throw new ConnectionException('Server error during connect: ' . ($frame->error ?? 'unknown'));
+                }
             }
         }
 
         throw new ConnectionException('Expected INFO during connect');
+    }
+
+    /**
+     * Returns the absolute handshake deadline based on connect timeout.
+     */
+    private function handshakeDeadline(): float
+    {
+        $timeoutSeconds = max(0.001, $this->options->connectTimeoutMs / 1000);
+
+        return microtime(true) + $timeoutSeconds;
+    }
+
+    /**
+     * Bounds handshake polling for transports that may return empty chunks immediately.
+     */
+    private function handshakePollBudget(): int
+    {
+        return max(16, (int) ceil(max(1, $this->options->connectTimeoutMs) / 10));
+    }
+
+    /**
+     * Reads the next handshake chunk within the remaining timeout budget.
+     */
+    private function readHandshakeChunk(float $deadline): ?string
+    {
+        $remainingMs = (int) ceil(($deadline - microtime(true)) * 1000);
+        if ($remainingMs <= 0) {
+            return null;
+        }
+
+        $sliceMs = min($remainingMs, 50);
+
+        try {
+            return $this->transport->readLine(new TimeoutCancellation(max(1, $sliceMs) / 1000))->await();
+        } catch (CancelledException) {
+            return null;
+        }
     }
 
     /**
@@ -669,8 +784,19 @@ final class NatsConnection
             return;
         }
 
+        if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
+            $this->serverInfo = $this->decodeServerInfoPayload($frame->infoPayload);
+
+            return;
+        }
+
         if ($frame->type === ProtocolFrameType::Err) {
-            throw new ConnectionException('Server sent error frame: ' . ($frame->error ?? 'unknown'));
+            $error = $frame->error ?? 'unknown';
+            if ($this->isRecoverableServerError($error)) {
+                return;
+            }
+
+            throw new ConnectionException('Server sent error frame: ' . $error);
         }
 
         if ($frame->type === ProtocolFrameType::Msg || $frame->type === ProtocolFrameType::HMsg) {
@@ -769,6 +895,32 @@ final class NatsConnection
                 $max,
             ));
         }
+    }
+
+    /**
+     * Parses an INFO payload JSON fragment into ServerInfo.
+     */
+    private function decodeServerInfoPayload(string $infoPayload): ServerInfo
+    {
+        /** @var array<string,mixed> $data */
+        $data = json_decode($infoPayload, true, 512, JSON_THROW_ON_ERROR);
+
+        return ServerInfo::fromInfoPayload($data);
+    }
+
+    /**
+     * Returns true when a server -ERR is documented as connection-nonfatal.
+     */
+    private function isRecoverableServerError(string $error): bool
+    {
+        $normalized = strtolower(trim($error, " '\t\r\n\0\x0B"));
+
+        if ($normalized === 'invalid subject') {
+            return true;
+        }
+
+        return str_starts_with($normalized, 'permissions violation for subscription to ')
+            || str_starts_with($normalized, 'permissions violation for publish to ');
     }
 
     /**

@@ -244,10 +244,8 @@ final class JetStreamContext
                 throw new JetStreamException('Consumer filter subject must not be empty (use null to omit)');
             }
 
-            $config = array_merge($options, [
-                'durable_name' => $consumer,
-                'ack_policy' => 'explicit',
-            ]);
+            $config = $this->applyDefaultAckPolicy($options);
+            $config['durable_name'] = $consumer;
 
             if ($filterSubject !== null) {
                 $config['filter_subject'] = $filterSubject;
@@ -271,9 +269,7 @@ final class JetStreamContext
     public function createEphemeralConsumer(string $stream, ?string $filterSubject = null, array $options = []): Future
     {
         return async(function () use ($stream, $filterSubject, $options): ConsumerInfo {
-            $config = array_merge($options, [
-                'ack_policy' => 'explicit',
-            ]);
+            $config = $this->applyDefaultAckPolicy($options);
 
             if ($filterSubject !== null && $filterSubject !== '') {
                 $config['filter_subject'] = $filterSubject;
@@ -302,11 +298,9 @@ final class JetStreamContext
         array $options = [],
     ): Future {
         return async(function () use ($stream, $consumer, $deliverSubject, $filterSubject, $options): ConsumerInfo {
-            $config = array_merge($options, [
-                'durable_name' => $consumer,
-                'ack_policy' => 'explicit',
-                'deliver_subject' => $deliverSubject,
-            ]);
+            $config = $this->applyDefaultAckPolicy($options);
+            $config['durable_name'] = $consumer;
+            $config['deliver_subject'] = $deliverSubject;
 
             if ($filterSubject !== null && $filterSubject !== '') {
                 $config['filter_subject'] = $filterSubject;
@@ -334,9 +328,8 @@ final class JetStreamContext
         array $options = [],
     ): Future {
         return async(function () use ($stream, $deliverSubject, $filterSubject, $options): ConsumerInfo {
-            $config = array_merge(['ack_policy' => 'explicit'], $options, [
-                'deliver_subject' => $deliverSubject,
-            ]);
+            $config = $this->applyDefaultAckPolicy($options);
+            $config['deliver_subject'] = $deliverSubject;
 
             if ($filterSubject !== null && $filterSubject !== '') {
                 $config['filter_subject'] = $filterSubject;
@@ -634,6 +627,7 @@ final class JetStreamContext
 
             $inbox = Inbox::generate('_INBOX.JS.FETCH');
             $messages = [];
+            /** @var array{code: int, description: string}|null $terminalStatus */
             $terminalStatus = null;
 
             $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages, &$terminalStatus): void {
@@ -645,7 +639,10 @@ final class JetStreamContext
                 }
 
                 if ($status >= 400) {
-                    $terminalStatus = $status;
+                    $terminalStatus = [
+                        'code' => $status,
+                        'description' => trim((string) ($headers['Description'] ?? '')),
+                    ];
 
                     return;
                 }
@@ -665,6 +662,13 @@ final class JetStreamContext
             }
 
             if ($messages === []) {
+                if ($terminalStatus !== null) {
+                    throw new JetStreamException(
+                        $this->formatPullTerminalStatusMessage($terminalStatus['code'], $terminalStatus['description']),
+                        $terminalStatus['code'],
+                    );
+                }
+
                 throw new JetStreamException('No messages received within timeout');
             }
 
@@ -771,16 +775,46 @@ final class JetStreamContext
                 return false;
             }
 
-            $description = strtolower((string) ($headers['Description'] ?? ''));
-            $isFlowControl = str_contains($description, 'flow') || array_key_exists('Nats-Consumer-Stalled', $headers);
+            $description = strtolower(trim((string) ($headers['Description'] ?? '')));
+            $normalizedDescription = preg_replace('/\s+/', ' ', $description) ?: '';
+            $replyTo = $message->replyTo ?? '';
 
-            if ($isFlowControl && $message->replyTo !== null && $message->replyTo !== '') {
-                $this->client->publish($message->replyTo, '')->await();
+            $isFlowControl = $normalizedDescription === 'flowcontrol request'
+                || str_starts_with($replyTo, '$JS.FC.')
+                || array_key_exists('Nats-Consumer-Stalled', $headers);
+
+            if ($isFlowControl && $replyTo !== '') {
+                $this->client->publish($replyTo, '')->await();
             }
 
             // Status 100 control messages are not user payload deliveries.
             return true;
         });
+    }
+
+    /**
+     * Applies JetStream's default explicit ack policy unless the caller overrides it.
+     *
+     * @param array<string,mixed> $options
+     * @return array<string,mixed>
+     */
+    private function applyDefaultAckPolicy(array $options): array
+    {
+        if (!array_key_exists('ack_policy', $options)) {
+            $options['ack_policy'] = 'explicit';
+        }
+
+        return $options;
+    }
+
+    /**
+     * Formats a terminal pull-consumer status frame into an actionable exception message.
+     */
+    private function formatPullTerminalStatusMessage(int $status, string $description): string
+    {
+        $suffix = $description !== '' ? ': ' . $description : '';
+
+        return sprintf('JetStream pull request ended with status %d%s', $status, $suffix);
     }
 
     /**
@@ -825,8 +859,8 @@ final class JetStreamContext
         }
 
         $parts = explode('.', $message->replyTo);
-        // Token index 5 is the stream sequence in the ACK reply subject.
-        if (count($parts) < 6) {
+        // ACK reply subjects follow: $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>
+        if (count($parts) < 9 || $parts[0] !== '$JS' || $parts[1] !== 'ACK') {
             return null;
         }
 

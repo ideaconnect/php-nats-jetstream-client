@@ -523,6 +523,7 @@ final class JetStreamContextTest extends TestCase
         self::assertSame('PROC', $created->name);
         self::assertTrue($created->push);
         self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS.PROC', $transport->writes[3]);
+        self::assertStringContainsString('"ack_policy":"explicit"', $transport->writes[3]);
         self::assertStringContainsString('"deliver_subject":"deliver.proc"', $transport->writes[3]);
     }
 
@@ -593,6 +594,9 @@ final class JetStreamContextTest extends TestCase
 
         self::assertStringContainsString("PUB fc.reply 0\r\n\r\n", implode('', $transport->writes));
         self::assertInstanceOf(\IDCT\NATS\Core\NatsMessage::class, $received);
+        if ($received === null) {
+            self::fail('Expected flow-control test to receive the user payload.');
+        }
         self::assertSame('hello', $received->payload);
     }
 
@@ -660,6 +664,7 @@ final class JetStreamContextTest extends TestCase
         self::assertSame('E1', $consumer->name);
         self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS', $transport->writes[3]);
         self::assertStringNotContainsString('$JS.API.CONSUMER.CREATE.ORDERS.', $transport->writes[3]);
+        self::assertStringContainsString('"ack_policy":"explicit"', $transport->writes[3]);
         self::assertStringContainsString('"filter_subject":"orders.*"', $transport->writes[3]);
         self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);
     }
@@ -694,6 +699,9 @@ final class JetStreamContextTest extends TestCase
         $client->processIncoming()->await();
 
         self::assertInstanceOf(\IDCT\NATS\Core\NatsMessage::class, $received);
+        if ($received === null) {
+            self::fail('Expected ephemeral push consumer helper to receive a payload.');
+        }
         self::assertSame('hello', $received->payload);
         self::assertStringContainsString('"deliver_subject":"deliver.ephemeral"', $transport->writes[3]);
         self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);
@@ -787,6 +795,7 @@ final class JetStreamContextTest extends TestCase
         $client->connect()->await();
 
         $consumer = $client->jetStream()->createConsumer('ORDERS', 'PROC', 'orders.*', [
+            'ack_policy' => 'all',
             'max_deliver' => 5,
             'ack_wait' => 30_000_000_000,
             'max_ack_pending' => 100,
@@ -794,10 +803,31 @@ final class JetStreamContextTest extends TestCase
 
         self::assertSame('PROC', $consumer->name);
         $written = $transport->writes[3];
+        self::assertStringContainsString('"ack_policy":"all"', $written);
         self::assertStringContainsString('"max_deliver":5', $written);
         self::assertStringContainsString('"ack_wait":30000000000', $written);
         self::assertStringContainsString('"max_ack_pending":100', $written);
         self::assertStringContainsString('"filter_subject":"orders.*"', $written);
+    }
+
+    public function testCreatePushConsumerAllowsAckPolicyOverride(): void
+    {
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","deliver_subject":"deliver.proc","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->createPushConsumer('ORDERS', 'PROC', 'deliver.proc', 'orders.*', [
+            'ack_policy' => 'none',
+        ])->await();
+
+        self::assertStringContainsString('"ack_policy":"none"', $transport->writes[3]);
     }
 
     public function testFetchBatch(): void
@@ -900,9 +930,32 @@ final class JetStreamContextTest extends TestCase
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
-        $this->expectExceptionMessage('No messages received within timeout');
+        $this->expectExceptionMessage('JetStream pull request ended with status 404: No Messages');
 
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500)->await();
+    }
+
+    public function testFetchBatchThrowsTerminalStatusDescription(): void
+    {
+        $statusHeaders = "NATS/1.0 409 MaxAckPending Exceeded\r\nStatus: 409\r\nDescription: MaxAckPending Exceeded\r\n\r\n";
+        $headerBytes = strlen($statusHeaders);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500)->await();
+            self::fail('Expected terminal pull status to raise JetStreamException.');
+        } catch (JetStreamException $e) {
+            self::assertSame(409, $e->getCode());
+            self::assertStringContainsString('status 409: MaxAckPending Exceeded', $e->getMessage());
+        }
     }
 
     // ─── Consumer Pause/Resume ──────────────────────────────────────────
@@ -1145,10 +1198,12 @@ final class JetStreamContextTest extends TestCase
 
         $noReply = new NatsMessage('s', 1, null, 'x');
         $shortReply = new NatsMessage('s', 1, '$JS.ACK.short', 'x');
+        $wrongPrefix = new NatsMessage('s', 1, '$JS.FC.ORDERS.token', 'x');
         $nonInt = new NatsMessage('s', 1, '$JS.ACK.ORDERS.CONS.1.NaN.2.123.0', 'x');
 
         self::assertNull($method->invoke($js, $noReply));
         self::assertNull($method->invoke($js, $shortReply));
+        self::assertNull($method->invoke($js, $wrongPrefix));
         self::assertNull($method->invoke($js, $nonInt));
     }
 
@@ -1182,5 +1237,24 @@ final class JetStreamContextTest extends TestCase
         $message = new NatsMessage('deliver', 1, null, '', $headers);
 
         self::assertTrue($method->invoke($js, $message)->await());
+    }
+
+    public function testHandlePushControlMessageRepliesToJetStreamFlowControlSubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+        ]);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+        $js = $client->jetStream();
+
+        $method = new \ReflectionMethod($js, 'handlePushControlMessage');
+
+        $headers = "NATS/1.0 100 Idle Heartbeat\r\nStatus: 100\r\nDescription: Idle Heartbeat\r\n\r\n";
+        $message = new NatsMessage('deliver', 1, '$JS.FC.ORDERS.token', '', $headers);
+
+        self::assertTrue($method->invoke($js, $message)->await());
+        self::assertStringContainsString('PUB $JS.FC.ORDERS.token 0' . "\r\n\r\n", implode('', $transport->writes));
     }
 }

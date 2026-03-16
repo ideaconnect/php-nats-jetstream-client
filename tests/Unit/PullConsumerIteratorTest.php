@@ -101,7 +101,7 @@ final class PullConsumerIteratorTest extends TestCase
             ...$this->infoAndPong(),
             // First iteration: 1 message delivered.
             $this->jsMsg('_INBOX.JS.FETCH.any', 'order-1', '$JS.ACK.ORDERS.PROC.1.1.1.123.0'),
-            // Second iteration: no messages → JetStreamException breaks loop.
+            // Second iteration: terminal 404 status → JetStreamException breaks loop.
             sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
         ]);
 
@@ -129,7 +129,7 @@ final class PullConsumerIteratorTest extends TestCase
 
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
-            // Immediately returns 404 — no messages.
+            // Immediately returns terminal 404 status — no messages.
             sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
         ]);
 

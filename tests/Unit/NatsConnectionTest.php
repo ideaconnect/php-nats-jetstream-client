@@ -593,6 +593,55 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * Verifies async INFO frames refresh server capabilities during an open connection.
+     */
+    public function testProcessIncomingUpdatesServerInfoFromAsyncInfoFrame(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":64,"headers":true}',
+            'PONG',
+            "INFO {\"server_id\":\"S1\",\"server_name\":\"n1\",\"version\":\"2.12.1\",\"jetstream\":true,\"max_payload\":128,\"headers\":true}\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        self::assertSame(64, $connection->serverInfo()?->maxPayload);
+
+        $frames = $connection->processIncoming()->await();
+
+        self::assertSame(1, $frames);
+        self::assertSame(128, $connection->serverInfo()?->maxPayload);
+        self::assertSame('2.12.1', $connection->serverInfo()?->version);
+    }
+
+    /**
+     * Verifies recoverable server permission errors do not close the connection.
+     */
+    public function testProcessIncomingIgnoresRecoverableServerErrFrame(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            "-ERR 'Permissions Violation for Publish to updates'\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $frames = $connection->processIncoming()->await();
+
+        self::assertSame(1, $frames);
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
      * Verifies the ping timer sends PING frames at the configured interval.
      */
     public function testPingTimerSendsPingAtInterval(): void
@@ -1231,7 +1280,7 @@ final class NatsConnectionTest extends TestCase
                 });
             }
 
-            public function readLine(): \Amp\Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
             {
                 return async(function (): string {
                     $index = max(0, $this->connected - 1);
@@ -1307,7 +1356,7 @@ final class NatsConnectionTest extends TestCase
                 });
             }
 
-            public function readLine(): \Amp\Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
             {
                 return async(function (): string {
                     $index = max(0, $this->connected - 1);
@@ -1377,7 +1426,7 @@ final class NatsConnectionTest extends TestCase
                 });
             }
 
-            public function readLine(): \Amp\Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
             {
                 return async(function (): string {
                     $index = max(0, $this->connected - 1);
@@ -1412,6 +1461,63 @@ final class NatsConnectionTest extends TestCase
         self::assertCount(2, $transport->connectCalls);
 
         $connection->disconnect()->await();
+    }
+
+    public function testReconnectRetriesWhenResubscribeGetsFatalServerError(): void
+    {
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                    '__THROW__',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                    "-ERR 'Authorization Violation'\r\n",
+                ],
+                [
+                    'INFO {"server_id":"S3","server_name":"n3","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+                    'PONG',
+                    "MSG updates 1 5\r\nhello\r\n",
+                ],
+            ],
+            connectFailures: 0,
+            readFailures: 0,
+        );
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        self::assertSame(0, $connection->processIncoming()->await());
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        $connection->processIncoming()->await();
+
+        self::assertSame(['hello'], $received);
+        self::assertCount(3, $transport->connectCalls);
+
+        $subWrites = array_values(array_filter(
+            $transport->writes,
+            static fn (string $write): bool => str_starts_with($write, 'SUB updates 1')
+        ));
+        self::assertCount(3, $subWrites);
+        self::assertSame('S3', $connection->serverInfo()?->serverId);
     }
 
     public function testPingTimerWriteFailureReconnectsWhenEnabled(): void
@@ -1452,7 +1558,7 @@ final class NatsConnectionTest extends TestCase
                 });
             }
 
-            public function readLine(): \Amp\Future
+            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
             {
                 return async(function (): string {
                     $index = max(0, $this->connected - 1);
