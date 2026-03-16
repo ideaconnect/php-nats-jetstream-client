@@ -1,12 +1,69 @@
 # idct/php-nats-jetstream-client
 
-Async-first NATS and JetStream client for PHP 8.2+.
+Async-first NATS and JetStream client for PHP 8.2+ with first-class support for core NATS messaging, JetStream, KeyValue, ObjectStore, and NATS microservices.
 
-## Status
+The library is built around Amp and provides a typed, high-level API for connection management, publish/subscribe, request/reply, reconnect handling, authentication flows, and JetStream resource management without falling back to blocking I/O.
 
-This project is in active development.
+It is intended for real application use, including service-to-service messaging, event processing, JetStream-backed persistence patterns, and NATS-based microservice discovery.
 
-Implemented functionality includes:
+## Installation
+
+Install from Packagist:
+
+```bash
+composer require idct/php-nats-jetstream-client
+```
+
+Package name: `idct/php-nats-jetstream-client`
+
+Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
+
+## Index
+
+- [Installation](#installation)
+- [Features](#features)
+- [Usage](#usage)
+- [Authentication Options](#authentication-options)
+- [Connect and Publish/Subscribe](#connect-and-publishsubscribe)
+- [Request/Reply](#requestreply)
+- [Headers and Server Info](#headers-and-server-info)
+- [JetStream Stream and Durable Consumer](#jetstream-stream-and-durable-consumer)
+- [JetStream Stream Update and Consumer Info](#jetstream-stream-update-and-consumer-info)
+- [JetStream Pull Consumer (Fetch + ACK)](#jetstream-pull-consumer-fetch--ack)
+- [JetStream Pull Consumer (NAK, Delayed NAK, TERM, In-Progress)](#jetstream-pull-consumer-nak-delayed-nak-term-in-progress)
+- [Queue Group Subscribe](#queue-group-subscribe)
+- [Polling Subscribe (SubscriptionQueue)](#polling-subscribe-subscriptionqueue)
+- [JetStream Push Consumer (Durable)](#jetstream-push-consumer-durable)
+- [JetStream Ephemeral Consumers](#jetstream-ephemeral-consumers)
+- [Scheduled Publish Example (`@at`)](#scheduled-publish-example-at)
+- [KeyValue Bucket](#keyvalue-bucket)
+- [Object Store Bucket](#object-store-bucket)
+- [Object Store Streaming to Callback](#object-store-streaming-to-callback)
+- [Services Framework](#services-framework)
+- [Services: SCHEMA Discovery](#services-schema-discovery)
+- [Graceful Drain](#graceful-drain)
+- [Ordered Consumer](#ordered-consumer)
+- [Consumer Pause/Resume](#consumer-pauseresume)
+- [Fetch Batch](#fetch-batch)
+- [Stream Purge and List](#stream-purge-and-list)
+- [Consumer List](#consumer-list)
+- [Stream Message Direct Get](#stream-message-direct-get)
+- [Credentials File Authentication](#credentials-file-authentication)
+- [Typed Stream Configuration](#typed-stream-configuration)
+- [Pull Consumer Batching/Iteration](#pull-consumer-batchingiteration)
+- [Stream Mirroring and Sourcing](#stream-mirroring-and-sourcing)
+- [Republish and Subject Transform](#republish-and-subject-transform)
+- [Compatibility Mapping](#compatibility-mapping)
+- [Behavior Notes](#behavior-notes)
+- [Configuration Option Mapping](#configuration-option-mapping)
+- [Performance Benchmark Recipe](#performance-benchmark-recipe)
+- [Testing](#testing)
+- [Contributing](#contributing)
+- [Current Test Baseline](#current-test-baseline)
+
+## Features
+
+Current functionality includes:
 
 - Core NATS connect/disconnect with graceful drain
 - Publish and subscribe
@@ -44,22 +101,6 @@ Current scheduling note: scheduled messages are implemented with NATS scheduler 
 Use `IDCT\\NATS\\JetStream\\Schedule::at(...)` or `Schedule::atTimestamp(...)` to generate valid `@at` expressions.
 
 ## Usage
-
-### Compatibility Mapping (basis-company README)
-
-This repository tracks parity against basis-company nats.php README examples.
-
-| Section | Status | Notes |
-| --- | --- | --- |
-| Connecting and Auth | workflow parity | Basic, token, username/password, JWT nonce signing, credentials file, and TLS CA/cert/key options are supported. |
-| Publish Subscribe | workflow parity | Callback, queue-group, and polling queue (`SubscriptionQueue` with `fetch()`/`next()`/`fetchAll()`) patterns are supported. |
-| Request Response | workflow parity | Awaited request/reply with timeout and cancellation is covered, but the API shape differs from basis-company's `dispatch()` and callback request helpers. |
-| JetStream API Usage | workflow parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, ordered-consumer helpers, batching/iteration chain API, stream mirroring/sourcing, republish/subject-transform helpers, and typed enums are covered. |
-| Microservices | workflow parity | Service registration, discovery (PING/INFO/STATS/SCHEMA), grouped hierarchy, enriched endpoint stats (requests/errors/last-error/processing time), reset API, opt-in schema validation hook with built-in adapter, handler adapters (callable/object/class-string), request lifecycle observers, standardized error envelopes, and run-loop helper are covered. |
-| Key Value Storage | workflow parity | Core KV flows plus update/purge/getAll/status parity are covered. |
-| Object Store | extended | Bucket/object lifecycle, object listing, chunked uploads, and digest verification are covered. |
-
-Detailed execution plan: see REGRESSION_PASS.md.
 
 ### Authentication Options
 
@@ -118,7 +159,6 @@ declare(strict_types=1);
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
-use IDCT\NATS\Services\BasicJsonSchemaValidator;
 
 $client = new NatsClient(new NatsOptions(servers: ['nats://127.0.0.1:4222']));
 $client->connect()->await();
@@ -452,7 +492,7 @@ $jetStream->publishScheduled(
 	payload: json_encode(['id' => 123], JSON_THROW_ON_ERROR),
 	schedule: Schedule::at(new DateTimeImmutable('+30 seconds')),
 	scheduleTtl: '5m',
-);
+)->await();
 
 $client->disconnect()->await();
 ```
@@ -620,6 +660,7 @@ declare(strict_types=1);
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Services\BasicJsonSchemaValidator;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -898,12 +939,12 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
-use IDCT\NATS\JetStream\RetentionPolicy;
-use IDCT\NATS\JetStream\StorageBackend;
-use IDCT\NATS\JetStream\DiscardPolicy;
-use IDCT\NATS\JetStream\DeliverPolicy;
-use IDCT\NATS\JetStream\AckPolicy;
-use IDCT\NATS\JetStream\ReplayPolicy;
+use IDCT\NATS\JetStream\Enum\AckPolicy;
+use IDCT\NATS\JetStream\Enum\DeliverPolicy;
+use IDCT\NATS\JetStream\Enum\DiscardPolicy;
+use IDCT\NATS\JetStream\Enum\ReplayPolicy;
+use IDCT\NATS\JetStream\Enum\RetentionPolicy;
+use IDCT\NATS\JetStream\Enum\StorageBackend;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -973,7 +1014,7 @@ $client->disconnect()->await();
 
 ### Stream Mirroring and Sourcing
 
-Use `StreamSource` to configure stream mirrors and aggregated sources:
+Use `StreamSource` to build mirror/source configuration arrays:
 
 ```php
 <?php
@@ -987,30 +1028,23 @@ use IDCT\NATS\JetStream\Configuration\StreamSource;
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
 
-$js = $client->jetStream();
+$mirror = StreamSource::mirror('ORDERS')->toArray();
 
-// Create a mirror of an origin stream.
-$js->createStream('ORDERS_MIRROR', [], [
-	'mirror' => StreamSource::mirror('ORDERS')->toArray(),
-])->await();
+$aggregateSources = [
+	StreamSource::source('ORDERS')->filterSubject('orders.>')->toArray(),
+	StreamSource::source('PAYMENTS')->startSeq(100)->toArray(),
+];
 
-// Create an aggregate stream from multiple sources.
-$js->createStream('ALL_EVENTS', ['events.>'], [
-	'sources' => [
-		StreamSource::source('ORDERS')->filterSubject('orders.>')->toArray(),
-		StreamSource::source('PAYMENTS')->startSeq(100)->toArray(),
-	],
-])->await();
+$remoteMirror = StreamSource::mirror('ORIGIN')
+	->external('$JS.hub.API', '_DELIVER.hub')
+	->toArray();
 
-// Cross-cluster source with external API reference.
-$js->createStream('REMOTE_MIRROR', [], [
-	'mirror' => StreamSource::mirror('ORIGIN')
-		->external('$JS.hub.API', '_DELIVER.hub')
-		->toArray(),
-])->await();
+var_dump($mirror, $aggregateSources, $remoteMirror);
 
 $client->disconnect()->await();
 ```
+
+Use those arrays in `createStream()` or `updateStream()` options. Mirror-only stream configs deserve special care here because `createStream()` intentionally rejects an empty `subjects` list.
 
 ### Republish and Subject Transform
 
@@ -1049,6 +1083,20 @@ $js->createStream('MAPPED', ['raw.>'], [
 $client->disconnect()->await();
 ```
 
+## Compatibility Mapping
+
+This repository tracks parity against the basis-company `nats.php` README examples while exposing an Amp-first API tailored to this library.
+
+| Section | Status | Notes |
+| --- | --- | --- |
+| Connecting and Auth | workflow parity | Basic, token, username/password, JWT nonce signing, credentials file, and TLS CA/cert/key options are supported. |
+| Publish Subscribe | workflow parity | Callback, queue-group, and polling queue (`SubscriptionQueue` with `fetch()`/`next()`/`fetchAll()`) patterns are supported. |
+| Request Response | workflow parity | Awaited request/reply with timeout and cancellation is covered, but the API shape differs from basis-company's `dispatch()` and callback request helpers. |
+| JetStream API Usage | workflow parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, ordered-consumer helpers, batching/iteration chain API, stream mirroring/sourcing, republish/subject-transform helpers, and typed enums are covered. |
+| Microservices | workflow parity | Service registration, discovery (PING/INFO/STATS/SCHEMA), grouped hierarchy, enriched endpoint stats (requests/errors/last-error/processing time), reset API, opt-in schema validation hook with built-in adapter, handler adapters (callable/object/class-string), request lifecycle observers, standardized error envelopes, and run-loop helper are covered. |
+| Key Value Storage | workflow parity | Core KV flows plus update/purge/getAll/status parity are covered. |
+| Object Store | extended | Bucket/object lifecycle, object listing, chunked uploads, and digest verification are covered. |
+
 ## Behavior Notes
 
 ### `processIncoming()`
@@ -1084,7 +1132,7 @@ The initial handshake is bounded by `connectTimeoutMs`, not by a fixed number of
 
 ### Ordered Consumer Gap Recovery
 
-`subscribeOrderedConsumer()` automatically detects stream sequence gaps in delivered messages. When a gap is detected, the consumer is transparently deleted and recreated starting from the expected sequence. The user callback is not invoked for gap messages.
+`subscribeOrderedConsumer()` automatically detects stream sequence gaps in delivered messages. When a gap is detected, the consumer is transparently deleted and recreated starting from the expected sequence, and the current message is still forwarded to the user callback before sequence tracking resumes.
 
 ## Configuration Option Mapping
 
@@ -1181,21 +1229,29 @@ php -d zend.assertions=1 path/to/benchmark.php
 docker compose down
 ```
 
-## Development
+## Testing
+
+Typical local workflow:
 
 ```bash
 composer install
-composer test
+composer test:unit
 composer stan
+composer test:e2e
 ```
 
-## Integration Tests
+Additional useful commands:
 
 ```bash
-docker compose up -d
+composer test
 RUN_INTEGRATION=1 composer test:integration
-docker compose down
+composer test:integration:repeat
+composer fixture:jwt:check
+composer fixture:jwt
+composer fix
 ```
+
+`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, and tears the stack down again.
 
 Base integration endpoint:
 
@@ -1211,7 +1267,7 @@ When you run `docker compose up -d` in this repository, additional local auth fi
 
 The integration tests use those defaults automatically. Override them with environment variables when you want to target external infrastructure instead.
 
-To regenerate the committed local JWT fixture artifacts and resolver config, run:
+To regenerate the committed local JWT fixture artifacts and resolver config intentionally, run:
 
 ```bash
 composer fixture:jwt
@@ -1302,6 +1358,16 @@ composer test:integration:repeat
 
 The CI workflow also exposes a manual `workflow_dispatch` soak job named `integration-soak`. When triggered from GitHub Actions, it runs `scripts/repeat-integration.sh` with a configurable repeat count on PHP 8.5.
 
+## Contributing
+
+Contributions should keep changes focused and paired with the narrowest useful verification.
+
+- Add or update tests when behavior changes.
+- Prefer `composer test:unit` for small local changes and `composer test:e2e` for auth, transport, protocol, JetStream, or integration-fixture changes.
+- Do not hand-edit generated JWT fixture files under `build/nats/jwt/`; regenerate them with `composer fixture:jwt`.
+- Run `composer stan` for code changes and `composer fix` when style adjustments are needed.
+- Review `AGENTS.md` for repository structure, standards, and continuation guidance before larger changes.
+
 ## Current Test Baseline
 
 - Unit tests cover protocol encoding/parsing, handshake/state transitions, subscriptions, backpressure policies, request/reply flows, reconnect/server-rotation behavior, and exponential backoff.
@@ -1310,7 +1376,3 @@ The CI workflow also exposes a manual `workflow_dispatch` soak job named `integr
 - Integration tests cover live connect/disconnect, publish-subscribe roundtrip, request-reply, connection rotation fallback, JetStream stream/consumer lifecycle with publish-ack flow, KV operations, ObjectStore operations, and service discovery.
 - Integration tests also cover local token auth, username/password auth, TLS handshake-first auth including strict peer-validation, hostname mismatch, and missing-client-cert failures, resolver-backed JWT auth, and standalone NKey auth.
 - Static analysis runs with PHPStan level 8.
-
-## Roadmap
-
-See the implementation checklist in docs/NEXT_STEPS.md.

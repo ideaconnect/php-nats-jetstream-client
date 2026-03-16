@@ -58,9 +58,6 @@ Use this file as the authoritative project guide for coding agents working in th
 - `build/tls/`
   TLS fixture material used by integration tests.
 
-- `docs/`
-  Planning and next-step notes. Useful for context, not the source of truth for implementation details.
-
 - `docker-compose.yml`
   Local integration fixture stack. Services expose client ports `14222` to `14227` and monitoring ports `18222` to `18227`.
 
