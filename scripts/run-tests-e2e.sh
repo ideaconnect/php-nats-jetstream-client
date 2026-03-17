@@ -7,19 +7,22 @@
 #   3. Wait for all NATS fixture services to become ready
 #   4. Run unit tests
 #   5. Run integration tests with RUN_INTEGRATION=1 enabled
+#   6. Run Behat feature tests against the same fixture stack
 #
 # Usage:
 #   bash scripts/run-tests-e2e.sh
 #
 # Environment:
-#   KEEP_NATS_SERVICES=1    Leave Docker Compose services running after completion
+#   KEEP_NATS_SERVICES=1      Leave Docker Compose services running after completion
 #   SKIP_JWT_FIXTURE_CHECK=1  Skip JWT fixture validation preflight
+#   BEHAT_SUITE=core          Run a specific Behat suite during the e2e pass
 
 set -euo pipefail
 
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 keep_services="${KEEP_NATS_SERVICES:-0}"
 skip_jwt_fixture_check="${SKIP_JWT_FIXTURE_CHECK:-0}"
+behat_suite="${BEHAT_SUITE:-}"
 had_running_services=0
 
 require_cmd() {
@@ -65,5 +68,12 @@ composer test:unit
 
 echo "[test:e2e] running integration tests"
 RUN_INTEGRATION=1 composer test:integration
+
+echo "[test:e2e] running Behat"
+if [[ -n "$behat_suite" ]]; then
+  RUN_INTEGRATION=1 vendor/bin/behat --suite "$behat_suite"
+else
+  RUN_INTEGRATION=1 vendor/bin/behat
+fi
 
 echo "[test:e2e] completed successfully"

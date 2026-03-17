@@ -146,10 +146,11 @@ Choose the narrowest useful test first, then broaden only as needed.
 - Default integration endpoints come from `tests/Integration/IntegrationTestBootstrap.php` and target local fixture ports.
 - The preferred local flow is `composer test:e2e`.
 - Behat feature tests reuse the same Docker Compose fixture stack and readiness flow via `composer test:bdd`.
-- `scripts/run-tests-e2e.sh` performs JWT fixture validation first, then starts compose, waits for readiness, runs unit tests, and runs integration tests.
+- `scripts/run-tests-e2e.sh` performs JWT fixture validation first, then starts compose, waits for readiness, runs unit tests, runs integration tests, and runs Behat.
 - `scripts/run-tests-bdd.sh` performs the same fixture preflight and readiness flow before running Behat.
 - `KEEP_NATS_SERVICES=1 composer test:e2e` leaves compose services running after the run.
 - `SKIP_JWT_FIXTURE_CHECK=1 composer test:e2e` skips JWT fixture validation when explicitly desired.
+- `BEHAT_SUITE=core composer test:e2e` narrows only the Behat stage while keeping the unit/integration steps intact.
 
 ## Development Standards
 

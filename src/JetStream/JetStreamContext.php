@@ -94,8 +94,10 @@ final class JetStreamContext
     public function createStream(string $name, array $subjects, array $options = []): Future
     {
         return async(function () use ($name, $subjects, $options): StreamInfo {
-            if ($subjects === []) {
-                throw new JetStreamException('Stream subjects must not be empty');
+            $hasMirrorConfig = is_array($options['mirror'] ?? null);
+
+            if ($subjects === [] && !$hasMirrorConfig) {
+                throw new JetStreamException('Stream subjects must not be empty unless mirror configuration is provided');
             }
 
             $payload = array_merge($options, [

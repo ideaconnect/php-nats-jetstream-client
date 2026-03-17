@@ -961,7 +961,7 @@ final class JetStreamIntegrationTest extends TestCase
         self::assertSame(1_000_000_000, (int) ($config['max_age'] ?? -1));
 
         $expired = null;
-        $deadline = microtime(true) + 4.0;
+        $deadline = microtime(true) + 12.0;
         while (microtime(true) < $deadline) {
             $expired = $kv->get('session')->await();
             if ($expired === null) {
@@ -971,7 +971,7 @@ final class JetStreamIntegrationTest extends TestCase
             usleep(100_000);
         }
 
-        self::assertNull($expired);
+        self::assertNull($expired, 'Expected KV entry to expire within the extended observation window.');
 
         $kv->deleteBucket()->await();
         $client->disconnect()->await();

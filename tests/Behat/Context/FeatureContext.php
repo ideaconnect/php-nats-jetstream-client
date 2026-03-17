@@ -21,6 +21,9 @@ use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Configuration\Republish;
+use IDCT\NATS\JetStream\Configuration\StreamSource;
+use IDCT\NATS\JetStream\Configuration\SubjectTransform;
 use IDCT\NATS\JetStream\Enum\AckPolicy;
 use IDCT\NATS\JetStream\Enum\DeliverPolicy;
 use IDCT\NATS\JetStream\Enum\DiscardPolicy;
@@ -863,6 +866,221 @@ final class FeatureContext implements Context
     {
         if ($this->state->lastPurgeCount < 1 || $this->state->lastObservedStreamMessages !== 0) {
             throw new RuntimeException('Expected stream purge to remove all stored messages.');
+        }
+    }
+
+    /**
+     * @When I create a stream with republish from the primary to the secondary subject
+     */
+    public function iCreateAStreamWithRepublishFromThePrimaryToTheSecondarySubject(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $sourceSubject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $destinationSubject = $this->requireValue($this->state->secondarySubject, 'secondary stream subject');
+
+        $this->client('primary')->jetStream()->createStream($stream, [$sourceSubject], [
+            'republish' => Republish::create($sourceSubject, $destinationSubject)->toArray(),
+        ])->await();
+        $this->createdStreams[] = $stream;
+    }
+
+    /**
+     * @When the second client subscribes to the secondary subject for republished messages
+     */
+    public function theSecondClientSubscribesToTheSecondarySubjectForRepublishedMessages(): void
+    {
+        $subject = $this->requireValue($this->state->secondarySubject, 'secondary stream subject');
+        $sid = $this->client('secondary')->subscribe($subject, function (NatsMessage $message): void {
+            $this->state->receivedPayloads[] = $message->payload;
+            $this->state->receivedSubjects[] = $message->subject;
+        })->await();
+
+        $this->subscriptions['secondary'][] = $sid;
+    }
+
+    /**
+     * @When I publish :payload to the republished primary subject
+     */
+    public function iPublishToTheRepublishedPrimarySubject(string $payload): void
+    {
+        $subject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $this->client('primary')->jetStream()->publish($subject, $payload)->await();
+    }
+
+    /**
+     * @Then the republished subscriber should receive :payload on the secondary subject
+     */
+    public function theRepublishedSubscriberShouldReceiveOnTheSecondarySubject(string $payload): void
+    {
+        $secondarySubject = $this->requireValue($this->state->secondarySubject, 'secondary stream subject');
+
+        $this->waitFor(function () use ($payload, $secondarySubject): bool {
+            $this->client('secondary')->processIncoming()->await();
+
+            foreach ($this->state->receivedPayloads as $index => $receivedPayload) {
+                $receivedSubject = $this->state->receivedSubjects[$index] ?? null;
+                if ($receivedPayload === $payload && $receivedSubject === $secondarySubject) {
+                    return true;
+                }
+            }
+
+            return false;
+        }, 4.0);
+    }
+
+    /**
+     * @When I create a stream with a subject transform from the primary to the secondary subject
+     */
+    public function iCreateAStreamWithASubjectTransformFromThePrimaryToTheSecondarySubject(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $sourceSubject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $destinationSubject = $this->requireValue($this->state->secondarySubject, 'secondary stream subject');
+
+        $this->client('primary')->jetStream()->createStream($stream, [$sourceSubject], [
+            'subject_transform' => SubjectTransform::create($sourceSubject, $destinationSubject)->toArray(),
+        ])->await();
+        $this->createdStreams[] = $stream;
+    }
+
+    /**
+     * @When I publish :payload to the transformed primary subject
+     */
+    public function iPublishToTheTransformedPrimarySubject(string $payload): void
+    {
+        $subject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $ack = $this->client('primary')->jetStream()->publish($subject, $payload)->await();
+        $this->state->lastAckSequence = $ack->seq;
+    }
+
+    /**
+     * @When I fetch the transformed stream message by the last publish sequence
+     */
+    public function iFetchTheTransformedStreamMessageByTheLastPublishSequence(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $message = $this->client('primary')->jetStream()->getStreamMessage($stream, $this->state->lastAckSequence)->await();
+        $this->state->lastReplyPayload = $message->payload;
+        $this->state->lastDirectSubject = $message->subject;
+    }
+
+    /**
+     * @Then the transformed stream message should be stored under the secondary subject with payload :payload
+     */
+    public function theTransformedStreamMessageShouldBeStoredUnderTheSecondarySubjectWithPayload(string $payload): void
+    {
+        $secondarySubject = $this->requireValue($this->state->secondarySubject, 'secondary stream subject');
+
+        if ($this->state->lastDirectSubject !== $secondarySubject || $this->state->lastReplyPayload !== $payload) {
+            throw new RuntimeException('Expected transformed stream message to be stored under the secondary subject with the original payload.');
+        }
+    }
+
+    /**
+     * @When I create an origin stream and a sourced stream filtered to the primary subject
+     */
+    public function iCreateAnOriginStreamAndASourcedStreamFilteredToThePrimarySubject(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $sourceSubject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $secondarySubject = $this->requireValue($this->state->secondarySubject, 'secondary stream subject');
+        $separator = strrpos($sourceSubject, '.');
+        $prefix = $separator === false ? $sourceSubject : substr($sourceSubject, 0, $separator);
+        $originStream = $stream . '_ORIGIN';
+        $aggregateSubject = 'behat.aggregate.' . strtolower($stream);
+        $js = $this->client('primary')->jetStream();
+
+        $js->createStream($originStream, [$prefix . '.>'])->await();
+        $this->createdStreams[] = $originStream;
+
+        $js->createStream($stream, [$aggregateSubject], [
+            'sources' => [
+                StreamSource::source($originStream)->filterSubject($sourceSubject)->toArray(),
+            ],
+        ])->await();
+        $this->createdStreams[] = $stream;
+
+        $js->publish($sourceSubject, 'sourced-event')->await();
+        $js->publish($secondarySubject, 'ignored-event')->await();
+    }
+
+    /**
+     * @Then the sourced stream should contain only :payload from the primary subject
+     */
+    public function theSourcedStreamShouldContainOnlyFromThePrimarySubject(string $payload): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $sourceSubject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $js = $this->client('primary')->jetStream();
+
+        $this->waitFor(function () use ($js, $stream): bool {
+            $state = $js->getStream($stream)->await()->raw['state'] ?? [];
+            $messages = max(0, (int) ($state['messages'] ?? 0));
+
+            return $messages >= 1;
+        }, 4.0);
+
+        delay(0.5);
+
+        $streamInfo = $js->getStream($stream)->await();
+        $messageCount = max(0, (int) (($streamInfo->raw['state'] ?? [])['messages'] ?? 0));
+        if ($messageCount !== 1) {
+            throw new RuntimeException(sprintf('Expected sourced stream to contain exactly one replicated message, got %d.', $messageCount));
+        }
+
+        $message = $js->getStreamMessage($stream, 1)->await();
+        if ($message->subject !== $sourceSubject || $message->payload !== $payload) {
+            throw new RuntimeException('Expected sourced stream to retain only the filtered primary-subject message.');
+        }
+    }
+
+    /**
+     * @When I create an origin stream and a mirror stream from it
+     */
+    public function iCreateAnOriginStreamAndAMirrorStreamFromIt(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $sourceSubject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $originStream = $stream . '_ORIGIN';
+        $js = $this->client('primary')->jetStream();
+
+        $js->createStream($originStream, [$sourceSubject])->await();
+        $this->createdStreams[] = $originStream;
+
+        $js->createStream($stream, [], [
+            'mirror' => StreamSource::mirror($originStream)->toArray(),
+        ])->await();
+        $this->createdStreams[] = $stream;
+    }
+
+    /**
+     * @When I publish :payload to the mirrored origin subject
+     */
+    public function iPublishToTheMirroredOriginSubject(string $payload): void
+    {
+        $subject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $this->client('primary')->jetStream()->publish($subject, $payload)->await();
+    }
+
+    /**
+     * @Then the mirror stream should contain :payload
+     */
+    public function theMirrorStreamShouldContain(string $payload): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $subject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $js = $this->client('primary')->jetStream();
+
+        $this->waitFor(function () use ($js, $stream): bool {
+            $state = $js->getStream($stream)->await()->raw['state'] ?? [];
+            $messages = max(0, (int) ($state['messages'] ?? 0));
+
+            return $messages >= 1;
+        }, 4.0);
+
+        $message = $js->getStreamMessage($stream, 1)->await();
+        if ($message->subject !== $subject || $message->payload !== $payload) {
+            throw new RuntimeException('Expected mirror stream to replicate the origin message unchanged.');
         }
     }
 

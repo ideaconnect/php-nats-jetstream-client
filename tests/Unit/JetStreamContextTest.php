@@ -11,6 +11,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Configuration\StreamSource;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
@@ -720,8 +721,31 @@ final class JetStreamContextTest extends TestCase
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
-        $this->expectExceptionMessage('Stream subjects must not be empty');
+        $this->expectExceptionMessage('Stream subjects must not be empty unless mirror configuration is provided');
         $client->jetStream()->createStream('test', [])->await();
+    }
+
+    public function testCreateStreamAllowsMirrorWithoutSubjects(): void
+    {
+        $streamPayload = '{"config":{"name":"MIRROR","subjects":[],"mirror":{"name":"ORIGIN"}}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}',
+            'PONG',
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $created = $client->jetStream()->createStream('MIRROR', [], [
+            'mirror' => StreamSource::mirror('ORIGIN')->toArray(),
+        ])->await();
+
+        self::assertSame('MIRROR', $created->name);
+        self::assertSame([], $created->subjects);
+        self::assertStringContainsString('"mirror":{"name":"ORIGIN"}', $transport->writes[3]);
+        self::assertStringContainsString('"subjects":[]', $transport->writes[3]);
     }
 
     public function testCreateConsumerRejectsEmptyFilterSubject(): void

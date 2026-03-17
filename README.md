@@ -1044,7 +1044,7 @@ var_dump($mirror, $aggregateSources, $remoteMirror);
 $client->disconnect()->await();
 ```
 
-Use those arrays in `createStream()` or `updateStream()` options. Mirror-only stream configs deserve special care here because `createStream()` intentionally rejects an empty `subjects` list.
+Use those arrays in `createStream()` or `updateStream()` options. Source configurations work with the current high-level API and are covered against the live fixture stack. Mirror-only stream configs also work through `createStream()` when you pass an empty `subjects` list together with the `mirror` configuration.
 
 ### Republish and Subject Transform
 
@@ -1092,7 +1092,7 @@ This repository tracks parity against the basis-company `nats.php` README exampl
 | Connecting and Auth | workflow parity | Basic, token, username/password, JWT nonce signing, credentials file, and TLS CA/cert/key options are supported. |
 | Publish Subscribe | workflow parity | Callback, queue-group, and polling queue (`SubscriptionQueue` with `fetch()`/`next()`/`fetchAll()`) patterns are supported. |
 | Request Response | workflow parity | Awaited request/reply with timeout and cancellation is covered, but the API shape differs from basis-company's `dispatch()` and callback request helpers. |
-| JetStream API Usage | workflow parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, ordered-consumer helpers, batching/iteration chain API, stream mirroring/sourcing, republish/subject-transform helpers, and typed enums are covered. |
+| JetStream API Usage | workflow parity | Stream/consumer lifecycle, pull/push flows, ephemeral consumers, scheduling, ordered-consumer helpers, batching/iteration chain API, republish/subject-transform live behavior, mirror/source live behavior, and typed enums are covered. |
 | Microservices | workflow parity | Service registration, discovery (PING/INFO/STATS/SCHEMA), grouped hierarchy, enriched endpoint stats (requests/errors/last-error/processing time), reset API, opt-in schema validation hook with built-in adapter, handler adapters (callable/object/class-string), request lifecycle observers, standardized error envelopes, and run-loop helper are covered. |
 | Key Value Storage | workflow parity | Core KV flows plus update/purge/getAll/status parity are covered. |
 | Object Store | extended | Bucket/object lifecycle, object listing, chunked uploads, and digest verification are covered. |
@@ -1254,9 +1254,9 @@ composer fixture:jwt
 composer fix
 ```
 
-`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, and tears the stack down again.
+`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, runs the Behat feature suite, and tears the stack down again.
 
-`composer test:bdd` runs the Behat feature suite against the same local Docker Compose fixtures. Use `BEHAT_SUITE=core composer test:bdd` to run a narrower slice while the broader feature matrix is still being expanded.
+`composer test:bdd` runs only the Behat feature suite against the same local Docker Compose fixtures. Use `BEHAT_SUITE=core composer test:bdd` to run a narrower slice while iterating locally, or `BEHAT_SUITE=core composer test:e2e` to keep the rest of the e2e flow and narrow only the Behat stage.
 
 Base integration endpoint:
 

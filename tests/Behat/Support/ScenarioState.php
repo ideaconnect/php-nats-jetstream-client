@@ -100,6 +100,8 @@ final class ScenarioState
 
     public ?string $lastServerName = null;
 
+    public ?string $lastDirectSubject = null;
+
     /** @var array<string,string> */
     public array $lastHeaders = [];
 
@@ -185,6 +187,7 @@ final class ScenarioState
         $this->lastPullIteratorTotal = 0;
         $this->lastObservedRequestHeader = null;
         $this->lastServerName = null;
+        $this->lastDirectSubject = null;
         $this->lastHeaders = [];
         $this->lastQueuePayloads = [];
         $this->lastListedStreams = [];
