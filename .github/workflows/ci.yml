@@ -54,6 +54,8 @@ jobs:
       - fast-quality
       - fixture-drift
       - coverage
+    env:
+      NATS_WAIT_TIMEOUT_SECONDS: "60"
     strategy:
       matrix:
         php: ["8.2", "8.5"]
@@ -86,6 +88,8 @@ jobs:
       - fast-quality
       - fixture-drift
     if: github.event_name == 'workflow_dispatch'
+    env:
+      NATS_WAIT_TIMEOUT_SECONDS: "60"
     steps:
       - uses: actions/checkout@v6
       - uses: shivammathur/setup-php@v2
