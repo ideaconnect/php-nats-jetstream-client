@@ -9,8 +9,10 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp_dir="$(mktemp -d)"
 stage_dir="$tmp_dir/jwt"
+nsc_dir="$tmp_dir/nsc"
 output_dir="$root_dir/build/nats/jwt"
 config_file="$root_dir/build/nats/jwt.conf"
+nats_box_image="${NATS_BOX_IMAGE:-natsio/nats-box:latest}"
 
 cleanup() {
   rm -rf "$tmp_dir"
@@ -56,10 +58,15 @@ if [[ ! -f "$root_dir/vendor/autoload.php" ]]; then
 fi
 
 mkdir -p "$stage_dir/raw-seeds"
+mkdir -p "$nsc_dir"
 
-docker run --rm -i --user "$(id -u):$(id -g)" -v "$stage_dir:/out" natsio/nats-box:latest sh <<'EOF'
+docker run --rm -i \
+  --user "$(id -u):$(id -g)" \
+  -v "$stage_dir:/out" \
+  -v "$nsc_dir:/nsc" \
+  "$nats_box_image" sh <<'EOF'
 set -e
-export NSC_HOME=/tmp/nsc
+export NSC_HOME=/nsc
 mkdir -p "$NSC_HOME"
 nsc add operator --name LOCALOP --sys >/dev/null
 nsc add account --name LOCALACC >/dev/null
