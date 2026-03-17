@@ -123,7 +123,7 @@ final class ProtocolParserTest extends TestCase
                 $parser->push($frameLine);
                 self::fail('Expected malformed frame to throw: ' . $frameLine);
             } catch (ProtocolException) {
-                self::assertTrue(true);
+                self::addToAssertionCount(1);
             }
         }
     }

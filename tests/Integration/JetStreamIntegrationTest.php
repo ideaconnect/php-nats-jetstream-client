@@ -534,9 +534,6 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertInstanceOf(NatsMessage::class, $received);
-        if ($received === null) {
-            self::fail('Expected durable push consumer to receive a message.');
-        }
         self::assertSame('{"event":"push"}', $received->payload);
 
         $client->unsubscribe($sid)->await();
@@ -584,9 +581,6 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertInstanceOf(NatsMessage::class, $received);
-        if ($received === null) {
-            self::fail('Expected explicit deliver push consumer to receive a message.');
-        }
         self::assertSame('{"event":"push-explicit"}', $received->payload);
 
         $client->unsubscribe($sid)->await();
@@ -633,9 +627,6 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertInstanceOf(NatsMessage::class, $received);
-        if ($received === null) {
-            self::fail('Expected ephemeral push consumer to receive a message.');
-        }
         self::assertSame('{"event":"ephemeral-push"}', $received->payload);
 
         $client->unsubscribe($sid)->await();
@@ -746,9 +737,6 @@ final class JetStreamIntegrationTest extends TestCase
         }
 
         self::assertNotNull($watched);
-        if ($watched === null) {
-            self::fail('Expected KV watch to observe the updated entry.');
-        }
         self::assertSame('theme', $watched->key);
         self::assertSame('dark', $watched->value);
 

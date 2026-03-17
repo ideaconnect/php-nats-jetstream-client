@@ -595,9 +595,6 @@ final class JetStreamContextTest extends TestCase
 
         self::assertStringContainsString("PUB fc.reply 0\r\n\r\n", implode('', $transport->writes));
         self::assertInstanceOf(\IDCT\NATS\Core\NatsMessage::class, $received);
-        if ($received === null) {
-            self::fail('Expected flow-control test to receive the user payload.');
-        }
         self::assertSame('hello', $received->payload);
     }
 
@@ -700,9 +697,6 @@ final class JetStreamContextTest extends TestCase
         $client->processIncoming()->await();
 
         self::assertInstanceOf(\IDCT\NATS\Core\NatsMessage::class, $received);
-        if ($received === null) {
-            self::fail('Expected ephemeral push consumer helper to receive a payload.');
-        }
         self::assertSame('hello', $received->payload);
         self::assertStringContainsString('"deliver_subject":"deliver.ephemeral"', $transport->writes[3]);
         self::assertStringNotContainsString('"durable_name"', $transport->writes[3]);

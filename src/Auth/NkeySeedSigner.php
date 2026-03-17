@@ -24,13 +24,16 @@ final class NkeySeedSigner implements NonceSignerInterface
     private readonly string $publicKeyRaw;
     private readonly int $publicPrefix;
 
-    public function __construct(private readonly string $seed)
+    public function __construct(string $seed)
     {
         if (!function_exists('sodium_crypto_sign_seed_keypair')) {
             throw new NatsException('NkeySeedSigner requires the sodium extension');
         }
 
         [$this->publicPrefix, $rawSeed] = self::decodeSeed($seed);
+        if ($rawSeed === '') {
+            throw new NatsException('Invalid NKey seed length');
+        }
 
         try {
             $keyPair = sodium_crypto_sign_seed_keypair($rawSeed);
@@ -90,6 +93,10 @@ final class NkeySeedSigner implements NonceSignerInterface
     {
         if (!self::isValidPublicPrefix($publicPrefix)) {
             throw new NatsException('Invalid NKey public prefix');
+        }
+
+        if ($publicPrefix < 0 || $publicPrefix > 255) {
+            throw new NatsException('Invalid NKey public prefix width');
         }
 
         if (strlen($publicKeyRaw) !== 32) {

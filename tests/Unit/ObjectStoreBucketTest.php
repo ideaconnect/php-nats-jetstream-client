@@ -95,11 +95,10 @@ final class ObjectStoreBucketTest extends TestCase
         self::assertInstanceOf(ObjectInfo::class, $stored);
         self::assertSame('logo.txt', $stored->name);
         self::assertInstanceOf(ObjectData::class, $fetched);
-        self::assertNotNull($fetched);
         self::assertSame('hello', $fetched->data);
         self::assertSame('logo.txt', $fetched->info->name);
         self::assertInstanceOf(ObjectInfo::class, $info);
-        self::assertSame('text/plain', $info?->metadata['content-type'] ?? null);
+        self::assertSame('text/plain', $info->metadata['content-type'] ?? null);
 
         self::assertStringStartsWith('PUB $O.assets.C.', $transport->writes[3]);
         self::assertStringStartsWith('PUB $O.assets.M.logo.txt', $transport->writes[6]);

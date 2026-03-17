@@ -40,6 +40,9 @@ final class NkeySeedSignerTest extends TestCase
         $signatureRaw = base64_decode(strtr($signature, '-_', '+/') . str_repeat('=', (4 - strlen($signature) % 4) % 4), true);
 
         self::assertIsString($signatureRaw);
+        if ($signatureRaw === '') {
+            self::fail('Expected a non-empty raw signature.');
+        }
         self::assertTrue(sodium_crypto_sign_verify_detached($signatureRaw, $nonce, $publicKeyRaw));
     }
 
@@ -55,6 +58,9 @@ final class NkeySeedSignerTest extends TestCase
         new NkeySeedSigner(substr(self::SAMPLE_SEED, 0, -1) . 'A');
     }
 
+    /**
+     * @return non-empty-string
+     */
     private function decodePublicKey(string $encoded): string
     {
         $raw = $this->base32Decode($encoded);
@@ -67,7 +73,12 @@ final class NkeySeedSignerTest extends TestCase
 
         self::assertSame(20 << 3, ord($payload[0]) & 248);
 
-        return substr($payload, 1);
+        $decoded = substr($payload, 1);
+        if ($decoded === '') {
+            self::fail('Expected decoded public key payload to be non-empty.');
+        }
+
+        return $decoded;
     }
 
     private function base32Decode(string $encoded): string

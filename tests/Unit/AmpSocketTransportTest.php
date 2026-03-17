@@ -24,7 +24,7 @@ final class AmpSocketTransportTest extends TestCase
 
         // Ensure idempotent close also remains safe.
         $transport->close()->await();
-        self::assertTrue(true);
+        self::assertSame('', $transport->readLine()->await());
     }
 
     /**

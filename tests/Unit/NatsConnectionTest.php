@@ -43,7 +43,6 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertNotNull($connection->serverInfo());
         $serverInfo = $connection->serverInfo();
         self::assertNotNull($serverInfo);
         self::assertSame('S1', $serverInfo->serverId);
@@ -609,13 +608,17 @@ final class NatsConnectionTest extends TestCase
         );
         $connection->connect()->await();
 
-        self::assertSame(64, $connection->serverInfo()?->maxPayload);
+        $serverInfo = $connection->serverInfo();
+        self::assertNotNull($serverInfo);
+        self::assertSame(64, $serverInfo->maxPayload);
 
         $frames = $connection->processIncoming()->await();
 
+        $updatedServerInfo = $connection->serverInfo();
+        self::assertNotNull($updatedServerInfo);
         self::assertSame(1, $frames);
-        self::assertSame(128, $connection->serverInfo()?->maxPayload);
-        self::assertSame('2.12.1', $connection->serverInfo()?->version);
+        self::assertSame(128, $updatedServerInfo->maxPayload);
+        self::assertSame('2.12.1', $updatedServerInfo->version);
     }
 
     /**

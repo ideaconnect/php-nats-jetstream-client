@@ -239,9 +239,7 @@ final class NatsConnectionInternalsTest extends TestCase
 
         $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport($queue));
 
-        $this->invokePrivate($connection, 'awaitInitialPong');
-
-        self::assertTrue(true);
+        self::assertNull($this->invokePrivate($connection, 'awaitInitialPong'));
     }
 
     public function testAwaitServerInfoRespondsToPingBeforeInfo(): void
@@ -332,13 +330,14 @@ final class NatsConnectionInternalsTest extends TestCase
     public function testHandleFrameRecoverableErrDoesNotThrow(): void
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $this->setPrivate($connection, 'state', ConnectionState::Open);
 
         $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(
             type: ProtocolFrameType::Err,
             error: "'Permissions Violation for Publish to updates'",
         ));
 
-        self::assertTrue(true);
+        self::assertSame(ConnectionState::Open, $connection->state());
     }
 
     public function testHandleFrameIgnoresUnknownSubscriptionSid(): void
@@ -467,9 +466,7 @@ final class NatsConnectionInternalsTest extends TestCase
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
 
-        $this->invokePrivate($connection, 'drainPendingForSid', 101);
-
-        self::assertTrue(true);
+        self::assertNull($this->invokePrivate($connection, 'drainPendingForSid', 101));
     }
 
     public function testIsNoRespondersStatusHandlesEmptyRawHeaderString(): void

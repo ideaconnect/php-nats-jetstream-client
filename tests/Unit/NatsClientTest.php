@@ -33,7 +33,6 @@ final class NatsClientTest extends TestCase
         $client->connect()->await();
         $client->publish('orders.created', '{"id":1}')->await();
 
-        self::assertNotNull($client->serverInfo());
         $serverInfo = $client->serverInfo();
         self::assertNotNull($serverInfo);
         self::assertSame('n1', $serverInfo->serverName);
@@ -63,9 +62,7 @@ final class NatsClientTest extends TestCase
         self::assertSame(1, $sid);
         self::assertSame(1, $client->processIncoming()->await());
         self::assertInstanceOf(NatsMessage::class, $message);
-        $receivedMessage = $message;
-        self::assertNotNull($receivedMessage);
-        self::assertSame('hello', $receivedMessage->payload);
+        self::assertSame('hello', $message->payload);
     }
 
     /**

@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Integration;
 
+use PHPUnit\Framework\TestCase;
+use RuntimeException;
+
 trait IntegrationTestBootstrap
 {
     /**
@@ -44,7 +47,11 @@ trait IntegrationTestBootstrap
     {
         $flag = getenv('RUN_INTEGRATION');
         if ($flag !== '1') {
-            $this->markTestSkipped('Set RUN_INTEGRATION=1 to run integration tests.');
+            if ($this instanceof TestCase) {
+                $this->markTestSkipped('Set RUN_INTEGRATION=1 to run integration tests.');
+            }
+
+            throw new RuntimeException('Set RUN_INTEGRATION=1 to run integration tests.');
         }
     }
 

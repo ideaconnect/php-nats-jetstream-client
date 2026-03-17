@@ -17,7 +17,7 @@ use function Amp\delay;
 
 final class ServiceTestObjectHandler implements ServiceEndpointHandlerInterface
 {
-    public function handle(NatsMessage $message): string|array|null
+    public function handle(NatsMessage $message): string
     {
         return 'obj:' . $message->payload;
     }
@@ -25,7 +25,7 @@ final class ServiceTestObjectHandler implements ServiceEndpointHandlerInterface
 
 final class ServiceTestClassHandler implements ServiceEndpointHandlerInterface
 {
-    public function handle(NatsMessage $message): string|array|null
+    public function handle(NatsMessage $message): string
     {
         return 'class:' . $message->payload;
     }
