@@ -10,6 +10,7 @@
     "psr/log": "^3.0"
   },
   "require-dev": {
+    "behat/behat": "^3.14",
     "phpunit/phpunit": "^11.0",
     "phpstan/phpstan": "^2.1",
     "friendsofphp/php-cs-fixer": "^3.64"
@@ -28,6 +29,8 @@
     "test": "phpunit",
     "test:unit": "phpunit --testsuite unit",
     "test:integration": "phpunit --testsuite integration",
+    "test:bdd": "bash scripts/run-tests-bdd.sh",
+    "test:bdd:core": "vendor/bin/behat --suite core",
     "test:e2e": "bash scripts/run-tests-e2e.sh",
     "test:integration:repeat": "bash scripts/repeat-integration.sh 3",
     "fixture:jwt": "bash scripts/regenerate-jwt-fixture.sh",

@@ -42,8 +42,14 @@ Use this file as the authoritative project guide for coding agents working in th
 - `tests/Integration/`
   Live NATS integration tests. These are gated by `RUN_INTEGRATION=1` and target the Docker Compose fixtures.
 
+- `tests/Behat/`
+  Behat step definitions and support helpers for end-to-end feature coverage against the real fixture stack.
+
 - `tests/Support/`
   Fakes and helpers shared by tests.
+
+- `features/`
+  Behat Gherkin feature files grouped by domain (`core`, `auth`, `jetstream-core`, `jetstream-data`, `services`, `resilience`).
 
 - `scripts/`
   Repo automation: coverage checks, JWT fixture generation/checking, NATS readiness, repeated integration runs, and full end-to-end test flow.
@@ -76,6 +82,12 @@ Use this file as the authoritative project guide for coding agents working in th
 
 - Run integration tests only:
   `RUN_INTEGRATION=1 composer test:integration`
+
+- Run Behat feature tests:
+  `composer test:bdd`
+
+- Run a specific Behat suite:
+  `BEHAT_SUITE=core composer test:bdd`
 
 - Run repeated integration tests for flake detection:
   `composer test:integration:repeat`
@@ -122,6 +134,9 @@ Choose the narrowest useful test first, then broaden only as needed.
 - Changes in `src/JetStream/`, `src/Services/`, or integration scripts:
   Run targeted unit tests if present, then `composer test:e2e`.
 
+- Changes that alter a documented workflow or README example:
+  Run the relevant Behat suite if one exists, then broaden to `composer test:bdd` or `composer test:e2e` when the change affects multiple flows.
+
 - Changes to `docker-compose.yml`, `build/nats/*.conf`, JWT fixtures, or integration bootstrap:
   Run `composer fixture:jwt:check` if JWT-related, then `composer test:e2e`.
 
@@ -130,7 +145,9 @@ Choose the narrowest useful test first, then broaden only as needed.
 - Integration tests skip unless `RUN_INTEGRATION=1`.
 - Default integration endpoints come from `tests/Integration/IntegrationTestBootstrap.php` and target local fixture ports.
 - The preferred local flow is `composer test:e2e`.
+- Behat feature tests reuse the same Docker Compose fixture stack and readiness flow via `composer test:bdd`.
 - `scripts/run-tests-e2e.sh` performs JWT fixture validation first, then starts compose, waits for readiness, runs unit tests, and runs integration tests.
+- `scripts/run-tests-bdd.sh` performs the same fixture preflight and readiness flow before running Behat.
 - `KEEP_NATS_SERVICES=1 composer test:e2e` leaves compose services running after the run.
 - `SKIP_JWT_FIXTURE_CHECK=1 composer test:e2e` skips JWT fixture validation when explicitly desired.
 
@@ -164,6 +181,7 @@ Choose the narrowest useful test first, then broaden only as needed.
 - When fixing a bug, add or update a test that exercises the bug path.
 - Keep test names descriptive and behavior-oriented.
 - If exception wording changes intentionally, update the tests in the same change.
+- Prefer Behat for end-to-end documented workflows and PHPUnit for low-level protocol edges and exhaustive negative cases.
 
 ### Editing boundaries
 

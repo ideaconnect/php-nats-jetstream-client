@@ -953,7 +953,7 @@ $js = $client->jetStream();
 
 // Create stream with typed configuration.
 $js->createStream('ORDERS', ['orders.>'], [
-	'retention' => RetentionPolicy::WorkQueue->value,
+	'retention' => RetentionPolicy::Limits->value,
 	'storage' => StorageBackend::Memory->value,
 	'discard' => DiscardPolicy::Old->value,
 	'max_msgs' => 100_000,
@@ -1236,6 +1236,7 @@ Typical local workflow:
 ```bash
 composer install
 composer test:unit
+composer test:bdd
 composer stan
 composer test:e2e
 ```
@@ -1245,6 +1246,8 @@ Additional useful commands:
 ```bash
 composer test
 RUN_INTEGRATION=1 composer test:integration
+composer test:bdd
+BEHAT_SUITE=core composer test:bdd
 composer test:integration:repeat
 composer fixture:jwt:check
 composer fixture:jwt
@@ -1252,6 +1255,8 @@ composer fix
 ```
 
 `composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, and tears the stack down again.
+
+`composer test:bdd` runs the Behat feature suite against the same local Docker Compose fixtures. Use `BEHAT_SUITE=core composer test:bdd` to run a narrower slice while the broader feature matrix is still being expanded.
 
 Base integration endpoint:
 

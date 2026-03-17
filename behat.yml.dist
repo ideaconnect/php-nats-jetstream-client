@@ -1,0 +1,35 @@
+default:
+  suites:
+    core:
+      paths:
+        - features/core
+      contexts:
+        - IDCT\NATS\Tests\Behat\Context\FeatureContext
+    auth:
+      paths:
+        - features/auth
+      contexts:
+        - IDCT\NATS\Tests\Behat\Context\FeatureContext
+    jetstream-core:
+      paths:
+        - features/jetstream-core
+      contexts:
+        - IDCT\NATS\Tests\Behat\Context\FeatureContext
+    jetstream-data:
+      paths:
+        - features/jetstream-data
+      contexts:
+        - IDCT\NATS\Tests\Behat\Context\FeatureContext
+    services:
+      paths:
+        - features/services
+      contexts:
+        - IDCT\NATS\Tests\Behat\Context\FeatureContext
+    resilience:
+      paths:
+        - features/resilience
+      contexts:
+        - IDCT\NATS\Tests\Behat\Context\FeatureContext
+
+  formatters:
+    progress: true
