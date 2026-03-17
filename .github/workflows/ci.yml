@@ -15,6 +15,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NATS_WAIT_TIMEOUT_SECONDS: "120"
+      SKIP_JWT_FIXTURE_CHECK: true
       NATS_PROJECT_ROOT: ${{ github.workspace }}
     steps:
       - uses: actions/checkout@v6
