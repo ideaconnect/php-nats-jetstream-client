@@ -55,7 +55,7 @@ jobs:
       - fixture-drift
       - coverage
     env:
-      NATS_WAIT_TIMEOUT_SECONDS: "60"
+      NATS_WAIT_TIMEOUT_SECONDS: "120"
     strategy:
       matrix:
         php: ["8.2", "8.5"]
@@ -67,9 +67,7 @@ jobs:
           extensions: sockets
       - uses: ramsey/composer-install@v3
       - name: Start NATS Docker Compose
-        run: docker compose up -d
-      - name: Wait for NATS services
-        run: bash scripts/wait-for-nats-services.sh
+        run: docker compose up -d --wait --wait-timeout "$NATS_WAIT_TIMEOUT_SECONDS"
       - name: Run integration tests
         env:
           RUN_INTEGRATION: "1"
@@ -89,7 +87,7 @@ jobs:
       - fixture-drift
     if: github.event_name == 'workflow_dispatch'
     env:
-      NATS_WAIT_TIMEOUT_SECONDS: "60"
+      NATS_WAIT_TIMEOUT_SECONDS: "120"
     steps:
       - uses: actions/checkout@v6
       - uses: shivammathur/setup-php@v2
@@ -98,9 +96,7 @@ jobs:
           extensions: sockets
       - uses: ramsey/composer-install@v3
       - name: Start NATS Docker Compose
-        run: docker compose up -d
-      - name: Wait for NATS services
-        run: bash scripts/wait-for-nats-services.sh
+        run: docker compose up -d --wait --wait-timeout "$NATS_WAIT_TIMEOUT_SECONDS"
       - name: Run repeated integration soak
         run: bash scripts/repeat-integration.sh "${{ github.event.inputs.integration-repeat-count || '2' }}"
       - name: Dump NATS Docker Compose logs

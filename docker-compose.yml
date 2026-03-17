@@ -2,6 +2,12 @@ services:
   nats:
     image: nats:2.12-alpine
     command: ["-js", "-m", "8222", "-DV"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     ports:
       - "14222:4222"
       - "18222:8222"
@@ -9,6 +15,12 @@ services:
   nats-token:
     image: nats:2.12-alpine
     command: ["--config", "/etc/nats/token.conf", "-DV"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     volumes:
       - ./build/nats/token.conf:/etc/nats/token.conf:ro
     ports:
@@ -18,6 +30,12 @@ services:
   nats-userpass:
     image: nats:2.12-alpine
     command: ["--config", "/etc/nats/userpass.conf", "-DV"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     volumes:
       - ./build/nats/userpass.conf:/etc/nats/userpass.conf:ro
     ports:
@@ -27,6 +45,12 @@ services:
   nats-tls:
     image: nats:2.12-alpine
     command: ["--config", "/etc/nats/tls.conf", "-DV"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     volumes:
       - ./build/nats/tls.conf:/etc/nats/tls.conf:ro
       - ./build/tls:/etc/nats-certs:ro
@@ -37,6 +61,12 @@ services:
   nats-nkey:
     image: nats:2.12-alpine
     command: ["--config", "/etc/nats/nkey.conf", "-DV"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     volumes:
       - ./build/nats/nkey.conf:/etc/nats/nkey.conf:ro
     ports:
@@ -46,6 +76,12 @@ services:
   nats-jwt:
     image: nats:2.12-alpine
     command: ["--config", "/etc/nats/jwt.conf", "-DV"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 60
+      start_period: 5s
     volumes:
       - ./build/nats/jwt.conf:/etc/nats/jwt.conf:ro
       - ./build/nats/jwt:/etc/nats-jwt:ro
