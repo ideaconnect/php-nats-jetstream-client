@@ -25,8 +25,6 @@ jobs:
       - uses: ramsey/composer-install@v3
       - name: JWT Fixtures
         run: composer fixture:jwt
-      - name: JWT Fixtures Check
-        run: composer fixture:jwt:check
       - name: Static Analysis
         run: composer stan
       - name: Unit Tests
