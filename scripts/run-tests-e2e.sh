@@ -15,6 +15,7 @@
 # Environment:
 #   KEEP_NATS_SERVICES=1      Leave Docker Compose services running after completion
 #   SKIP_JWT_FIXTURE_CHECK=1  Skip JWT fixture validation preflight
+#   SKIP_JWT_FIXTURE_CHECK=true  Also accepted; truthy values are 1/true/yes/on
 #   BEHAT_SUITE=core          Run a specific Behat suite during the e2e pass
 
 set -euo pipefail
@@ -32,6 +33,17 @@ require_cmd() {
   fi
 }
 
+is_truthy() {
+  case "${1,,}" in
+    1|true|yes|on)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
 cleanup() {
   if [[ "$keep_services" == "1" || "$had_running_services" == "1" ]]; then
     return
@@ -46,7 +58,7 @@ require_cmd bash
 
 cd "$root_dir"
 
-if [[ "$skip_jwt_fixture_check" != "1" ]]; then
+if ! is_truthy "$skip_jwt_fixture_check"; then
   echo "[test:e2e] checking JWT fixtures"
   composer fixture:jwt:check
 fi
