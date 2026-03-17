@@ -67,7 +67,9 @@ jobs:
           extensions: sockets
       - uses: ramsey/composer-install@v3
       - name: Start NATS Docker Compose
-        run: docker compose up -d --wait --wait-timeout "$NATS_WAIT_TIMEOUT_SECONDS"
+        run: docker compose up -d
+      - name: Wait for NATS services
+        run: bash scripts/wait-for-nats-services.sh
       - name: Run integration tests
         env:
           RUN_INTEGRATION: "1"
@@ -96,7 +98,9 @@ jobs:
           extensions: sockets
       - uses: ramsey/composer-install@v3
       - name: Start NATS Docker Compose
-        run: docker compose up -d --wait --wait-timeout "$NATS_WAIT_TIMEOUT_SECONDS"
+        run: docker compose up -d
+      - name: Wait for NATS services
+        run: bash scripts/wait-for-nats-services.sh
       - name: Run repeated integration soak
         run: bash scripts/repeat-integration.sh "${{ github.event.inputs.integration-repeat-count || '2' }}"
       - name: Dump NATS Docker Compose logs

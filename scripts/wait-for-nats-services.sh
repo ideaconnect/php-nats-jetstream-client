@@ -28,10 +28,23 @@ wait_for_port() {
       return 0
     fi
 
+    if command -v docker >/dev/null 2>&1; then
+      if [[ -n "$(docker compose ps --status exited --services 2>/dev/null)" ]]; then
+        echo "Detected exited NATS fixture service while waiting for port ${port}." >&2
+        docker compose ps >&2 || true
+        docker compose logs --no-color >&2 || true
+        return 1
+      fi
+    fi
+
     sleep 1
   done
 
   echo "Timed out waiting for NATS monitoring endpoint on port ${port}." >&2
+  if command -v docker >/dev/null 2>&1; then
+    docker compose ps >&2 || true
+    docker compose logs --no-color >&2 || true
+  fi
   return 1
 }
 
