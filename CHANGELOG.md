@@ -17,6 +17,13 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Removed
+
+- `[bc-break]` Dropped support for **PHP 8.2**; the minimum is now **PHP 8.3** (`"php": "^8.3"`). The CI
+  matrix covers 8.3 / 8.4 / 8.5 and the CS Fixer baseline moved to `@PHP83Migration`. No source/API change —
+  this only raises the runtime floor (prompted by the dev toolchain: Infection 0.33 requires PHP 8.3).
+  Applications still on PHP 8.2 should stay on the 2.4.x line.
+
 ### Testing & CI
 
 - `[docs]` Added mutation testing with [Infection](https://infection.github.io/) (`composer infection`,

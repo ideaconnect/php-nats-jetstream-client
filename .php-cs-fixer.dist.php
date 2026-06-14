@@ -15,10 +15,11 @@ $finder = (new Finder())
 return (new Config())
     ->setRiskyAllowed(true)
     ->setRules([
-        // Modern baseline: PER Coding Style 3.0 (the PSR-12 successor) plus PHP 8.2 modernization.
+        // Modern baseline: PER Coding Style 3.0 (the PSR-12 successor) plus PHP 8.3 modernization.
+        // (@PHP83Migration has no :risky variant yet; @PHP82Migration:risky is the latest risky set.)
         '@PER-CS3.0' => true,
         '@PER-CS3.0:risky' => true,
-        '@PHP82Migration' => true,
+        '@PHP83Migration' => true,
         '@PHP82Migration:risky' => true,
 
         // Project conventions and a few widely-used quality rules.

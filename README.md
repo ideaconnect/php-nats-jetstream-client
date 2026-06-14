@@ -4,7 +4,7 @@
 [![CI](https://github.com/ideaconnect/php-nats-jetstream-client/actions/workflows/ci.yml/badge.svg)](https://github.com/ideaconnect/php-nats-jetstream-client/actions/workflows/ci.yml)
 [![Made in EU](https://raw.githubusercontent.com/ideaconnect/made-in-eu/main/software-badge/made-in-eu.svg)](https://github.com/ideaconnect/made-in-eu)
 
-Async-first NATS and JetStream client for PHP 8.2+ with first-class support for core NATS messaging, JetStream, KeyValue, ObjectStore, and NATS microservices.
+Async-first NATS and JetStream client for PHP 8.3+ with first-class support for core NATS messaging, JetStream, KeyValue, ObjectStore, and NATS microservices.
 
 The library is built around Amp and provides a typed, high-level API for connection management, publish/subscribe, request/reply, reconnect handling, authentication flows, and JetStream resource management without falling back to blocking I/O.
 
@@ -1911,7 +1911,7 @@ _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`test
 
 ## Production Notes and Limitations
 
-- **Runtime requirements.** PHP 8.2+ on the async runtime `amphp/amp ^3.1` and `amphp/socket ^2.3` (which requires `ext-openssl` for TLS). `ext-sodium` is additionally required for NKey / JWT authentication, and `ext-zlib` for WebSocket permessage-deflate compression; both are optional otherwise (declared under `suggest`). The library is async-first; it does **not** require Swoole/ReactPHP or `ext-sockets`.
+- **Runtime requirements.** PHP 8.3+ on the async runtime `amphp/amp ^3.1` and `amphp/socket ^2.3` (which requires `ext-openssl` for TLS). `ext-sodium` is additionally required for NKey / JWT authentication, and `ext-zlib` for WebSocket permessage-deflate compression; both are optional otherwise (declared under `suggest`). The library is async-first; it does **not** require Swoole/ReactPHP or `ext-sockets`.
 - **Concurrency model.** Message delivery, request replies, and JetStream pull/push consumption are driven by reads. An application must run a `processIncoming()` loop (directly, or indirectly via helpers such as `request()`, `flush()`, `SubscriptionQueue::next()`, or the consumer iterators, which pump it for you) for callbacks to fire. An idle, publisher-only connection stays alive on its own because the heartbeat timer self-reads `PONG`s — see [Heartbeat and Request Timeouts](#heartbeat-and-request-timeouts).
 - **One connection per fiber/process boundary.** A `NatsConnection` serializes its writes and owns a single socket read; share a connection within a coroutine tree, not across independent concurrent readers.
 - **Interoperability.** KeyValue and Object Store buckets use the official NATS layouts (`KV_`/`OBJ_` streams, base64url object-name encoding, `SHA-256=`-prefixed base64url digests), so buckets written by this client are readable by the `nats` CLI and other official clients, and vice-versa.
