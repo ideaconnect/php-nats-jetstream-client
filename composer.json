@@ -14,7 +14,8 @@
     "behat/behat": "^3.14",
     "phpunit/phpunit": "^11.0",
     "phpstan/phpstan": "^2.1",
-    "friendsofphp/php-cs-fixer": "^3.64"
+    "friendsofphp/php-cs-fixer": "^3.64",
+    "infection/infection": "^0.33"
   },
   "suggest": {
     "ext-sodium": "Required for NKey / JWT nonce-signed authentication (NkeySeedSigner).",
@@ -56,11 +57,18 @@
       "bash scripts/check-clover-coverage.sh 95 coverage.xml"
     ],
     "stan": "phpstan analyse",
-    "fix": "php-cs-fixer fix"
+    "fix": "php-cs-fixer fix",
+    "infection": "bash scripts/run-mutation.sh"
   },
   "scripts-descriptions": {
-    "test:everything": "Full verification of code health: PHPStan level 8, then the compose-backed e2e flow (Docker stack up, unit + integration + Behat, stack down). Skips the JWT fixture validity check; run 'composer fixture:jwt:check' separately for that."
+    "test:everything": "Full verification of code health: PHPStan level 8, then the compose-backed e2e flow (Docker stack up, unit + integration + Behat, stack down). Skips the JWT fixture validity check; run 'composer fixture:jwt:check' separately for that.",
+    "infection": "Strict mutation testing (Infection) against the unit testsuite; fails below the INFECTION_MIN_MSI / INFECTION_MIN_COVERED_MSI thresholds. Requires a coverage driver (Xdebug/PCOV)."
   },
   "minimum-stability": "stable",
-  "prefer-stable": true
+  "prefer-stable": true,
+  "config": {
+    "allow-plugins": {
+      "infection/extension-installer": true
+    }
+  }
 }

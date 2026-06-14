@@ -101,3 +101,20 @@ jobs:
       - name: Stop NATS services
         if: always()
         run: docker compose down
+
+  mutation:
+    name: Mutation (PHP 8.5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.5"
+          extensions: openssl, sodium, zlib, xdebug
+          coverage: xdebug
+      - uses: ramsey/composer-install@v3
+      - name: Mutation Tests (strict, >= 90% MSI)
+        # Infection against the unit testsuite (no Docker). Fails below the 90% MSI / covered-MSI floor
+        # set in scripts/run-mutation.sh (the suite currently scores ~93%) — a quality gate on top of
+        # line coverage that catches assertions which pass but do not actually pin behavior.
+        run: composer infection

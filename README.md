@@ -2079,7 +2079,10 @@ composer test:integration:repeat
 composer fixture:jwt:check
 composer fixture:jwt
 composer fix
+composer infection
 ```
+
+`composer infection` runs [Infection](https://infection.github.io/) mutation testing against the `unit` testsuite (no Docker; needs a coverage driver — Xdebug or PCOV). It is a quality gate on top of line coverage: it makes small changes ("mutants") to `src/` and fails if the tests don't catch them. The suite scores ~93% Covered MSI and CI enforces a strict 90% floor via the dedicated `mutation` job. The strictness is overridable for local exploration, e.g. `INFECTION_MIN_MSI=0 composer infection -- --show-mutations`, and `INFECTION_DIFF_BASE=origin/main composer infection` mutates only your changed lines.
 
 `composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, runs the Behat feature suite, and tears the stack down again.
 
