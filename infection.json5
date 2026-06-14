@@ -1,0 +1,21 @@
+{
+    // Mutation testing config. Run against the fast `unit` testsuite only (the `integration` suite needs a
+    // live dockerized NATS server, which is impractical to re-run per mutant). `--only-covered` (passed on
+    // the CLI / via the composer script) keeps the score meaningful by mutating only unit-covered code, so
+    // integration-only paths (TLS upgrade, socket transport, ObjectStore download) don't dilute the MSI.
+    "$schema": "vendor/infection/infection/resources/schema.json",
+    "source": {
+        "directories": ["src"]
+    },
+    "mutators": {
+        "@default": true
+    },
+    // Generous per-mutant timeout: async / event-loop code (delays, heartbeats, reconnect backoff) is
+    // slower than typical synchronous code, and a too-low budget makes Infection skip those mutants
+    // (excluding them from the score) rather than evaluating them.
+    "timeout": 20,
+    "logs": {
+        "text": "build/infection/infection.log",
+        "summary": "build/infection/summary.log"
+    }
+}

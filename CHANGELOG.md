@@ -17,6 +17,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Testing & CI
+
+- `[docs]` Added mutation testing with [Infection](https://infection.github.io/) (`composer infection`,
+  `scripts/run-mutation.sh`, `infection.json5`). 517 new unit tests under `tests/Unit/Mutation/` raised the
+  suite's mutation score (Covered MSI) from **75% to 93%**, killing ~870 previously-surviving mutants. CI
+  now enforces a **strict mutation gate** (a dedicated `mutation` job that fails the build below 90% MSI) —
+  a quality bar on top of line coverage that catches assertions which pass but don't actually pin behavior.
+  Mutation runs against the fast `unit` testsuite (no Docker); the remaining ~6% are mutants verified to be
+  equivalent (no observable behavioral difference), documented in each test's reasoning rather than chased
+  with meaningless assertions. Dev-only — no runtime/library change.
+
 ## [2.4.0] - 2026-06-14
 
 ### Added
