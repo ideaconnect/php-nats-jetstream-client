@@ -17,13 +17,6 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
-### Removed
-
-- `[bc-break]` Dropped support for **PHP 8.2**; the minimum is now **PHP 8.3** (`"php": "^8.3"`). The CI
-  matrix covers 8.3 / 8.4 / 8.5 and the CS Fixer baseline moved to `@PHP83Migration`. No source/API change —
-  this only raises the runtime floor (prompted by the dev toolchain: Infection 0.33 requires PHP 8.3).
-  Applications still on PHP 8.2 should stay on the 2.4.x line.
-
 ### Testing & CI
 
 - `[docs]` Added mutation testing with [Infection](https://infection.github.io/) (`composer infection`,
@@ -33,7 +26,9 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   a quality bar on top of line coverage that catches assertions which pass but don't actually pin behavior.
   Mutation runs against the fast `unit` testsuite (no Docker); the remaining ~6% are mutants verified to be
   equivalent (no observable behavioral difference), documented in each test's reasoning rather than chased
-  with meaningless assertions. Dev-only — no runtime/library change.
+  with meaningless assertions. Dev-only — no runtime/library change. **PHP 8.2 support is unchanged:**
+  Infection requires PHP 8.3+ and is intentionally not in `require-dev`, so `composer install` still works
+  on PHP 8.2; the `mutation` CI job runs on PHP 8.3 and installs Infection itself.
 
 ## [2.4.0] - 2026-06-14
 
