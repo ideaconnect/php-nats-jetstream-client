@@ -17,6 +17,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-06-15
+
 ### Testing & CI
 
 - `[docs]` Added mutation testing with [Infection](https://infection.github.io/) (`composer infection`,
