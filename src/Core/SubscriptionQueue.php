@@ -207,7 +207,7 @@ final class SubscriptionQueue
         }
 
         // A finite cancellation always bounds each read so a real socket cannot block past the
-        // timeout window — and, when no timeout is configured, past a single non-blocking cycle.
+        // timeout window - and, when no timeout is configured, past a single non-blocking cycle.
         $hasTimeout = $this->timeout > 0;
         $cancellation = new TimeoutCancellation($hasTimeout ? $this->timeout : self::NON_BLOCKING_TIMEOUT);
 

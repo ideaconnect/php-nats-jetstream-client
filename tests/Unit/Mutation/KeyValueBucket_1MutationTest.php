@@ -35,7 +35,7 @@ final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
         return sprintf("HMSG _INBOX.x %d %d %d\r\n%s%s\r\n", $sid, $h, $h + strlen($value), $hdrs, $value);
     }
 
-    /** Direct Get status-only reply (HMSG) — e.g. a 503 no-responders that triggers the MSG.GET fallback. */
+    /** Direct Get status-only reply (HMSG) - e.g. a 503 no-responders that triggers the MSG.GET fallback. */
     private function kvDirectStatus(int $sid, int $code, string $description): string
     {
         $hdrs = "NATS/1.0 {$code} {$description}\r\nStatus: {$code}\r\n\r\n";
@@ -167,7 +167,7 @@ final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
     /**
      * get() must reject an invalid key up front, before issuing any Direct Get request. A valid Direct
      * Get reply is queued so that if the guard is removed the mutant completes (returning an entry)
-     * instead of hanging — turning a missing "Invalid KV key" rejection into an observable failure.
+     * instead of hanging - turning a missing "Invalid KV key" rejection into an observable failure.
      */
     public function testGetValidatesKey(): void
     {
@@ -409,7 +409,7 @@ final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
 
     /**
      * A delivery reporting num_pending=0 in its $JS.ACK reply must fire onCaughtUp exactly once. The
-     * consumer starts with num_pending=1 so the immediate (onConsumerCreated) path does not fire — the
+     * consumer starts with num_pending=1 so the immediate (onConsumerCreated) path does not fire - the
      * signal is driven purely by the in-handler caught-up check.
      */
     public function testWatchFiresCaughtUpFromDeliveryWhenPendingZero(): void

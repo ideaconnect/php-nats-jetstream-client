@@ -73,9 +73,9 @@ final class JetStreamContext_4MutationTest extends TestCase
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
             $msg = $e->getMessage();
-            // kills ConcatOperandRemoval @ 1171 — the parenthetical suffix must be present.
+            // kills ConcatOperandRemoval @ 1171 - the parenthetical suffix must be present.
             self::assertStringContainsString('not bound to a stream', $msg);
-            // kills Concat @ 1171 — order is "subject <subj> (the subject ...)", so the literal
+            // kills Concat @ 1171 - order is "subject <subj> (the subject ...)", so the literal
             // "subject orders.created" appears BEFORE the parenthetical, not after it.
             self::assertStringContainsString('No JetStream responder for subject orders.created', $msg);
             self::assertStringEndsWith('enabled)', $msg);
@@ -101,7 +101,7 @@ final class JetStreamContext_4MutationTest extends TestCase
 
         $js = new JetStreamContext($client, publishRetryAttempts: 1, publishRetryWaitMs: 1);
 
-        // kills IncrementInteger @ 1263 (max(1,..)->max(2,..)) — a 2nd attempt would consume the
+        // kills IncrementInteger @ 1263 (max(1,..)->max(2,..)) - a 2nd attempt would consume the
         // success ack and return; real code must throw on the single attempt.
         $this->expectException(JetStreamException::class);
         $this->expectExceptionCode(503);
@@ -123,7 +123,7 @@ final class JetStreamContext_4MutationTest extends TestCase
 
         $js = new JetStreamContext($client, publishRetryAttempts: 2, publishRetryWaitMs: 1);
 
-        // kills IncrementInteger @ 1265 (for $attempt=1 -> $attempt=2) — starting the counter at 2
+        // kills IncrementInteger @ 1265 (for $attempt=1 -> $attempt=2) - starting the counter at 2
         // makes the first iteration already satisfy attempt>=attempts and throw with NO retry.
         $ack = $js->publish('orders.created', '{"id":1}')->await();
         self::assertSame(51, $ack->seq);
@@ -151,7 +151,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             Schedule::every('1h'),
         )->await();
 
-        // kills FalseValue @ 1303 (rollup default false->true) — defaulting to true would emit the
+        // kills FalseValue @ 1303 (rollup default false->true) - defaulting to true would emit the
         // rollup header even though the caller never asked for it.
         self::assertStringNotContainsString('Nats-Schedule-Rollup', $transport->writes[3]);
     }
@@ -175,7 +175,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             source: '',
         )->await();
 
-        // kills LogicalAnd @ 1321 (&& -> ||) — with source='' the OR form is true (because
+        // kills LogicalAnd @ 1321 (&& -> ||) - with source='' the OR form is true (because
         // '' !== null) and would emit an empty Nats-Schedule-Source header.
         self::assertStringNotContainsString('Nats-Schedule-Source', $transport->writes[3]);
     }
@@ -198,11 +198,11 @@ final class JetStreamContext_4MutationTest extends TestCase
             $client->jetStream()->publish('orders.created', '{"id":1}')->await();
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
-            // kills Concat @ 1347 — prefix-first ordering.
+            // kills Concat @ 1347 - prefix-first ordering.
             self::assertStringStartsWith('Malformed JetStream publish ack: ', $e->getMessage());
-            // kills ConcatOperandRemoval @ 1347 — the JsonException detail must be appended.
+            // kills ConcatOperandRemoval @ 1347 - the JsonException detail must be appended.
             self::assertStringContainsString('Syntax error', $e->getMessage());
-            // kills Increment/DecrementInteger @ 1347 — wrap code is exactly 0.
+            // kills Increment/DecrementInteger @ 1347 - wrap code is exactly 0.
             self::assertSame(0, $e->getCode());
         }
     }
@@ -225,7 +225,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             $client->jetStream()->publish('orders.created', '{"id":1}')->await();
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
-            // kills Increment/DecrementInteger @ 1355 — absent code defaults to 0, not 1 or -1.
+            // kills Increment/DecrementInteger @ 1355 - absent code defaults to 0, not 1 or -1.
             self::assertSame(0, $e->getCode());
             self::assertSame('publish failed', $e->getMessage());
         }
@@ -245,7 +245,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             $client->jetStream()->publish('orders.created', '{"id":1}')->await();
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
-            // kills Coalesce @ 1355 ($error['code'] ?? 0  ->  0 ?? $error['code']) — the mutant always
+            // kills Coalesce @ 1355 ($error['code'] ?? 0  ->  0 ?? $error['code']) - the mutant always
             // yields 0; real code must surface the provided 500.
             self::assertSame(500, $e->getCode());
         }
@@ -267,7 +267,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ], $transport);
 
-        // kills UnwrapTrim @ 1375 — without trim, ' 10 ' fails the /^[+-]?\d+$/ check and throws.
+        // kills UnwrapTrim @ 1375 - without trim, ' 10 ' fails the /^[+-]?\d+$/ check and throws.
         $value = $client->jetStream()->incrementCounter('counters.visits', ' 10 ')->await();
         self::assertSame('10', $value);
         self::assertStringContainsString('Nats-Incr:10', $transport->writes[3]);
@@ -281,7 +281,7 @@ final class JetStreamContext_4MutationTest extends TestCase
         $transport = null;
         $client = $this->connectedClientWith([], $transport);
 
-        // kills PregMatchRemoveCaret @ 1376 — dropping ^ would let 'x10' match (\d+ at the end) and
+        // kills PregMatchRemoveCaret @ 1376 - dropping ^ would let 'x10' match (\d+ at the end) and
         // be dispatched; the anchored regex must reject it before any request.
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Counter increment must be an integer string');
@@ -311,11 +311,11 @@ final class JetStreamContext_4MutationTest extends TestCase
             $client->jetStream()->incrementCounter('counters.visits', '+1')->await();
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
-            // kills Concat @ 1421 — prefix-first ordering.
+            // kills Concat @ 1421 - prefix-first ordering.
             self::assertStringStartsWith('Malformed counter response: ', $e->getMessage());
-            // kills ConcatOperandRemoval @ 1421 — the JsonException detail must be appended.
+            // kills ConcatOperandRemoval @ 1421 - the JsonException detail must be appended.
             self::assertStringContainsString('Syntax error', $e->getMessage());
-            // kills Increment/DecrementInteger @ 1421 — wrap code is exactly 0.
+            // kills Increment/DecrementInteger @ 1421 - wrap code is exactly 0.
             self::assertSame(0, $e->getCode());
         }
     }
@@ -338,7 +338,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             $client->jetStream()->incrementCounter('counters.visits', '+1')->await();
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
-            // kills Increment/DecrementInteger @ 1429 — absent code defaults to 0, not 1 or -1.
+            // kills Increment/DecrementInteger @ 1429 - absent code defaults to 0, not 1 or -1.
             self::assertSame(0, $e->getCode());
             self::assertSame('counter failed', $e->getMessage());
         }
@@ -358,7 +358,7 @@ final class JetStreamContext_4MutationTest extends TestCase
             $client->jetStream()->incrementCounter('counters.visits', '+1')->await();
             self::fail('Expected JetStreamException');
         } catch (JetStreamException $e) {
-            // kills Coalesce @ 1429 ($error['code'] ?? 0  ->  0 ?? $error['code']) — mutant always
+            // kills Coalesce @ 1429 ($error['code'] ?? 0  ->  0 ?? $error['code']) - mutant always
             // yields 0; real code must surface the provided 503.
             self::assertSame(503, $e->getCode());
         }
@@ -382,9 +382,9 @@ final class JetStreamContext_4MutationTest extends TestCase
         $client->jetStream()->fetchNext('ORDERS', 'PROC')->await();
 
         $written = $transport->writes[3];
-        // kills Increment/DecrementInteger @ 1451 — default expiresMs is exactly 3000 ms.
+        // kills Increment/DecrementInteger @ 1451 - default expiresMs is exactly 3000 ms.
         self::assertStringContainsString('"expires":3000000000', $written);
-        // kills IncrementInteger @ 1454 — fetchNext always pulls a batch of 1.
+        // kills IncrementInteger @ 1454 - fetchNext always pulls a batch of 1.
         self::assertStringContainsString('"batch":1', $written);
     }
 
@@ -401,7 +401,7 @@ final class JetStreamContext_4MutationTest extends TestCase
 
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1)->await();
 
-        // kills Increment/DecrementInteger @ 1484 — default expiresMs is exactly 3000 ms.
+        // kills Increment/DecrementInteger @ 1484 - default expiresMs is exactly 3000 ms.
         self::assertStringContainsString('"expires":3000000000', $transport->writes[3]);
     }
 }

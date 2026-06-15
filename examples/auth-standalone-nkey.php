@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Standalone NKey Authentication — challenge signing without a JWT.
+ * Standalone NKey Authentication - challenge signing without a JWT.
  *
  * Ed25519 nonce-challenge auth using only nkey + nonceSigner (no JWT): the server trusts
  * the account's public NKey and the client proves ownership by signing the nonce. Skips

@@ -1529,13 +1529,13 @@ final class ServiceTest extends TestCase
      * Scenario: two endpoints are added; the connection is dropped before start(). The first
      * discovery subscribe succeeds (the fake transport is still open) but everything breaks
      * after that... actually we need a subtler approach: connect, immediately close the transport,
-     * then call start() so that even the first subscribe fails — but then the rollback tries
+     * then call start() so that even the first subscribe fails - but then the rollback tries
      * unsub on the already-queued SIDs and THAT also fails (line 326 catch fires).
      *
      * The simplest reliable trigger: start successfully, close the connection, then force a second
      * start() with a bad endpoint. The partial subscribe at "bad subject" throws, and the rollback
      * over the already-subscribed SIDs (discovery + first endpoint) also throws because the
-     * connection is now closed — exercising the line-326 swallow path.
+     * connection is now closed - exercising the line-326 swallow path.
      */
     public function testStartRollbackSwallowsUnsubscribeFailureOnClosedConnection(): void
     {
@@ -1633,7 +1633,7 @@ final class ServiceTest extends TestCase
         $service = $client->service('echo', '1.0.0')
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
 
-        // Provide BOTH a timeout and an external DeferredCancellation — this exercises the
+        // Provide BOTH a timeout and an external DeferredCancellation - this exercises the
         // CompositeCancellation branch (line 751). The external cancel fires first.
         $deferred = new \Amp\DeferredCancellation();
         $runner = \Amp\async(static function () use ($service, $deferred): void {

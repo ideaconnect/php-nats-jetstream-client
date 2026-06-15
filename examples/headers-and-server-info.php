@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Headers and Server Info — NATS headers + server metadata.
+ * Headers and Server Info - NATS headers + server metadata.
  *
  * Publishes a message carrying NATS headers, runs an echo responder that reflects a
  * request-id header back via requestWithHeaders(), and reads the negotiated

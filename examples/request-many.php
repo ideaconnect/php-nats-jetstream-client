@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Request Many (scatter-gather) — one request, many replies.
+ * Request Many (scatter-gather) - one request, many replies.
  *
  * Stands up several responders on a shared subject and uses requestMany() to
  * scatter one request and gather every reply, bounded by a total timeout and a

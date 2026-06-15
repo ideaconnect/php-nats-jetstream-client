@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Token Authentication — connect with an auth token.
+ * Token Authentication - connect with an auth token.
  *
  * Sends an auth token in the CONNECT frame; connect() only resolves once the server
  * accepts it. Round-trips a message to prove the authenticated session works.

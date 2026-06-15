@@ -9,7 +9,7 @@ namespace IDCT\NATS\Transport;
  * actually established before sending credentials.
  *
  * Kept separate from {@see TransportInterface} so adding it does not break third-party transport
- * implementations; the connection layer uses an instanceof check and simply does not apply the
+ * implementations; the connection layer uses an instanceof check and does not apply the
  * TLS fail-safe to transports that do not implement it.
  */
 interface TlsAwareTransportInterface extends TransportInterface

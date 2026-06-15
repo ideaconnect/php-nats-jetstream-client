@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Username / Password Authentication — connect with user + pass.
+ * Username / Password Authentication - connect with user + pass.
  *
  * Sends a username and password in the CONNECT frame; connect() only resolves once the
  * server accepts them. Round-trips a message to prove the authenticated session works.

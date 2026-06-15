@@ -253,7 +253,7 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // kills MethodCallRemoval @ line 402 (record outbound on buffered publish) and
-    // ReturnRemoval @ line 404 (return after buffering — a fall-through writes + records twice)
+    // ReturnRemoval @ line 404 (return after buffering - a fall-through writes + records twice)
     public function testBufferedPublishRecordsOutboundExactlyOnceAndDoesNotWriteImmediately(): void
     {
         $connection = $this->openConnection(transport: $transport);

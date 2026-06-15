@@ -1,7 +1,7 @@
 <?php
 
 /**
- * JetStream Direct Get — low-latency reads served by any replica.
+ * JetStream Direct Get - low-latency reads served by any replica.
  *
  * On an allow_direct stream, fetches a stored message by sequence with
  * directGetStreamMessage() and the last message stored on a subject with

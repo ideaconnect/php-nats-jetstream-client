@@ -186,7 +186,7 @@ final class PullConsumerIterator
 
     /**
      * Registers a diagnostics callback invoked when the consume loop terminates on a non-routine error
-     * (e.g. 409 "Consumer Deleted", a server error) — as opposed to a routine empty window (404/408) or
+     * (e.g. 409 "Consumer Deleted", a server error) - as opposed to a routine empty window (404/408) or
      * an explicit stop()/drain(). Mirrors nats.go's `ConsumeErrHandler` for surfacing why a consumer
      * stopped (#63).
      *

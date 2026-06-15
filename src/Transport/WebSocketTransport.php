@@ -365,7 +365,7 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 continue;
             }
             // Strip CR/LF from BOTH name and value (and ':' from the name) to prevent header/request
-            // injection — a CR/LF or colon in the name would otherwise forge additional header lines.
+            // injection - a CR/LF or colon in the name would otherwise forge additional header lines.
             $cleanName = str_replace(["\r", "\n", ':'], '', $name);
             $lines[] = $cleanName . ': ' . str_replace(["\r", "\n"], '', $value);
         }

@@ -296,7 +296,7 @@ final class JetStreamIntegrationTest extends TestCase
 
     /**
      * Verifies that many request()/reply round-trips issued concurrently on one connection all
-     * resolve independently and quickly — the contract KV getAll() / ObjectStore list() rely on when
+     * resolve independently and quickly - the contract KV getAll() / ObjectStore list() rely on when
      * they fan out Direct Get lookups. Guards against a regression in the self-pumping read machinery.
      */
     public function testConcurrentRequestsAllResolve(): void
@@ -620,7 +620,7 @@ final class JetStreamIntegrationTest extends TestCase
                 if (!str_contains($e->getMessage(), '408')) {
                     throw $e;
                 }
-                // 408 Request Timeout: the redelivery has not arrived yet — pull again.
+                // 408 Request Timeout: the redelivery has not arrived yet - pull again.
             }
         }
 

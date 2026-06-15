@@ -1,7 +1,7 @@
 <?php
 
 /**
- * JetStream Ephemeral Consumers — server-named, auto-cleaned consumers.
+ * JetStream Ephemeral Consumers - server-named, auto-cleaned consumers.
  *
  * Creates an ephemeral PULL consumer (server-assigned name) and fetches/acks from it,
  * then runs an ephemeral PUSH consumer via subscribeEphemeralPushConsumer(). Both are

@@ -101,7 +101,7 @@ final class PullConsumerIteratorTest extends TestCase
             ...$this->infoAndPong(),
             // First iteration: 1 message delivered.
             $this->jsMsg('_INBOX.JS.FETCH.any', 'order-1', '$JS.ACK.ORDERS.PROC.1.1.1.123.0'),
-            // Second iteration: terminal 404 status → JetStreamException breaks loop.
+            // Second iteration: terminal 404 status -> JetStreamException breaks loop.
             sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
         ]);
 
@@ -257,7 +257,7 @@ final class PullConsumerIteratorTest extends TestCase
 
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
-            // Immediately returns terminal 404 status — no messages.
+            // Immediately returns terminal 404 status - no messages.
             sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
         ]);
 
@@ -286,7 +286,7 @@ final class PullConsumerIteratorTest extends TestCase
 
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
-            // iter 1 (sid 1): empty window (404) — infinite mode must keep polling, not stop.
+            // iter 1 (sid 1): empty window (404) - infinite mode must keep polling, not stop.
             sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
             // iter 2 (sid 2): a message arrives after the idle gap.
             sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
@@ -324,7 +324,7 @@ final class PullConsumerIteratorTest extends TestCase
 
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
-            // iter 1 (sid 1): transient 409 (backpressure) — infinite mode must keep polling.
+            // iter 1 (sid 1): transient 409 (backpressure) - infinite mode must keep polling.
             sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hMax, $hMax, $maxAck),
             // iter 2 (sid 2): a message arrives once backpressure clears.
             sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),

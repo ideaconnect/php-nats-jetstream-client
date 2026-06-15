@@ -301,7 +301,7 @@ final class BatchPublisherTest extends TestCase
     {
         $commitAck = '{"stream":"ORDERS","seq":2,"batch":"batch-nonjson","count":2}';
 
-        // The start reply is non-empty and non-JSON — the server replied with something unexpected
+        // The start reply is non-empty and non-JSON - the server replied with something unexpected
         // but not an error JSON; the client should treat it as accepted and continue.
         $nonJsonStart = 'OK';
 
@@ -339,7 +339,7 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Commit request reply (single-message batch — no start request).
+            // Commit request reply (single-message batch - no start request).
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($badAck), $badAck),
         ]);
 

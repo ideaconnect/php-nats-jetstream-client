@@ -55,7 +55,7 @@ final class NatsOptionsTest extends TestCase
     public function testAllowsDisabledHeartbeatAndEmptyServers(): void
     {
         // pingIntervalSeconds <= 0 disables the heartbeat, maxPingsOut 0 is aggressive-but-valid, and
-        // an empty servers list falls back to the default — all legitimate, so none must be rejected.
+        // an empty servers list falls back to the default - all legitimate, so none must be rejected.
         $options = new NatsOptions(servers: [], pingIntervalSeconds: 0, maxPingsOut: 0);
 
         self::assertSame(0, $options->pingIntervalSeconds);

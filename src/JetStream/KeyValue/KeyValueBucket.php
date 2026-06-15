@@ -207,7 +207,7 @@ final class KeyValueBucket
      *
      * Returns null only when the key has no record at all (never written, or its history was purged
      * out). When the latest record is a delete/purge marker the entry is still returned, with
-     * operation `DEL`/`PURGE` and a null value — inspect `$entry->operation` to tell a live value from
+     * operation `DEL`/`PURGE` and a null value - inspect `$entry->operation` to tell a live value from
      * a tombstone. (`getAll()`, by contrast, omits deleted keys entirely.)
      *
      * @return Future<KeyValueEntry|null>
@@ -383,7 +383,7 @@ final class KeyValueBucket
             $caughtUpFired = false;
 
             // Deliver via a JetStream push consumer (not a plain core subscription) so each update
-            // carries its stream sequence — i.e. the KV revision — which a watcher needs to feed back
+            // carries its stream sequence - i.e. the KV revision - which a watcher needs to feed back
             // into update()/CAS.
             return $this->jetStream->subscribeEphemeralPushConsumer(
                 $this->streamName(),
@@ -412,7 +412,7 @@ final class KeyValueBucket
                     if ($onCaughtUp !== null && !$caughtUpFired) {
                         // Use the null-tolerant metadata parse: a non-conformant delivery without a
                         // parseable $JS.ACK subject must NOT throw out of the shared dispatch loop and
-                        // tear down every subscription on the connection (#90) — skip the check instead.
+                        // tear down every subscription on the connection (#90) - skip the check instead.
                         $metadata = JsMessageMetadata::fromMessage($message);
                         if ($metadata !== null && $metadata->numPending === 0) {
                             $caughtUpFired = true;
@@ -424,7 +424,7 @@ final class KeyValueBucket
                 consumerOptions: $consumerOptions,
                 onConsumerCreated: static function (ConsumerInfo $consumer) use ($onCaughtUp, &$caughtUpFired): void {
                     // End-of-initial-data on an empty / no-match bucket: the consumer starts with nothing
-                    // pending, so no delivery will ever arrive to drive the in-handler caught-up check —
+                    // pending, so no delivery will ever arrive to drive the in-handler caught-up check -
                     // fire the signal now instead of leaving a blocked caller hanging (#99).
                     if ($onCaughtUp !== null && !$caughtUpFired && (int) ($consumer->raw['num_pending'] ?? 0) === 0) {
                         $caughtUpFired = true;
@@ -449,7 +449,7 @@ final class KeyValueBucket
         return async(function () use ($key, $value, $ttl): PubAck {
             $this->assertValidKey($key);
 
-            // First attempt: exclusive create — succeeds only when the subject has no prior message.
+            // First attempt: exclusive create - succeeds only when the subject has no prior message.
             try {
                 return $this->putExpectingSubjectSeq($key, $value, 0, $ttl)->await();
             } catch (JetStreamException $e) {
@@ -493,7 +493,7 @@ final class KeyValueBucket
     }
 
     /**
-     * Returns the full ordered history of a key — every stored revision (puts and delete/purge
+     * Returns the full ordered history of a key - every stored revision (puts and delete/purge
      * tombstones), oldest first. Requires the bucket to retain history (created with a `history` > 1);
      * a history-1 bucket yields only the latest record. Mirrors nats.go / nats.java `KeyValue.History`
      * (#41).
@@ -524,7 +524,7 @@ final class KeyValueBucket
             $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use (&$entries, &$caughtUp, $key): void {
                 // Use the null-tolerant metadata parse: a non-conformant / control delivery without a
                 // parseable $JS.ACK reply subject must NOT throw out of the shared dispatch loop and tear
-                // down every subscription on the connection (the #90 class, here for history() — #96).
+                // down every subscription on the connection (the #90 class, here for history() - #96).
                 // Skip such a frame instead of recording it as a bogus history entry.
                 $meta = JsMessageMetadata::fromMessage($message);
                 if ($meta === null) {

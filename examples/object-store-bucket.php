@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Object Store Bucket — store and retrieve whole objects.
+ * Object Store Bucket - store and retrieve whole objects.
  *
  * Demonstrates put / info / get (digest-verified) / list / delete on an Object Store
  * bucket, reading the returned ObjectInfo (name, SHA-256 digest, ...).

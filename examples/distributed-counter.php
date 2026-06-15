@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Distributed Counter — CRDT counters on a stream (NATS 2.12+).
+ * Distributed Counter - CRDT counters on a stream (NATS 2.12+).
  *
  * On a stream with allow_msg_counter + allow_direct, atomically increments a subject
  * with incrementCounter() and reads the running total with counterValue() (served by

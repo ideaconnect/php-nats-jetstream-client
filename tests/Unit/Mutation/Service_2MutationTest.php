@@ -22,7 +22,7 @@ use function Amp\async;
  * subject bytes written for discovery subscriptions, the exact keys/values of the stats / discovery
  * payloads, the observer-context correlation precedence, the error-header collapsing, the reply
  * de-duplication, and the run-loop break boundary. All async work is driven by pumping
- * processIncoming() against pre-seeded frames — no sleeps, no real sockets.
+ * processIncoming() against pre-seeded frames - no sleeps, no real sockets.
  */
 final class Service_2MutationTest extends \PHPUnit\Framework\TestCase
 {

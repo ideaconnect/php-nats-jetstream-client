@@ -1759,7 +1759,7 @@ final class NatsClientIntegrationTest extends TestCase
         });
 
         // Use a deliberately long timeout: the responder never replies, so the wait can only end two
-        // ways — the external cancellation (CancelledException) or the deadline (TimeoutException).
+        // ways - the external cancellation (CancelledException) or the deadline (TimeoutException).
         // request() throws CancelledException ONLY when the external token aborted the wait, so
         // catching it is itself proof that cancellation (not the timeout) stopped the await. We assert
         // on the EXCEPTION TYPE rather than wall-clock latency: an occasional event-loop/GC stall can
@@ -1772,7 +1772,7 @@ final class NatsClientIntegrationTest extends TestCase
             $client->request($subject, 'cancel-me', $timeoutMs, $requestCancellation->getCancellation())->await();
             self::fail('Expected request cancellation.');
         } catch (CancelledException) {
-            // Cancellation aborted the wait before the deadline — proven by the exception type.
+            // Cancellation aborted the wait before the deadline - proven by the exception type.
             self::assertLessThan($timeoutMs / 1000, $this->monotonic() - $start, 'Cancellation must abort before the request deadline');
         } finally {
             $serverPumpCancellation->cancel();
@@ -1863,7 +1863,7 @@ final class NatsClientIntegrationTest extends TestCase
 
     /**
      * flush() completes a PING/PONG round-trip against the live server, confirming prior writes were
-     * processed (#66 — flush had no dedicated functional test).
+     * processed (#66 - flush had no dedicated functional test).
      */
     public function testFlushRoundTripConfirmsServerProcessing(): void
     {
@@ -1886,7 +1886,7 @@ final class NatsClientIntegrationTest extends TestCase
     }
 
     /**
-     * The polling SubscriptionQueue API delivers live messages via next() with a timeout (#66 —
+     * The polling SubscriptionQueue API delivers live messages via next() with a timeout (#66 -
      * SubscriptionQueue had only unit/Behat coverage, no integration test).
      */
     public function testSubscriptionQueuePollingDeliversLive(): void
@@ -1917,7 +1917,7 @@ final class NatsClientIntegrationTest extends TestCase
 
     /**
      * An idle (publisher-only) connection stays open across multiple ping intervals without the app
-     * pumping processIncoming, because the heartbeat self-read consumes the PONGs (#67 — P0-2 guard).
+     * pumping processIncoming, because the heartbeat self-read consumes the PONGs (#67 - P0-2 guard).
      */
     public function testIdleConnectionStaysOpenViaHeartbeat(): void
     {
@@ -1948,7 +1948,7 @@ final class NatsClientIntegrationTest extends TestCase
 
     /**
      * A request timeout cancels the in-flight read and does NOT poison the transport: a subsequent
-     * request on the same connection succeeds (#67 — P0-1 guard).
+     * request on the same connection succeeds (#67 - P0-1 guard).
      */
     public function testRequestTimeoutDoesNotPoisonConnection(): void
     {
@@ -1986,7 +1986,7 @@ final class NatsClientIntegrationTest extends TestCase
                     $client->request($silent, 'hello', 300)->await();
                     self::fail('Expected request timeout exception.');
                 } catch (TimeoutException) {
-                    // Expected — the read should have been cancelled, not orphaned.
+                    // Expected - the read should have been cancelled, not orphaned.
                 }
 
                 // The connection must still be open and usable: the next request succeeds.

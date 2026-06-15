@@ -34,7 +34,7 @@ final class MultiConsumerIntegrationTest extends TestCase
     public function testTwoDurableConsumersOnSameStreamEachReceiveAllMessages(): void
     {
         // Fan-out: two independent durable consumers on one stream each have their own cursor, so each
-        // must receive the full message set — one consumer acking must not consume the other's copy.
+        // must receive the full message set - one consumer acking must not consume the other's copy.
         $stream = $this->streamName();
         $subject = $this->subjectFor($stream);
         $client = $this->connect();
@@ -68,7 +68,7 @@ final class MultiConsumerIntegrationTest extends TestCase
     public function testSharedDurableConsumerLoadBalancesAcrossTwoConnectionsWithoutDuplication(): void
     {
         // Load-balance: two client connections pulling from the SAME durable consumer must split the
-        // messages — every message is delivered to exactly one puller (union complete, zero duplicates).
+        // messages - every message is delivered to exactly one puller (union complete, zero duplicates).
         $stream = $this->streamName();
         $subject = $this->subjectFor($stream);
         $consumer = 'CS' . strtoupper(bin2hex(random_bytes(2)));
@@ -114,7 +114,7 @@ final class MultiConsumerIntegrationTest extends TestCase
     public function testConsumersOnSeparateStreamsDoNotCrossTalk(): void
     {
         // Isolation: two streams with disjoint subjects and one consumer each. Each consumer must see only
-        // its own stream's messages — no cross-stream delivery.
+        // its own stream's messages - no cross-stream delivery.
         $client = $this->connect();
         $streamA = $this->streamName();
         $streamB = $this->streamName();
@@ -217,7 +217,7 @@ final class MultiConsumerIntegrationTest extends TestCase
     public function testCoreQueueGroupSubscribersLoadBalanceWithoutDuplication(): void
     {
         // Core NATS queue group: several subscribers on the same subject and queue group must split the
-        // messages — every message delivered to exactly one group member, none duplicated.
+        // messages - every message delivered to exactly one group member, none duplicated.
         $client = $this->connect();
         $subject = 'q.' . strtolower(bin2hex(random_bytes(3)));
 

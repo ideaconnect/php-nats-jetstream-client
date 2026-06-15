@@ -45,7 +45,7 @@ final class JetStreamContext
       *
       * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
       * @param int $publishRetryAttempts Max publish attempts when the JetStream API momentarily has no
-      *                                  responder (503). 1 disables retry. Only 503s are retried — a real
+      *                                  responder (503). 1 disables retry. Only 503s are retried - a real
       *                                  publish error (precondition mismatch, bad subject) is not.
       * @param int $publishRetryWaitMs Delay between publish retry attempts, in milliseconds.
      */
@@ -239,7 +239,7 @@ final class JetStreamContext
     }
 
     /**
-     * Creates a stream, falling back to an update when it already exists — an idempotent upsert.
+     * Creates a stream, falling back to an update when it already exists - an idempotent upsert.
      * Mirrors nats.go / nats.java `CreateOrUpdateStream` (#44).
      *
      * @param list<string> $subjects
@@ -480,7 +480,7 @@ final class JetStreamContext
 
     /**
      * Deletes a single message from a stream by sequence number ($JS.API.STREAM.MSG.DELETE). By default
-     * this is a fast delete (the message is removed but its bytes are not overwritten — `no_erase`).
+     * this is a fast delete (the message is removed but its bytes are not overwritten - `no_erase`).
      * Pass `$secureErase = true` for a secure delete that overwrites the message data with random bytes
      * before removal (slower; mirrors nats.go `SecureDeleteMsg` / nats.java `deleteMessage(seq, true)`).
      *
@@ -608,12 +608,12 @@ final class JetStreamContext
 
             // This convenience caps `batch` at the number of subjects, which is correct only for exact
             // subjects (one match each). A wildcard filter can match many stored subjects, so capping at
-            // the filter count would silently truncate the result — reject it and point to directGetBatch().
+            // the filter count would silently truncate the result - reject it and point to directGetBatch().
             foreach ($subjects as $subject) {
                 if (str_contains($subject, '*') || str_contains($subject, '>')) {
                     throw new JetStreamException(
                         'directGetLastForSubjects expects exact subjects; the wildcard "' . $subject
-                        . '" would be truncated — use directGetBatch() with an explicit batch size instead',
+                        . '" would be truncated - use directGetBatch() with an explicit batch size instead',
                     );
                 }
             }
@@ -657,7 +657,7 @@ final class JetStreamContext
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
                 $status = (int) ($headers['Status'] ?? 0);
 
-                // End-of-batch marker (204), with no payload — the stream is complete.
+                // End-of-batch marker (204), with no payload - the stream is complete.
                 if ($status === 204) {
                     $done = true;
 
@@ -927,7 +927,7 @@ final class JetStreamContext
      * @param callable(NatsMessage):void $handler
      * @param array<string,mixed> $consumerOptions Additional consumer config fields.
      * @param (callable(ConsumerInfo):void)|null $onConsumerCreated Invoked with the created consumer
-     *        before the subscription is established — e.g. to inspect `num_pending` and signal an
+     *        before the subscription is established - e.g. to inspect `num_pending` and signal an
      *        end-of-initial-data when the consumer starts with nothing pending (#99).
      * @return Future<int>
      */
@@ -992,7 +992,7 @@ final class JetStreamContext
             // Recreate the consumer starting just after the last in-order message and restart the
             // consumer-sequence count. Shared by the missed-push path and the idle-heartbeat tail-gap
             // path. The recreated consumer replays the missing range in order; if the restart point was
-            // pruned it resumes from the next available message — no out-of-order/duplicate delivery
+            // pruned it resumes from the next available message - no out-of-order/duplicate delivery
             // and no recreate storm. A failed recreate (stream pruned/deleted, leadership change,
             // transient timeout) is CONTAINED here so it cannot throw out of the shared subscription
             // dispatch loop and abort delivery for every other subscription on the connection.
@@ -1019,7 +1019,7 @@ final class JetStreamContext
                 if ($this->handlePushControlMessage($message)->await()) {
                     // Tail-gap detection: an idle heartbeat reports the server's last delivered consumer
                     // sequence. If it is ahead of what we have processed in order, deliveries at the tail
-                    // were missed and no further message will arrive to expose the gap on its own —
+                    // were missed and no further message will arrive to expose the gap on its own -
                     // recreate proactively from the last in-order point (#86).
                     $lastDelivered = $this->heartbeatLastConsumerSeq($message);
                     if ($lastDelivered !== null && $lastDelivered > $expectedConsumerSeq - 1) {
@@ -1040,7 +1040,7 @@ final class JetStreamContext
 
                 if ($metadata->consumer !== $consumerName) {
                     // A stale delivery from a previous (deleted) consumer instance arriving on the
-                    // reused deliver inbox after a recreate — ignore it so it cannot trigger a spurious
+                    // reused deliver inbox after a recreate - ignore it so it cannot trigger a spurious
                     // recreate or skew the new consumer-sequence count (#86).
                     return;
                 }
@@ -1191,7 +1191,7 @@ final class JetStreamContext
      * Optimistic-concurrency preconditions can be attached so the append only succeeds when the stream
      * is in the expected state (the server rejects a mismatch with a `JetStreamException`):
      * `$expectedStream` (Nats-Expected-Stream), `$expectedLastSequence` (Nats-Expected-Last-Sequence),
-     * `$expectedLastSubjectSequence` (Nats-Expected-Last-Subject-Sequence — `0` asserts "no prior
+     * `$expectedLastSubjectSequence` (Nats-Expected-Last-Subject-Sequence - `0` asserts "no prior
      * message on this subject"), and `$expectedLastMsgId` (Nats-Expected-Last-Msg-Id).
      *
      * @param array<string,string> $headers Additional message headers.
@@ -1253,7 +1253,7 @@ final class JetStreamContext
 
     /**
      * Issues a JetStream publish request, retrying when the JetStream API momentarily has no responder
-     * (a 503 — e.g. a brief leadership change or the API not yet wired up after reconnect). Mirrors
+     * (a 503 - e.g. a brief leadership change or the API not yet wired up after reconnect). Mirrors
      * nats.go `RetryAttempts`/`RetryWait` and nats.java's publish retry (#29).
      *
      * @param array<string,string>|null $headers
@@ -1281,7 +1281,7 @@ final class JetStreamContext
      * Publishes a scheduled message using the NATS 2.12 scheduler headers (ADR-51). The target stream
      * must be created with `allow_msg_schedules` enabled (and `allow_msg_ttl` when a schedule TTL is
      * used). The schedule expression may be `@at <RFC3339>`, `@every <duration>`, or a 6-field cron
-     * expression — build it with the {@see Schedule} helper.
+     * expression - build it with the {@see Schedule} helper.
      *
      * Requires NATS server 2.12+.
      *
@@ -1474,7 +1474,7 @@ final class JetStreamContext
      *        a non-empty (partial) batch, when the pull ended with a terminal status (>=400) that
      *        arrived mid-batch. The partial batch is still returned (nats.go parity); this only makes a
      *        non-routine termination (e.g. 409 consumer deleted, 423 stale pin) observable. Routine
-     *        batch-completion codes (404/408) flow through too — inspect the code (#92).
+     *        batch-completion codes (404/408) flow through too - inspect the code (#92).
      * @return Future<list<NatsMessage>>
      */
     public function fetchBatch(
@@ -1657,7 +1657,7 @@ final class JetStreamContext
     {
         $schedule = trim($schedule);
 
-        // @at <RFC3339> — UTC "Z" or a numeric timezone offset (the server normalizes to UTC), with
+        // @at <RFC3339> - UTC "Z" or a numeric timezone offset (the server normalizes to UTC), with
         // optional fractional seconds.
         if (preg_match('/^@at\s+\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/', $schedule) === 1) {
             return;
@@ -1733,7 +1733,7 @@ final class JetStreamContext
 
             // A flow-control REQUEST carries its reply subject in the message reply ($JS.FC.*). A
             // stalled idle heartbeat instead carries the flow-control reply subject in the
-            // Nats-Consumer-Stalled header VALUE and leaves the message reply empty — answer that one,
+            // Nats-Consumer-Stalled header VALUE and leaves the message reply empty - answer that one,
             // otherwise the server never gets its ack and keeps the consumer stalled (delivery hangs).
             $stalledReply = (string) ($headers['Nats-Consumer-Stalled'] ?? '');
 
@@ -1768,8 +1768,8 @@ final class JetStreamContext
 
     /**
      * Resolves the consumer filter configuration. A consumer may filter on a single subject (the
-     * `$filterSubject` argument → `filter_subject`) or on multiple subjects (a `filter_subjects` array
-     * supplied via the options → `filter_subjects`), but not both. Validates the array and rejects the
+     * `$filterSubject` argument -> `filter_subject`) or on multiple subjects (a `filter_subjects` array
+     * supplied via the options -> `filter_subjects`), but not both. Validates the array and rejects the
      * mutually-exclusive combination client-side (issue #10, NATS 2.10+).
      *
      * @param array<string,mixed> $config
@@ -1789,7 +1789,7 @@ final class JetStreamContext
                 }
             }
 
-            // Mutually exclusive with the singular filter — whether supplied as the argument or
+            // Mutually exclusive with the singular filter - whether supplied as the argument or
             // smuggled in via the options bag.
             if ($filterSubject !== null || array_key_exists('filter_subject', $config)) {
                 throw new JetStreamException('Use either a single filter subject or filter_subjects, not both');
@@ -1941,7 +1941,7 @@ final class JetStreamContext
     /**
      * Raises a JetStream API error, upgrading it to an {@see \IDCT\NATS\Exception\UnsupportedFeatureException}
      * when the server's response shows the failure is a version-gated feature this server is too old for
-     * (e.g. an `unknown field "allow_atomic"` rejection). Reactive only — no per-request version probe.
+     * (e.g. an `unknown field "allow_atomic"` rejection). Reactive only - no per-request version probe.
      */
     private function throwApiError(string $description, int $code): never
     {
@@ -1968,9 +1968,9 @@ final class JetStreamContext
     }
 
     /**
-     * Returns the full JetStream delivery metadata for a consumed message — stream/consumer sequences,
+     * Returns the full JetStream delivery metadata for a consumed message - stream/consumer sequences,
      * redelivery count (`num_delivered`), pending backlog (`num_pending`), server timestamp, and the
-     * JetStream domain — parsed from its `$JS.ACK` reply subject. Mirrors nats.go `Msg.Metadata()` /
+     * JetStream domain - parsed from its `$JS.ACK` reply subject. Mirrors nats.go `Msg.Metadata()` /
      * nats.java `Message.metaData()` (#30).
      *
      * @throws JetStreamException When the message was not delivered by a JetStream consumer.

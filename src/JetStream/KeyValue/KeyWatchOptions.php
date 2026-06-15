@@ -10,7 +10,7 @@ namespace IDCT\NATS\JetStream\KeyValue;
  * Delivery-policy precedence (highest first): {@see $resumeFromRevision}, {@see $includeHistory},
  * {@see $updatesOnly}. When an instance of this class is supplied with none of those flags set, the
  * watcher replays the current value of every matching key (last-per-subject) and then streams live
- * updates — the reference-client default.
+ * updates - the reference-client default.
  *
  * Note: this last-per-subject default applies only when an instance is passed. {@see KeyValueBucket::watch()}
  * called with `$options = null` (the common form) is updates-only (deliver_policy=new) and replays nothing;
@@ -29,7 +29,7 @@ final class KeyWatchOptions
      * @param int|null      $resumeFromRevision Start delivery at this stream sequence
      *                                          (deliver_policy=by_start_sequence), e.g. to resume a watch.
      * @param (\Closure():void)|null $onCaughtUp Invoked once when the initial replay has caught up to the
-     *                                          current end of the stream — either a delivered message
+     *                                          current end of the stream - either a delivered message
      *                                          reports num_pending = 0, or the consumer starts with nothing
      *                                          pending (empty / no-match bucket), in which case it fires
      *                                          immediately without any delivery (#99). Mirrors the

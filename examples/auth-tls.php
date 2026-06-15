@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Mutual TLS — encrypted connection with a client certificate.
+ * Mutual TLS - encrypted connection with a client certificate.
  *
  * Connects over tls:// presenting a client certificate (CA + cert + key fixtures) for
  * mutual TLS, then round-trips a message to prove the encrypted channel carries

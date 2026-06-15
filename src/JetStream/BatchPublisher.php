@@ -19,7 +19,7 @@ use function Amp\async;
  * `Nats-Batch-Id` and an incrementing `Nats-Batch-Sequence`; the final message carries
  * `Nats-Batch-Commit: 1`, on which the server atomically commits the whole batch and returns a single
  * PubAck (with the batch id and committed `count`). A consistency-check failure aborts the entire
- * batch — nothing is stored.
+ * batch - nothing is stored.
  *
  * Usage:
  *   $ack = $js->batch()

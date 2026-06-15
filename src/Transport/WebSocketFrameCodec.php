@@ -30,8 +30,8 @@ final class WebSocketFrameCodec
     private const MAX_FRAME_PAYLOAD = 64 * 1024 * 1024;
 
     /**
-     * Encodes a single final ({@code FIN=1}) frame. When $mask is true (the default — required for
-     * client→server frames) the payload is masked with a fresh 4-byte key.
+     * Encodes a single final ({@code FIN=1}) frame. When $mask is true (the default - required for
+     * client->server frames) the payload is masked with a fresh 4-byte key.
      *
      * @param string|null $maskKey Optional fixed mask key (4 bytes) for deterministic tests; otherwise random.
      */

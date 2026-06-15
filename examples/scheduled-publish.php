@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Scheduled Publish (@at) — deliver a message at a future time.
+ * Scheduled Publish (@at) - deliver a message at a future time.
  *
  * Creates a schedule-enabled stream and uses publishScheduled() with Schedule::at() to
  * queue a delayed delivery, then polls the target subject (via Direct Get) until the

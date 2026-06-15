@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Services Framework — a NATS micro-service.
+ * Services Framework - a NATS micro-service.
  *
  * Builds a service exposing a flat endpoint and a grouped endpoint, calls both, and
  * queries the spec discovery channel ($SRV.PING.<name>). The service shares the

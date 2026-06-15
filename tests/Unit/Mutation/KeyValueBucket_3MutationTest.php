@@ -150,7 +150,7 @@ final class KeyValueBucket_3MutationTest extends TestCase
     {
         // kills GreaterThan @ 718 (> -> >=) and LogicalAnd @ 718 (&& -> ||)
         // Non-KV-prefixed subjects drive pagination without triggering Direct Get lookups, so the
-        // only frames in play are the STREAM.INFO pages — letting us count requests precisely.
+        // only frames in play are the STREAM.INFO pages - letting us count requests precisely.
         $page1 = '{"state":{"subjects":{"other.a":1}}}';     // +1 new
         $page2 = '{"state":{"subjects":{"other.b":1}}}';     // +1 new
         $page3 = '{"state":{"subjects":{"other.a":1}}}';     // duplicate, newCount 0, non-empty -> real STOPS here

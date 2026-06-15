@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pull Consumer Priority Groups — pinned-client steering (NATS 2.11+).
+ * Pull Consumer Priority Groups - pinned-client steering (NATS 2.11+).
  *
  * Creates a pull consumer with a pinned-client priority group, pulls under the group
  * (the iterator captures and resends the Nats-Pin-Id and re-pins transparently on a

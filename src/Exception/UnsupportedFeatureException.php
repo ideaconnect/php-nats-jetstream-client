@@ -10,7 +10,7 @@ namespace IDCT\NATS\Exception;
  *
  * It is a {@see JetStreamException}, so existing `catch (JetStreamException)` handlers still catch it;
  * catch this type specifically to detect "feature not available on this server version" distinctly.
- * The detection is reactive — it is derived from the server's own error response, not from a
+ * The detection is reactive - it is derived from the server's own error response, not from a
  * per-request version probe.
  */
 final class UnsupportedFeatureException extends JetStreamException

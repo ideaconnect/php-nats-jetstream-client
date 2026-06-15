@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Publish / Subscribe — the most basic core messaging round-trip.
+ * Publish / Subscribe - the most basic core messaging round-trip.
  *
  * Subscribes to a subject, publishes one JSON message to it, then drives
  * processIncoming() until the subscription callback receives the message.

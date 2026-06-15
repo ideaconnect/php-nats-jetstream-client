@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Connection Statistics and RTT — client counters + latency.
+ * Connection Statistics and RTT - client counters + latency.
  *
  * Reads the synchronous statistics() snapshot (in/out message + byte counts and
  * reconnects) and measures round-trip latency to the server with rtt().

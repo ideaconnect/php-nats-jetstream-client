@@ -275,7 +275,7 @@ final class SubscriptionQueueMutationTest extends TestCase
     }
 
     /**
-     * Once a message is buffered, next() must BREAK out of the wait loop immediately — it must not
+     * Once a message is buffered, next() must BREAK out of the wait loop immediately - it must not
      * keep pumping the socket. With a blocking transport that supplies one frame then parks, the real
      * code reads exactly the queued chunk and breaks (no blocking read is ever started); the mutant
      * keeps looping and starts a blocking processIncoming read.
@@ -452,7 +452,7 @@ final class SubscriptionQueueMutationTest extends TestCase
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
             // Three frames in ONE chunk: a single processIncoming buffers a,b,c together, so the inner
-            // drain (line 218) — not the pre-buffer drain (201) — is what must honor the limit.
+            // drain (line 218) - not the pre-buffer drain (201) - is what must honor the limit.
             "MSG events 1 1\r\na\r\nMSG events 1 1\r\nb\r\nMSG events 1 1\r\nc\r\n",
         ]);
         $client = $this->makeConnectedClient($transport);

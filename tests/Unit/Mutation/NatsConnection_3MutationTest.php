@@ -169,7 +169,7 @@ final class NatsConnection_3MutationTest extends TestCase
     /**
      * requestMany with no maxResponses and no stall runs until the total deadline. When the per-slice
      * read times out (CancelledException) and there is NO external cancellation, the loop must continue
-     * and ultimately return the collected messages — never rethrow / dereference a null cancellation.
+     * and ultimately return the collected messages - never rethrow / dereference a null cancellation.
      */
     public function testRequestManyTotalTimeoutWithoutExternalCancellationReturnsCollected(): void
     {

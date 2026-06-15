@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Stream Message Get — fetch a stored message by sequence.
+ * Stream Message Get - fetch a stored message by sequence.
  *
  * Publishes a message, reads the stream sequence from its PubAck, and fetches the
  * stored message back by that sequence with getStreamMessage().

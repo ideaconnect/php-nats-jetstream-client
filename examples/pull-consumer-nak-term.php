@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pull Consumer (NAK / Delayed NAK / TERM / In-Progress) — redelivery control.
+ * Pull Consumer (NAK / Delayed NAK / TERM / In-Progress) - redelivery control.
  *
  * On a pulled message, demonstrates inProgress() (extend the ack deadline), nak()
  * (redeliver now), nakWithDelay() (redeliver after a delay), and term() (stop

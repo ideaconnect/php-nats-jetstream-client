@@ -81,7 +81,7 @@ final class NatsOptions
       *        With reconnect enabled the initial connect already retries; this decouples "try hard to
       *        connect once" from "reconnect forever after".
       * @param array<string,string> $webSocketHeaders Extra HTTP headers added to the WebSocket upgrade
-      *        request (e.g. cookies, proxy auth) — used by {@see \IDCT\NATS\Transport\WebSocketTransport}.
+      *        request (e.g. cookies, proxy auth) - used by {@see \IDCT\NATS\Transport\WebSocketTransport}.
       * @param bool $webSocketCompression Request permessage-deflate compression on the WebSocket
       *        connection; payloads are (de)compressed only when the server agrees in the handshake.
       * @param LoggerInterface|null $logger Optional PSR-3 logger; lifecycle events (connect/disconnect/

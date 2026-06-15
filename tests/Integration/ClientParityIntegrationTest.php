@@ -22,7 +22,7 @@ use PHPUnit\Framework\TestCase;
 use function Amp\async;
 
 /**
- * Live-server coverage for the P1 client-API parity features (#16–#32) against the Docker fixtures.
+ * Live-server coverage for the P1 client-API parity features (#16-#32) against the Docker fixtures.
  */
 final class ClientParityIntegrationTest extends TestCase
 {
@@ -59,7 +59,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #17 — a delivered message replies to its own reply subject via respond().
+     * #17 - a delivered message replies to its own reply subject via respond().
      */
     public function testRespondHelperRepliesToRequester(): void
     {
@@ -90,7 +90,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #21 — requestMany collects multiple replies and stops at maxResponses.
+     * #21 - requestMany collects multiple replies and stops at maxResponses.
      */
     public function testRequestManyCollectsMultipleReplies(): void
     {
@@ -127,7 +127,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #42 — multi-value headers round-trip through the server and are preserved by fromWireBlockMulti.
+     * #42 - multi-value headers round-trip through the server and are preserved by fromWireBlockMulti.
      */
     public function testMultiValueHeadersRoundTrip(): void
     {
@@ -161,7 +161,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #22 — the connection listener observes Connected then Closed.
+     * #22 - the connection listener observes Connected then Closed.
      */
     public function testConnectionLifecycleListenerObservesConnectAndClose(): void
     {
@@ -182,7 +182,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #24 — a token provider supplies credentials on connect (token-auth server).
+     * #24 - a token provider supplies credentials on connect (token-auth server).
      */
     public function testDynamicTokenProviderAuthenticates(): void
     {
@@ -223,7 +223,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #16 — optimistic-concurrency publish expectations: match succeeds, mismatch fails.
+     * #16 - optimistic-concurrency publish expectations: match succeeds, mismatch fails.
      */
     public function testPublishExpectationsEnforceLastSequence(): void
     {
@@ -254,7 +254,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #20 — deleteMessage removes a stored message by sequence.
+     * #20 - deleteMessage removes a stored message by sequence.
      */
     public function testDeleteMessageRemovesStoredMessage(): void
     {
@@ -284,7 +284,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #18 + #30 — ackSync double-acks a pulled message and messageMetadata exposes the $JS.ACK tuple.
+     * #18 + #30 - ackSync double-acks a pulled message and messageMetadata exposes the $JS.ACK tuple.
      */
     public function testAckSyncAndMessageMetadataOnPulledMessage(): void
     {
@@ -321,7 +321,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #32 — a pull consumer's handle loop stops promptly when stop() is signalled from the handler.
+     * #32 - a pull consumer's handle loop stops promptly when stop() is signalled from the handler.
      */
     public function testPullConsumerStopHaltsLoop(): void
     {
@@ -357,7 +357,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #37 — credentials embedded in the server URL authenticate (user:pass against the userpass server).
+     * #37 - credentials embedded in the server URL authenticate (user:pass against the userpass server).
      */
     public function testUrlEmbeddedUserPasswordAuthenticates(): void
     {
@@ -391,7 +391,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #37 — a token embedded in the server URL authenticates (token@host against the token server).
+     * #37 - a token embedded in the server URL authenticates (token@host against the token server).
      */
     public function testUrlEmbeddedTokenAuthenticates(): void
     {
@@ -408,7 +408,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #45 — an injected ClientTlsContext is used verbatim for the handshake.
+     * #45 - an injected ClientTlsContext is used verbatim for the handshake.
      */
     public function testInjectedTlsContextConnects(): void
     {
@@ -440,7 +440,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #52 — connection accessors (connectedUrl, maxPayload, RTT, statistics) against a live server.
+     * #52 - connection accessors (connectedUrl, maxPayload, RTT, statistics) against a live server.
      */
     public function testConnectionAccessorsLive(): void
     {
@@ -477,14 +477,14 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #46 — a bad credential fails fast with AuthenticationException, not an exhausted reconnect loop.
+     * #46 - a bad credential fails fast with AuthenticationException, not an exhausted reconnect loop.
      */
     public function testAuthenticationErrorFailsFast(): void
     {
         $this->requireIntegrationEnabled();
 
         // Capture reconnect activity so fast-fail can be asserted on BEHAVIOR rather than wall-clock
-        // latency (a wall-clock bound flakes under an occasional event-loop stall — see #70).
+        // latency (a wall-clock bound flakes under an occasional event-loop stall - see #70).
         $logger = new class extends \Psr\Log\AbstractLogger {
             /** @var list<string> */
             public array $messages = [];
@@ -523,7 +523,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #60 — KV and Object Store bucket discovery lists created buckets.
+     * #60 - KV and Object Store bucket discovery lists created buckets.
      */
     public function testBucketDiscovery(): void
     {
@@ -548,7 +548,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #33 + #41 — KV getRevision reads a historical revision and history() returns all revisions.
+     * #33 + #41 - KV getRevision reads a historical revision and history() returns all revisions.
      */
     public function testKeyValueGetRevisionAndHistory(): void
     {
@@ -577,7 +577,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #62 — a KV mirror bucket is created with its mirror pointing at the source bucket's KV_ stream.
+     * #62 - a KV mirror bucket is created with its mirror pointing at the source bucket's KV_ stream.
      */
     public function testKeyValueMirrorBucketConfig(): void
     {
@@ -600,7 +600,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #34 — compare-and-delete: a stale expected revision is rejected, the current one succeeds.
+     * #34 - compare-and-delete: a stale expected revision is rejected, the current one succeeds.
      */
     public function testKeyValueCompareAndDelete(): void
     {
@@ -633,7 +633,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #53 + #54 — typed StreamConfiguration / ConsumerConfiguration builders create matching assets.
+     * #53 + #54 - typed StreamConfiguration / ConsumerConfiguration builders create matching assets.
      */
     public function testTypedStreamAndConsumerBuilders(): void
     {
@@ -676,7 +676,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #35 — streamNames() and consumerNames() list names without the full info payload.
+     * #35 - streamNames() and consumerNames() list names without the full info payload.
      */
     public function testStreamAndConsumerNames(): void
     {
@@ -700,7 +700,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #36 — getLastMessageForSubject returns the most recent message for a subject (leader path).
+     * #36 - getLastMessageForSubject returns the most recent message for a subject (leader path).
      */
     public function testGetLastMessageForSubjectLive(): void
     {
@@ -725,7 +725,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #44 — createOrUpdateStream upserts: creates first, then updates the existing stream's subjects.
+     * #44 - createOrUpdateStream upserts: creates first, then updates the existing stream's subjects.
      */
     public function testCreateOrUpdateStreamUpserts(): void
     {
@@ -748,7 +748,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #19 — KV createKey is exclusive: first create wins, a second throws.
+     * #19 - KV createKey is exclusive: first create wins, a second throws.
      */
     public function testKeyValueCreateKeyIsExclusive(): void
     {
@@ -777,7 +777,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #25 — keys() returns live key names, excluding deleted keys.
+     * #25 - keys() returns live key names, excluding deleted keys.
      */
     public function testKeyValueKeysListsLiveKeys(): void
     {
@@ -803,7 +803,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #26 — watch options replay history and signal end-of-initial-data, suppressing deletes.
+     * #26 - watch options replay history and signal end-of-initial-data, suppressing deletes.
      */
     public function testKeyValueWatchOptionsReplayHistoryAndSignalCaughtUp(): void
     {
@@ -849,7 +849,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #28 — ObjectStore updateMeta renames an object without re-uploading its bytes.
+     * #28 - ObjectStore updateMeta renames an object without re-uploading its bytes.
      */
     public function testObjectStoreUpdateMetaRenames(): void
     {
@@ -881,7 +881,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #27 — a service endpoint handler replies with a custom ServiceError (code/description/body).
+     * #27 - a service endpoint handler replies with a custom ServiceError (code/description/body).
      */
     public function testServiceHandlerRepliesWithCustomError(): void
     {
@@ -928,7 +928,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #39 — ObjectStore typed config maps to the backing stream configuration.
+     * #39 - ObjectStore typed config maps to the backing stream configuration.
      */
     public function testObjectStoreTypedConfigApplied(): void
     {
@@ -947,7 +947,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #58 — an object description is stored and surfaced on ObjectInfo.
+     * #58 - an object description is stored and surfaced on ObjectInfo.
      */
     public function testObjectStoreDescriptionStored(): void
     {
@@ -970,7 +970,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #59 — get() transparently follows an object link to the target's content.
+     * #59 - get() transparently follows an object link to the target's content.
      */
     public function testObjectStoreGetFollowsLink(): void
     {
@@ -995,7 +995,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #48 — addLink writes a resolvable link object pointing at a target object.
+     * #48 - addLink writes a resolvable link object pointing at a target object.
      */
     public function testObjectStoreAddLink(): void
     {
@@ -1021,7 +1021,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #38 — a sealed bucket rejects further writes.
+     * #38 - a sealed bucket rejects further writes.
      */
     public function testObjectStoreSealRejectsWrites(): void
     {
@@ -1053,7 +1053,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #40 + #50 — a grouped endpoint forwards metadata to $SRV.INFO and a stats supplier to $SRV.STATS.
+     * #40 + #50 - a grouped endpoint forwards metadata to $SRV.INFO and a stats supplier to $SRV.STATS.
      */
     public function testServiceGroupedMetadataAndCustomStats(): void
     {
@@ -1096,7 +1096,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #57 — the service done handler fires when run() stops.
+     * #57 - the service done handler fires when run() stops.
      */
     public function testServiceDoneHandlerFiresWhenRunStops(): void
     {
@@ -1121,7 +1121,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #51 — drain() stops the service serving requests (subsequent requests get no responder).
+     * #51 - drain() stops the service serving requests (subsequent requests get no responder).
      */
     public function testServiceDrainStopsServing(): void
     {
@@ -1172,7 +1172,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #43 — drainSubscription delivers the in-flight message then stops further delivery.
+     * #43 - drainSubscription delivers the in-flight message then stops further delivery.
      */
     public function testSubscriptionDrainStopsDelivery(): void
     {
@@ -1205,7 +1205,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #61 — WebSocket with permessage-deflate compression + a custom upgrade header round-trips.
+     * #61 - WebSocket with permessage-deflate compression + a custom upgrade header round-trips.
      */
     public function testWebSocketCompressionAndCustomHeaders(): void
     {
@@ -1242,7 +1242,7 @@ final class ClientParityIntegrationTest extends TestCase
     }
 
     /**
-     * #31 — the WebSocket transport carries core pub/sub and JetStream over ws://.
+     * #31 - the WebSocket transport carries core pub/sub and JetStream over ws://.
      */
     public function testWebSocketTransportCarriesPubSubAndJetStream(): void
     {

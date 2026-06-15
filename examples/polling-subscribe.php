@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Polling Subscribe — synchronous consumption with SubscriptionQueue.
+ * Polling Subscribe - synchronous consumption with SubscriptionQueue.
  *
  * Uses subscribeQueue() to get a SubscriptionQueue, then pulls messages with the
  * blocking next() (single, returns null on timeout) and fetchAll() (batch within
@@ -37,10 +37,10 @@ try {
     $client->publish('events.created', 'two')->await();
     $client->publish('events.created', 'three')->await();
 
-    // Blocking fetch — waits up to the configured timeout, returns null on timeout.
+    // Blocking fetch - waits up to the configured timeout, returns null on timeout.
     $first = $queue->next();
 
-    // Batch fetch — collects up to 10 messages within the timeout window.
+    // Batch fetch - collects up to 10 messages within the timeout window.
     $rest = $queue->fetchAll(limit: 10);
 
     $total = ($first !== null ? 1 : 0) + count($rest);

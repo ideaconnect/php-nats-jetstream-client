@@ -107,7 +107,7 @@ final class PullConsumerIteratorMutationTest extends TestCase
 
     /**
      * Reinforces the iteration counter for iterations=2: the loop must run EXACTLY twice (two pulls,
-     * two messages) and stop — not once, not three times. Provides a clearer failure for the
+     * two messages) and stop - not once, not three times. Provides a clearer failure for the
      * off-by-one / counter-direction mutants on the loop.
      *
      * Kills (corroborates): DecrementInteger@262, LessThan@264, Increment@268.
@@ -163,7 +163,7 @@ final class PullConsumerIteratorMutationTest extends TestCase
             ->setBatching(1)
             ->setExpiresMs(100)
             ->setIterations(1)
-            ->setNoWait() // default argument — must be true
+            ->setNoWait() // default argument - must be true
             ->handle(static function (): void {})->await();
 
         $pulls = $this->pullWrites($transport);
@@ -178,7 +178,7 @@ final class PullConsumerIteratorMutationTest extends TestCase
      * loop must keep polling and ultimately deliver the message that arrives on the next pull.
      *
      * Both mutants at line 296 drop 408 from the routine list ([404,408] -> [404,407] / [404,409]),
-     * which would make a 408 terminal and stop the loop before the message — total would be 0.
+     * which would make a 408 terminal and stop the loop before the message - total would be 0.
      *
      * Kills: DecrementInteger @ 296, IncrementInteger @ 296.
      */
@@ -186,7 +186,7 @@ final class PullConsumerIteratorMutationTest extends TestCase
     {
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
-            // iter 1 (sid 1): routine 408 timeout — infinite mode must keep polling, not stop.
+            // iter 1 (sid 1): routine 408 timeout - infinite mode must keep polling, not stop.
             $this->statusFrame(408, 'Request Timeout', '1'),
             // iter 2 (sid 2): the message arrives on the next pull.
             $this->jsMsg('after-timeout', '2', '$JS.ACK.S.C.1.1.1.0.0'),
@@ -226,7 +226,7 @@ final class PullConsumerIteratorMutationTest extends TestCase
             ...$this->infoAndPong(),
             // iter 1 (sid 1): terminal 409 must stop the loop immediately.
             $this->statusFrame(409, 'Consumer Deleted', '1'),
-            // If the loop (wrongly) kept polling, it would deliver this — it must NOT be reached.
+            // If the loop (wrongly) kept polling, it would deliver this - it must NOT be reached.
             $this->jsMsg('should-not-arrive', '2', '$JS.ACK.S.C.1.1.1.0.0'),
         ]);
 

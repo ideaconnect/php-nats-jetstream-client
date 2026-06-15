@@ -55,7 +55,7 @@ final class KeyWatchOptionsMutationTest extends \PHPUnit\Framework\TestCase
     }
 
     /**
-     * When metaOnly IS set, headers_only=true is emitted — this anchors the
+     * When metaOnly IS set, headers_only=true is emitted - this anchors the
      * positive side of the metaOnly default so the two states are distinguishable.
      */
     public function testMetaOnlyTrueEmitsHeadersOnly(): void
@@ -79,7 +79,7 @@ final class KeyWatchOptionsMutationTest extends \PHPUnit\Framework\TestCase
         self::assertSame('none', $defaultConfig['ack_policy']);
 
         // kills ArrayItemRemoval @ line 54 (also present on the resumeFromRevision branch,
-        // which never touches ack_policy itself — proving the seed, not a branch, supplies it)
+        // which never touches ack_policy itself - proving the seed, not a branch, supplies it)
         $resumeConfig = (new KeyWatchOptions(resumeFromRevision: 7))->toConsumerConfig();
         self::assertArrayHasKey('ack_policy', $resumeConfig);
         self::assertSame('none', $resumeConfig['ack_policy']);

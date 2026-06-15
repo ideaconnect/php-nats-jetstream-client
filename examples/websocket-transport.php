@@ -1,7 +1,7 @@
 <?php
 
 /**
- * WebSocket Transport — NATS over a ws:// connection.
+ * WebSocket Transport - NATS over a ws:// connection.
  *
  * Connects with WebSocketTransport (negotiating permessage-deflate compression and
  * sending custom upgrade headers) and round-trips a message to prove the WebSocket

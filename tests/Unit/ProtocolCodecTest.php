@@ -363,7 +363,7 @@ final class ProtocolCodecTest extends TestCase
         $codec = new ProtocolCodec();
         $options = new NatsOptions(
             jwt: 'jwt-value',
-            // Intentionally wrong public key — does not match the seed above.
+            // Intentionally wrong public key - does not match the seed above.
             nkey: 'UABC123WRONGKEY',
             nonceSigner: $signer,
         );
@@ -391,8 +391,8 @@ final class ProtocolCodecTest extends TestCase
      * Verifies that a bare 'INFO' line without a trailing space throws the prefix error (line 240).
      *
      * NOTE: The "INFO payload cannot be empty" guard at line 246 is structurally unreachable:
-     * trim() strips trailing whitespace, so any trimmed line that passes the str_starts_with(…, 'INFO ')
-     * check must contain at least one non-whitespace character after position 5, making substr(…, 5)
+     * trim() strips trailing whitespace, so any trimmed line that passes the str_starts_with(..., 'INFO ')
+     * check must contain at least one non-whitespace character after position 5, making substr(..., 5)
      * always non-empty. This test documents the reachable boundary instead.
      */
     public function testDecodeInfoLineThrowsOnBareInfoWithoutSpace(): void

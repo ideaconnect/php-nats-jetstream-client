@@ -5,8 +5,8 @@ declare(strict_types=1);
 namespace IDCT\NATS\Services;
 
 /**
- * Thrown by a service endpoint handler to reply with an explicit micro-spec error — a chosen code and
- * description (and optional body) — instead of the generic internal-error response. The runtime emits
+ * Thrown by a service endpoint handler to reply with an explicit micro-spec error - a chosen code and
+ * description (and optional body) - instead of the generic internal-error response. The runtime emits
  * the `Nats-Service-Error` / `Nats-Service-Error-Code` reply headers so a generic micro client detects
  * the failure without parsing the body. Mirrors nats.go `Request.Error()` / nats.java `respondStandardError`.
  */

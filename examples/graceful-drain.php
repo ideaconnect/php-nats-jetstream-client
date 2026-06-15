@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Graceful Drain — flush in-flight work before closing.
+ * Graceful Drain - flush in-flight work before closing.
  *
  * Publishes a message that is in flight, then calls drain(): it unsubscribes all
  * subscriptions, delivers the pending messages to their handlers, and closes the

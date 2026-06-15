@@ -1,7 +1,7 @@
 <?php
 
 /**
- * JetStream Pull Consumer (Fetch + ACK) — pull one, acknowledge it.
+ * JetStream Pull Consumer (Fetch + ACK) - pull one, acknowledge it.
  *
  * Uses fetchNext() to pull a single message and ack() it, then demonstrates ackSync()
  * (double-ack): it sends the ACK as a request and waits for the server to confirm

@@ -17,7 +17,7 @@ use PHPUnit\Framework\TestCase;
  *
  * Each test pins an exact observable behavior (return value, thrown message, bytes written, count,
  * boundary) that a specific surviving mutant would change. Frames are fed deterministically through
- * FakeTransport and the in-process Amp loop — no sockets, no sleeps.
+ * FakeTransport and the in-process Amp loop - no sockets, no sleeps.
  */
 final class ObjectStoreBucket_2MutationTest extends TestCase
 {
@@ -113,15 +113,15 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         // Locate the meta HPUB (it is the only frame carrying the encoded meta subject + JSON body).
         self::assertStringContainsString('HPUB $O.assets.M.' . $this->encodeName('big.txt') . ' ', $writes);
 
-        // kills ArrayItem @ 345 — the 'bucket' key must be present in the meta record.
+        // kills ArrayItem @ 345 - the 'bucket' key must be present in the meta record.
         self::assertStringContainsString('"bucket":"assets"', $writes);
 
-        // kills FalseValue @ 351 — a freshly stored object is NOT a tombstone.
+        // kills FalseValue @ 351 - a freshly stored object is NOT a tombstone.
         self::assertStringContainsString('"deleted":false', $writes);
         self::assertStringNotContainsString('"deleted":true', $writes);
         self::assertFalse($stored->deleted);
 
-        // kills ArrayItem @ 352 and ArrayItemRemoval @ 352 — options carries max_chunk_size.
+        // kills ArrayItem @ 352 and ArrayItemRemoval @ 352 - options carries max_chunk_size.
         self::assertStringContainsString('"options":{"max_chunk_size":3}', $writes);
     }
 
@@ -161,7 +161,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
     }
 
     /**
-     * get() throws the exact link-hop message (depth 9 chain) — pins the message text/operand order.
+     * get() throws the exact link-hop message (depth 9 chain) - pins the message text/operand order.
      */
     public function testGetTooManyHopsMessageIsExact(): void
     {
@@ -173,7 +173,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
         $client = $this->connect(new FakeTransport($queue));
 
-        // kills Concat/ConcatOperandRemoval @ 387 (x4) — exact message, name interpolated in place.
+        // kills Concat/ConcatOperandRemoval @ 387 (x4) - exact message, name interpolated in place.
         try {
             $client->jetStream()->objectStore('assets')->get('loop.txt')->await();
             self::fail('expected JetStreamException');
@@ -213,14 +213,14 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         self::assertSame('hello', $fetched->data);
 
         $writes = implode('||', $transport->writes);
-        // kills Coalesce @ 429 and Ternary @ 431 — the target lookup hits OBJ_other, not OBJ_assets.
+        // kills Coalesce @ 429 and Ternary @ 431 - the target lookup hits OBJ_other, not OBJ_assets.
         self::assertStringContainsString('$JS.API.DIRECT.GET.OBJ_other', $writes);
         self::assertStringContainsString('$O.other.M.' . $this->encodeName('doc.txt'), $writes);
         self::assertStringContainsString('$O.other.C.' . $nuid, $writes);
     }
 
     /**
-     * A bucket link (no 'name' key) is rejected with the exact message — pins line 426 concat order.
+     * A bucket link (no 'name' key) is rejected with the exact message - pins line 426 concat order.
      */
     public function testGetBucketLinkMessageIsExact(): void
     {
@@ -232,7 +232,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
         $client = $this->connect($transport);
 
-        // kills Concat/ConcatOperandRemoval @ 426 (x4) — exact message, name interpolated in place.
+        // kills Concat/ConcatOperandRemoval @ 426 (x4) - exact message, name interpolated in place.
         try {
             $client->jetStream()->objectStore('assets')->get('bucket-link')->await();
             self::fail('expected JetStreamException');
@@ -249,7 +249,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
     // ------------------------------------------------------------------------------------------
 
     /**
-     * getToCallback() must start at depth 0, increment by 1, and treat 8 as inclusive — same boundary
+     * getToCallback() must start at depth 0, increment by 1, and treat 8 as inclusive - same boundary
      * proof as get() but for the streaming path (lines 446, 459, 471).
      */
     public function testGetToCallbackResolvesExactlyEightLinkHops(): void
@@ -280,7 +280,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
     }
 
     /**
-     * getToCallback() throws the exact link-hop message — pins line 460 concat order/operands.
+     * getToCallback() throws the exact link-hop message - pins line 460 concat order/operands.
      */
     public function testGetToCallbackTooManyHopsMessageIsExact(): void
     {
@@ -325,7 +325,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
         $client = $this->connect($transport);
 
-        // kills MethodCallRemoval @ 482 — without verifyDigest() this returns info silently.
+        // kills MethodCallRemoval @ 482 - without verifyDigest() this returns info silently.
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Object digest mismatch');
         $client->jetStream()->objectStore('assets')->getToCallback('doc.txt', static function (string $c): void {})->await();
@@ -347,7 +347,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $meta, // info() (sid 1) — no further frames; the real code must not pull anything.
+            $meta, // info() (sid 1) - no further frames; the real code must not pull anything.
         ]);
 
         $client = $this->connect($transport);
@@ -357,7 +357,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         self::assertInstanceOf(ObjectData::class, $fetched);
         self::assertSame('', $fetched->data);
 
-        // kills LessThanOrEqualTo @ 508 — the zero-chunk case never touches the consumer API.
+        // kills LessThanOrEqualTo @ 508 - the zero-chunk case never touches the consumer API.
         $writes = implode('||', $transport->writes);
         self::assertStringNotContainsString('$JS.API.CONSUMER.CREATE', $writes);
         self::assertStringNotContainsString('$JS.API.CONSUMER.MSG.NEXT', $writes);
@@ -397,19 +397,19 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         self::assertSame($assembled, $fetched->data);
 
         $writes = implode('||', $transport->writes);
-        // kills ArrayItemRemoval @ 549 — the consumer config keeps deliver_policy:all.
+        // kills ArrayItemRemoval @ 549 - the consumer config keeps deliver_policy:all.
         self::assertStringContainsString('"deliver_policy":"all"', $writes);
         // kills NotIdentical @ 585 (x2), LogicalAndNegation @ 585, LogicalAndAllSubExprNegation @ 585,
-        // and MethodCallRemoval @ 587 — the non-empty consumer name IS deleted.
+        // and MethodCallRemoval @ 587 - the non-empty consumer name IS deleted.
         self::assertStringContainsString('$JS.API.CONSUMER.DELETE.OBJ_assets.EPHMC', $writes);
     }
 
     /**
      * When the consumer create FAILS, $consumerName stays null at the finally, so the guard
-     * ($consumerName !== null && $consumerName !== '') is false and NO delete is attempted — the
+     * ($consumerName !== null && $consumerName !== '') is false and NO delete is attempted - the
      * original create error propagates as a JetStreamException. The LogicalAnd mutant ('||') makes the
      * guard true for a null name and calls deleteConsumer(stream, null), which is a TypeError under
-     * strict_types — a different (non-JetStream) exception type, so the JetStreamException expectation
+     * strict_types - a different (non-JetStream) exception type, so the JetStreamException expectation
      * fails and the mutant is killed.
      */
     public function testNullConsumerNameSkipsDeletionOnCreateFailure(): void
@@ -476,7 +476,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
         self::assertTrue($threw, 'expected the 409 fetch error to propagate');
 
-        // kills UnwrapFinally @ 543 — the finally still deletes the consumer even though fetch threw.
+        // kills UnwrapFinally @ 543 - the finally still deletes the consumer even though fetch threw.
         $writes = implode('||', $transport->writes);
         self::assertStringContainsString('$JS.API.CONSUMER.DELETE.OBJ_assets.EPHFIN', $writes);
     }
@@ -487,7 +487,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
     /**
      * The digest-mismatch message must read exactly "expected <stored>, got <computed>" with both
-     * operands in place — pins all six concat mutants on line 625.
+     * operands in place - pins all six concat mutants on line 625.
      */
     public function testDigestMismatchMessageIsExact(): void
     {
@@ -507,7 +507,7 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
         $client = $this->connect($transport);
 
-        // kills Concat/ConcatOperandRemoval @ 625 (x6) — full message text + operand order.
+        // kills Concat/ConcatOperandRemoval @ 625 (x6) - full message text + operand order.
         try {
             $client->jetStream()->objectStore('assets')->get('doc.txt')->await();
             self::fail('expected JetStreamException');

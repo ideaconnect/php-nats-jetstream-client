@@ -119,14 +119,14 @@ final class WebSocketTransportTest extends TestCase
      *
      * The DSN contains a query part, so path is built as '/?q=v' on line 76.  The closure then
      * proceeds to the socket connect which fails (port 1 is not listening), surfacing an Amp
-     * ConnectException — proof that input-validation and path-building ran without error.
+     * ConnectException - proof that input-validation and path-building ran without error.
      */
     public function testConnectAppendsQueryStringToPathBeforeSocketAttempt(): void
     {
         $transport = new WebSocketTransport(new NatsOptions());
 
         $this->expectException(AmpConnectException::class);
-        // ws:// with a query string — parse_url yields ['host'=>..., 'query'=>'q=v'].
+        // ws:// with a query string - parse_url yields ['host'=>..., 'query'=>'q=v'].
         // Line 76 executes ($path .= '?' . $parts['query']) before the socket connect fails.
         $transport->connect('ws://127.0.0.1:1/?q=v', 100)->await();
     }
@@ -144,7 +144,7 @@ final class WebSocketTransportTest extends TestCase
 
         $this->expectException(AmpConnectException::class);
         // wss:// activates the secure branch; buildTlsContext() runs on line 83, then port 1
-        // refuses the connection — ConnectException is the expected outcome.
+        // refuses the connection - ConnectException is the expected outcome.
         $transport->connect('wss://127.0.0.1:1/', 100)->await();
     }
 
@@ -153,7 +153,7 @@ final class WebSocketTransportTest extends TestCase
      *
      * A plain-TCP listener is started locally so the socket connect (line 86) succeeds.  The
      * transport then calls setupTls() on line 89 (still inside the `if ($secure)` block), which
-     * fails because the server speaks plain TCP — surfacing a TlsException.  This confirms line 89
+     * fails because the server speaks plain TCP - surfacing a TlsException.  This confirms line 89
      * is reachable; line 90 ($this->tlsEstablished = true) requires a real TLS server and is
      * therefore skipped.
      */
@@ -163,7 +163,7 @@ final class WebSocketTransportTest extends TestCase
         $server = listen('tcp://127.0.0.1:0');
         $address = (string) $server->getAddress();
 
-        // Accept and immediately close — we just need TCP to connect; no TLS handshake.
+        // Accept and immediately close - we just need TCP to connect; no TLS handshake.
         \Amp\async(static function () use ($server): void {
             $client = $server->accept();
             if ($client !== null) {
@@ -177,7 +177,7 @@ final class WebSocketTransportTest extends TestCase
             $transport->connect('wss://' . $address . '/', 2000)->await();
             self::fail('Expected TlsException was not thrown');
         } catch (TlsException) {
-            // Line 89 (setupTls) ran and threw because the server is plain TCP — expected.
+            // Line 89 (setupTls) ran and threw because the server is plain TCP - expected.
             self::assertFalse($transport->tlsActive(), 'tlsEstablished must remain false when setupTls throws');
         } finally {
             $server->close();
@@ -209,7 +209,7 @@ final class WebSocketTransportTest extends TestCase
         self::assertStringContainsString("X-InjectEvil-Header pwned: ok\r\n", $request);
         self::assertStringContainsString("X-Value: goodSmuggled-Header: pwned\r\n", $request);
 
-        // Exactly one header/body terminator — no extra blank line was injected.
+        // Exactly one header/body terminator - no extra blank line was injected.
         self::assertSame(1, substr_count($request, "\r\n\r\n"));
     }
 

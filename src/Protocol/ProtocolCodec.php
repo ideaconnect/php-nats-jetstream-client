@@ -99,7 +99,7 @@ final class ProtocolCodec
         }
 
         // Catch a copy/paste mismatch locally: if a seed signer is configured alongside an explicit
-        // nkey, the nkey must equal the public key the seed derives — otherwise the server would reject
+        // nkey, the nkey must equal the public key the seed derives - otherwise the server would reject
         // the handshake with an opaque auth error.
         if ($options->nkey !== null && $options->nkey !== ''
             && $options->nonceSigner instanceof NkeySeedSigner

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Pull Consumer Batching / Iteration — the fluent pull iterator.
+ * Pull Consumer Batching / Iteration - the fluent pull iterator.
  *
  * Uses the fluent pullConsumer() builder (setBatching / setExpiresMs / setIterations)
  * with handle() to process messages in bounded batches across a bounded number of

@@ -41,7 +41,7 @@ final class Service_3MutationTest extends \PHPUnit\Framework\TestCase
         $start = strpos($joined, $needle);
         self::assertNotFalse($start, "No PUB to {$replySubject} was written.");
 
-        // PUB <subject> <len>\r\n<body>\r\n — skip past the header line to the body.
+        // PUB <subject> <len>\r\n<body>\r\n - skip past the header line to the body.
         $headerEnd = strpos($joined, "\r\n", $start);
         self::assertNotFalse($headerEnd);
         $bodyStart = $headerEnd + 2;
@@ -97,15 +97,15 @@ final class Service_3MutationTest extends \PHPUnit\Framework\TestCase
         $entry = $info['endpoints'][0] ?? null;
         self::assertIsArray($entry);
 
-        // kills ArrayItem @ line 748 — the endpoint "name" key would vanish under the mutation.
+        // kills ArrayItem @ line 748 - the endpoint "name" key would vanish under the mutation.
         self::assertArrayHasKey('name', $entry);
         self::assertSame('adder', $entry['name']);
 
-        // kills ArrayItem @ line 749 — the endpoint "subject" key would vanish under the mutation.
+        // kills ArrayItem @ line 749 - the endpoint "subject" key would vanish under the mutation.
         self::assertArrayHasKey('subject', $entry);
         self::assertSame('calc.add', $entry['subject']);
 
-        // kills ArrayItem @ line 750 — the endpoint "queue_group" key would vanish under the mutation.
+        // kills ArrayItem @ line 750 - the endpoint "queue_group" key would vanish under the mutation.
         self::assertArrayHasKey('queue_group', $entry);
         self::assertSame('qg', $entry['queue_group']);
 
@@ -123,7 +123,7 @@ final class Service_3MutationTest extends \PHPUnit\Framework\TestCase
     {
         $info = $this->fetchInfoResponse();
 
-        // kills ArrayItem @ line 768 — the top-level "description" key would vanish under the mutation.
+        // kills ArrayItem @ line 768 - the top-level "description" key would vanish under the mutation.
         self::assertArrayHasKey('description', $info);
         self::assertSame('Adder service', $info['description']);
     }

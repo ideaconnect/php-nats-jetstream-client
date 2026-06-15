@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Consumer List — enumerate a stream's consumers.
+ * Consumer List - enumerate a stream's consumers.
  *
  * Creates two durable consumers on a stream and lists them with listConsumers(),
  * reading the returned ConsumerInfo fields (name, push/pull, ...).
