@@ -29,6 +29,15 @@ set -uo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$root_dir"
 
+# Infection is not in require-dev (it requires PHP 8.3+, while the library still supports PHP 8.2), so it
+# may not be installed. Give a clear hint instead of a bare "command not found".
+if [ ! -x vendor/bin/infection ]; then
+  echo "Infection is not installed. Mutation testing requires PHP 8.3+ and Infection, which is intentionally"
+  echo "not in require-dev (so the library stays installable on PHP 8.2). Install it with:"
+  echo "  composer require --dev infection/infection:^0.33"
+  exit 1
+fi
+
 min_msi="${INFECTION_MIN_MSI:-90}"
 min_covered_msi="${INFECTION_MIN_COVERED_MSI:-90}"
 threads="${INFECTION_THREADS:-max}"

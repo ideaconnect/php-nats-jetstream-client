@@ -1,10 +1,10 @@
 {
   "name": "idct/php-nats-jetstream-client",
-  "description": "Async-first NATS + JetStream client for PHP 8.3+",
+  "description": "Async-first NATS + JetStream client for PHP 8.2+",
   "type": "library",
   "license": "BSD-3-Clause",
   "require": {
-    "php": "^8.3",
+    "php": "^8.2",
     "ext-openssl": "*",
     "amphp/amp": "^3.1",
     "amphp/socket": "^2.3",
@@ -14,8 +14,7 @@
     "behat/behat": "^3.14",
     "phpunit/phpunit": "^11.0",
     "phpstan/phpstan": "^2.1",
-    "friendsofphp/php-cs-fixer": "^3.64",
-    "infection/infection": "^0.33"
+    "friendsofphp/php-cs-fixer": "^3.64"
   },
   "suggest": {
     "ext-sodium": "Required for NKey / JWT nonce-signed authentication (NkeySeedSigner).",
@@ -62,7 +61,7 @@
   },
   "scripts-descriptions": {
     "test:everything": "Full verification of code health: PHPStan level 8, then the compose-backed e2e flow (Docker stack up, unit + integration + Behat, stack down). Skips the JWT fixture validity check; run 'composer fixture:jwt:check' separately for that.",
-    "infection": "Strict mutation testing (Infection) against the unit testsuite; fails below the INFECTION_MIN_MSI / INFECTION_MIN_COVERED_MSI thresholds. Requires a coverage driver (Xdebug/PCOV)."
+    "infection": "Strict mutation testing (Infection) against the unit testsuite; fails below the INFECTION_MIN_MSI / INFECTION_MIN_COVERED_MSI thresholds. Requires PHP 8.3+, a coverage driver (Xdebug/PCOV), and Infection installed separately ('composer require --dev infection/infection:^0.33' — it is not in require-dev so the library stays installable on PHP 8.2)."
   },
   "minimum-stability": "stable",
   "prefer-stable": true,

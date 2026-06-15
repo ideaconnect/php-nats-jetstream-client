@@ -7,7 +7,7 @@ Use this file as the authoritative project guide for coding agents working in th
 ## Repository Purpose
 
 - Library: async NATS client with JetStream, KeyValue, ObjectStore, and service-framework support.
-- Runtime stack: PHP 8.3+, Amp 3.x, Amp Socket, PHPUnit 11, PHPStan 2, PHP CS Fixer.
+- Runtime stack: PHP 8.2+, Amp 3.x, Amp Socket, PHPUnit 11, PHPStan 2, PHP CS Fixer.
 - Test infrastructure: local Docker Compose NATS fixtures, including token, user/pass, TLS, NKey, and JWT-auth servers.
 
 ## Repository Structure

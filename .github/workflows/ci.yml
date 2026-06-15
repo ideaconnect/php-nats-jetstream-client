@@ -17,8 +17,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The package targets php ^8.3 — verify unit + static analysis on every supported minor.
-        php-version: ["8.3", "8.4", "8.5"]
+        # The package targets php ^8.2 — verify unit + static analysis on every supported minor.
+        php-version: ["8.2", "8.3", "8.4", "8.5"]
     steps:
       - uses: actions/checkout@v6
       - uses: shivammathur/setup-php@v2
@@ -103,16 +103,21 @@ jobs:
         run: docker compose down
 
   mutation:
-    name: Mutation (PHP 8.5)
+    # Mutation testing runs only on PHP 8.3+ (Infection 0.33 requires it). Infection is NOT in require-dev
+    # — that would block `composer install` on PHP 8.2, which the library still supports — so this job
+    # installs it on the fly into the ephemeral CI checkout.
+    name: Mutation (PHP 8.3)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
       - uses: shivammathur/setup-php@v2
         with:
-          php-version: "8.5"
+          php-version: "8.3"
           extensions: openssl, sodium, zlib, xdebug
           coverage: xdebug
       - uses: ramsey/composer-install@v3
+      - name: Install Infection (PHP 8.3+ only; not in require-dev)
+        run: composer require --dev "infection/infection:^0.33" -W --no-interaction
       - name: Mutation Tests (strict, >= 90% MSI)
         # Infection against the unit testsuite (no Docker). Fails below the 90% MSI / covered-MSI floor
         # set in scripts/run-mutation.sh (the suite currently scores ~93%) — a quality gate on top of
