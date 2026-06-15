@@ -257,7 +257,7 @@ final class Service
                                 $response = ($this->handlers[$subject])($message);
                             } catch (ServiceError $serviceError) {
                                 // The handler explicitly chose to fail with a custom code/description
-                                // (and optional body). Honor it verbatim — this is a deliberate error
+                                // (and optional body). Honor it verbatim - this is a deliberate error
                                 // reply, not an internal fault, so the chosen detail IS sent to the caller.
                                 $endpoint->errors++;
                                 $endpoint->lastError = $serviceError->description;
@@ -473,7 +473,7 @@ final class Service
 
                     try {
                         // Thread the cancellation INTO processIncoming (not just the outer await) so
-                        // the underlying socket read is actually bounded and torn down on cancel —
+                        // the underlying socket read is actually bounded and torn down on cancel -
                         // otherwise an idle read is orphaned and leaves the shared connection wedged.
                         $processed = $this->client->processIncoming($effectiveCancellation)->await($effectiveCancellation);
                         if ($processed === 0) {
@@ -485,7 +485,7 @@ final class Service
                     } catch (\Throwable) {
                         // A connection-level failure. If the connection is unrecoverable (closed for
                         // good), stop instead of busy-spinning forever silently swallowing the error;
-                        // otherwise back off — interruptibly — and let reconnect catch up.
+                        // otherwise back off - interruptibly - and let reconnect catch up.
                         if ($this->client->state() === ConnectionState::Closed) {
                             break;
                         }
@@ -639,7 +639,7 @@ final class Service
 
     /**
      * Builds the micro-spec error reply headers. The description is collapsed to a single line because
-     * header values cannot contain CR/LF — a crafted handler/validation message must not break framing.
+     * header values cannot contain CR/LF - a crafted handler/validation message must not break framing.
      *
      * @return array<string,string>
      */

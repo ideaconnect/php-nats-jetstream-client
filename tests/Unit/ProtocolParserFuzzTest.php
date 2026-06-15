@@ -10,7 +10,7 @@ use IDCT\NATS\Protocol\ProtocolParser;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Robustness / fuzz coverage for the protocol parser — the kind of timing/byte-boundary and
+ * Robustness / fuzz coverage for the protocol parser - the kind of timing/byte-boundary and
  * malformed-input behavior a static review cannot prove. Seeds are fixed so the run is deterministic.
  *
  * Invariants asserted:
@@ -62,7 +62,7 @@ final class ProtocolParserFuzzTest extends TestCase
     public function testRandomProtocolTokenSoupOnlyRaisesProtocolException(): void
     {
         // Bias the input toward real protocol tokens so the MSG/HMSG/control-line branches are exercised
-        // with adversarial spacing, counts, and truncation — not just uniformly random bytes.
+        // with adversarial spacing, counts, and truncation - not just uniformly random bytes.
         $tokens = [
             'MSG ', 'HMSG ', 'PING', 'PONG', '+OK', '-ERR boom', 'INFO {"a":1}',
             "\r\n", ' ', '0', '5', '999999999', 'subj', 'sid', '_INBOX.x', "\x00", "\xff", 'NATS/1.0',

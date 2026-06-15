@@ -66,7 +66,7 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
 
     /**
      * With the DEFAULT publishRetryAttempts (3), a THIRD consecutive 503 (the 3rd attempt) must throw
-     * — retries are exhausted.
+     * - retries are exhausted.
      * kills IncrementInteger @ 54 (default 4 would make a 3rd 503 followed by an ack succeed instead).
      */
     public function testDefaultRetryAttemptsStopsAfterThreeAttempts(): void
@@ -78,7 +78,7 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
             'HMSG _INBOX.b 2 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
             'HMSG _INBOX.c 3 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
-            // A 4th frame is an ack — only reached if attempts were (incorrectly) 4.
+            // A 4th frame is an ack - only reached if attempts were (incorrectly) 4.
             self::msg($ack, '_INBOX.d', 4),
         ]);
 
@@ -136,7 +136,7 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
     // ── assertValidBucket() error message concatenation (line 174) ───────────────────────────────
 
     /**
-     * The invalid-bucket message is exactly `Invalid bucket name "<bucket>": only letters, ...` — the
+     * The invalid-bucket message is exactly `Invalid bucket name "<bucket>": only letters, ...` - the
      * anchored match pins operand order and presence of every concat operand.
      * kills Concat @ 174 (leading bucket), Concat @ 174 (trailing bucket),
      *       ConcatOperandRemoval @ 174 (dropped $bucket) and ConcatOperandRemoval @ 174 (dropped suffix).
@@ -192,7 +192,7 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
     // ── createOrUpdateStream fallback merges options + subjects into the UPDATE (line 260) ────────
 
     /**
-     * On the create→update fallback, the UPDATE body must carry BOTH the original options and the
+     * On the create->update fallback, the UPDATE body must carry BOTH the original options and the
      * subjects (array_merge($options, ['subjects' => $subjects])).
      * kills ArrayItemRemoval @ 260 (subjects dropped), UnwrapArrayMerge @ 260 => $options (subjects
      *       dropped) and UnwrapArrayMerge @ 260 => ['subjects'=>$subjects] (options dropped).
@@ -302,7 +302,7 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     /**
-     * Across THREE pages the offset advances cumulatively (0, 2, 4) — it accumulates, not resets.
+     * Across THREE pages the offset advances cumulatively (0, 2, 4) - it accumulates, not resets.
      * kills Assignment @ 290 ($offset = count($page) never reaches 4) and
      *       PlusEqual @ 290 ($offset -= count($page) goes negative, never reaches 4).
      */

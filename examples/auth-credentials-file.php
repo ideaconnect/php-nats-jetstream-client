@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Credentials File Authentication — auth from a .creds bundle.
+ * Credentials File Authentication - auth from a .creds bundle.
  *
  * Parses a .creds file (bundled user JWT + NKey seed) with CredentialsParser, signs the
  * nonce with NkeySeedSigner, connects, and round-trips a message. Skips cleanly if the

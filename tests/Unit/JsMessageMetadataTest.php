@@ -67,7 +67,7 @@ final class JsMessageMetadataTest extends TestCase
      */
     public function testFromMessageReturnsNullForUnrecognisedTokenCount(): void
     {
-        // "$JS.ACK" + 5 more tokens = 7 total — not 9/11/12
+        // "$JS.ACK" + 5 more tokens = 7 total - not 9/11/12
         $result = JsMessageMetadata::fromMessage($this->makeMessage('$JS.ACK.a.b.c.d.e'));
 
         self::assertNull($result);
@@ -137,7 +137,7 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------
-    // 12-token form (line 60 — trailing random token)
+    // 12-token form (line 60 - trailing random token)
     // ---------------------------------------------------------------------------
 
     /**
@@ -198,7 +198,7 @@ final class JsMessageMetadataTest extends TestCase
         self::assertNotNull($meta);
         $dt = $meta->timestamp();
 
-        // Microsecond portion: 500_000 ns / 1_000 = 500 µs → "000500"
+        // Microsecond portion: 500_000 ns / 1_000 = 500 µs -> "000500"
         self::assertSame('000500', $dt->format('u'));
     }
 

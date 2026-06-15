@@ -52,7 +52,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     /**
-     * The fetch subscription must be removed (UNSUB) once the pull completes — it is issued from the
+     * The fetch subscription must be removed (UNSUB) once the pull completes - it is issued from the
      * `finally` block.
      */
     public function testFetchBatchUnsubscribesAfterCompletion(): void
@@ -197,7 +197,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
 
     /**
      * isCronSchedule trims before testing, so a leading-space "@every" is still classified as @every
-     * (NOT cron) — and a time zone supplied with it is rejected.
+     * (NOT cron) - and a time zone supplied with it is rejected.
      */
     public function testIsCronScheduleTrimsBeforeClassifying(): void
     {

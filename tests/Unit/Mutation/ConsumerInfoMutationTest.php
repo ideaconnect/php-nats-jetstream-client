@@ -11,9 +11,9 @@ use PHPUnit\Framework\TestCase;
  * Mutation-killing unit tests for {@see ConsumerInfo::fromArray()}.
  *
  * The factory hydrates an immutable value object from a JetStream CONSUMER.INFO payload:
- *   - line 37: `$deliverSubject = (string) ($config['deliver_subject'] ?? '')` — the cast forces a
+ *   - line 37: `$deliverSubject = (string) ($config['deliver_subject'] ?? '')` - the cast forces a
  *     string, so a non-string falsy value (e.g. bool false) collapses to '' and yields push=false.
- *   - line 41: `name: (string) ($data['name'] ?? ($config['durable_name'] ?? ''))` — top-level
+ *   - line 41: `name: (string) ($data['name'] ?? ($config['durable_name'] ?? ''))` - top-level
  *     `name` wins, falling back to the nested `config.durable_name`, finally to ''.
  *
  * Source must NOT be modified. Tests are pure construction + value assertions: deterministic, no I/O.

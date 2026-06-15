@@ -13,7 +13,7 @@ final class NatsHeaders
      * Encodes headers using the NATS/1.0 header block wire format.
      *
      * A value may be a single string (one header line) or a list of strings (one line per value, for
-     * multi-value/multimap headers per ADR-4) — so `['Link' => ['a', 'b']]` emits two `Link:` lines.
+     * multi-value/multimap headers per ADR-4) - so `['Link' => ['a', 'b']]` emits two `Link:` lines.
      *
      * @param array<string,string|list<string>> $headers
      */
@@ -39,7 +39,7 @@ final class NatsHeaders
 
                 // Compact "key:value" form (no space after the colon) because some server-side header
                 // parsers do not trim a leading space from values. Surrounding whitespace in a value is
-                // not significant — it is trimmed here and again on decode — so values round-trip
+                // not significant - it is trimmed here and again on decode - so values round-trip
                 // symmetrically rather than asymmetrically losing leading/trailing spaces.
                 $lines[] = $name . ':' . trim($singleValue);
             }
@@ -104,7 +104,7 @@ final class NatsHeaders
      *
      * A repeated header name collapses to last-value-wins (the map is `array<string,string>`, not a
      * multimap); use {@see fromWireBlockMulti()} to preserve every value. This matches every header the
-     * client consumes — the system headers it reads (Status, Nats-Sequence, KV-Operation,
+     * client consumes - the system headers it reads (Status, Nats-Sequence, KV-Operation,
      * Nats-Consumer-Stalled, ...) are single-valued.
      *
      * @return array<string,string>

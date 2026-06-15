@@ -66,17 +66,17 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         $client->jetStream()->objectStore('assets')->create()->await();
         $w = $this->writes();
 
-        // kills ArrayItemRemoval @ 79, Concat/ConcatOperandRemoval @ 80 — exact description string.
+        // kills ArrayItemRemoval @ 79, Concat/ConcatOperandRemoval @ 80 - exact description string.
         self::assertStringContainsString('"description":"Object Store bucket assets"', $w);
         self::assertStringNotContainsString('"description":"assetsObject Store bucket "', $w);
         self::assertStringNotContainsString('"description":"assets"', $w);
         self::assertStringNotContainsString('"description":"Object Store bucket "', $w);
 
-        // kills TrueValue @ 81 — allow_direct defaults to true, never false.
+        // kills TrueValue @ 81 - allow_direct defaults to true, never false.
         self::assertStringContainsString('"allow_direct":true', $w);
         self::assertStringNotContainsString('"allow_direct":false', $w);
 
-        // kills Concat / ConcatOperandRemoval / ArrayItemRemoval @ 88 — both subjects present, each
+        // kills Concat / ConcatOperandRemoval / ArrayItemRemoval @ 88 - both subjects present, each
         // suffixed with '>' in the correct order, no operand swap or dropped item.
         self::assertStringContainsString('"subjects":["$O.assets.C.>","$O.assets.M.>"]', $w);
         self::assertStringNotContainsString('">$O.assets.C."', $w);
@@ -100,7 +100,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         self::assertTrue($client->jetStream()->objectStore('assets')->seal()->await());
         $w = $this->writes();
 
-        // kills UnwrapArrayFilter @ 110 — the empty-array field is removed; without array_filter it
+        // kills UnwrapArrayFilter @ 110 - the empty-array field is removed; without array_filter it
         // would be re-sent (as an empty JSON array) on the UPDATE.
         self::assertStringContainsString('"sealed":true', $w);
         self::assertStringContainsString('"max_bytes":1000', $w);
@@ -109,7 +109,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
 
     /**
      * addLink(): an empty name is rejected (assertValidName side effect) and the explicit target
-     * bucket — not this bucket — is recorded in the link.
+     * bucket - not this bucket - is recorded in the link.
      */
     public function testAddLinkValidatesNameAndUsesExplicitTargetBucket(): void
     {
@@ -118,7 +118,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         ]);
         $bucket = $client->jetStream()->objectStore('assets');
 
-        // kills Coalesce @ 131 — targetBucket ('other') is used, not $this->bucket ('assets').
+        // kills Coalesce @ 131 - targetBucket ('other') is used, not $this->bucket ('assets').
         $link = $bucket->addLink('shortcut', 'real.bin', 'other')->await();
         self::assertSame(['bucket' => 'other', 'name' => 'real.bin'], $link->link);
         self::assertStringContainsString('"link":{"bucket":"other","name":"real.bin"}', $this->writes());
@@ -128,7 +128,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     {
         $client = $this->client([]);
 
-        // kills MethodCallRemoval @ 129 — without assertValidName the empty name would be accepted.
+        // kills MethodCallRemoval @ 129 - without assertValidName the empty name would be accepted.
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Invalid object name');
         $client->jetStream()->objectStore('assets')->addLink('', 'real.bin')->await();
@@ -138,7 +138,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     {
         $client = $this->client([]);
 
-        // kills MethodCallRemoval @ 147 — addBucketLink must validate the name too.
+        // kills MethodCallRemoval @ 147 - addBucketLink must validate the name too.
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Invalid object name');
         $client->jetStream()->objectStore('assets')->addBucketLink('', 'target-bucket')->await();
@@ -157,11 +157,11 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         $link = $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();
         $w = $this->writes();
 
-        // kills ArrayItemRemoval @ 164 — the 'name' key must be present (ObjectInfo->name resolves it).
+        // kills ArrayItemRemoval @ 164 - the 'name' key must be present (ObjectInfo->name resolves it).
         self::assertSame('shortcut', $link->name);
         self::assertStringContainsString('"name":"shortcut"', $w);
 
-        // kills ArrayItem @ 166 — 'bucket' => $this->bucket stays a real keyed array entry. The
+        // kills ArrayItem @ 166 - 'bucket' => $this->bucket stays a real keyed array entry. The
         // mutation ('bucket' > $this->bucket) drops the key and inserts "0":true at the top level
         // (the inner options.link.bucket would still read "bucket":"assets", so we pin the top-level
         // key directly after "name" and reject the numeric-index artifact).
@@ -169,19 +169,19 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         self::assertStringContainsString('"name":"shortcut","bucket":"assets"', $w);
         self::assertStringNotContainsString('"0":true', $w);
 
-        // kills Increment/DecrementInteger @ 168 — size is exactly 0 for a link (no content).
+        // kills Increment/DecrementInteger @ 168 - size is exactly 0 for a link (no content).
         self::assertSame(0, $link->size);
         self::assertStringContainsString('"size":0', $w);
         self::assertStringNotContainsString('"size":1', $w);
         self::assertStringNotContainsString('"size":-1', $w);
 
-        // kills Increment/DecrementInteger @ 169 — chunks is exactly 0 for a link.
+        // kills Increment/DecrementInteger @ 169 - chunks is exactly 0 for a link.
         self::assertSame(0, $link->chunks);
         self::assertStringContainsString('"chunks":0', $w);
         self::assertStringNotContainsString('"chunks":1', $w);
         self::assertStringNotContainsString('"chunks":-1', $w);
 
-        // kills FalseValue @ 172 — a freshly created link is NOT deleted.
+        // kills FalseValue @ 172 - a freshly created link is NOT deleted.
         self::assertFalse($link->deleted);
         self::assertStringContainsString('"deleted":false', $w);
         self::assertStringNotContainsString('"deleted":true', $w);
@@ -212,17 +212,17 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         // The assertion below still pins the correct single-chunk behaviour.
         self::assertSame(1, substr_count($w, 'PUB $O.assets.C.' . $stored->nuid . ' '));
 
-        // kills ArrayItem @ 242 — 'bucket' stays a real keyed entry directly after "name"
+        // kills ArrayItem @ 242 - 'bucket' stays a real keyed entry directly after "name"
         // (the comparison mutation drops the key and inserts a numeric-index boolean).
         self::assertSame('assets', $stored->bucket);
         self::assertStringContainsString('"name":"logo.txt","bucket":"assets"', $w);
         self::assertStringNotContainsString('"0":', $w);
 
-        // kills FalseValue @ 248 — a stored object is not deleted.
+        // kills FalseValue @ 248 - a stored object is not deleted.
         self::assertFalse($stored->deleted);
         self::assertStringContainsString('"deleted":false', $w);
 
-        // kills ArrayItem / ArrayItemRemoval @ 249 — options.max_chunk_size present with the value
+        // kills ArrayItem / ArrayItemRemoval @ 249 - options.max_chunk_size present with the value
         // (ArrayItem -> 'max_chunk_size' > chunkSize would drop the key; ArrayItemRemoval -> []).
         self::assertStringContainsString('"options":{"max_chunk_size":5}', $w);
     }
@@ -230,7 +230,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     public function testPutBoundaryExactChunkSizeIsSingleChunk(): void
     {
         // Pins the exact boundary (size == chunkSize -> chunks=1, one publish). NOTE: the @213
-        // LessThanOrEqualTo->LessThan mutant is EQUIVALENT here — the < else branch also yields
+        // LessThanOrEqualTo->LessThan mutant is EQUIVALENT here - the < else branch also yields
         // chunks=1 with the same single PUB frame; this test documents the intended behaviour.
         $client = $this->client([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
@@ -254,7 +254,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
-        // kills LogicalAnd @ 252 — with '||' an empty-string description ('' !== null is true) would
+        // kills LogicalAnd @ 252 - with '||' an empty-string description ('' !== null is true) would
         // still be added as "description":""; with the real '&&' it must be omitted.
         $client->jetStream()->objectStore('assets')->put('logo.txt', 'hi', [], '')->await();
         self::assertStringNotContainsString('"description"', $this->writes());
@@ -268,7 +268,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
-        // kills LogicalAnd @ 252 — a real description (both clauses true) IS added.
+        // kills LogicalAnd @ 252 - a real description (both clauses true) IS added.
         $client->jetStream()->objectStore('assets')->put('logo.txt', 'hi', [], 'hello')->await();
         self::assertStringContainsString('"description":"hello"', $this->writes());
     }
@@ -277,7 +277,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     {
         $client = $this->client([]);
 
-        // kills MethodCallRemoval @ 283 — putStream must validate the name.
+        // kills MethodCallRemoval @ 283 - putStream must validate the name.
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Invalid object name');
         $client->jetStream()->objectStore('assets')->putStream('', static fn(): ?string => null)->await();
@@ -303,16 +303,16 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
             return $blocks[$i++] ?? null;
         })->await();
 
-        // kills Assignment @ 318 — totalSize must be 5 (3+2), not 2 (last block only).
+        // kills Assignment @ 318 - totalSize must be 5 (3+2), not 2 (last block only).
         self::assertSame(5, $stored->size);
 
         $w = $this->writes();
         self::assertSame(1, $stored->chunks);
         self::assertSame(1, substr_count($w, 'PUB $O.assets.C.' . $stored->nuid . ' '));
 
-        // kills Assignment @ 319 — the buffer ACCUMULATES, so the single tail chunk's published body
+        // kills Assignment @ 319 - the buffer ACCUMULATES, so the single tail chunk's published body
         // is the whole "abcde" (5 bytes). With '$buffer = $block' it would be only the last block "de".
-        // (The digest is computed from per-block hash_update, so it is unaffected by this mutation —
+        // (The digest is computed from per-block hash_update, so it is unaffected by this mutation -
         // the published chunk bytes are the discriminating signal.)
         self::assertStringContainsString(" 5\r\nabcde\r\n", $w);
         self::assertStringNotContainsString(" 2\r\nde\r\n", $w);
@@ -333,7 +333,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
             return $blocks[$i++] ?? null;
         })->await();
 
-        // kills ArrayItemRemoval @ 343 — the 'name' key must be present in putStream's info record.
+        // kills ArrayItemRemoval @ 343 - the 'name' key must be present in putStream's info record.
         self::assertSame('named.bin', $stored->name);
         self::assertStringContainsString('"name":"named.bin"', $this->writes());
     }
@@ -370,7 +370,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
 
         $w = $this->writes();
         self::assertSame(3, substr_count($w, 'PUB $O.assets.C.' . $stored->nuid . ' '));
-        // Each published chunk body is exactly 3 bytes in stream order — the frame ends " <n>\r\n<body>".
+        // Each published chunk body is exactly 3 bytes in stream order - the frame ends " <n>\r\n<body>".
         // UnwrapSubstr @ 327 would publish the whole 9-byte buffer ("abcdefghi") instead.
         self::assertStringContainsString(" 3\r\nabc\r\n", $w);
         self::assertStringContainsString(" 3\r\ndef\r\n", $w);
@@ -381,7 +381,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     /**
      * put() pipeline window (line 229): with exactly UPLOAD_PIPELINE_DEPTH (16) chunks no chunk is
      * dropped; chunks/size/digest stay correct. NOTE: the @229 GreaterThanOrEqualTo mutants are
-     * EQUIVALENT under a fake transport — the in-loop flush only changes await/batch timing; the
+     * EQUIVALENT under a fake transport - the in-loop flush only changes await/batch timing; the
      * trailing flush guarantees every chunk is published regardless, so results are identical.
      */
     public function testPutPipelineFlushesAtDepthBoundary(): void
@@ -399,7 +399,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         $stored = $store->put('many.bin', $data)->await();
 
         // Pins that all 16 chunks publish with the full-payload size and digest (boundary mutants @229
-        // are equivalent here — see the method docblock).
+        // are equivalent here - see the method docblock).
         self::assertSame(16, $stored->size);
         self::assertSame(16, $stored->chunks);
         self::assertSame($this->digestOf($data), $stored->digest);
@@ -409,7 +409,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     /**
      * putStream() pipeline window (line 301): same depth-boundary contract via the streaming path.
      * NOTE: the @301 GreaterThanOrEqualTo mutants are EQUIVALENT under a fake transport for the same
-     * reason as @229 — the trailing flush still publishes every chunk; only await timing changes.
+     * reason as @229 - the trailing flush still publishes every chunk; only await timing changes.
      */
     public function testPutStreamPipelineFlushesAtDepthBoundary(): void
     {
@@ -428,7 +428,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
             return $blocks[$i++] ?? null;
         })->await();
 
-        // Pins full-payload chunks/size/digest (boundary mutants @301 are equivalent — see docblock).
+        // Pins full-payload chunks/size/digest (boundary mutants @301 are equivalent - see docblock).
         self::assertSame(16, $stored->size);
         self::assertSame(16, $stored->chunks);
         self::assertSame($this->digestOf($data), $stored->digest);

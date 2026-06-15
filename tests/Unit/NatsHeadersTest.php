@@ -194,7 +194,7 @@ final class NatsHeadersTest extends TestCase
 
     /**
      * Verifies fromWireBlockMulti accumulates multiple values for the same header name (multimap
-     * behaviour) — complements testFromWireBlockMultiPreservesAllValues with a raw wire block
+     * behaviour) - complements testFromWireBlockMultiPreservesAllValues with a raw wire block
      * that already has repeated header lines.
      */
     public function testFromWireBlockMultiAccumulatesRepeatedHeaderLines(): void

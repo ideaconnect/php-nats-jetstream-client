@@ -1,7 +1,7 @@
 <?php
 
 /**
- * JetStream Stream and Durable Consumer — the basic JetStream setup.
+ * JetStream Stream and Durable Consumer - the basic JetStream setup.
  *
  * Creates a stream and a durable (explicit-ack) consumer, publishes a message, and
  * reads the resulting PubAck (the stream it landed in and its stream sequence).

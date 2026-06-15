@@ -25,7 +25,7 @@ final class NatsConnection_5MutationTest extends TestCase
 {
     /**
      * A transport whose readLine() always returns an empty string, counting the calls. Used to count
-     * how many handshake polls awaitServerInfo() performs before giving up — which equals the value
+     * how many handshake polls awaitServerInfo() performs before giving up - which equals the value
      * returned by handshakePollBudget(). The connect() handshake never receives an INFO and fails with
      * "Expected INFO during connect" after exactly handshakePollBudget() reads.
      *
@@ -70,7 +70,7 @@ final class NatsConnection_5MutationTest extends TestCase
     /**
      * Runs a doomed handshake (no INFO ever arrives) and returns the number of readLine() calls the
      * handshake performed, which is exactly handshakePollBudget(). The deadline is large relative to
-     * the empty-read loop, so the poll budget — not the wall-clock deadline — bounds the loop.
+     * the empty-read loop, so the poll budget - not the wall-clock deadline - bounds the loop.
      */
     private function handshakePollCount(int $connectTimeoutMs): int
     {
@@ -160,7 +160,7 @@ final class NatsConnection_5MutationTest extends TestCase
 
     /**
      * A recoverable server -ERR frame (permissions violation) must be surfaced to the error listener with
-     * the message "Server sent recoverable error frame: " followed by the error text — connection stays
+     * the message "Server sent recoverable error frame: " followed by the error text - connection stays
      * open. Pins the concatenation order at line 1547.
      *
      * // kills Concat (operand order swap) @ line 1547
@@ -193,7 +193,7 @@ final class NatsConnection_5MutationTest extends TestCase
 
     /**
      * A malformed async INFO frame must be surfaced to the error listener with the message
-     * "Discarding malformed async INFO frame: " followed by the underlying JSON error — without tearing
+     * "Discarding malformed async INFO frame: " followed by the underlying JSON error - without tearing
      * down the read loop. Pins the emitError call, the concatenation order, and both operands at line 1533.
      *
      * // kills MethodCallRemoval (drop emitError call entirely) @ line 1533
@@ -258,7 +258,7 @@ final class NatsConnection_5MutationTest extends TestCase
     }
 
     /**
-     * An HMSG frame with a header-bytes count of exactly 0 must be treated as "no headers" — rawHeaders
+     * An HMSG frame with a header-bytes count of exactly 0 must be treated as "no headers" - rawHeaders
      * stays null (the <= 0 short-circuit), not an empty string (which the < 0 mutant would produce by
      * falling through to substr()). Pins the boundary at line 1586.
      *

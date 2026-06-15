@@ -162,7 +162,7 @@ final class WebSocketFrameCodecTest extends TestCase
      */
     public function testEncode64BitLengthFrameRoundTrips(): void
     {
-        // Payload is 65536 bytes — exactly one past the 16-bit threshold.
+        // Payload is 65536 bytes - exactly one past the 16-bit threshold.
         $payload = str_repeat('A', 65536);
         $encoded = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
 
@@ -226,7 +226,7 @@ final class WebSocketFrameCodecTest extends TestCase
 
         // MAX_FRAME_PAYLOAD is 64 * 1024 * 1024 = 67108864. Use one byte over.
         $tooLarge = 64 * 1024 * 1024 + 1;
-        // FIN+binary, 64-bit length marker, 8-byte big-endian length (no payload needed — decode
+        // FIN+binary, 64-bit length marker, 8-byte big-endian length (no payload needed - decode
         // throws before trying to read the payload).
         $buffer = pack('CC', 0x82, 127) . pack('J', $tooLarge);
 
@@ -241,7 +241,7 @@ final class WebSocketFrameCodecTest extends TestCase
     {
         // Craft a masked frame: FIN+binary, mask bit set, 7-bit length = 5.
         // Full frame would be: 2 header + 4 mask key + 5 payload = 11 bytes.
-        // Provide header + only 2 of the 4 mask key bytes — not enough.
+        // Provide header + only 2 of the 4 mask key bytes - not enough.
         $buffer = pack('CC', 0x82, 0x80 | 5) . "\xAB\xCD";
         $original = $buffer;
 
@@ -281,7 +281,7 @@ final class WebSocketFrameCodecTest extends TestCase
     {
         set_error_handler(static function (int $errno, string $errstr): bool {
             if ((error_reporting() & $errno) === 0) {
-                return false; // suppressed via @ — respect it, do not promote to an exception
+                return false; // suppressed via @ - respect it, do not promote to an exception
             }
 
             throw new \ErrorException($errstr, 0, $errno);

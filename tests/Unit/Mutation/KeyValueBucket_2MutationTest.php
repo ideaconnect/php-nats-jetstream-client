@@ -73,7 +73,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
 
     public function testCreateKeyValidatesKeyBeforePublishing(): void
     {
-        // kills MethodCallRemoval @ 450 — removing assertValidKey() would let an invalid key through.
+        // kills MethodCallRemoval @ 450 - removing assertValidKey() would let an invalid key through.
         $kv = $this->connect([])->jetStream()->keyValue('cfg');
 
         $this->expectException(JetStreamException::class);
@@ -95,9 +95,9 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
             $kv->createKey('theme', 'blue')->await();
             self::fail('Expected JetStreamException for an existing key.');
         } catch (JetStreamException $e) {
-            // kills Concat + ConcatOperandRemoval @ 465 — message is exactly "<prefix><key>", not reordered/truncated.
+            // kills Concat + ConcatOperandRemoval @ 465 - message is exactly "<prefix><key>", not reordered/truncated.
             self::assertSame('Key already exists: theme', $e->getMessage());
-            // kills IncrementInteger + DecrementInteger @ 465 — the err code is exactly 10071, not 10070/10072.
+            // kills IncrementInteger + DecrementInteger @ 465 - the err code is exactly 10071, not 10070/10072.
             self::assertSame(10071, $e->getCode());
         }
     }
@@ -187,7 +187,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
 
     public function testHistoryRequestsDeliverPolicyAll(): void
     {
-        // kills ArrayItemRemoval @ 513 — dropping 'deliver_policy' => 'all' changes the consumer config.
+        // kills ArrayItemRemoval @ 513 - dropping 'deliver_policy' => 'all' changes the consumer config.
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":0,"config":{"deliver_subject":"d","ack_policy":"none"}}';
         $transport = new FakeTransport([
             self::INFO,
@@ -246,7 +246,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
 
     public function testHistoryUnsubscribesAfterCollecting(): void
     {
-        // kills MethodCallRemoval @ 553 — the finally must unsubscribe the history delivery sid (2).
+        // kills MethodCallRemoval @ 553 - the finally must unsubscribe the history delivery sid (2).
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":1,"config":{"deliver_subject":"d","ack_policy":"none"}}';
         $transport = new FakeTransport([
             self::INFO,
@@ -268,7 +268,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
 
     public function testGetAllReturnsEveryLiveKeyNotJustTheFirst(): void
     {
-        // kills ArrayOneItem @ 620 — returning array_slice(..,0,1) would drop the second key.
+        // kills ArrayOneItem @ 620 - returning array_slice(..,0,1) would drop the second key.
         $page1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"subjects":{"$KV.cfg.username":2,"$KV.cfg.email":2}}}';
         $page2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
         $uHdrs = "NATS/1.0\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 3\r\n\r\n";
@@ -312,11 +312,11 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
             }
         }
         self::assertNotSame('', $infoRequest, 'Expected a STREAM.INFO request to be written.');
-        // kills ConcatOperandRemoval @ 678 — the request subject must keep the STREAM.INFO prefix.
+        // kills ConcatOperandRemoval @ 678 - the request subject must keep the STREAM.INFO prefix.
         self::assertStringContainsString('PUB $JS.API.STREAM.INFO.KV_cfg ', $infoRequest);
-        // kills ArrayItemRemoval @ 687 + Concat/ConcatOperandRemoval @ 688 — exact subjects_filter token.
+        // kills ArrayItemRemoval @ 687 + Concat/ConcatOperandRemoval @ 688 - exact subjects_filter token.
         self::assertStringContainsString('"subjects_filter":"$KV.cfg.>"', $infoRequest);
-        // kills DecrementInteger @ 684 — the first page must request offset 0.
+        // kills DecrementInteger @ 684 - the first page must request offset 0.
         self::assertStringContainsString('"offset":0', $infoRequest);
     }
 
@@ -330,9 +330,9 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
         ])->jetStream()->keyValue('cfg')->getStatus()->await();
 
-        // kills CastInt @ 639/640/641 — strict identity fails against float 7.0/12.0/128.0.
+        // kills CastInt @ 639/640/641 - strict identity fails against float 7.0/12.0/128.0.
         self::assertSame(7, $status['messages']);
-        // kills Coalesce @ 640 — real prefers last_seq (12); the swapped mutant would yield messages (7).
+        // kills Coalesce @ 640 - real prefers last_seq (12); the swapped mutant would yield messages (7).
         self::assertSame(12, $status['last_sequence']);
         self::assertSame(128, $status['bytes']);
     }
@@ -359,7 +359,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         // Empty bucket (num_pending=0) fires onCaughtUp in onConsumerCreated and latches caughtUpFired.
         // A subsequent delivery (numPending=0) must NOT re-fire it.
-        // kills TrueValue @ 430 — flipping the latch to false would let the in-handler check re-fire.
+        // kills TrueValue @ 430 - flipping the latch to false would let the in-handler check re-fire.
         $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","num_pending":0,"config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
         $client = $this->connect([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),

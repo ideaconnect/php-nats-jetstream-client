@@ -1,11 +1,11 @@
 <?php
 
 /**
- * Object Store Streaming Upload — upload large objects without buffering.
+ * Object Store Streaming Upload - upload large objects without buffering.
  *
  * Uses putStream() to pull bytes from a producer callback, re-chunk them to the bucket
  * chunk size, publish them in bounded in-flight windows, and compute the SHA-256 digest
- * incrementally — the streaming counterpart to getToCallback().
+ * incrementally - the streaming counterpart to getToCallback().
  *
  * Mirrors the README "Object Store Streaming Upload" example. Run: php examples/object-store-streaming-upload.php
  */

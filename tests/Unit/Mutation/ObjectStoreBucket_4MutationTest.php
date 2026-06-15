@@ -16,7 +16,7 @@ use PHPUnit\Framework\TestCase;
  *
  * Each test pins an exact observable behavior (return value, thrown type/code/message, the bytes
  * written to FakeTransport, a count, or a boundary) that a specific surviving mutant would change.
- * Frames are fed deterministically through FakeTransport against the in-process Amp loop — no
+ * Frames are fed deterministically through FakeTransport against the in-process Amp loop - no
  * sockets, no sleeps, no wall-clock timing.
  */
 final class ObjectStoreBucket_4MutationTest extends TestCase
@@ -101,7 +101,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // list() — line 937 Ternary, line 954 Continue_
+    // list() - line 937 Ternary, line 954 Continue_
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -163,7 +163,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // getStatus() — lines 979/980/981 CastInt
+    // getStatus() - lines 979/980/981 CastInt
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -199,7 +199,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // publishMeta() error handling — line 1073 (Decrement/Increment/Coalesce)
+    // publishMeta() error handling - line 1073 (Decrement/Increment/Coalesce)
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -252,7 +252,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // metaSubjects() — line 1100 ConcatOperandRemoval, line 1124 (Dec/Inc/Coalesce), 1143 boundary
+    // metaSubjects() - line 1100 ConcatOperandRemoval, line 1124 (Dec/Inc/Coalesce), 1143 boundary
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -351,14 +351,14 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         self::assertSame('a.txt', $objects[0]->name);
 
         // kills GreaterThan @ 1143 and LogicalAnd @ 1143: exactly two enumeration requests were made
-        // (a third loop iteration would have written another STREAM.INFO request — and blocked on a
+        // (a third loop iteration would have written another STREAM.INFO request - and blocked on a
         // missing frame). Count the enumeration writes precisely.
         $writes = implode('||', $transport->writes);
         self::assertSame(2, substr_count($writes, '$JS.API.STREAM.INFO.OBJ_assets'));
     }
 
     // ---------------------------------------------------------------------------------------------
-    // requestStreamMessage() — line 1154 ArrayItemRemoval, 1163 CastString, 1164 (Dec/Inc/Coalesce/CastInt)
+    // requestStreamMessage() - line 1154 ArrayItemRemoval, 1163 CastString, 1164 (Dec/Inc/Coalesce/CastInt)
     // Reached via info() 503 fallback -> fetchInfo(name, false) -> requestStreamMessage().
     // ---------------------------------------------------------------------------------------------
 
@@ -401,7 +401,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
 
     /**
      * requestStreamMessage() error: the description must be cast to string and the code to int. When
-     * the server reports a NON-STRING description and a STRING code, the casts are load-bearing — the
+     * the server reports a NON-STRING description and a STRING code, the casts are load-bearing - the
      * JetStreamException constructor is strictly typed (string $message, int $code), so dropping a
      * cast would raise a TypeError instead of the expected JetStreamException, and the code must equal
      * the parsed integer (not -1/1 and not flattened to 0).
@@ -492,7 +492,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // nuid() — line 1222 (Decrement/Increment)
+    // nuid() - line 1222 (Decrement/Increment)
     // ---------------------------------------------------------------------------------------------
 
     /**

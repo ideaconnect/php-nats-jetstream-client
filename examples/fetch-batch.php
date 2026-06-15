@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Fetch Batch — pull several messages in one request.
+ * Fetch Batch - pull several messages in one request.
  *
  * Publishes several messages, then retrieves up to N of them in a single pull with
  * fetchBatch() (bounded by a pull expiry) and acks each one.

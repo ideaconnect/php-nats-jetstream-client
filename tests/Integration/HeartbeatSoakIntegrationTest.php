@@ -16,7 +16,7 @@ use function Amp\async;
 use function Amp\delay;
 
 /**
- * Soak coverage for the heartbeat / read-loop interaction — timing behavior a static review and the
+ * Soak coverage for the heartbeat / read-loop interaction - timing behavior a static review and the
  * fast unit doubles cannot prove against a real socket. Uses a 1s ping interval so several heartbeat
  * ticks elapse during each test.
  */

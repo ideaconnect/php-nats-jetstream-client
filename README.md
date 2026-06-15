@@ -2,9 +2,9 @@
 
 [![codecov](https://codecov.io/gh/ideaconnect/php-nats-jetstream-client/graph/badge.svg?token=A816f4EXon)](https://codecov.io/gh/ideaconnect/php-nats-jetstream-client)
 [![CI](https://github.com/ideaconnect/php-nats-jetstream-client/actions/workflows/ci.yml/badge.svg)](https://github.com/ideaconnect/php-nats-jetstream-client/actions/workflows/ci.yml)
-[![Made in EU](https://raw.githubusercontent.com/ideaconnect/made-in-eu/main/software-badge/made-in-eu.svg)](https://github.com/ideaconnect/made-in-eu)
+[![Made in the EU](https://raw.githubusercontent.com/ideaconnect/made-in-the-eu/main/software-badge/made-in-the-eu.svg)](https://github.com/ideaconnect/made-in-the-eu)
 
-Async-first NATS and JetStream client for PHP 8.2+ with first-class support for core NATS messaging, JetStream, KeyValue, ObjectStore, and NATS microservices.
+Async-first NATS and JetStream client for PHP 8.2+ with support for core NATS messaging, JetStream, KeyValue, ObjectStore, and NATS microservices.
 
 The library is built around Amp and provides a typed, high-level API for connection management, publish/subscribe, request/reply, reconnect handling, authentication flows, and JetStream resource management without falling back to blocking I/O.
 
@@ -27,6 +27,7 @@ Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
 - [Installation](#installation)
 - [Features](#features)
 - [NATS Server Version Requirements](#nats-server-version-requirements)
+- [PHP Support Policy](#php-support-policy)
 - [Usage](#usage)
 - [Authentication Options](#authentication-options)
 - [WebSocket Transport](#websocket-transport)
@@ -95,15 +96,15 @@ Current functionality includes:
 - JetStream ordered consumers with automatic sequence tracking and gap recovery
 - JetStream consumer pause/resume
 - JetStream publish ACK
-- JetStream stream message get by sequence — both the regular `STREAM.MSG.GET` request and the Direct Get API (`directGetStreamMessage()` / `directGetLastMessageForSubject()`)
-- JetStream atomic (all-or-nothing) batch publish (`batch()` → `BatchPublisher`, ADR-50; requires `allow_atomic`, NATS 2.12+)
+- JetStream stream message get by sequence - both the regular `STREAM.MSG.GET` request and the Direct Get API (`directGetStreamMessage()` / `directGetLastMessageForSubject()`)
+- JetStream atomic (all-or-nothing) batch publish (`batch()` -> `BatchPublisher`, ADR-50; requires `allow_atomic`, NATS 2.12+)
 - Scheduled publish (`@at` support)
 - Distributed counter CRDT (atomic `incrementCounter()` / `counterValue()`, arbitrary-precision values)
 - KeyValue API (bucket lifecycle with history/TTL/storage options, put/get/update/delete/purge, watch, getAll/status)
 - ObjectStore API (bucket lifecycle, put/get/delete/list/watch, chunked uploads, streaming upload via `putStream()`, SHA-256 digest verification)
 - Connection `flush()` (PING/PONG round-trip) to confirm the server has processed prior writes
 - Request-many scatter-gather (`requestMany()`: collect multiple replies bounded by max-count / stall / timeout)
-- Connection traffic statistics (`statistics()` → `ConnectionStats`) and round-trip-time measurement (`rtt()`)
+- Connection traffic statistics (`statistics()` -> `ConnectionStats`) and round-trip-time measurement (`rtt()`)
 - Microservices framework (service registration, PING/INFO/STATS/SCHEMA discovery, grouped endpoints)
 - Server authorization methods: token, username/password, JWT + nonce signer, built-in NKey seed signer, credentials file parser
 - Standalone NKey authentication (Ed25519 challenge signing without JWT)
@@ -116,13 +117,13 @@ Current functionality includes:
 - Stream mirroring and sourcing configuration helpers (`StreamSource`)
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
 
-Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, …). Build expressions with `IDCT\\NATS\\JetStream\\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+).
+Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\\NATS\\JetStream\\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+).
 
 ## NATS Server Version Requirements
 
 Most of this library works against any JetStream-enabled server. Some features depend on newer NATS
 server versions; the table below lists the minimum version per feature. **You do not need to check the
-version yourself** — if you use a feature against a server that is too old, the request fails fast with
+version yourself** - if you use a feature against a server that is too old, the request fails fast with
 an `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) carrying the
 feature name, the required version, and the version the server reported. The check is reactive (derived
 from the server's own error response), so there is no per-request version probe.
@@ -135,7 +136,7 @@ from the server's own error response), so there is no per-request version probe.
 | Pull priority groups | `fetchBatch(..., $pull)`, `PullConsumerIterator::setGroup/setPriority/...`, `unpinConsumer()` | 2.11 (`prioritized` 2.12) | `priority_groups`/`priority_policy`, `Nats-Pin-Id` |
 | Batched / multi Direct Get | `directGetBatch()`, `directGetLastForSubjects()` | 2.11 | `allow_direct` |
 | Scheduled publishing (`@every`/cron/aliases) | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.12 | `allow_msg_schedules`, `Nats-Schedule*` |
-| Atomic batch publish | `batch()` → `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
+| Atomic batch publish | `batch()` -> `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
 | Distributed counter CRDT | `incrementCounter()`, `counterValue()` | 2.12 | `allow_msg_counter`, `Nats-Incr` |
 | Publish de-duplication | `publish(..., msgId:)` | 2.2 | `Nats-Msg-Id` |
 
@@ -152,19 +153,19 @@ try {
 
 You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`.
 
+## PHP Support Policy
+
+This library follows [PHP's official release schedule](https://www.php.net/supported-versions.php). The minimum required PHP version tracks the releases that still receive official support (active or security), and a version is dropped once it reaches end-of-life - we neither require a PHP version before it is broadly available nor keep supporting one after upstream stops patching it.
+
+- **Current minimum: PHP 8.2.** CI runs the full test suite on every still-supported minor - currently **8.2, 8.3, 8.4, and 8.5**.
+- **PHP 8.2 reaches end-of-life on 2026-12-31.** Support for PHP 8.2 will therefore be **dropped by the end of 2026**, after which the minimum becomes **PHP 8.3**. Applications that must stay on PHP 8.2 should pin to the last release made before that change.
+- Mutation testing (Infection) requires PHP 8.3+ and so runs only on 8.3+ in CI, but it is a development-only tool - it does **not** affect the runtime requirement, and the library installs and runs on PHP 8.2.
+
 ## 🚀 This project looks for funding. Love my work? Support it! 💖
 
 * ☕ **Buy me a coffee**: https://buymeacoffee.com/idct
 
 * 💝 **Sponsor**: https://github.com/sponsors/ideaconnect
-
-* 🪙 **BTC**: bc1qntms755swm3nplsjpllvx92u8wdzrvs474a0hr
-
-* 💎 **ETH**: 0x08E27250c91540911eD27F161572aFA53Ca24C0a
-
-* ⚡ **TRX**: TVXWaU4ScNV9RBYX5RqFmySuB4zF991QaE
-
-* 🚀 **LTC**: LN5ApP1Yhk4iU9Bo1tLU8eHX39zDzzyZxB
 
 ## Usage
 
@@ -232,7 +233,7 @@ $tlsClient = new NatsClient(new NatsOptions(
 
 > 📄 **Runnable example:** [`examples/websocket-transport.php`](examples/websocket-transport.php)
 
-By default `NatsClient` uses the TCP transport (`AmpSocketTransport`). To connect over WebSocket — e.g. through a NATS gateway that only exposes `ws://` / `wss://` — construct a `WebSocketTransport` and inject it. The `ws://` / `wss://` endpoint goes in `servers`; `wss://` negotiates TLS during connect (using the same `tls*` options), and the optional `webSocketHeaders` / `webSocketCompression` options apply to the upgrade handshake.
+By default `NatsClient` uses the TCP transport (`AmpSocketTransport`). To connect over WebSocket - e.g. through a NATS gateway that only exposes `ws://` / `wss://` - construct a `WebSocketTransport` and inject it. The `ws://` / `wss://` endpoint goes in `servers`; `wss://` negotiates TLS during connect (using the same `tls*` options), and the optional `webSocketHeaders` / `webSocketCompression` options apply to the upgrade handshake.
 
 ```php
 <?php
@@ -645,14 +646,14 @@ $client->connect()->await();
 $queue = $client->subscribeQueue('events.>', queue: 'workers')->await();
 $queue->setTimeout(5.0);
 
-// Non-blocking fetch — returns null if nothing available.
+// Non-blocking fetch - returns null if nothing available.
 $msg = $queue->fetch();
 
-// Blocking fetch — waits up to the configured timeout, returns null on timeout.
+// Blocking fetch - waits up to the configured timeout, returns null on timeout.
 // With no timeout configured it performs a single processIncoming() cycle (like fetch()).
 $msg = $queue->next();
 
-// Batch fetch — collects up to 10 messages within the timeout window.
+// Batch fetch - collects up to 10 messages within the timeout window.
 $messages = $queue->fetchAll(limit: 10);
 
 $client->unsubscribe($queue->sid)->await();
@@ -1045,7 +1046,7 @@ $store->create()->await();
 // putStream() pulls the object's bytes from a producer callback (return the next block, or null at
 // end of stream), so the whole payload is never held in memory. Blocks of any size are re-chunked to
 // the bucket's chunk size, published in bounded in-flight windows, and the SHA-256 digest is computed
-// incrementally — the streaming counterpart to getToCallback().
+// incrementally - the streaming counterpart to getToCallback().
 $handle = fopen('/path/to/large.bin', 'rb');
 $info = $store->putStream('large.bin', static function () use ($handle): ?string {
 	$block = fread($handle, 1 << 16);
@@ -1550,7 +1551,7 @@ a `Future<PubAck>`. Every message carries a shared `Nats-Batch-Id` and an increm
 `Nats-Batch-Sequence`; the final message carries `Nats-Batch-Commit: 1`, on which the server atomically
 commits the whole batch and replies with a single `PubAck` whose `batchCount` is the committed count and
 whose `batchId` echoes the batch id. If any consistency check fails the entire batch is aborted and
-nothing is stored — the failure surfaces as a `JetStreamException`.
+nothing is stored - the failure surfaces as a `JetStreamException`.
 
 This is a NATS 2.12+ feature: the target stream must be created with `allow_atomic` enabled. On a
 pre-2.12 server `createStream(..., ['allow_atomic' => true])` fails fast with an
@@ -1717,7 +1718,7 @@ $client->disconnect()->await();
 
 _Verified by: [PullConsumerIteratorTest::testHandleRePinsOnStalePin](tests/Unit/PullConsumerIteratorTest.php); [PullConsumerIteratorTest::testBuildPullIncludesAllOptionalFields](tests/Unit/PullConsumerIteratorTest.php); [JetStreamContextTest::testCreateConsumerWithPriorityGroups](tests/Unit/JetStreamContextTest.php); [JetStreamContextTest::testUnpinConsumer](tests/Unit/JetStreamContextTest.php); [JetStreamContextTest::testPinIdOf](tests/Unit/JetStreamContextTest.php)._
 
-ADR-42 priority groups let several pull clients share one consumer while the server steers delivery. Create the consumer with `priority_groups` (a non-empty array of 1..16-character group names) and a `priority_policy` — one of `overflow`, `pinned_client`, or `prioritized`. The priority-group fields require **NATS server 2.11+**; the `prioritized` policy requires **2.12+** (an older server rejects them). See [NATS Server Version Requirements](#nats-server-version-requirements).
+ADR-42 priority groups let several pull clients share one consumer while the server steers delivery. Create the consumer with `priority_groups` (a non-empty array of 1..16-character group names) and a `priority_policy` - one of `overflow`, `pinned_client`, or `prioritized`. The priority-group fields require **NATS server 2.11+**; the `prioritized` policy requires **2.12+** (an older server rejects them). See [NATS Server Version Requirements](#nats-server-version-requirements).
 
 Then pull under a group with the `PullConsumerIterator` setters: `setGroup()` (required for any priority policy), and as the policy needs them `setPriority()` (0-9, for `prioritized`), `setMinPending()` / `setMinAckPending()` (for `overflow`), plus the general `setMaxBytes()` and `setNoWait()`. Under the `pinned_client` policy the server pins one client at a time: the iterator automatically captures the `Nats-Pin-Id` from the first delivered message and resends it on subsequent pulls, and transparently re-pins if the pin goes stale (the server returns a 423 status). Call `JetStreamContext::pinIdOf($msg)` to read a message's pin id, and `JetStreamContext::unpinConsumer($stream, $consumer, $group)` to release the active pin so another client can take over.
 
@@ -1846,7 +1847,7 @@ $client->disconnect()->await();
 
 ## Compatibility Mapping
 
-This repository tracks parity against the basis-company `nats.php` README examples while exposing an Amp-first API tailored to this library.
+This repository tracks parity against the basis-company `nats.php` README examples while exposing an Amp-first API.
 
 | Section | Status | Notes |
 | --- | --- | --- |
@@ -1864,7 +1865,7 @@ This repository tracks parity against the basis-company `nats.php` README exampl
 
 _Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testProcessIncomingDispatchesMsgToSubscriber`, `testProcessIncomingUpdatesServerInfoFromAsyncInfoFrame`)._
 
-`processIncoming()` reads a single transport chunk, parses all complete frames from it, and dispatches them to subscription callbacks. It is **non-blocking** — if no data is available, it returns immediately with a frame count of `0`. Because one read returns only a single chunk (and TCP may coalesce several protocol messages into one chunk), call it in a loop to process all available messages:
+`processIncoming()` reads a single transport chunk, parses all complete frames from it, and dispatches them to subscription callbacks. It is **non-blocking** - if no data is available, it returns immediately with a frame count of `0`. Because one read returns only a single chunk (and TCP may coalesce several protocol messages into one chunk), call it in a loop to process all available messages:
 
 ```php
 // Process all available messages for up to 1 second.
@@ -1883,7 +1884,7 @@ The client also applies asynchronous `INFO` updates received after connect, so `
 
 _Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testIdleConnectionStaysOpenViaHeartbeatSelfRead`, `testHeartbeatReadHandlesEmptyErrorAndFatalFrames`, `testRequestTimeoutCancelsReadAndAllowsSubsequentRequest`); live: [NatsClientIntegrationTest](tests/Integration/NatsClientIntegrationTest.php) (`testIdleConnectionStaysOpenViaHeartbeat`, `testRequestTimeoutDoesNotPoisonConnection`, `testMaxPingsOutTriggersReconnect`)._
 
-The heartbeat timer answers its own `PONG`: after sending a `PING` it performs a short, bounded read to consume the reply (unless an application `processIncoming()` read is already in flight). Liveness detection therefore does not depend on the application continuously calling `processIncoming()`, so an otherwise idle connection (for example a pure publisher) is not closed by spurious `maxPingsOut` detection. Only an actual server `PONG` resets the outstanding-ping counter — other inbound frames (data, `INFO`, `PING`) do not — so a server that keeps sending data but stops answering `PING`s is still detected via `maxPingsOut`.
+The heartbeat timer answers its own `PONG`: after sending a `PING` it performs a short, bounded read to consume the reply (unless an application `processIncoming()` read is already in flight). Liveness detection therefore does not depend on the application continuously calling `processIncoming()`, so an otherwise idle connection (for example a pure publisher) is not closed by spurious `maxPingsOut` detection. Only an actual server `PONG` resets the outstanding-ping counter - other inbound frames (data, `INFO`, `PING`) do not - so a server that keeps sending data but stops answering `PING`s is still detected via `maxPingsOut`.
 
 Request and pull-fetch timeouts cancel the underlying socket read rather than leaving it pending. A timed-out `request()` (or `fetchBatch()`/`fetchNext()`) cleanly releases the read, so it cannot orphan an in-flight read or trigger a spurious reconnect on the next operation.
 
@@ -1907,16 +1908,16 @@ The initial handshake is bounded by `connectTimeoutMs`, not by a fixed number of
 
 _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testSubscribeOrderedConsumerRecreatesOnSequenceGap`, `testSubscribeOrderedConsumerDeliversFilteredMessagesWithoutSpuriousRecreate`); [JetStreamIntegrationTest::testJetStreamOrderedConsumerWithFilteredSubjectAfterPriorMessages](tests/Integration/JetStreamIntegrationTest.php)._
 
-`subscribeOrderedConsumer()` tracks the JetStream **consumer** delivery sequence (which is contiguous per delivery, even for a filtered consumer over a stream that also carries non-matching subjects). If a push is missed — the consumer sequence skips — the consumer is transparently deleted and recreated starting just after the last in-order message; the out-of-order message that exposed the gap is **discarded** (not forwarded), and the recreated consumer replays the missing range in order. Delivery to your callback therefore stays in order and gap-free, with no duplicates and no recreate storm. If the restart point has been pruned/expired, recovery resumes from the next available message. If the recreate itself fails (for example the stream was deleted or a leadership change is in progress), the error is contained to this ordered consumer rather than disrupting delivery to other subscriptions on the connection.
+`subscribeOrderedConsumer()` tracks the JetStream **consumer** delivery sequence (which is contiguous per delivery, even for a filtered consumer over a stream that also carries non-matching subjects). If a push is missed - the consumer sequence skips - the consumer is transparently deleted and recreated starting just after the last in-order message; the out-of-order message that exposed the gap is **discarded** (not forwarded), and the recreated consumer replays the missing range in order. Delivery to your callback therefore stays in order and gap-free, with no duplicates and no recreate storm. If the restart point has been pruned/expired, recovery resumes from the next available message. If the recreate itself fails (for example the stream was deleted or a leadership change is in progress), the error is contained to this ordered consumer rather than disrupting delivery to other subscriptions on the connection.
 
 ## Production Notes and Limitations
 
 - **Runtime requirements.** PHP 8.2+ on the async runtime `amphp/amp ^3.1` and `amphp/socket ^2.3` (which requires `ext-openssl` for TLS). `ext-sodium` is additionally required for NKey / JWT authentication, and `ext-zlib` for WebSocket permessage-deflate compression; both are optional otherwise (declared under `suggest`). The library is async-first; it does **not** require Swoole/ReactPHP or `ext-sockets`.
-- **Concurrency model.** Message delivery, request replies, and JetStream pull/push consumption are driven by reads. An application must run a `processIncoming()` loop (directly, or indirectly via helpers such as `request()`, `flush()`, `SubscriptionQueue::next()`, or the consumer iterators, which pump it for you) for callbacks to fire. An idle, publisher-only connection stays alive on its own because the heartbeat timer self-reads `PONG`s — see [Heartbeat and Request Timeouts](#heartbeat-and-request-timeouts).
+- **Concurrency model.** Message delivery, request replies, and JetStream pull/push consumption are driven by reads. An application must run a `processIncoming()` loop (directly, or indirectly via helpers such as `request()`, `flush()`, `SubscriptionQueue::next()`, or the consumer iterators, which pump it for you) for callbacks to fire. An idle, publisher-only connection stays alive on its own because the heartbeat timer self-reads `PONG`s - see [Heartbeat and Request Timeouts](#heartbeat-and-request-timeouts).
 - **One connection per fiber/process boundary.** A `NatsConnection` serializes its writes and owns a single socket read; share a connection within a coroutine tree, not across independent concurrent readers.
 - **Interoperability.** KeyValue and Object Store buckets use the official NATS layouts (`KV_`/`OBJ_` streams, base64url object-name encoding, `SHA-256=`-prefixed base64url digests), so buckets written by this client are readable by the `nats` CLI and other official clients, and vice-versa.
 - **Observability.** Pass a PSR-3 `LoggerInterface` via `new NatsOptions(logger: $logger)` to capture lifecycle events (connect, disconnect, reconnect, close, server discovery, lame-duck), per-attempt reconnect/backoff, and async errors. It defaults to a `NullLogger`. For structured, programmatic hooks (metrics, alerting, circuit breakers) without parsing log strings, pass typed closures instead: `connectionListener: Closure(ConnectionEvent $event, ?Throwable $error): void` is invoked on every connection-lifecycle transition, and `errorListener: Closure(Throwable $error): void` on async errors. Exceptions thrown by a listener are swallowed so a faulty hook cannot disrupt the connection. _Verified by: [NatsConnectionTest::testLoggerCapturesLifecycleEvents](tests/Unit/NatsConnectionTest.php)._
-- **Server version requirements.** Newer features (per-message TTL, atomic batch publish, scheduled publish, priority groups, counters, batched Direct Get) require recent NATS servers — see [NATS Server Version Requirements](#nats-server-version-requirements).
+- **Server version requirements.** Newer features (per-message TTL, atomic batch publish, scheduled publish, priority groups, counters, batched Direct Get) require recent NATS servers - see [NATS Server Version Requirements](#nats-server-version-requirements).
 - **Not yet implemented.** A dedicated high-throughput fast-ingest batch publisher ([#12](https://github.com/ideaconnect/php-nats-jetstream-client/issues/12)) is tracked but blocked on an upstream reference; standard JetStream publish with in-flight pipelining is available today and is sufficient for most workloads.
 
 ## Configuration Option Mapping
@@ -2082,7 +2083,7 @@ composer fix
 composer infection
 ```
 
-`composer infection` runs [Infection](https://infection.github.io/) mutation testing against the `unit` testsuite (no Docker; needs a coverage driver — Xdebug or PCOV). It is a quality gate on top of line coverage: it makes small changes ("mutants") to `src/` and fails if the tests don't catch them. The suite scores ~93% Covered MSI and CI enforces a strict 90% floor via the dedicated `mutation` job. The strictness is overridable for local exploration, e.g. `INFECTION_MIN_MSI=0 composer infection -- --show-mutations`, and `INFECTION_DIFF_BASE=origin/main composer infection` mutates only your changed lines.
+`composer infection` runs [Infection](https://infection.github.io/) mutation testing against the `unit` testsuite (no Docker; needs a coverage driver - Xdebug or PCOV). It is a quality gate on top of line coverage: it makes small changes ("mutants") to `src/` and fails if the tests don't catch them. The suite scores ~93% Covered MSI and CI enforces a strict 90% floor via the dedicated `mutation` job. The strictness is overridable for local exploration, e.g. `INFECTION_MIN_MSI=0 composer infection -- --show-mutations`, and `INFECTION_DIFF_BASE=origin/main composer infection` mutates only your changed lines.
 
 Infection requires **PHP 8.3+** and is intentionally **not** in `require-dev` (so the library stays installable on PHP 8.2). The CI `mutation` job installs it on the fly; to run mutation testing locally, add it first: `composer require --dev infection/infection:^0.33`.
 
@@ -2221,4 +2222,4 @@ Many thanks for all the contributions:
 
 ## License
 
-This project is licensed under the **BSD 3-Clause License** — see the [LICENSE](LICENSE) file for the full text. Copyright © IDCT — Bartosz Pachołek.
+This project is licensed under the **BSD 3-Clause License** - see the [LICENSE](LICENSE) file for the full text. Copyright © IDCT - Bartosz Pachołek.

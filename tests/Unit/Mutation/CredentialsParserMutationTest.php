@@ -33,7 +33,7 @@ final class CredentialsParserMutationTest extends TestCase
             CredentialsParser::fromFile($dir);
             self::fail('Expected NatsException for a directory path.');
         } catch (NatsException $e) {
-            // kills LogicalOr @ line 21 — must be the readability guard message,
+            // kills LogicalOr @ line 21 - must be the readability guard message,
             // NOT a downstream "does not contain ... block" parse error.
             self::assertStringContainsString('not found or not readable', $e->getMessage());
         }
@@ -53,11 +53,11 @@ final class CredentialsParserMutationTest extends TestCase
         } catch (NatsException $e) {
             $message = $e->getMessage();
 
-            // kills Concat @ line 22 — operands must be in order:
+            // kills Concat @ line 22 - operands must be in order:
             // the literal prefix comes first, the path is appended last.
             self::assertStringStartsWith('Credentials file not found or not readable: ', $message);
 
-            // kills ConcatOperandRemoval @ line 22 — the path must be present in the message.
+            // kills ConcatOperandRemoval @ line 22 - the path must be present in the message.
             self::assertStringContainsString($path, $message);
             self::assertStringEndsWith($path, $message);
 
@@ -78,7 +78,7 @@ final class CredentialsParserMutationTest extends TestCase
 
         $result = CredentialsParser::parse($contents);
 
-        // kills UnwrapTrim @ line 70 — without trim() these would retain the
+        // kills UnwrapTrim @ line 70 - without trim() these would retain the
         // surrounding whitespace ("  jwt-value-x  " / "\tseed-value-y\t").
         self::assertSame('jwt-value-x', $result['jwt']);
         self::assertSame('seed-value-y', $result['nkeySeed']);

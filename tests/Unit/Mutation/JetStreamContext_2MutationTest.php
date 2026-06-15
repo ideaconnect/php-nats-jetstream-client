@@ -228,7 +228,7 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
         } catch (JetStreamException $e) {
             self::assertSame(
                 'directGetLastForSubjects expects exact subjects; the wildcard "orders.*"'
-                . ' would be truncated — use directGetBatch() with an explicit batch size instead',
+                . ' would be truncated - use directGetBatch() with an explicit batch size instead',
                 $e->getMessage(),
             );
         }

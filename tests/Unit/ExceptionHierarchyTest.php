@@ -17,8 +17,8 @@ use RuntimeException;
 use Throwable;
 
 /**
- * Guards #91: every library exception — including the transport exceptions that extend
- * \RuntimeException rather than NatsException — is catchable via the shared NatsThrowable marker, and
+ * Guards #91: every library exception - including the transport exceptions that extend
+ * \RuntimeException rather than NatsException - is catchable via the shared NatsThrowable marker, and
  * the CONNECT fallback version is kept current.
  */
 final class ExceptionHierarchyTest extends TestCase

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * JetStream Push Consumer (Durable) — server-pushed delivery.
+ * JetStream Push Consumer (Durable) - server-pushed delivery.
  *
  * Uses subscribePushConsumer(), which creates the durable consumer and transparently
  * handles JetStream flow-control / idle-heartbeat control frames, invoking the handler

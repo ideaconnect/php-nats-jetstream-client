@@ -55,7 +55,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // connect() — timeout clamp and per-attempt state resets (lines 67, 71, 72)
+    // connect() - timeout clamp and per-attempt state resets (lines 67, 71, 72)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -102,7 +102,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // connect() — DSN validation and error message (lines 75, 76)
+    // connect() - DSN validation and error message (lines 75, 76)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -138,7 +138,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // connect() — scheme lower-casing decides TLS (line 79)
+    // connect() - scheme lower-casing decides TLS (line 79)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -169,7 +169,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // connect() — handshake request path building (lines 83, 85)
+    // connect() - handshake request path building (lines 83, 85)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -210,7 +210,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
 
         $request = $requestFuture->await();
         try {
-            // The server closed without a valid 101, so connect() throws — irrelevant to the path assertion.
+            // The server closed without a valid 101, so connect() throws - irrelevant to the path assertion.
             $connectFuture->await();
         } catch (\Throwable) {
         }
@@ -221,7 +221,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
 
     public function testHandshakePreservesNonRootPath(): void
     {
-        // kills Coalesce ('' ?? path) & Ternary (swapped) @ line 83 — a non-root path would collapse to '/'.
+        // kills Coalesce ('' ?? path) & Ternary (swapped) @ line 83 - a non-root path would collapse to '/'.
         self::assertSame('GET /foo HTTP/1.1', $this->captureUpgradeRequestLine('/foo'));
     }
 
@@ -233,7 +233,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // readLine() — raw read buffer accumulation (line 161)
+    // readLine() - raw read buffer accumulation (line 161)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -254,7 +254,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
                 $serverSocket->write(substr($frame, $half));
             });
 
-            // kills Assignment (.= -> =) @ line 161 — without accumulation the first half is discarded and
+            // kills Assignment (.= -> =) @ line 161 - without accumulation the first half is discarded and
             // no frame ever completes; the bounded cancellation then surfaces as a clean failure (not a hang).
             self::assertSame("PING\r\n", $transport->readLine(new TimeoutCancellation(3.0))->await());
             $writer->await();
@@ -266,7 +266,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // close() — close frame + socket teardown (lines 174, 179, 184)
+    // close() - close frame + socket teardown (lines 174, 179, 184)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -316,7 +316,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // drainDataFrames() — opcode handling, accumulation, ping reply (lines 198, 201, 214, 220, 229)
+    // drainDataFrames() - opcode handling, accumulation, ping reply (lines 198, 201, 214, 220, 229)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -348,7 +348,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
             self::serverFrame(WebSocketFrameCodec::OP_PING, 'p', true),
         );
 
-        // kills NullSafeMethodCall (?-> -> ->) @ line 201 — the hard call would throw on null socket.
+        // kills NullSafeMethodCall (?-> -> ->) @ line 201 - the hard call would throw on null socket.
         self::assertSame('', self::drain($transport));
     }
 
@@ -422,7 +422,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
     }
 
     // -------------------------------------------------------------------------------------------
-    // enforceFragmentBound() — boundary + post-throw state reset (lines 250, 256, 257)
+    // enforceFragmentBound() - boundary + post-throw state reset (lines 250, 256, 257)
     // -------------------------------------------------------------------------------------------
 
     /**
@@ -437,7 +437,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
             . self::serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'BBBB', true);
         self::prop('readBuffer')->setValue($transport, $buffer);
 
-        // kills LessThanOrEqualTo (<= -> <) @ line 250 — strict '<' would throw at exactly the cap.
+        // kills LessThanOrEqualTo (<= -> <) @ line 250 - strict '<' would throw at exactly the cap.
         self::assertSame('AAAABBBB', self::drain($transport));
     }
 

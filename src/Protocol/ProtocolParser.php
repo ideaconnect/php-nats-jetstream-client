@@ -11,7 +11,7 @@ use IDCT\NATS\Protocol\Enum\ProtocolFrameType;
  * Streaming parser for NATS protocol frames read from transport.
  *
  * Control-line operations (MSG, HMSG, PING, PONG, INFO, +OK, -ERR) are matched case-sensitively as
- * the NATS server emits them — always upper-case per the protocol — so no case-folding is performed.
+ * the NATS server emits them - always upper-case per the protocol - so no case-folding is performed.
  */
 final class ProtocolParser
 {
@@ -163,7 +163,7 @@ final class ProtocolParser
             );
         }
 
-        // PING/PONG/+OK carry no arguments — require the whole (case-insensitive) line to be the verb.
+        // PING/PONG/+OK carry no arguments - require the whole (case-insensitive) line to be the verb.
         $normalized = strtoupper($line);
         if ($normalized === 'PING') {
             return new ProtocolFrame(type: ProtocolFrameType::Ping);

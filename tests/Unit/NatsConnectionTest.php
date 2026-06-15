@@ -93,7 +93,7 @@ final class NatsConnectionTest extends TestCase
         $split = intdiv(strlen($info), 2);
 
         $transport = new FakeTransport([
-            substr($info, 0, $split),  // first segment: incomplete INFO — the parser must buffer it
+            substr($info, 0, $split),  // first segment: incomplete INFO - the parser must buffer it
             substr($info, $split),     // tail segment completes the frame
             "PONG\r\n",
         ]);
@@ -344,7 +344,7 @@ final class NatsConnectionTest extends TestCase
     {
         // #94: the server advertises a 16 MiB max_payload, so a 9 MiB inbound message (larger than the
         // historical fixed 8 MiB inbound bound) must be delivered intact rather than rejected as an
-        // oversized frame — which previously threw a ProtocolException and forced a reconnect.
+        // oversized frame - which previously threw a ProtocolException and forced a reconnect.
         $payload = str_repeat('A', 9 * 1024 * 1024);
         $frame = sprintf("MSG big.subject 1 %d\r\n%s\r\n", strlen($payload), $payload);
 
@@ -808,7 +808,7 @@ final class NatsConnectionTest extends TestCase
     {
         // Hardening (3b): several publishes buffered during a reconnect must be replayed in their exact
         // publish order, as a single ordered block, and BEFORE any publish issued after the reconnect
-        // completes — so a reconnect never reorders or interleaves the outbound stream.
+        // completes - so a reconnect never reorders or interleaves the outbound stream.
         $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
         $release = new DeferredFuture();
 
@@ -2284,9 +2284,9 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Verifies an injected PSR-3 logger records the full connection lifecycle — connect/close,
+     * Verifies an injected PSR-3 logger records the full connection lifecycle - connect/close,
      * server discovery + lame-duck (from an async INFO), and a real reconnect (disconnect,
-     * per-attempt backoff warning, reconnect) — with the exact message strings and levels the
+     * per-attempt backoff warning, reconnect) - with the exact message strings and levels the
      * connection emits (#69).
      */
     public function testLoggerCapturesLifecycleEvents(): void
@@ -2569,7 +2569,7 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(800, $method->invoke($connection, 4));   // 100 * 2^3 = 800
         self::assertSame(1600, $method->invoke($connection, 5));  // 100 * 2^4 = 1600
         self::assertSame(3200, $method->invoke($connection, 6));  // 100 * 2^5 = 3200
-        self::assertSame(5000, $method->invoke($connection, 7));  // 100 * 2^6 = 6400 → capped at 5000
+        self::assertSame(5000, $method->invoke($connection, 7));  // 100 * 2^6 = 6400 -> capped at 5000
         self::assertSame(5000, $method->invoke($connection, 10)); // capped
     }
 
@@ -3734,7 +3734,7 @@ final class NatsConnectionTest extends TestCase
     {
         // #95: a configured tlsContext is documented to imply TLS-required. The server's INFO does NOT
         // advertise tls_required and the DSN is plaintext (nats://), yet the client must still upgrade
-        // to TLS before writing CONNECT (which carries credentials) — otherwise credentials leak in
+        // to TLS before writing CONNECT (which carries credentials) - otherwise credentials leak in
         // cleartext despite the user having configured a TLS context.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -3764,7 +3764,7 @@ final class NatsConnectionTest extends TestCase
     {
         // #95: when a tlsContext is configured but the handshake cannot establish TLS (canUpgrade=false),
         // the credentials fail-safe must fire and CONNECT/PING must NOT be written over the plaintext
-        // socket — even though neither tlsRequired nor the server's INFO requested TLS.
+        // socket - even though neither tlsRequired nor the server's INFO requested TLS.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -3999,7 +3999,7 @@ final class NatsConnectionTest extends TestCase
 
         self::assertSame(ConnectionState::Connecting, $connection->state());
 
-        // The buffer is only 1 byte; a publish frame won't fit → bufferFrame() returns false → throw.
+        // The buffer is only 1 byte; a publish frame won't fit -> bufferFrame() returns false -> throw.
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
 
@@ -4074,7 +4074,7 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // No PONG response for flush → flush times out, but drainSubscription() must still succeed.
+            // No PONG response for flush -> flush times out, but drainSubscription() must still succeed.
         ]);
 
         $connection = new NatsConnection(
@@ -4085,7 +4085,7 @@ final class NatsConnectionTest extends TestCase
 
         $sid = $connection->subscribe('events', static function (NatsMessage $message): void {})->await();
 
-        // drainSubscription() sends UNSUB then flush(); flush times out (no PONG in queue) → swallowed.
+        // drainSubscription() sends UNSUB then flush(); flush times out (no PONG in queue) -> swallowed.
         $connection->drainSubscription($sid)->await();
 
         // Subscription state must be gone after the (failed) flush.
@@ -4113,7 +4113,7 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // No PONG for the flush PING → TimeoutException.
+            // No PONG for the flush PING -> TimeoutException.
         ]);
 
         $connection = new NatsConnection(
@@ -4321,7 +4321,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testRetryInitialConnectReturnsFalseWhenExhausted(): void
     {
-        // All connect attempts fail → retryInitialConnect() returns false → connect() closes and throws.
+        // All connect attempts fail -> retryInitialConnect() returns false -> connect() closes and throws.
         $transport = new FlakyTransport(
             readQueuesByConnection: [],
             connectFailures: 10, // more than maxReconnectAttempts
@@ -4414,7 +4414,7 @@ final class NatsConnectionTest extends TestCase
                     'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
                     "PONG\r\n",
                     "+OK\r\n",
-                    // Queue exhausted → subsequent poll reads return '' (treated as CancelledException poll timeout).
+                    // Queue exhausted -> subsequent poll reads return '' (treated as CancelledException poll timeout).
                 ],
             ],
             connectFailures: 0,
@@ -4529,7 +4529,7 @@ final class NatsConnectionTest extends TestCase
         );
         $connection->connect()->await();
 
-        // consumeHeartbeatResponse() reads EOF → calls recoverConnection() → reconnect disabled → throws.
+        // consumeHeartbeatResponse() reads EOF -> calls recoverConnection() -> reconnect disabled -> throws.
         // The catch block on line 1706 must absorb the exception and mark state as Closed.
         (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
 
@@ -4635,8 +4635,8 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
             // First async INFO: discover a peer (pool grows to 2).
             'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
-            // Second async INFO: lame-duck with reconnect enabled + pool of 2 → recoverConnection() fires.
-            // With no second server actually available, recovery will fail → emitError() is called.
+            // Second async INFO: lame-duck with reconnect enabled + pool of 2 -> recoverConnection() fires.
+            // With no second server actually available, recovery will fail -> emitError() is called.
             'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
         ]);
 
@@ -4660,7 +4660,7 @@ final class NatsConnectionTest extends TestCase
 
         // Read the discovery INFO (pool grows to 2).
         $connection->processIncoming()->await();
-        // Read the lame-duck INFO (triggers failover attempt → fails → emitError).
+        // Read the lame-duck INFO (triggers failover attempt -> fails -> emitError).
         $connection->processIncoming()->await();
 
         self::assertContains(ConnectionEvent::LameDuck, $events);
@@ -5115,8 +5115,8 @@ final class NatsConnectionTest extends TestCase
 
         $connection->connect()->await();
 
-        // processIncoming() reads EOF → triggers recoverConnection() → performRecovery() →
-        // transport.close() throws → swallowed → reconnect attempt succeeds.
+        // processIncoming() reads EOF -> triggers recoverConnection() -> performRecovery() ->
+        // transport.close() throws -> swallowed -> reconnect attempt succeeds.
         $connection->processIncoming()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());

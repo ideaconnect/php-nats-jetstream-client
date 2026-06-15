@@ -99,7 +99,7 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
         if (!$this->tlsContextConfigured) {
             // The connection layer asked to upgrade (the server/options require TLS) but no TLS
             // materials were configured at connect time. Fail fast instead of leaving the socket
-            // plaintext — otherwise the subsequent CONNECT would send credentials in the clear.
+            // plaintext - otherwise the subsequent CONNECT would send credentials in the clear.
             throw new TlsRequiredException(
                 'TLS upgrade requested but no TLS context was configured at connect time; '
                 . 'set NatsOptions tlsRequired (or use a tls:// server and provide CA/cert materials) '

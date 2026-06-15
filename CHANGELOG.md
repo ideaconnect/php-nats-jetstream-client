@@ -22,13 +22,23 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[docs]` Added mutation testing with [Infection](https://infection.github.io/) (`composer infection`,
   `scripts/run-mutation.sh`, `infection.json5`). 517 new unit tests under `tests/Unit/Mutation/` raised the
   suite's mutation score (Covered MSI) from **75% to 93%**, killing ~870 previously-surviving mutants. CI
-  now enforces a **strict mutation gate** (a dedicated `mutation` job that fails the build below 90% MSI) —
+  now enforces a **strict mutation gate** (a dedicated `mutation` job that fails the build below 90% MSI) -
   a quality bar on top of line coverage that catches assertions which pass but don't actually pin behavior.
   Mutation runs against the fast `unit` testsuite (no Docker); the remaining ~6% are mutants verified to be
   equivalent (no observable behavioral difference), documented in each test's reasoning rather than chased
-  with meaningless assertions. Dev-only — no runtime/library change. **PHP 8.2 support is unchanged:**
+  with meaningless assertions. Dev-only - no runtime/library change. **PHP 8.2 support is unchanged:**
   Infection requires PHP 8.3+ and is intentionally not in `require-dev`, so `composer install` still works
   on PHP 8.2; the `mutation` CI job runs on PHP 8.3 and installs Infection itself.
+
+### Documentation
+
+- `[docs]` Added a "PHP Support Policy" section to the README: the library follows PHP's official release
+  schedule, so PHP 8.2 support will be dropped by the end of 2026 (when PHP 8.2 reaches end-of-life),
+  raising the minimum to PHP 8.3 at that point.
+- `[docs]` Pointed the "Made in the EU" badge at the renamed `ideaconnect/made-in-the-eu` repository.
+- `[docs]` Replaced AI-style typography in the README, CHANGELOG, TESTS.md, and PHP docblocks/comments
+  with plain ASCII: em/en dashes become `-`, the ellipsis character becomes `...`, and arrow / `x` for the
+  arrow and multiplication signs. Functional non-ASCII (the `µs` duration unit, `©`, `§`) is left intact.
 
 ## [2.4.0] - 2026-06-14
 
@@ -44,7 +54,7 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[bugfix]` JetStream: `createStream()` no longer rejects an empty `subjects` list when a non-empty
   `sources` configuration is provided. A pure aggregate/sourcing stream legitimately has no subjects of its
   own (the server allows it); the client previously only exempted `mirror`, so creating a sources-only
-  aggregate stream failed with "Stream subjects must not be empty…".
+  aggregate stream failed with "Stream subjects must not be empty...".
 - `[bugfix]` Connection: a malformed async `INFO` frame is no longer allowed to throw out of the core
   `processIncoming()` read loop. Previously a non-JSON async INFO (corruption in flight, or a non-conformant
   server push) raised an uncaught `JsonException` that aborted the read cycle and skipped delivery of the
@@ -53,16 +63,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   Handshake INFO is still validated strictly and fails the connect on bad JSON.
 - `[bugfix]` WebSocket transport: the frame decoder no longer re-slices the entire remaining receive buffer
   once per frame. A single read carrying many coalesced frames is now decoded in O(total bytes) instead of
-  O(frames × bytes) by advancing a cursor and trimming once, improving throughput under bursty high-fanout
+  O(frames x bytes) by advancing a cursor and trimming once, improving throughput under bursty high-fanout
   traffic. Behavior (including the "leave an incomplete trailing frame buffered" contract) is unchanged.
 
 ### Documentation
 
-- `[docs]` Added `TESTS.md` — a catalogue of every unit, integration, and Behat test with a one-line
-  description of what it verifies — linked from the README's test baseline section.
+- `[docs]` Added `TESTS.md` - a catalogue of every unit, integration, and Behat test with a one-line
+  description of what it verifies - linked from the README's test baseline section.
 - `[docs]` Added an `examples/` directory: one runnable, self-contained script per README example (42
   files), plus `scripts/run-examples.sh` which runs them all against dockerized NATS and reports
-  pass/skip/fail — a gate that keeps the README examples honest. Linked from the README Usage section.
+  pass/skip/fail - a gate that keeps the README examples honest. Linked from the README Usage section.
 - `[docs]` Distributed Counter example now creates its backing stream with `allow_direct: true` (required
   because `counterValue()` reads via Direct Get); without it the documented example threw "no responders
   for $JS.API.DIRECT.GET". Prose updated accordingly.
@@ -83,8 +93,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 ### Security
 
 - **Credential exposure via a configured `tlsContext` (#95).** Versions before 2.3.0 could transmit the
-  CONNECT frame — which carries the configured credentials (token / user-password / JWT signature / NKey
-  signature) — in **cleartext** when a `NatsOptions::$tlsContext` was supplied but `tlsRequired` was off,
+  CONNECT frame - which carries the configured credentials (token / user-password / JWT signature / NKey
+  signature) - in **cleartext** when a `NatsOptions::$tlsContext` was supplied but `tlsRequired` was off,
   the DSN used the `nats://` scheme, and the server's INFO did not advertise `tls_required`. The TLS-required
   check ignored `tlsContext`, so the upgrade and the cleartext fail-safe were both skipped. Fixed: a
   configured `tlsContext` now forces the TLS upgrade (and fails fast if TLS cannot be established).
@@ -95,8 +105,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[feature]` Object Store: `ObjectStoreBucket::watch()` now accepts an optional `ObjectStoreWatchOptions`
   to select the delivery policy, mirroring the KeyValue watch matrix and the reference ObjectStore.Watch.
   With no options (`null`) the watcher stays updates-only (`deliver_policy=new`, unchanged). Passing an
-  `ObjectStoreWatchOptions` instance opts into "snapshot then follow" — replay the current metadata of
-  every existing object first, then live updates (`last_per_subject`, the reference default) — or full
+  `ObjectStoreWatchOptions` instance opts into "snapshot then follow" - replay the current metadata of
+  every existing object first, then live updates (`last_per_subject`, the reference default) - or full
   history (`includeHistory`) / explicit updates-only (`updatesOnly`). (#98)
 - `[feature]` Services: a declared endpoint `schema` is now also surfaced in the standard `$SRV.INFO`
   response endpoint entries. ADR-32 stabilizes only PING/INFO/STATS, so spec-conformant tooling (nats CLI
@@ -117,7 +127,7 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   nothing pending. (#99)
 - `[bugfix]` Protocol: the inbound MSG/HMSG frame bound is now coupled to the server's negotiated
   `max_payload` instead of a fixed 8 MiB. On a server with a raised `max_payload` (e.g. 16/32/64 MiB), a
-  legitimately large message larger than 8 MiB was rejected as an oversized frame — throwing a
+  legitimately large message larger than 8 MiB was rejected as an oversized frame - throwing a
   `ProtocolException` that the connection turned into a reconnect, so the message was effectively
   undeliverable. The parser bound is raised from INFO (`max_payload` + a header-block margin, never below
   the historical 8 MiB), with a generous 64 MiB fallback when `max_payload` is unknown. (#94)
@@ -129,8 +139,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   endpoint returning binary data can no longer take down the whole client's dispatch. (#97)
 - `[bugfix]` KeyValue: `history()` no longer uses the throwing `messageMetadata()` path. A delivery
   lacking a parseable `$JS.ACK` reply subject (a control / non-conformant frame) is now skipped instead of
-  throwing out of the shared dispatch loop — which would tear down delivery for every subscription on the
-  connection (the same class fixed for `watch()` in #90) — and is no longer recorded as a bogus history
+  throwing out of the shared dispatch loop - which would tear down delivery for every subscription on the
+  connection (the same class fixed for `watch()` in #90) - and is no longer recorded as a bogus history
   entry. (#96)
 - `[bugfix]` TLS: a configured `NatsOptions::$tlsContext` now correctly forces the TLS upgrade, matching
   its documented "treated as TLS-required" contract. Previously `requiresTls()` ignored `tlsContext`, so
@@ -150,9 +160,9 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   default 8 MiB, and flushed on reconnect; rejected only when the buffer is full, buffering is disabled, or
   the connection is closed/not reconnecting), with test citations. (#102)
 - `[docs]` README "Configuration Option Mapping" table now lists the 11 previously-omitted `NatsOptions`
-  fields — `connectionListener`, `errorListener`, `jwtProvider`, `tokenProvider`, `reconnectBufferSize`,
+  fields - `connectionListener`, `errorListener`, `jwtProvider`, `tokenProvider`, `reconnectBufferSize`,
   `tlsContext`, `randomizeServers`, `retryOnFailedInitialConnect`, `webSocketHeaders`,
-  `webSocketCompression`, `logger` — with types/defaults. `NatsOptionsTest::testDefaultsMatchDocumentedValues`
+  `webSocketCompression`, `logger` - with types/defaults. `NatsOptionsTest::testDefaultsMatchDocumentedValues`
   now asserts these defaults too, keeping the table's "asserted by" claim accurate. (#103)
 - `[docs]` README: new "WebSocket Transport" section (with an Index entry) showing how to wire
   `WebSocketTransport`, the `ws://` / `wss://` expectations, and the `webSocketHeaders` /
@@ -164,7 +174,7 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[docs]` PHPDoc: `KeyWatchOptions` and `KeyValueBucket::watch()` now make clear that the
   last-per-subject "snapshot then follow" default applies only when a `KeyWatchOptions` instance is
   supplied; `watch()` called with `$options = null` is updates-only and replays nothing. (#107)
-- `[docs]` PHPDoc: `ObjectInfo::$digest` is no longer described as "Server-provided" — it is the content
+- `[docs]` PHPDoc: `ObjectInfo::$digest` is no longer described as "Server-provided" - it is the content
   digest recorded by the writing client and verified on read. (#108)
 - `[docs]` Added a runnable performance baseline script (`scripts/benchmark.php`, request/reply + publish
   throughput) and a sample-results table in the README's Performance section.
@@ -176,11 +186,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[feature]` Server-version awareness for version-gated features. Each feature's minimum NATS version
   is documented (PHPDoc `Requires NATS X.Y+` notes + a compatibility table in the README) and exposed
   programmatically via the new `IDCT\NATS\JetStream\FeatureSupport` registry
-  (`FeatureSupport::requiredVersion('allow_atomic')` → `"2.12"`).
+  (`FeatureSupport::requiredVersion('allow_atomic')` -> `"2.12"`).
 - `[feature]` New `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`).
   When a JetStream request fails because the connected server is too old for a feature (the server
   rejects the config field with `unknown field "X"`), the client now raises this typed exception
-  carrying the feature, the required version, and the server's reported version — instead of an opaque
+  carrying the feature, the required version, and the server's reported version - instead of an opaque
   error. The detection is **reactive** (derived from the server's own response on failure); there is no
   per-request version probe. `JetStreamException` is no longer `final` so it can be specialized
   (existing `catch (JetStreamException)` handlers are unaffected).
@@ -191,7 +201,7 @@ Verification pass for the 2.1.0 roadmap features against a live NATS 2.12.9 serv
 
 ### Fixed
 
-- `[bugfix]` Atomic batch publish (#8): the stream-config field is **`allow_atomic`** — the server
+- `[bugfix]` Atomic batch publish (#8): the stream-config field is **`allow_atomic`** - the server
   rejects the previously-documented `allow_atomic_publish` with `unknown field`. Corrected the
   `batch()`/`BatchPublisher` docblocks (the `BatchPublisher` code itself was already correct and is now
   verified end-to-end: a 3-message batch commits 3/3 with the `batch`/`count` ack parsed).
@@ -204,7 +214,7 @@ Verification pass for the 2.1.0 roadmap features against a live NATS 2.12.9 serv
 
 ## [2.1.0] - 2026-06-10
 
-NATS 2.11/2.12 client feature support (roadmap milestone, GitHub issues #4–#14). All changes are
+NATS 2.11/2.12 client feature support (roadmap milestone, GitHub issues #4-#14). All changes are
 backward compatible (new optional parameters / new methods); the one behavior change (#5 delete
 markers) is bug-driven and flagged `[bugfix]`, so this is a minor release.
 
@@ -223,7 +233,7 @@ markers) is bug-driven and flagged `[bugfix]`, so this is a minor release.
 - `[feature]` Batched / multi Direct Get (ADR-31, issue #13). New `directGetBatch()` collects a
   multi-response Direct Get stream (terminated by a 204 EOB or `Nats-Num-Pending: 0`), and
   `directGetLastForSubjects()` fetches the latest message for many subjects in one request via
-  `multi_last`. Additive — the existing per-subject bulk paths (`getAll()`/`list()`) are unchanged
+  `multi_last`. Additive - the existing per-subject bulk paths (`getAll()`/`list()`) are unchanged
   pending live verification on a 2.11+ server.
 - `[feature]` Pull-consumer priority groups and richer pull options (ADR-42, issue #7).
   `fetchBatch()`/`fetchNext()` accept a `$pull` array (`group`, `id`, `min_pending`,
@@ -247,10 +257,10 @@ markers) is bug-driven and flagged `[bugfix]`, so this is a minor release.
   `counterValue()` reads the current value via Direct Get ("0" when absent). Values are handled as
   strings (decoded with `JSON_BIGINT_AS_STRING`) so arbitrary-precision counters are not truncated.
   The target stream must be created with `allow_msg_counter` enabled.
-- `[feature]` `JetStreamContext::publish()` now accepts optional message headers — a generic
+- `[feature]` `JetStreamContext::publish()` now accepts optional message headers - a generic
   `array $headers`, a `$msgId` (`Nats-Msg-Id`) for server-side de-duplication within the stream's
   `duplicate_window` (issue #11), and a per-message `$ttl` (`Nats-TTL`; requires `allow_msg_ttl` on
-  the stream — issue #4). `KeyValueBucket::put()` takes an optional per-key `$ttl`, and
+  the stream - issue #4). `KeyValueBucket::put()` takes an optional per-key `$ttl`, and
   `delete()`/`purge()` take an optional tombstone TTL. TTL values (integer seconds, a Go duration
   string, or "never") are validated client-side via the new `MessageTtl` helper.
 - `[feature]` Recurring and cron scheduled publishing (ADR-51, issue #6). `Schedule::every()` builds
@@ -293,7 +303,7 @@ were all verified working and are unchanged.
 - `[bugfix]` KeyValue/Object Store bucket names are now validated (`^[A-Za-z0-9_-]+$`); a name with
   dots or wildcards would otherwise mis-scope the backing stream subjects.
 - `[bugfix]` JetStream `publish()`/`publishScheduled()` now translate a no-responders reply into a
-  `JetStreamException` (code 503) — e.g. publishing to a subject not bound to any stream — so a
+  `JetStreamException` (code 503) - e.g. publishing to a subject not bound to any stream - so a
   `catch (JetStreamException)` no longer misses it as a bare `NatsException`.
 - `[bugfix]` `drain()` now always closes the socket and clears state even if a fatal frame surfaces
   mid-flush, instead of escaping the flush loop and leaving the connection wedged in `Draining`.
@@ -338,8 +348,8 @@ were all verified working and are unchanged.
 - `[bugfix]` Subscription dispatch is now non-reentrant per SID. If a handler awaits on the
   connection (e.g. an ordered consumer recreating itself during gap recovery), a heartbeat tick
   or a nested `request()` self-pump could previously re-enter the per-SID drain and deliver that
-  subscription's next message on top of the still-suspended handler — corrupting ordered-consumer
-  recovery state (stale by-reference sequence/consumer-name → duplicate `deleteConsumer`/recreate)
+  subscription's next message on top of the still-suspended handler - corrupting ordered-consumer
+  recovery state (stale by-reference sequence/consumer-name -> duplicate `deleteConsumer`/recreate)
   and causing overlapping/duplicate delivery. Delivery for a SID in flight is now deferred until
   the suspended handler returns (FIFO preserved); other SIDs stay deliverable so nested requests
   still complete.
@@ -355,7 +365,7 @@ were all verified working and are unchanged.
   coupling where the request UNSUB cleanup was gated on the (now-released) pending queue.
 - `[bugfix]` Object Store `get()`/`getToCallback()` now fetch a single-chunk object with one
   Direct Get on its chunk subject, instead of creating, pulling from, and deleting a transient
-  ephemeral consumer — turning the common small-object download from 4 round-trips into 1 (plus
+  ephemeral consumer - turning the common small-object download from 4 round-trips into 1 (plus
   the metadata read). Multi-chunk objects still use the batched pull-consumer path.
 - `[bugfix]` Object Store `put()` and `delete()` now run the previous-revision lookup
   concurrently with the chunk upload / tombstone publish, awaiting it only just before the
@@ -396,7 +406,7 @@ were all verified working and are unchanged.
   half-initialized with the idempotency guard then masking a retried `start()` as a no-op.
   A separate `started` flag tracks completion.
 - `[bugfix]` Microservice request observers now receive the terminal `request_end` event
-  on the schema-validation rejection path too (previously only `request_start` →
+  on the schema-validation rejection path too (previously only `request_start` ->
   `request_error` fired), so observer spans/timers/gauges are not leaked for rejected
   (often hostile) traffic.
 - `[bugfix]` `NatsClient::service()` now validates the service name
@@ -421,7 +431,7 @@ were all verified working and are unchanged.
   fire; previously a synchronous 0-frame read starved the event loop, so the
   `TimeoutCancellation` could never fire and `drain()` never returned.
 - `[bugfix]` `drain()` no longer resurrects the connection on a read failure mid-flush. A
-  peer close during drain previously triggered `recoverConnection()` — reconnecting and
+  peer close during drain previously triggered `recoverConnection()` - reconnecting and
   re-SUBscribing the very subscriptions `drain()` had just removed (and possibly
   re-delivering messages). `processIncoming()` now skips recovery while the connection is
   `Draining` and treats the read failure as end-of-flush.
@@ -429,7 +439,7 @@ were all verified working and are unchanged.
   marker regex required exactly five dashes on both the BEGIN and END lines, but the
   NATS toolchain emits five dashes on BEGIN and **six** on END, so
   `CredentialsParser::fromFile()` threw `Credentials file does not contain a NATS USER
-  JWT block` on essentially every genuine credentials file — making the documented
+  JWT block` on essentially every genuine credentials file - making the documented
   JWT-via-`.creds` auth path unusable. Both markers now accept five-or-more dashes.
 - `[bugfix]` Object Store now stores a 0-byte object with `chunks=0` and publishes no
   chunk message, matching the official Object Store layout; previously it wrote one
@@ -465,7 +475,7 @@ were all verified working and are unchanged.
   below 1, and negative reconnect/`maxPingsOut` values) with an `InvalidArgumentException`,
   instead of misbehaving later. Legitimate edge values stay valid: `pingIntervalSeconds`
   `<= 0` disables the heartbeat, `maxPingsOut` 0 is allowed, and an empty `servers` list
-  falls back to the default — so this is input validation, not a breaking change.
+  falls back to the default - so this is input validation, not a breaking change.
 - `[bugfix]` KeyValue keys with a leading, trailing, or consecutive dot (which produce a
   malformed `$KV.<bucket>.<key>` subject) are now rejected up front; dots, colons and
   slashes elsewhere in a key remain valid.
@@ -473,8 +483,8 @@ were all verified working and are unchanged.
   windows instead of awaiting one PubAck round-trip per chunk, so large-object uploads
   are no longer strictly round-trip-bound. PUB frames are written to the single
   connection in chunk order, so stream order (and download reassembly) is preserved.
-- `[bugfix]` Single-record reads — KeyValue `get()` and Object Store `info()` (and the
-  metadata read behind `get()`/`getToCallback()`) — now use the Direct Get API (served by
+- `[bugfix]` Single-record reads - KeyValue `get()` and Object Store `info()` (and the
+  metadata read behind `get()`/`getToCallback()`) - now use the Direct Get API (served by
   any replica) instead of leader-only `STREAM.MSG.GET`, consistent with `getAll()`/`list()`.
   On clustered/replicated streams this stops concentrating reads on the stream leader. (The
   internal put/delete cleanup lookup stays on `STREAM.MSG.GET` for deterministic ordering.)

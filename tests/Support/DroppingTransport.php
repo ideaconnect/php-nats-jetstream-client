@@ -81,7 +81,7 @@ final class DroppingTransport implements TlsAwareTransportInterface
                 $out .= $frame;
             }
 
-            // '' here means every complete frame in this read was dropped (or none completed yet) —
+            // '' here means every complete frame in this read was dropped (or none completed yet) -
             // a valid "no bytes available" result per the transport contract.
             return $out;
         });

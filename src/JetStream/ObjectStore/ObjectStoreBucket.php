@@ -105,8 +105,8 @@ final class ObjectStoreBucket
             $config = is_array($info->raw['config'] ?? null) ? $info->raw['config'] : [];
 
             // Empty JSON objects in the fetched config (e.g. consumer_limits {}) decode to PHP [] and
-            // would re-encode as a JSON array the server rejects. Drop empty-array fields — the server
-            // re-applies their defaults — while preserving scalar/non-empty config (max_bytes, etc.).
+            // would re-encode as a JSON array the server rejects. Drop empty-array fields - the server
+            // re-applies their defaults - while preserving scalar/non-empty config (max_bytes, etc.).
             $config = array_filter($config, static fn($value): bool => $value !== []);
             $config['sealed'] = true;
 
@@ -216,8 +216,8 @@ final class ObjectStoreBucket
             } else {
                 // Pipeline chunk publishes in bounded in-flight windows instead of one full PubAck
                 // round-trip per chunk. The PUB frames are written to the single connection in chunk
-                // order (writes are serialized in call order), so stream order — and therefore
-                // download reassembly — is preserved; the acks for a window are awaited together.
+                // order (writes are serialized in call order), so stream order - and therefore
+                // download reassembly - is preserved; the acks for a window are awaited together.
                 $pending = [];
                 $offset = 0;
                 while ($offset < $totalSize) {
@@ -776,11 +776,11 @@ final class ObjectStoreBucket
 
     /**
      * Updates an object's metadata (rename and/or replace its metadata bag) WITHOUT re-uploading its
-     * bytes — the stored chunks are referenced by NUID, which is preserved. Mirrors nats.go
+     * bytes - the stored chunks are referenced by NUID, which is preserved. Mirrors nats.go
      * `ObjectStore.UpdateMeta` / nats.java `ObjectStore.updateMeta` (#28).
      *
      * On rename the new meta is written under the new name and the old name is tombstoned (its chunks
-     * are NOT purged — they now belong to the renamed object). Renaming onto an existing live object is
+     * are NOT purged - they now belong to the renamed object). Renaming onto an existing live object is
      * rejected.
      *
      * @param string|null               $newName  New object name, or null to keep the current name.
@@ -848,7 +848,7 @@ final class ObjectStoreBucket
      *
      * With `$options = null` only updates published after the watch starts are delivered
      * (deliver_policy=new), preserving the original behavior. Pass an {@see ObjectStoreWatchOptions}
-     * instance to opt into the reference ObjectStore.Watch semantics — replay the current metadata of
+     * instance to opt into the reference ObjectStore.Watch semantics - replay the current metadata of
      * every existing object first, then follow (last_per_subject), or full history / explicit
      * updates-only (#98).
      *
@@ -1031,7 +1031,7 @@ final class ObjectStoreBucket
     /**
      * Best-effort lookup of the existing object's metadata, returned as a Future so callers can run
      * it concurrently with the upload/meta publish and only await it before purging the previous
-     * revision's chunks — saving a serial round-trip on the write path. Any error maps to null.
+     * revision's chunks - saving a serial round-trip on the write path. Any error maps to null.
      *
      * @return Future<ObjectInfo|null>
      */
@@ -1100,7 +1100,7 @@ final class ObjectStoreBucket
         $apiSubject = JetStreamApi::STREAM_INFO_PREFIX . $this->streamName();
 
         // The STREAM.INFO subjects map is capped by the server, so a bucket with many objects must be
-        // enumerated across pages (offset) — otherwise list() would silently truncate. The
+        // enumerated across pages (offset) - otherwise list() would silently truncate. The
         // no-new-subjects guard terminates safely even against a server that ignores `offset` (it
         // then returns the whole first page and the second page adds nothing).
         $collected = [];

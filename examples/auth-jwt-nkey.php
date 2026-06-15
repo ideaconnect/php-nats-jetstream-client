@@ -1,7 +1,7 @@
 <?php
 
 /**
- * JWT + NKey Authentication — operator/account credentials.
+ * JWT + NKey Authentication - operator/account credentials.
  *
  * Loads a user JWT and its NKey seed (from `composer fixture:jwt`), signs the server's
  * nonce challenge with NkeySeedSigner, connects, and round-trips a message. Skips

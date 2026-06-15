@@ -49,11 +49,11 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // add() — MAX_MESSAGES overflow message (line 59)
+    // add() - MAX_MESSAGES overflow message (line 59)
     // -----------------------------------------------------------------------------------------------
 
     /**
-     * The overflow exception message must be exactly "Atomic batch is limited to 1000 messages" — the
+     * The overflow exception message must be exactly "Atomic batch is limited to 1000 messages" - the
      * literal, the constant, and the suffix concatenated in that order.
      */
     public function testOverflowMessageIsExactConcatenation(): void
@@ -77,7 +77,7 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // commit() — the START request must use messages[0] (line 109)
+    // commit() - the START request must use messages[0] (line 109)
     // -----------------------------------------------------------------------------------------------
 
     /**
@@ -120,7 +120,7 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // assertStartAccepted() — json_decode depth (line 155)
+    // assertStartAccepted() - json_decode depth (line 155)
     // -----------------------------------------------------------------------------------------------
 
     /**
@@ -181,7 +181,7 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // assertStartAccepted() — start-rejection error code defaulting (line 166)
+    // assertStartAccepted() - start-rejection error code defaulting (line 166)
     // -----------------------------------------------------------------------------------------------
 
     /**
@@ -235,7 +235,7 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // parseCommitAck() — json_decode depth (line 198)
+    // parseCommitAck() - json_decode depth (line 198)
     // -----------------------------------------------------------------------------------------------
 
     /**
@@ -292,7 +292,7 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // parseCommitAck() — malformed-ack message + code (line 200)
+    // parseCommitAck() - malformed-ack message + code (line 200)
     // -----------------------------------------------------------------------------------------------
 
     /**
@@ -320,7 +320,7 @@ final class BatchPublisherMutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // parseCommitAck() — embedded error description cast (line 206) + code defaulting (line 207)
+    // parseCommitAck() - embedded error description cast (line 206) + code defaulting (line 207)
     // -----------------------------------------------------------------------------------------------
 
     /**

@@ -20,7 +20,7 @@ use function Amp\Socket\listen;
  * Each method exercises the exact input where the real code and the mutant diverge and asserts the
  * specific observable difference (a stored field, a built TLS/connect context, the bytes a peer
  * receives, or a thrown exception). All async work runs in-process against a local loopback
- * listener — no Docker, no real NATS server, no wall-clock timing.
+ * listener - no Docker, no real NATS server, no wall-clock timing.
  */
 final class AmpSocketTransportMutationTest extends \PHPUnit\Framework\TestCase
 {
@@ -186,7 +186,7 @@ final class AmpSocketTransportMutationTest extends \PHPUnit\Framework\TestCase
     }
 
     /**
-     * Peer verification must stay ON by default (tlsVerifyPeer=true) — withoutPeerVerification()
+     * Peer verification must stay ON by default (tlsVerifyPeer=true) - withoutPeerVerification()
      * must NOT be called. The LogicalNot mutant drops the negation, disabling verification.
      */
     public function testPeerVerificationStaysEnabledByDefault(): void
@@ -223,7 +223,7 @@ final class AmpSocketTransportMutationTest extends \PHPUnit\Framework\TestCase
         self::assertInstanceOf(ClientTlsContext::class, $tls);
 
         // kills NotIdentical(left), NotIdentical(right), LogicalAndAllSubExprNegation,
-        // LogicalAndNegation @ line 186 — all of which would skip withCaFile().
+        // LogicalAndNegation @ line 186 - all of which would skip withCaFile().
         self::assertSame('/nonexistent/ca.pem', $tls->getCaFile());
     }
 
@@ -231,7 +231,7 @@ final class AmpSocketTransportMutationTest extends \PHPUnit\Framework\TestCase
      * An empty CA file must NOT be applied (the && guard is false for '').
      *
      * The LogicalAnd mutant turns && into ||, which becomes true for '' (since '' !== null) and
-     * wrongly calls withCaFile('') — making getCaFile() return '' instead of null.
+     * wrongly calls withCaFile('') - making getCaFile() return '' instead of null.
      */
     public function testEmptyCaFileIsNotApplied(): void
     {
@@ -267,7 +267,7 @@ final class AmpSocketTransportMutationTest extends \PHPUnit\Framework\TestCase
         self::assertInstanceOf(ClientTlsContext::class, $tls);
 
         $certificate = $tls->getCertificate();
-        // kills NotIdentical(right) and LogicalAndAllSubExprNegation @ line 190 — both skip the cert.
+        // kills NotIdentical(right) and LogicalAndAllSubExprNegation @ line 190 - both skip the cert.
         self::assertNotNull($certificate);
         self::assertSame('/nonexistent/cert.pem', $certificate->getCertFile());
     }

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Stream Purge and List — purge messages, enumerate streams.
+ * Stream Purge and List - purge messages, enumerate streams.
  *
  * Purges a stream by subject filter and then fully with purgeStream() (reading the
  * purged counts), and enumerates all streams on the server with listStreams().

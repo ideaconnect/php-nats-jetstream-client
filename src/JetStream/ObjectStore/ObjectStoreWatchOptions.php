@@ -10,7 +10,7 @@ namespace IDCT\NATS\JetStream\ObjectStore;
  *
  * Delivery-policy precedence (highest first): {@see $includeHistory}, {@see $updatesOnly}. With none set,
  * the watcher first replays the current metadata of every existing object (last-per-subject) and then
- * streams live updates — the reference-client ObjectStore.Watch default.
+ * streams live updates - the reference-client ObjectStore.Watch default.
  *
  * Note: calling `watch()` with `$options = null` keeps the original updates-only behavior
  * (deliver_policy=new) for backward compatibility; pass an instance of this class (even with no flags

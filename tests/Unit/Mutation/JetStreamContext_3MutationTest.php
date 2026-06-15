@@ -18,7 +18,7 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  * Each test pins the exact observable behaviour a surviving mutant would change: a wire payload,
  * a return value, a thrown message, a collected-message count/ordering, or a boundary on the
  * ordered-consumer recreate logic. Frames are fed via FakeTransport and pumped with processIncoming(),
- * mirroring the existing JetStreamContextTest patterns — no real sockets, no sleeps.
+ * mirroring the existing JetStreamContextTest patterns - no real sockets, no sleeps.
  */
 final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
 {
@@ -232,7 +232,7 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
     public function testConsumerNamesPaginatesAndAccumulatesOffset(): void
     {
         // Three pages of two names each (total 6). The accumulated offset must reach 4 on the third
-        // request — a plain assignment (offset = count(page)) would re-request offset 2 instead.
+        // request - a plain assignment (offset = count(page)) would re-request offset 2 instead.
         $page1 = '{"consumers":["c1","c2"],"total":6,"offset":0}';
         $page2 = '{"consumers":["c3","c4"],"total":6,"offset":2}';
         $page3 = '{"consumers":["c5","c6"],"total":6,"offset":4}';

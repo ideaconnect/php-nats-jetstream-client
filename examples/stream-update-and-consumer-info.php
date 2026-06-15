@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Stream Update and Consumer Info — reconfigure + introspect.
+ * Stream Update and Consumer Info - reconfigure + introspect.
  *
  * Widens a stream's accepted subjects with updateStream(), creates a consumer, and
  * reads it back with getConsumer() to inspect its ConsumerInfo.

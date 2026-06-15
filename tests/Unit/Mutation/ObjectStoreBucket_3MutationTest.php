@@ -112,7 +112,7 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
      * decodeDigest(): a digest WITHOUT the "SHA-256=" prefix must be rejected (return null), which
      * makes verifyDigest() throw a mismatch. The body after the wrong 8-char prefix decodes to the
      * CORRECT 32 content bytes, so dropping `return null` (ReturnRemoval @ 638) would accept it and
-     * let get() succeed — this test fails on that mutant by requiring the mismatch throw.
+     * let get() succeed - this test fails on that mutant by requiring the mismatch throw.
      */
     public function testGetRejectsDigestWithoutSha256Prefix(): void
     {

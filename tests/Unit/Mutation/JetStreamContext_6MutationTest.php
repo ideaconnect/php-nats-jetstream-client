@@ -77,7 +77,7 @@ final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
     /**
      * The real depth is 512, so a structure nested 512 levels is REJECTED (one level too deep) and the
      * call throws "Malformed JetStream API response". The IncrementInteger mutant (depth 513) would
-     * accept 512-deep JSON and return normally — no exception.
+     * accept 512-deep JSON and return normally - no exception.
      */
     public function testRejectsJsonAtTheDepthLimit(): void
     {

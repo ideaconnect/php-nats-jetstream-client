@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Services: SCHEMA Discovery — request validation + observability.
+ * Services: SCHEMA Discovery - request validation + observability.
  *
  * An endpoint declares a JSON schema validated by BasicJsonSchemaValidator (invalid
  * requests get a VALIDATION_ERROR reply), registers a lifecycle observer, and exposes

@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Object Store Streaming to Callback — download chunk-by-chunk.
+ * Object Store Streaming to Callback - download chunk-by-chunk.
  *
  * Uses getToCallback() to stream a stored object to a callback one chunk at a time
  * (the whole object is never buffered in memory) and verifies the SHA-256 digest

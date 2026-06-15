@@ -17,7 +17,7 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  * Each test pins the EXACT observable behavior a specific mutation would change: a thrown
  * constructor exception, the bytes written to FakeTransport, an observer-context key/value, an
  * accumulated counter, or the precise id length. All async work is driven by pumping
- * processIncoming() against pre-seeded frames — no sleeps, no real sockets.
+ * processIncoming() against pre-seeded frames - no sleeps, no real sockets.
  */
 final class Service_1MutationTest extends \PHPUnit\Framework\TestCase
 {

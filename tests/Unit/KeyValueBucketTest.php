@@ -347,7 +347,7 @@ final class KeyValueBucketTest extends TestCase
     public function testHistoryToleratesDeliveryWithoutMetadataAndKeepsCollecting(): void
     {
         // #96: a delivery lacking a parseable $JS.ACK reply subject (a control / non-conformant frame)
-        // must be skipped — not thrown out of the shared dispatch loop (which would tear down delivery for
+        // must be skipped - not thrown out of the shared dispatch loop (which would tear down delivery for
         // every subscription, the #90 class) and not recorded as a bogus history entry.
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":1,"config":{"deliver_subject":"d","ack_policy":"none"}}';
 
@@ -803,7 +803,7 @@ final class KeyValueBucketTest extends TestCase
         $kv = $client->jetStream()->keyValue('cfg');
 
         // Leading/trailing/consecutive dots make an empty subject token; all must be rejected.
-        // (Dots, colons and slashes elsewhere remain valid — see testPutAcceptsKeyWithDotsColonsSlashes.)
+        // (Dots, colons and slashes elsewhere remain valid - see testPutAcceptsKeyWithDotsColonsSlashes.)
         foreach (['.theme', 'theme.', 'a..b'] as $key) {
             try {
                 $kv->put($key, 'data')->await();
@@ -1099,7 +1099,7 @@ final class KeyValueBucketTest extends TestCase
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
-        // 'mirror' is an array with 'bucket' key — kvSourceConfig should replace
+        // 'mirror' is an array with 'bucket' key - kvSourceConfig should replace
         // 'bucket' with 'name' = 'KV_src' and retain extra fields.
         $client->jetStream()->keyValue('dst')->create([
             'mirror' => ['bucket' => 'src', 'start_seq' => 5],
@@ -1371,7 +1371,7 @@ final class KeyValueBucketTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            // A message on a completely different subject — keyFromSubject() will return null.
+            // A message on a completely different subject - keyFromSubject() will return null.
             "MSG some.other.subject 2 \$JS.ACK.KV_cfg.KVWATCH.1.1.1.0.0 4\r\ndata\r\n",
         ]);
 
@@ -1420,7 +1420,7 @@ final class KeyValueBucketTest extends TestCase
      */
     public function testCreateKeySucceedsAfterKeyDeletedEntryIsNull(): void
     {
-        // First attempt (expected seq 0) → wrong-last-sequence.
+        // First attempt (expected seq 0) -> wrong-last-sequence.
         $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 3"}}';
         // get() via Direct Get returns 404 (key fully gone / race condition).
         // Then the second put (seq 0 from null entry) succeeds.
@@ -1452,7 +1452,7 @@ final class KeyValueBucketTest extends TestCase
      */
     public function testCreateKeySucceedsAfterTombstoneRevision(): void
     {
-        // First attempt (expected seq 0) → wrong-last-sequence.
+        // First attempt (expected seq 0) -> wrong-last-sequence.
         $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 5"}}';
         // get() returns a DEL tombstone at revision 5.
         $putAck2 = '{"stream":"KV_cfg","seq":6,"duplicate":false}';
@@ -1720,7 +1720,7 @@ final class KeyValueBucketTest extends TestCase
     {
         // num_pending:1 reflects the single pending delivery below, so the end-of-initial-data signal is
         // driven by a delivery (not fired immediately at creation, which only happens when nothing is
-        // pending — see testWatchFiresOnCaughtUpImmediatelyOnEmptyBucket).
+        // pending - see testWatchFiresOnCaughtUpImmediatelyOnEmptyBucket).
         $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","num_pending":1,"config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
 
         $transport = new FakeTransport([

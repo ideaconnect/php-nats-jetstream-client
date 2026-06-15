@@ -45,7 +45,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // performRecovery — AuthenticationException branch (line 1283)
+    // performRecovery - AuthenticationException branch (line 1283)
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -91,7 +91,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // performRecovery — exhaustion branch (lines 1299, 1302)
+    // performRecovery - exhaustion branch (lines 1299, 1302)
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -251,7 +251,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // flushReconnectBuffer — empty-buffer early return (line 1313)
+    // flushReconnectBuffer - empty-buffer early return (line 1313)
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -286,7 +286,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // drainImmediateServerFrames — frame handling (lines 1357, 1363)
+    // drainImmediateServerFrames - frame handling (lines 1357, 1363)
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -332,7 +332,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
      * kills ReturnRemoval @ line 1357
      *
      * drainImmediateServerFrames returns on an empty read, so a MSG queued AFTER an empty chunk is
-     * NOT drained during replay — it is left for the next processIncoming(). Removing the return
+     * NOT drained during replay - it is left for the next processIncoming(). Removing the return
      * keeps polling and drains (delivers) that MSG eagerly during the reconnect critical section.
      */
     public function testDrainStopsOnEmptyChunkLeavingLaterMsgForNextRead(): void
@@ -370,7 +370,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // awaitInitialPong — handshake loop (lines 1395, 1413)
+    // awaitInitialPong - handshake loop (lines 1395, 1413)
     // ---------------------------------------------------------------------------------------------
 
     /**
@@ -421,7 +421,7 @@ final class NatsConnection_4MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     // ---------------------------------------------------------------------------------------------
-    // awaitServerInfo — handshake loop (line 1456)
+    // awaitServerInfo - handshake loop (line 1456)
     // ---------------------------------------------------------------------------------------------
 
     /**

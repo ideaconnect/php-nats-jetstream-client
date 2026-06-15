@@ -58,7 +58,7 @@ final class NatsConnection
      * connection (e.g. an ordered consumer recreating itself), which suspends the dispatch fiber
      * with readInProgress already cleared; a heartbeat tick or nested request() self-pump would then
      * re-enter the drain for the SAME sid and deliver its next message on top of the suspended one.
-     * This per-sid guard makes same-sid delivery non-reentrant (FIFO preserved — the suspended loop
+     * This per-sid guard makes same-sid delivery non-reentrant (FIFO preserved - the suspended loop
      * resumes and continues), while leaving OTHER sids deliverable so nested requests still complete.
      *
      * @var array<int, true>
@@ -110,7 +110,7 @@ final class NatsConnection
     /** Encoded publishes buffered while reconnecting (flushed on a successful reconnect); see #49. */
     private string $reconnectBuffer = '';
     /**
-     * Configured servers in dial order — shuffled once when {@see NatsOptions::$randomizeServers} is
+     * Configured servers in dial order - shuffled once when {@see NatsOptions::$randomizeServers} is
      * set (#55), otherwise the configured order. Discovered peers are appended in {@see serverPool()}.
      *
      * @var list<string>
@@ -336,7 +336,7 @@ final class NatsConnection
 
             // Read until the server's PONG confirms the flush (handleFrame clears drainFlushPending),
             // bounded by a deadline so a slow/wedged server cannot hang drain() forever. A partial
-            // chunk (0 complete frames yet) must NOT end the flush early — only the PONG or the
+            // chunk (0 complete frames yet) must NOT end the flush early - only the PONG or the
             // deadline does.
             $flushCancellation = new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000));
             try {
@@ -350,7 +350,7 @@ final class NatsConnection
 
                     if ($frames === 0) {
                         // No complete frame this read. Yield so the event loop advances and the
-                        // deadline can fire — processIncoming() returns 0 synchronously on an empty
+                        // deadline can fire - processIncoming() returns 0 synchronously on an empty
                         // read, so without this the loop would busy-spin and starve the timer forever.
                         delay(0.001, cancellation: $flushCancellation);
                     }
@@ -463,7 +463,7 @@ final class NatsConnection
 
     /**
      * Buffers an encoded publish while a reconnect is in flight (flushed on reconnect). Returns false
-     * when buffering does not apply — no active reconnect, buffering disabled, or the buffer is full.
+     * when buffering does not apply - no active reconnect, buffering disabled, or the buffer is full.
      */
     private function bufferFrame(string $frame): bool
     {
@@ -669,7 +669,7 @@ final class NatsConnection
             }
 
             // Note: the outstanding-ping counter is reset only when an actual PONG is handled (see
-            // handleFrame), not on any inbound bytes — otherwise a server that stops answering PINGs
+            // handleFrame), not on any inbound bytes - otherwise a server that stops answering PINGs
             // but still trickles data would never trip maxPingsOut and the watchdog could not escalate.
 
             // Drain buffered deliveries after each chunk to preserve wire-order delivery.
@@ -1065,7 +1065,7 @@ final class NatsConnection
         }
 
         // Never write CONNECT (which carries credentials) over a socket that is still plaintext when
-        // TLS is required — regardless of which path was meant to establish it. This guard runs for the
+        // TLS is required - regardless of which path was meant to establish it. This guard runs for the
         // handshake-first path too, so a misconfiguration (tlsHandshakeFirst=true but no TLS materials
         // or a nats:// DSN, while the server's INFO advertises tls_required) fails fast instead of
         // leaking credentials in cleartext.
@@ -1086,9 +1086,9 @@ final class NatsConnection
         // Reset parser state after handshake to avoid carrying partial bootstrap chunks, and couple the
         // inbound frame bound to the server's negotiated max_payload so a legitimately large message
         // (on a server with a raised max_payload) is receivable instead of being rejected as an
-        // oversized frame — which would throw and force a reconnect (#94).
+        // oversized frame - which would throw and force a reconnect (#94).
         $this->parser = new ProtocolParser($this->inboundFrameBound());
-        // Seed the discovered-servers set from the initial INFO (without emitting a discovery event —
+        // Seed the discovered-servers set from the initial INFO (without emitting a discovery event -
         // that is reserved for subsequent async INFO changes), so failover can use the cluster peers.
         if ($this->serverInfo !== null && $this->serverInfo->connectUrls !== []) {
             $this->knownConnectUrls = $this->serverInfo->connectUrls;
@@ -1527,7 +1527,7 @@ final class NatsConnection
             } catch (\JsonException $e) {
                 // A malformed async INFO (corruption in flight, or a non-conformant server push) must not
                 // throw out of the shared read loop and abort delivery of the MSG frames parsed from the
-                // same chunk — mirrors the #97 dispatch-containment principle. Skip the bad update and keep
+                // same chunk - mirrors the #97 dispatch-containment principle. Skip the bad update and keep
                 // the last known serverInfo; surface it to the error listener. (Handshake INFO is decoded
                 // separately in awaitServerInfo() and still fails the connect on bad JSON.)
                 $this->emitError(new NatsException('Discarding malformed async INFO frame: ' . $e->getMessage()));

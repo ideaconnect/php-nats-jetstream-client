@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Stream Mirroring and Sourcing — mirror one stream, aggregate many.
+ * Stream Mirroring and Sourcing - mirror one stream, aggregate many.
  *
  * Builds StreamSource configs to create a subjectless mirror-only stream
  * (StreamSource::mirror) and a subjectless multi-source aggregate stream

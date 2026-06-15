@@ -161,7 +161,7 @@ final class AmpSocketTransportTest extends TestCase
 
     /**
      * Verifies a real peer close (EOF) surfaces as TransportClosedException rather than being
-     * collapsed into '' — the root-cause regression test for read-path reconnect.
+     * collapsed into '' - the root-cause regression test for read-path reconnect.
      */
     public function testReadLineThrowsTransportClosedOnPeerEof(): void
     {

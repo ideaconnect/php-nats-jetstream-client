@@ -47,13 +47,13 @@ final class NatsClientMutationTest extends TestCase
         $client->connect()->await();
 
         // Start subscribeQueue() concurrently. Its body registers the subscription handler and then
-        // suspends awaiting the SUB write — at that point $subscriptionQueue (captured by ref) is null.
+        // suspends awaiting the SUB write - at that point $subscriptionQueue (captured by ref) is null.
         /** @var Future<SubscriptionQueue> $queueFuture */
         $queueFuture = $client->subscribeQueue('updates');
 
         // Pump the loop so the subscribeQueue fiber advances to (and parks at) its write await with the
         // handler already registered, then dispatch the pending MSG into the still-null queue.
-        // kills NullSafeMethodCall @ 127 — on the mutant this call to enqueue() on null throws an Error.
+        // kills NullSafeMethodCall @ 127 - on the mutant this call to enqueue() on null throws an Error.
         $delivered = async(static fn(): int => $client->processIncoming()->await())->await();
 
         // Real code: the message is dispatched to the handler, the nullsafe no-ops, one frame processed.
@@ -85,7 +85,7 @@ final class NatsClientMutationTest extends TestCase
 
         $writesBeforeFlush = count($transport->writes);
 
-        // kills PublicVisibility @ 181 — calling a protected flush() from this scope would be an Error.
+        // kills PublicVisibility @ 181 - calling a protected flush() from this scope would be an Error.
         // flush() resolves with Future<void>; the load-bearing kill is that this public call succeeds
         // (a protected method invoked from this foreign scope would be a fatal Error before await()).
         $client->flush()->await();

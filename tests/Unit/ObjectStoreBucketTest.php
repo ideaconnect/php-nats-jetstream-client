@@ -520,7 +520,7 @@ final class ObjectStoreBucketTest extends TestCase
             },
         )->await();
 
-        // One invocation per stored chunk, in order — the whole object is never assembled.
+        // One invocation per stored chunk, in order - the whole object is never assembled.
         self::assertSame(['abc', 'def', 'ghi'], $captured);
         self::assertNotNull($info);
         self::assertSame('multi.txt', $info->name);
@@ -833,14 +833,14 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // list(): paginated enumeration — page 1 (sid 1) returns the subjects, the empty page 2
-            // (sid 2) terminates the loop — then a concurrent Direct Get per meta subject (logo ->
+            // list(): paginated enumeration - page 1 (sid 1) returns the subjects, the empty page 2
+            // (sid 2) terminates the loop - then a concurrent Direct Get per meta subject (logo ->
             // sid 3, old -> sid 4).
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
             $this->directMetaReply('logo.txt', $logoExtra, 3),
             $this->directMetaReply('old.txt', $oldExtra, 4),
-            // list(includeDeleted: true): same again — pages (sid 5, 6) then Direct Gets (sid 7, 8).
+            // list(includeDeleted: true): same again - pages (sid 5, 6) then Direct Gets (sid 7, 8).
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
             sprintf("MSG _INBOX.f 6 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
             $this->directMetaReply('logo.txt', $logoExtra, 7),
@@ -887,7 +887,7 @@ final class ObjectStoreBucketTest extends TestCase
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
 
-        // Both objects are returned (one came from page 2 — the old single-page code would miss it).
+        // Both objects are returned (one came from page 2 - the old single-page code would miss it).
         self::assertCount(2, $objects);
         $names = array_map(static fn($o): string => $o->name, $objects);
         sort($names);
@@ -1018,7 +1018,7 @@ final class ObjectStoreBucketTest extends TestCase
     public function testWatchWithOptionsRequestsSnapshotDeliverPolicy(): void
     {
         // #98: supplying ObjectStoreWatchOptions (no flags) must request the reference snapshot-then-follow
-        // policy (last_per_subject) on the CONSUMER.CREATE, so existing objects are replayed — unlike the
+        // policy (last_per_subject) on the CONSUMER.CREATE, so existing objects are replayed - unlike the
         // null-options default which stays updates-only (deliver_policy=new).
         $createReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
 
@@ -1575,7 +1575,7 @@ final class ObjectStoreBucketTest extends TestCase
      */
     public function testGetThrowsOnBucketLink(): void
     {
-        // A bucket link has options.link = {bucket: 'other'} — no 'name' key.
+        // A bucket link has options.link = {bucket: 'other'} - no 'name' key.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -1731,7 +1731,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 530 (503 fall-through): single-chunk object, Direct Get returns 503 → falls through to
+     * Line 530 (503 fall-through): single-chunk object, Direct Get returns 503 -> falls through to
      * the ephemeral consumer path and successfully downloads the chunk.
      */
     public function testGetSingleChunkFallsThrough503ToEphemeralConsumer(): void
@@ -1776,7 +1776,7 @@ final class ObjectStoreBucketTest extends TestCase
             'nuid' => $nuid,
             'size' => 5,
             'chunks' => 1,
-            'digest' => '', // empty → verifyDigest returns early, no check performed
+            'digest' => '', // empty -> verifyDigest returns early, no check performed
         ]);
 
         $transport = new FakeTransport([
@@ -1789,7 +1789,7 @@ final class ObjectStoreBucketTest extends TestCase
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
-        // No digest to check → must succeed even though digest field is empty.
+        // No digest to check -> must succeed even though digest field is empty.
         $fetched = $client->jetStream()->objectStore('assets')->get('doc.txt')->await();
 
         self::assertInstanceOf(\IDCT\NATS\JetStream\ObjectStore\ObjectData::class, $fetched);
@@ -1803,7 +1803,7 @@ final class ObjectStoreBucketTest extends TestCase
     public function testGetThrowsOnUnknownDigestPrefix(): void
     {
         $nuid = 'nuidbadpfx01';
-        // Store a digest with an unrecognised prefix — decodeDigest() returns null for both sides,
+        // Store a digest with an unrecognised prefix - decodeDigest() returns null for both sides,
         // and verifyDigest throws because $expected === null.
         $badDigest = 'MD5=abc123'; // not SHA-256 prefixed
         $meta = $this->metaGetResponse('doc.txt', [
@@ -1878,7 +1878,7 @@ final class ObjectStoreBucketTest extends TestCase
      */
     public function testInfoFallbackRethrowsNon404Error(): void
     {
-        // Direct Get returns 503 → falls back to STREAM.MSG.GET; that returns a 500 error → thrown.
+        // Direct Get returns 503 -> falls back to STREAM.MSG.GET; that returns a 500 error -> thrown.
         $msgGetError = '{"error":{"code":500,"description":"stream error"}}';
 
         $transport = new FakeTransport([
@@ -1898,7 +1898,7 @@ final class ObjectStoreBucketTest extends TestCase
 
     /**
      * Line 732: fetchInfo returns null when decodeMetadataFromApiMessage returns null (empty data field).
-     * Triggered via info() 503 fallback → fetchInfo(name, false); response has no 'data' key.
+     * Triggered via info() 503 fallback -> fetchInfo(name, false); response has no 'data' key.
      */
     public function testInfoFallbackReturnsNullWhenMessageDataIsEmpty(): void
     {
@@ -2284,9 +2284,9 @@ final class ObjectStoreBucketTest extends TestCase
      */
     public function testGetThrowsOnBucketLinkWithEmptyName(): void
     {
-        // options.link with name='' — ObjectInfo.fromArray will NOT set 'name' in $link
+        // options.link with name='' - ObjectInfo.fromArray will NOT set 'name' in $link
         // because of the `$options['link']['name'] !== ''` guard.
-        // So $info->link = ['bucket' => 'assets'] (no 'name' key) → bucket link guard fires.
+        // So $info->link = ['bucket' => 'assets'] (no 'name' key) -> bucket link guard fires.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",

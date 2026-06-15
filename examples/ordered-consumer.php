@@ -1,7 +1,7 @@
 <?php
 
 /**
- * Ordered Consumer — gap-free, strictly in-order delivery.
+ * Ordered Consumer - gap-free, strictly in-order delivery.
  *
  * Uses subscribeOrderedConsumer() (an ephemeral push consumer with flow control, idle
  * heartbeat and ack_policy=none). The helper transparently recreates the consumer on a

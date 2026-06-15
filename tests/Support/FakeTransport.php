@@ -24,7 +24,7 @@ final class FakeTransport implements TlsAwareTransportInterface
     /** Whether a TLS handshake has "completed" (set by upgradeTls() when $canUpgrade). */
     public bool $tlsActive = false;
 
-    /** When true, connect() marks TLS active — models a handshake-first transport with TLS materials. */
+    /** When true, connect() marks TLS active - models a handshake-first transport with TLS materials. */
     public bool $tlsActiveOnConnect = false;
 
     /** @var list<string> */
@@ -50,7 +50,7 @@ final class FakeTransport implements TlsAwareTransportInterface
      *                             it suspends until the supplied cancellation fires (or forever when
      *                             the cancellation is null) instead of returning '' immediately.
      * @param string|null $holdChunkContaining When set, readLine() delays $holdSeconds (ignoring the
-     *                             cancellation) before returning a chunk containing this substring —
+     *                             cancellation) before returning a chunk containing this substring -
      *                             used to reproduce "reply delivered as the deadline fires" races.
      */
     public function __construct(

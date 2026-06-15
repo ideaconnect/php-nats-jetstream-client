@@ -21,7 +21,7 @@ use Psr\Log\LoggerInterface;
  * Each test pins the exact observable behaviour a specific mutant would change: the bytes/events a
  * recording logger captures, the events a listener receives, a thrown exception, a dial count, or
  * the redelivery of a buffered message. All async work is driven cooperatively against the in-process
- * FakeTransport — no sockets, no timers, no wall-clock.
+ * FakeTransport - no sockets, no timers, no wall-clock.
  */
 final class NatsConnection_7MutationTest extends TestCase
 {

@@ -34,8 +34,8 @@ final class CredentialsParser
      * Extracts JWT and NKey seed from credential file contents.
      *
      * NATS `.creds` files contain two PEM-like blocks. Note that nsc/the NATS toolchain
-     * emits asymmetric dash runs — five dashes on the BEGIN marker and six on the END
-     * marker — so the parser accepts five-or-more dashes on either side:
+     * emits asymmetric dash runs - five dashes on the BEGIN marker and six on the END
+     * marker - so the parser accepts five-or-more dashes on either side:
      * - `-----BEGIN NATS USER JWT-----` / `------END NATS USER JWT------`
      * - `-----BEGIN USER NKEY SEED-----` / `------END USER NKEY SEED------`
      *
