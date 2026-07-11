@@ -17,6 +17,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Changed
+
+- `[bugfix]` Concurrent requests no longer poll: a request waiting while another fiber owns the
+  socket read used to wake every 1ms (allocating a Future per wakeup), so N concurrent requests
+  burned O(N x 1000/s) wakeups - a KV `getAll()` on a large bucket became CPU-bound. Waiters now
+  park on their reply or on a read-slot-release signal and one of them takes over the read pump
+  when it frees; `requestMany()` waiters additionally wake per delivery so stall detection is
+  unchanged. Measured with 200 concurrent requests idling 300ms against a live server: CPU time
+  dropped from 425ms (a full core for the whole window) to 92ms (#135).
+
 ### Fixed
 
 - `[bugfix]` `SubscriptionQueue` slow-consumer drops are no longer silent (#134): an overflow under
