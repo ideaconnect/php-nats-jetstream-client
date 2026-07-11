@@ -250,6 +250,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Documentation
 
+- `[docs]` README fixes: the feature table now shows the real named arguments for KV tombstones
+  (`delete/purge(..., tombstoneTtl:)` - the documented `ttl:` threw "Unknown named parameter"),
+  and the Schedule FQCN in the scheduling note renders with single backslashes (the doubled
+  `IDCT\\NATS\\...` form inside a code span displayed literally and broke copy-paste) (#143).
 - `[docs]` `disconnect()` and plain `unsubscribe()` docblocks (connection and client facade) plus
   the README drain section now state that locally queued, undelivered messages are discarded
   (intentional nats.go `Close()`/`Unsubscribe()` parity) and name `drain()`/`drainSubscription()`
