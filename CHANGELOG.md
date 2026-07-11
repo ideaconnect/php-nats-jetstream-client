@@ -36,6 +36,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   are never cached. Measured against a live server: 50k serial small publishes went from ~4.5s
   wall / ~4.4s CPU (~11k msg/s) to ~3.9s / ~3.8s (~13k msg/s), and a 5k serial JetStream
   fetch-and-ack loop from ~1.0s wall / ~0.9s CPU (~4.9k acks/s) to ~0.5s / ~0.5s (~9.2k acks/s).
+- `[bugfix]` Reconnect subscription replay no longer has a ~5ms x N-subscriptions latency floor
+  (#137): `resubscribeAll()` used to issue an awaited SUB write (plus the optional #112 UNSUB
+  re-arm) and then a ~5ms drain poll per sid - with verbose off the server sends nothing after a
+  successful SUB, so the poll always ate its full timeout serially inside the reconnect critical
+  section (publishes buffering, no dispatch; 500 subscriptions added ~2.5s of blackout). The
+  replay is now coalesced into O(1) transport writes - one buffer with every SUB (+UNSUB re-arm)
+  frame, byte-identical on the wire and in order - followed by a single bounded drain poll, so
+  prompt `-ERR` responses still abort the attempt exactly as before.
 
 ### Fixed
 
