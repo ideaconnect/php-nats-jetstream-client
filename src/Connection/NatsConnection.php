@@ -117,6 +117,15 @@ final class NatsConnection
      */
     private ?DeferredFuture $reconnecting = null;
     /**
+     * The fiber that owns the in-flight recovery (the only one that can complete {@see $reconnecting}).
+     * Lifecycle/error listeners run synchronously inside it, so a listener-initiated connect() that
+     * joined the recovery would await a deferred its own fiber must complete - a permanent deadlock.
+     * connect() compares its caller's fiber against this to refuse such a join loudly (#145).
+     *
+     * @var ?\Fiber<mixed, mixed, mixed, mixed>
+     */
+    private ?\Fiber $recoveryFiber = null;
+    /**
      * In-progress user connect(), so a concurrent connect() shares its outcome instead of starting
      * a parallel dial chain against the same transport and parser (#145).
      *
@@ -306,15 +315,24 @@ final class NatsConnection
      * an exhausted reconnect): connecting the same instance again starts from a clean slate, and
      * the application must re-create its subscriptions (nats.go parity, #127).
      *
-     * There is exactly one owner of any dial chain (nats.go conn.mu parity, #145): connect()
-     * during an in-flight recovery joins the recovery and shares its outcome, connect() while
-     * another connect() is dialing awaits that dial, and connect() during drain() throws.
+     * Dial-chain ownership (nats.go conn.mu parity, #145) - what is enforced, exactly: connect()
+     * during an in-flight recovery joins the recovery (throwing when the recovery ends without the
+     * connection Open, and refusing outright when called from inside the recovery fiber - see the
+     * guards below); connect() while another connect() is dialing awaits that dial (same not-Open
+     * rule); connect() during drain() throws; and {@see recoverConnection()} ignores recovery
+     * requests from stale failure continuations while a user connect() is dialing. A recovery that
+     * starts BETWEEN user connects (no connect() in flight) still owns its own dial loop.
      *
      * @return Future<void>
      */
     public function connect(): Future
     {
-        return async(function (): void {
+        // Captured on the CALLER's fiber: the closure below runs on its own async() fiber, so a
+        // connect() issued from a listener inside the recovery fiber is only recognizable by the
+        // fiber connect() was called from.
+        $caller = \Fiber::getCurrent();
+
+        return async(function () use ($caller): void {
             if ($this->state === ConnectionState::Open) {
                 return;
             }
@@ -327,7 +345,19 @@ final class NatsConnection
             // moved state to Closed while the recovery fiber is still winding down.
             $recovery = $this->reconnecting;
             if ($recovery !== null) {
+                // A connection/error listener runs synchronously inside the recovery fiber - the
+                // only fiber that can complete the recovery deferred. Joining from there would
+                // await that deferred forever: refuse loudly instead of deadlocking (#145).
+                if ($caller !== null && $caller === $this->recoveryFiber) {
+                    throw new ConnectionException(
+                        'connect() cannot join the in-flight recovery from a connection/error listener: '
+                        . 'the listener runs inside the recovery fiber, and awaiting the join there '
+                        . 'deadlocks. Schedule supervision reconnects with Revolt\EventLoop::queue() instead.',
+                    );
+                }
+
                 $recovery->getFuture()->await();
+                $this->throwUnlessOpenAfterJoin('Recovery was aborted before the connection opened');
 
                 return;
             }
@@ -341,6 +371,7 @@ final class NatsConnection
             $inFlight = $this->connecting;
             if ($inFlight !== null) {
                 $inFlight->getFuture()->await();
+                $this->throwUnlessOpenAfterJoin('Connect was aborted before the connection opened');
 
                 return;
             }
@@ -370,6 +401,22 @@ final class NatsConnection
     }
 
     /**
+     * A joined dial can RESOLVE without the connection opening: performRecovery() completes (rather
+     * than errors) its deferred when a concurrent disconnect()/drain() set close-intent mid-recovery,
+     * and the connecting deferred inherits that outcome through the recovery hand-off. Callers of
+     * connect() treat resolution as "connected", so a join whose outcome is not Open must surface as
+     * a failure, not as success (#145).
+     *
+     * @phpstan-impure Reads state mutated across the caller's suspension points.
+     */
+    private function throwUnlessOpenAfterJoin(string $message): void
+    {
+        if ($this->state !== ConnectionState::Open) {
+            throw new ConnectionException($message);
+        }
+    }
+
+    /**
      * Runs one user-initiated connect - dial + handshake with the standing failure policy (auth
      * failures fail fast; other failures hand off to recovery or the initial-connect retry loop;
      * otherwise the connection closes terminally). Serialized by {@see connect()}.
@@ -390,7 +437,9 @@ final class NatsConnection
             throw $e;
         } catch (\Throwable $e) {
             if ($this->options->reconnectEnabled && $this->options->maxReconnectAttempts > 0) {
-                $this->recoverConnection();
+                // ownedByConnect: this hand-off runs inside the connect fiber while $connecting is
+                // still set - it is the one recovery request the in-flight-connect guard must admit.
+                $this->recoverConnection(ownedByConnect: true);
 
                 return;
             }
@@ -1608,12 +1657,25 @@ final class NatsConnection
      * Concurrent callers are coalesced: while one reconnect is running, others (e.g. a ping-timer
      * callback resuming after its write while the read path already began recovering) await the same
      * attempt and share its outcome, rather than racing on the parser, state, and socket.
+     *
+     * @param bool $ownedByConnect True only for the hand-off from {@see performConnect()}, which
+     *                             runs inside the connect fiber while {@see $connecting} is set and
+     *                             must bypass the in-flight-connect guard below.
      */
-    private function recoverConnection(): void
+    private function recoverConnection(bool $ownedByConnect = false): void
     {
         // The user asked to close (disconnect/drain): never start or join a reconnect that would
         // re-open the connection (#84).
         if ($this->closing) {
+            return;
+        }
+
+        // A user-initiated connect() owns the dial while $connecting is set. A stale failure
+        // continuation from the previous epoch (a write/read that suspended before a terminal
+        // close and resumed failing after connect() started dialing) must not start a recovery
+        // here: its first attempt would close the fresh dial's socket - the #145 race in reverse.
+        // Only the connect fiber's own failure policy (performConnect()) may hand off to recovery.
+        if ($this->connecting !== null && !$ownedByConnect) {
             return;
         }
 
@@ -1629,6 +1691,9 @@ final class NatsConnection
         // the error from await().
         $deferred->getFuture()->ignore();
         $this->reconnecting = $deferred;
+        // Recorded so connect() can refuse a join issued from inside this fiber (a listener call),
+        // which could never complete: this fiber is the one that resolves $reconnecting (#145).
+        $this->recoveryFiber = \Fiber::getCurrent();
 
         try {
             $this->performRecovery();
@@ -1638,6 +1703,7 @@ final class NatsConnection
 
             throw $e;
         } finally {
+            $this->recoveryFiber = null;
             $this->reconnecting = null;
         }
 
