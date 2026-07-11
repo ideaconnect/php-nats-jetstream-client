@@ -387,15 +387,93 @@ final class NatsConnectionTest extends TestCase
 
         // The read failure triggers recovery; the replayed SUB resets the server's per-sid count, so
         // auto-unsubscribe must be re-armed with the REMAINING allowance (3 total - 1 delivered = 2),
-        // mirroring nats.go resendSubscriptions (#112).
+        // mirroring nats.go resendSubscriptions (#112). The replay is coalesced into a single
+        // transport write (#137), so the SUB and its UNSUB re-arm arrive as one buffer entry.
         $connection->processIncoming()->await();
-        self::assertContains("UNSUB 1 2\r\n", $transport->writes);
+        self::assertContains("SUB updates 1\r\nUNSUB 1 2\r\n", $transport->writes);
 
         for ($i = 0; $i < 3; $i++) {
             $connection->processIncoming()->await();
         }
 
         self::assertSame(['m1', 'm2', 'm3'], $received);
+    }
+
+    public function testReconnectCoalescesResubscribeReplayIntoSingleWrite(): void
+    {
+        // The resubscribe replay must be O(1) transport writes regardless of subscription count:
+        // the per-sid awaited write + ~5ms drain poll made reconnect latency scale at ~5ms x N
+        // inside the reconnect critical section (#137). Three subscriptions, one with a #112
+        // remaining allowance armed, must arrive as ONE write containing every SUB (+UNSUB
+        // re-arm) frame in registration order - and the single post-replay drain must still
+        // detect a prompt fatal -ERR (attempt 1 fails, attempt 2 recovers).
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 2 2\r\nm1\r\n",
+                    "MSG updates 2 2\r\nm2\r\n",
+                    '__THROW__',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    // Delivered by the drain right after the coalesced replay write: fatal, so
+                    // this reconnect attempt must fail and the loop must retry on S3.
+                    "-ERR 'Authorization Violation'\r\n",
+                ],
+                [
+                    'INFO {"server_id":"S3","server_name":"n3","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                ],
+            ],
+            connectFailures: 0,
+            readFailures: 0,
+        );
+
+        $options = new NatsOptions(
+            reconnectEnabled: true,
+            maxReconnectAttempts: 3,
+            reconnectDelayMs: 1,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $handler = static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        };
+        $connection->subscribe('orders', $handler)->await();   // sid 1
+        $sid = $connection->subscribe('updates', $handler)->await(); // sid 2
+        $connection->subscribe('metrics', $handler)->await();  // sid 3
+
+        // Arm auto-unsubscribe on sid 2 with max 5; two deliveries below leave a remaining
+        // allowance of 3 for the replay to re-arm (#112).
+        $connection->unsubscribe($sid, 5)->await();
+
+        $connection->processIncoming()->await();
+        $connection->processIncoming()->await();
+        self::assertSame(['m1', 'm2'], $received);
+
+        // Read failure -> recovery: attempt 1 (S2) replays, drain hits the fatal -ERR, attempt 2
+        // (S3) replays again and succeeds.
+        $connection->processIncoming()->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(3, $transport->connectCalls);
+
+        $expectedReplay = "SUB orders 1\r\nSUB updates 2\r\nUNSUB 2 3\r\nSUB metrics 3\r\n";
+
+        // Exactly 12 writes total pins each replay to ONE transport write:
+        // conn 1: CONNECT, PING, SUB x3, UNSUB 2 5 (0-5)
+        // conn 2: CONNECT, PING, coalesced replay (6-8)
+        // conn 3: CONNECT, PING, coalesced replay (9-11)
+        self::assertCount(12, $transport->writes);
+        self::assertSame($expectedReplay, $transport->writes[8]);
+        self::assertSame($expectedReplay, $transport->writes[11]);
     }
 
     public function testSubscribeRollsBackStateWhenSubWriteFails(): void
@@ -2481,6 +2559,8 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(['hello'], $received);
         self::assertCount(2, $transport->connectCalls);
         self::assertSame("SUB updates 1\r\n", $transport->writes[2]);
+        // writes[5] is the whole coalesced replay buffer (#137); with a single subscription it
+        // is byte-identical to the lone SUB frame.
         self::assertSame("SUB updates 1\r\n", $transport->writes[5]);
     }
 

@@ -1608,9 +1608,18 @@ final class NatsConnection
 
     /**
      * Replays existing SUB registrations after a reconnect.
+     *
+     * The whole replay is coalesced into ONE transport write followed by ONE bounded drain:
+     * a per-sid awaited write plus a ~5ms drain poll (the server sends nothing after a
+     * successful SUB with verbose off) made reconnect latency scale at ~5ms x subscription
+     * count inside the reconnect critical section, where publishes buffer and nothing
+     * dispatches (#137). The byte stream is identical to the per-sid version - each SUB is
+     * immediately followed by its UNSUB re-arm, in registration order.
      */
     private function resubscribeAll(): void
     {
+        $buffer = '';
+
         foreach ($this->subscriptionMeta as $sid => $meta) {
             $max = $this->autoUnsubMax[$sid] ?? null;
             $remaining = $max === null ? null : $max - ($this->receivedCounts[$sid] ?? 0);
@@ -1624,17 +1633,29 @@ final class NatsConnection
                 continue;
             }
 
-            $this->transport->write($this->codec->encodeSubscribe($meta['subject'], $sid, $meta['queue']))->await();
+            $buffer .= $this->codec->encodeSubscribe($meta['subject'], $sid, $meta['queue']);
 
             if ($remaining !== null) {
                 // A fresh SUB resets the server's per-sid count, so re-arm auto-unsubscribe with the
                 // REMAINING allowance; the cumulative local counter still ends delivery at the
                 // original max (#112). Mirrors nats.go resendSubscriptions.
-                $this->transport->write($this->codec->encodeUnsubscribe($sid, $remaining))->await();
+                $buffer .= $this->codec->encodeUnsubscribe($sid, $remaining);
             }
-
-            $this->drainImmediateServerFrames();
         }
+
+        // Nothing to replay (no subscriptions, or all were dropped above): no write, no drain.
+        if ($buffer === '') {
+            return;
+        }
+
+        // A single large buffer is fine here: write() runs inline and suspends on backpressure
+        // (#136) - the same path flushReconnectBuffer() takes.
+        $this->transport->write($buffer)->await();
+
+        // One bounded poll for the whole replay so prompt -ERR responses (e.g. permission
+        // violations) still abort this reconnect attempt instead of leaving silently rejected
+        // subscriptions (#137 keeps the detection, drops the per-sid latency floor).
+        $this->drainImmediateServerFrames();
     }
 
     /**
