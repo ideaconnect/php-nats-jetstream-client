@@ -10,6 +10,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\JetStreamContext;
 
 use function Amp\async;
+use function Amp\delay;
 
 /**
  * Fluent builder for pull-consumer batch iteration.
@@ -25,6 +26,19 @@ use function Amp\async;
  */
 final class PullConsumerIterator
 {
+    /**
+     * First idle-backoff delay (ms) after an immediately answered empty pull in infinite mode
+     * (a no_wait 404/408 or a non-terminal 409). Doubles per consecutive empty pull (#153).
+     */
+    private const IDLE_BACKOFF_INITIAL_MS = 10;
+
+    /**
+     * Idle-backoff ceiling (ms): an idle no_wait consumer (or one stuck behind an oversized
+     * pending message under max_bytes) settles at ~2 pulls per second instead of an unthrottled
+     * re-pull storm (#153).
+     */
+    private const IDLE_BACKOFF_MAX_MS = 500;
+
     private int $batch = 1;
     private int $expiresMs = 3000;
     private ?int $iterations = null;
@@ -173,7 +187,10 @@ final class PullConsumerIterator
     }
 
     /**
-     * Enables `no_wait` mode (return immediately rather than waiting for the expiry).
+     * Enables `no_wait` mode (return immediately rather than waiting for the expiry). In infinite
+     * mode consecutive empty no_wait pulls are paced with an escalating idle backoff (see
+     * {@see self::IDLE_BACKOFF_INITIAL_MS}/{@see self::IDLE_BACKOFF_MAX_MS}) so an idle consumer
+     * is not busy-polled (#153).
      *
      * @return $this
      */
@@ -260,6 +277,7 @@ final class PullConsumerIterator
             $this->resetLifecycle();
             $totalProcessed = 0;
             $iteration = 0;
+            $consecutiveEmptyPulls = 0;
 
             while (($this->iterations === null || $iteration < $this->iterations)
                 && !$this->stopRequested
@@ -275,6 +293,9 @@ final class PullConsumerIterator
                         $this->expiresMs,
                         $this->buildPull(),
                     )->await();
+
+                    // A delivery ends the idle streak: the next empty window backs off from scratch.
+                    $consecutiveEmptyPulls = 0;
                 } catch (JetStreamException $e) {
                     // A stale pin (423) is never terminal: drop the pin id and re-pull without it so
                     // the server re-pins this client (or hands the pin to another). Applies in both
@@ -288,12 +309,23 @@ final class PullConsumerIterator
                     // In infinite mode keep polling through routine/transient conditions so a
                     // long-running worker is not killed by a quiet period, backpressure, or a
                     // failover: 404 (no messages) and 408 (request timeout) are routine empty
-                    // windows, and a 409 may be transient (MaxAckPending exceeded / leadership
-                    // change / server shutdown / max-waiting) rather than terminal (Consumer
-                    // Deleted). Finite mode keeps the existing stop-on-any-error behavior.
+                    // windows, and a 409 may be a pull-completion status (Batch Completed /
+                    // Message Size Exceeds MaxBytes) or transient (MaxAckPending exceeded /
+                    // leadership change / server shutdown / max-waiting) rather than terminal
+                    // (Consumer Deleted). Finite mode keeps the existing stop-on-any-error behavior.
                     if ($this->iterations === null) {
                         $code = $e->getCode();
-                        if (in_array($code, [404, 408], true) || ($code === 409 && self::isTransientPullStatus($e->getMessage()))) {
+                        if (in_array($code, [404, 408], true) || ($code === 409 && self::isNonTerminalPullStatus($e->getMessage()))) {
+                            // The server answers a no_wait pull on an empty consumer (and any of the
+                            // non-terminal 409s) immediately, so re-pulling right away would storm an
+                            // idle consumer with thousands of requests per second. Pace consecutive
+                            // empty windows with an escalating, capped backoff (#153); a plain
+                            // waiting pull's 404/408 already spent the expires window on the server.
+                            if ($code === 409 || $this->noWait) {
+                                ++$consecutiveEmptyPulls;
+                                delay(self::idleBackoffMs($consecutiveEmptyPulls) / 1000);
+                            }
+
                             continue;
                         }
                     }
@@ -392,17 +424,39 @@ final class PullConsumerIterator
     }
 
     /**
-     * Whether a 409 pull status describes a transient, self-clearing condition that an infinite
-     * worker should keep polling through (as opposed to a terminal one such as "Consumer Deleted").
+     * Whether a 409 pull status describes a non-terminal condition an infinite worker should keep
+     * polling through: either a pull-COMPLETION status ("Batch Completed", "Message Size Exceeds
+     * MaxBytes" - nats.go excludes ErrBatchCompleted/ErrMaxBytesExceeded from terminal handling) or
+     * a transient, self-clearing one (backpressure/failover). Terminal 409s such as "Consumer
+     * Deleted" or "Consumer is push based" stay terminal.
      */
-    private static function isTransientPullStatus(string $message): bool
+    private static function isNonTerminalPullStatus(string $message): bool
     {
-        foreach (['MaxAckPending', 'Leadership Change', 'Server Shutdown', 'Exceeded MaxWaiting'] as $needle) {
+        $needles = [
+            // Pull-completion statuses: the request ended without messages, the consumer is fine.
+            'Batch Completed', 'Message Size Exceeds MaxBytes',
+            // Transient conditions that clear on their own.
+            'MaxAckPending', 'Leadership Change', 'Server Shutdown', 'Exceeded MaxWaiting',
+        ];
+
+        foreach ($needles as $needle) {
             if (stripos($message, $needle) !== false) {
                 return true;
             }
         }
 
         return false;
+    }
+
+    /**
+     * Escalating idle backoff for the Nth consecutive immediately answered empty pull: doubles from
+     * {@see self::IDLE_BACKOFF_INITIAL_MS} up to {@see self::IDLE_BACKOFF_MAX_MS}.
+     */
+    private static function idleBackoffMs(int $consecutiveEmptyPulls): int
+    {
+        // The shift is capped so a long idle streak cannot overflow the integer before min() clamps.
+        $exponent = min(6, max(0, $consecutiveEmptyPulls - 1));
+
+        return min(self::IDLE_BACKOFF_MAX_MS, self::IDLE_BACKOFF_INITIAL_MS << $exponent);
     }
 }

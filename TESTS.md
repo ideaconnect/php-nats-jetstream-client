@@ -122,6 +122,10 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testFetchBatchRejectsInvalidPriority` - fetchBatch() rejects an out-of-range priority (must be 0..9) before dispatch.
 - `testFetchBatchRejectsUnknownPullField` - fetchBatch() with an unknown $pull key throws JetStreamException naming the offending key and the supported field set before anything reaches the wire, instead of silently dropping it (#132).
 - `testFetchBatchSendsIdleHeartbeat` - fetchBatch() with idle_heartbeat (ADR-13, nanoseconds) carries the field into the pull request JSON on the wire (#132).
+- `testFetchBatchRejectsIdleHeartbeatAboveHalfOfExpires` - fetchBatch() rejects an idle_heartbeat above 50% of expires client-side with a clear InvalidArgumentException before anything reaches the wire (ADR-13) (#153).
+- `testFetchBatchRejectsNonPositiveIdleHeartbeat` - fetchBatch() rejects a non-positive idle_heartbeat ("must be a positive integer") before dispatch (#153).
+- `testFetchBatchAcceptsIdleHeartbeatAtExactlyHalfOfExpires` - the ADR-13 boundary: an idle_heartbeat of exactly 50% of expires is accepted and reaches the wire (#153).
+- `testFetchBatchFailsFastOnMissedIdleHeartbeats` - with idle_heartbeat requested and a silent transport (no message, no status-100 frame), fetchBatch() fails within ~2 heartbeat intervals (monotonic elapsed bound, well under the expires+slack deadline) with a "missed idle heartbeats" JetStreamException (nats.go ErrNoHeartbeat parity) (#153).
 - `testUnpinConsumer` - unpinConsumer() issues a CONSUMER.UNPIN request carrying the group and returns true.
 - `testPinIdOf` - pinIdOf() extracts the Nats-Pin-Id header value, returning null when absent.
 - `testDirectGetBatchCollectsUntilEob` - directGetBatch() collects multiple HMSG replies, stops at the 204 EOB, and does not consume a frame sent after EOB.
@@ -855,6 +859,9 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testHandleStopsOnNoMessages` - an immediate terminal 404 stops handle() without invoking the handler and returns total 0.
 - `testHandleInfiniteModeContinuesPastEmptyWindow` - in infinite mode a 404 empty window does not stop the loop; polling continues, the next message is delivered (total 1, `['order-1']`), then a terminal 409 stops it.
 - `testHandleInfiniteModeContinuesPastTransient409` - in infinite mode a transient 409 (Exceeded MaxAckPending) keeps polling; the subsequent message is delivered (total 1, `['job-7']`) and a terminal 409 Consumer Deleted stops the loop.
+- `testHandleInfiniteModeContinuesPastMaxBytes409` - a 409 "Message Size Exceeds MaxBytes" is a pull-completion status, not terminal: an infinite loop with setMaxBytes() keeps pulling past it and delivers the next message (total 1, `['fits-now']`) instead of stopping the worker permanently (#153).
+- `testHandleInfiniteModeContinuesPastBatchCompleted409` - a 409 "Batch Completed" is a pull-completion status, not terminal: the infinite loop re-pulls and delivers the next message (total 1, `['next-batch']`) (#153).
+- `testNoWaitInfiniteModePacesConsecutiveEmptyPulls` - three consecutive immediate 404s on a no_wait infinite loop are paced by the escalating idle backoff (monotonic elapsed >= 65ms for the 10+20+40ms schedule; exactly one pull per scripted response, no storm), then the message is delivered and a terminal 409 stops the loop (#153).
 - `testSetGroupRejectsInvalidName` - `setGroup()` with an over-long/invalid group name throws `JetStreamException`.
 - `testSetGroupAcceptsNull` - `setGroup('g1')` then `setGroup(null)` clears the group without throwing and returns the iterator.
 - `testSetPriorityRejectsNegative` - `setPriority(-1)` throws `JetStreamException`.
@@ -1106,6 +1113,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testJetStreamPullNakWithDelayRedelivery` - Fetches a message, NAKs with a 1.2s delay, polls (tolerating 408 timeouts) until the message is redelivered, and asserts the redelivered payload then acks it.
 - `testJetStreamTermAndInProgressTokens` - Verifies a WPI/inProgress heartbeat delays redelivery (immediate fetch raises 404/408), then redelivery eventually arrives and is acked; and that TERM stops further redelivery (subsequent fetch raises 404/408).
 - `testJetStreamPullIteratorBatching` - Publishes 5 messages and runs a pullConsumer iterator with batching=2, expires=700ms, iterations=4, acking each; asserts total returned is 5 and all 5 distinct payloads were seen.
+- `testJetStreamInfiniteConsumeWithMaxBytesSurvivesOversizedPendingMessage` - Publishes an oversized head message; asserts a direct max_bytes-capped fetchBatch surfaces the 409 "Message Size Exceeds MaxBytes" status, and that an infinite consume loop with setMaxBytes() keeps (paced) pulling through that window, delivering a fitting message after the oversized one is deleted (#153).
 - `testJetStreamPushConsumerHelperDelivery` - Subscribes a durable push consumer (default deliver subject), publishes one message, pumps processIncoming until received, and asserts the delivered NatsMessage payload.
 - `testJetStreamPushConsumerWithExplicitDeliverSubject` - Same as the durable push helper test but with an explicit deliver subject, asserting the delivered payload.
 - `testJetStreamEphemeralPushConsumerDelivery` - Subscribes an ephemeral push consumer, publishes one message, pumps until received, and asserts the delivered payload (acking when a replyTo is present).

@@ -1610,8 +1610,10 @@ final class JetStreamContext
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
-     * `no_wait`, and `idle_heartbeat` (nanoseconds, ADR-13; the fetch loop absorbs the resulting
-     * status-100 heartbeat frames). Any other key is rejected with a JetStreamException instead of
+     * `no_wait`, and `idle_heartbeat` (nanoseconds, ADR-13; must not exceed 50% of expires or an
+     * InvalidArgumentException is thrown; the fetch loop absorbs the resulting status-100 heartbeat
+     * frames and fails fast with a heartbeat-miss JetStreamException when two intervals pass with
+     * no frame at all, #153). Any other key is rejected with a JetStreamException instead of
      * being silently dropped (#132). When a consumer is pinned, the first delivered message carries
      * a `Nats-Pin-Id` header (read it with {@see pinIdOf()}); a stale pin id yields a 423 status
      * surfaced as a JetStreamException with code 423.
@@ -1657,7 +1659,16 @@ final class JetStreamContext
             /** @var array{code: int, description: string}|null $terminalStatus */
             $terminalStatus = null;
 
-            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages, &$terminalStatus): void {
+            // When idle heartbeats were requested (ADR-13), the server emits a status-100 frame at
+            // least every idle_heartbeat interval, so any frame on the inbox proves it is alive.
+            // Track the last arrival (monotonic) to detect a dead server/route mid-window (#153);
+            // buildPullRequest() already validated the value, the is_int check only narrows the type.
+            $idleHeartbeatNs = isset($pull['idle_heartbeat']) && is_int($pull['idle_heartbeat']) ? $pull['idle_heartbeat'] : null;
+            $lastActivityNs = hrtime(true);
+
+            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages, &$terminalStatus, &$lastActivityNs): void {
+                $lastActivityNs = hrtime(true);
+
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
                 $status = (int) ($headers['Status'] ?? 0);
 
@@ -1680,18 +1691,49 @@ final class JetStreamContext
             try {
                 $this->client->publish($subject, $json, $inbox)->await();
 
-                // Bound the pull by the server expiry (plus slack). The cancellation cancels the
-                // underlying socket read so a silent server cannot hang the fetch indefinitely.
-                $waitCancellation = new TimeoutCancellation(($expiresMs + 1000) / 1000);
-                try {
-                    while (count($messages) < $batch && $terminalStatus === null) {
+                // Bound the pull by the server expiry (plus slack), and - when heartbeats were
+                // requested - by the heartbeat-miss deadline (2 silent intervals, nats.go
+                // ErrNoHeartbeat parity). Each wait's cancellation cancels the underlying socket
+                // read so a silent server cannot hang the fetch indefinitely.
+                $deadlineNs = hrtime(true) + ($expiresMs + 1000) * 1_000_000;
+                $lastActivityNs = hrtime(true);
+
+                while (count($messages) < $batch && $terminalStatus === null) {
+                    $nowNs = hrtime(true);
+                    if ($nowNs >= $deadlineNs) {
+                        break;
+                    }
+
+                    $waitUntilNs = $deadlineNs;
+                    if ($idleHeartbeatNs !== null) {
+                        $missAtNs = $lastActivityNs + 2 * $idleHeartbeatNs;
+                        if ($nowNs >= $missAtNs) {
+                            // Two heartbeat intervals of silence: the server (or route) is gone.
+                            // A partial batch is still returned - those messages are real - but an
+                            // empty fetch fails fast instead of sitting out the full deadline.
+                            if ($messages !== []) {
+                                break;
+                            }
+
+                            throw new JetStreamException(sprintf(
+                                'JetStream pull fetch missed idle heartbeats: no message or heartbeat received for %d ms (2 x idle_heartbeat)',
+                                intdiv(2 * $idleHeartbeatNs, 1_000_000),
+                            ));
+                        }
+
+                        $waitUntilNs = min($waitUntilNs, $missAtNs);
+                    }
+
+                    $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
+                    try {
                         $frames = $this->client->processIncoming($waitCancellation)->await();
                         if ($frames === 0) {
                             delay(0.001, cancellation: $waitCancellation);
                         }
+                    } catch (CancelledException) {
+                        // This wait segment ended (overall deadline or a heartbeat check came due);
+                        // loop around to re-evaluate the deadlines against fresh activity.
                     }
-                } catch (CancelledException) {
-                    // Deadline reached; fall through to evaluate collected messages / terminal status.
                 }
             } finally {
                 $this->client->unsubscribe($sid)->await();
@@ -2016,7 +2058,8 @@ final class JetStreamContext
      * Builds a pull-consumer CONSUMER.MSG.NEXT request body, merging supported ADR-13/ADR-42 pull
      * fields onto the mandatory batch/expires. An unknown `$pull` key is rejected loudly - silently
      * dropping it would make the caller believe the option took effect (#132). Lightly validates
-     * `group` and `priority`; the server validates the rest.
+     * `group` and `priority`, and enforces the ADR-13 `idle_heartbeat <= expires/2` rule (#153);
+     * the server validates the rest.
      *
      * @param array<string,mixed> $pull
      * @return array<string,mixed>
@@ -2049,6 +2092,25 @@ final class JetStreamContext
             $priority = $pull['priority'];
             if (!is_int($priority) || $priority < 0 || $priority > 9) {
                 throw new JetStreamException('Pull priority must be an integer between 0 and 9');
+            }
+        }
+
+        if (isset($pull['idle_heartbeat'])) {
+            $idleHeartbeat = $pull['idle_heartbeat'];
+            if (!is_int($idleHeartbeat) || $idleHeartbeat <= 0) {
+                throw new \InvalidArgumentException('Pull idle_heartbeat must be a positive integer (nanoseconds)');
+            }
+
+            // ADR-13: the heartbeat interval may not exceed half the request expiry, otherwise the
+            // server cannot fit two heartbeats into the pull window. Reject client-side with a
+            // clear error instead of forwarding a value the server will refuse (#153).
+            $expiresNs = $expiresMs * 1_000_000;
+            if ($idleHeartbeat * 2 > $expiresNs) {
+                throw new \InvalidArgumentException(sprintf(
+                    'Pull idle_heartbeat (%d ns) must not exceed 50%% of expires (%d ns) per ADR-13',
+                    $idleHeartbeat,
+                    $expiresNs,
+                ));
             }
         }
 
