@@ -2088,6 +2088,116 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A terminal initial-connect failure (reconnect and initial-retry disabled) must close the
+     * transport socket best-effort: connectOnce() dials BEFORE the handshake can fail, so without
+     * the close the failed client pins an open fd until the object itself is GC'd (#133).
+     */
+    public function testTerminalInitialConnectFailureClosesTransportSocket(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "-ERR Maximum Connections Exceeded\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: false, retryOnFailedInitialConnect: false),
+            $transport,
+        );
+
+        try {
+            $connection->connect()->await();
+            self::fail('expected ConnectionException for the failed handshake');
+        } catch (ConnectionException) {
+            // Terminal by construction: no reconnect, no initial-connect retry.
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertTrue($transport->closed, 'a terminal connect failure must not leave the socket open');
+    }
+
+    /**
+     * Reconnect exhaustion must close the LAST attempt's socket: performRecovery() closes only at
+     * the START of each attempt, so the final failed dial's socket survived the terminal exit and
+     * stayed pinned by the transport until the client object was GC'd (#133). With every attempt
+     * preceded by one close, the terminal exit must add exactly one more (attempts + 1 in total).
+     */
+    public function testReconnectExhaustionClosesLastAttemptSocket(): void
+    {
+        $transport = new class implements TransportInterface {
+            public int $closeCalls = 0;
+            private int $connects = 0;
+            /** @var list<string> */
+            private array $reads = [
+                'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                "PONG\r\n",
+            ];
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    // The first dial succeeds; every reconnect attempt fails.
+                    if (++$this->connects > 1) {
+                        throw new TransportClosedException('dial failed');
+                    }
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static function (): void {});
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static function (): void {});
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads);
+                    if ($next === null) {
+                        // Epoch 1 dies: the EOF triggers automatic recovery.
+                        throw new TransportClosedException('Socket closed by peer (EOF)');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(function (): void {
+                    $this->closeCalls++;
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 2,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected ConnectionException after reconnect exhaustion');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect attempts exhausted', $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        // One close before each of the 2 attempts + the terminal close of the last attempt's socket.
+        self::assertSame(3, $transport->closeCalls, 'the exhausted recovery must close the last attempt\'s socket');
+    }
+
+    /**
      * Verifies credentials embedded in the server URL are applied to CONNECT and stripped from the dial (#37).
      */
     public function testConnectExtractsUrlCredentials(): void

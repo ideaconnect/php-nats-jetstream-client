@@ -19,6 +19,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Resource-release roundup from the July review (#133): `keyValue()`/`objectStore()`
+  no longer memoize bucket wrappers - the per-name cache had no eviction (not even
+  `deleteBucket()`), so a long-lived client touching many bucket names (e.g. one per tenant)
+  retained one wrapper per name forever; the wrappers are all-readonly value objects, so a fresh
+  instance per call is behavior-equivalent. Every terminal connect/reconnect failure (failed
+  initial connect, exhausted or auth-aborted recovery) now closes the transport socket
+  best-effort, mirroring `disconnect()` - previously the last failed attempt's socket stayed
+  pinned by the transport until the client object was GC'd. `BatchPublisher::commit()` releases
+  the staged payloads once the batch is sent - a retained committed publisher (e.g. kept keyed by
+  `batchId()` to correlate acks) previously pinned up to 1000 full payloads for its lifetime; as
+  a consequence, `count()` now returns 0 after `commit()` (it previously kept reporting the
+  staged total).
 - `[bugfix]` `fetchBatch()`/`fetchNext()` no longer silently drop unrecognized `$pull` fields: an
   unknown key now throws a `JetStreamException` naming the offending key and the supported set, so
   a typo (or a field this client does not implement) can no longer make the caller believe the

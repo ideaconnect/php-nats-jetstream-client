@@ -287,6 +287,7 @@ final class NatsConnection
             } catch (AuthenticationException $e) {
                 // An auth failure will not resolve by retrying: fail fast instead of entering reconnect.
                 $this->state = ConnectionState::Closed;
+                $this->closeTransportBestEffort();
                 $this->releaseRuntimeState();
                 $this->emitEvent(ConnectionEvent::Closed, $e);
 
@@ -308,6 +309,7 @@ final class NatsConnection
                 }
 
                 $this->state = ConnectionState::Closed;
+                $this->closeTransportBestEffort();
                 $this->releaseRuntimeState();
                 $this->emitEvent(ConnectionEvent::Closed, $e);
                 throw new ConnectionException($e->getMessage(), (int) $e->getCode(), $e);
@@ -356,6 +358,22 @@ final class NatsConnection
         $this->autoUnsubMax = [];
         $this->reconnectBuffer = '';
         $this->parser = new ProtocolParser();
+    }
+
+    /**
+     * Best-effort transport close for terminal failure exits, mirroring disconnect(). connectOnce()
+     * opens the socket before the handshake can fail, so every path that gives up (terminal connect
+     * failure, exhausted or auth-aborted recovery) must close it - otherwise the fd stays pinned by
+     * the transport until the client object itself is GC'd (#133). Close failures are irrelevant
+     * here: the socket may already be gone, and the terminal state transition is what matters.
+     */
+    private function closeTransportBestEffort(): void
+    {
+        try {
+            $this->transport->close()->await();
+        } catch (\Throwable) {
+            // Ignore: already closed/broken sockets must not mask the original failure.
+        }
     }
 
     /**
@@ -1345,6 +1363,7 @@ final class NatsConnection
                 return true;
             } catch (AuthenticationException $e) {
                 $this->state = ConnectionState::Closed;
+                $this->closeTransportBestEffort();
                 $this->emitEvent(ConnectionEvent::Closed, $e);
 
                 throw $e;
@@ -1352,6 +1371,10 @@ final class NatsConnection
                 // Keep retrying until attempts are exhausted.
             }
         }
+
+        // Attempts exhausted: the last attempt's socket may still be open (connectOnce() dials
+        // before the handshake can fail) - release it before reporting failure (#133).
+        $this->closeTransportBestEffort();
 
         return false;
     }
@@ -1425,6 +1448,7 @@ final class NatsConnection
                 // Credentials will not become valid by retrying: stop the reconnect loop immediately
                 // rather than hammering the server until attempts are exhausted (#46).
                 $this->state = ConnectionState::Closed;
+                $this->closeTransportBestEffort();
                 $this->releaseRuntimeState();
                 $this->emitError($e);
                 $this->emitEvent(ConnectionEvent::Closed, $e);
@@ -1453,6 +1477,10 @@ final class NatsConnection
                 sprintf('Reconnect exhausted: %d bytes of buffered publishes were discarded', $abandonedBytes),
             ));
         }
+
+        // The last attempt's socket may still be open (each attempt closes only at its START, and
+        // connectOnce() dials before the handshake can fail) - release it now (#133).
+        $this->closeTransportBestEffort();
 
         // The connection is terminally closed: subscriptions do not survive it. Releasing here
         // keeps handler closures/payloads from outliving the connection and stops a later manual

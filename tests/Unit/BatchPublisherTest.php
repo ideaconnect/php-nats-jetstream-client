@@ -394,6 +394,51 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
+     * commit() must release the staged payloads: they are dead weight afterwards (add() rejects a
+     * committed batch), yet an app retaining the publisher (e.g. keyed by batchId() to correlate
+     * acks) would pin up to MAX_MESSAGES full payloads for the object's lifetime (#133). The
+     * retention itself is not observable through behavior, so the internal array is checked via
+     * reflection; count() going to 0 is the public face of the release. The full 3-message wire
+     * exchange must still happen (the release must not disturb what is sent).
+     */
+    public function testCommitReleasesStagedPayloads(): void
+    {
+        $commitAck = '{"stream":"ORDERS","seq":3,"batch":"b-release","count":3}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Zero-byte ack to the batch-start request (sid 1).
+            "MSG _INBOX.a 1 0\r\n\r\n",
+            // Commit PubAck to the commit request (sid 2).
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-release')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->add('orders.created', 'c');
+
+        $ack = $batch->commit()->await();
+        self::assertSame(3, $ack->batchCount);
+
+        // All 3 staged messages reached the wire despite the release...
+        $batchWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'Nats-Batch-Id:b-release'),
+        ));
+        self::assertCount(3, $batchWrites);
+
+        // ...and nothing is retained on the committed publisher.
+        $prop = new \ReflectionProperty($batch, 'messages');
+        self::assertSame([], $prop->getValue($batch), 'a committed batch must not retain its staged payloads');
+        self::assertSame(0, $batch->count());
+    }
+
+    /**
      * Verifies that a non-JSON (but non-empty) reply to the batch-start request is treated as
      * accepted and publish continues (lines 156-158 in assertStartAccepted).
      */

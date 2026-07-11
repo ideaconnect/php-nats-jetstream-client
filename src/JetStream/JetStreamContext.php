@@ -41,11 +41,6 @@ final class JetStreamContext
     /** Base backoff between ordered-consumer recreate attempts, in seconds (#114). */
     private const ORDERED_RECREATE_RETRY_DELAY_S = 0.05;
 
-    /** @var array<string,KeyValueBucket> */
-    private array $kvBuckets = [];
-    /** @var array<string,ObjectStoreBucket> */
-    private array $objectBuckets = [];
-
     /**
      * Creates a JetStream API context bound to a NATS client.
       *
@@ -145,31 +140,27 @@ final class JetStreamContext
     }
 
     /**
-     * Returns a KeyValue bucket context.
+     * Returns a KeyValue bucket context. The wrapper is an all-readonly value object and cheap to
+     * build, so it is constructed per call rather than memoized: a per-name cache on this
+     * long-lived context had no eviction (not even deleteBucket()), so a client touching many
+     * bucket names (e.g. one per tenant) retained one wrapper per name forever (#133).
      */
     public function keyValue(string $bucket): KeyValueBucket
     {
         self::assertValidBucket($bucket);
 
-        if (!isset($this->kvBuckets[$bucket])) {
-            $this->kvBuckets[$bucket] = new KeyValueBucket($this->client, $this, $bucket);
-        }
-
-        return $this->kvBuckets[$bucket];
+        return new KeyValueBucket($this->client, $this, $bucket);
     }
 
     /**
-     * Returns an Object Store bucket context.
+     * Returns an Object Store bucket context. Constructed per call, not memoized - same rationale
+     * as {@see keyValue()} (#133).
      */
     public function objectStore(string $bucket): ObjectStoreBucket
     {
         self::assertValidBucket($bucket);
 
-        if (!isset($this->objectBuckets[$bucket])) {
-            $this->objectBuckets[$bucket] = new ObjectStoreBucket($this->client, $this, $bucket);
-        }
-
-        return $this->objectBuckets[$bucket];
+        return new ObjectStoreBucket($this->client, $this, $bucket);
     }
 
     /**

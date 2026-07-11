@@ -332,9 +332,12 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies object store context is cached per bucket.
+     * Verifies objectStore() constructs an equivalent bucket wrapper per call instead of memoizing:
+     * the per-name cache had no eviction, so a long-lived context accumulated one wrapper per bucket
+     * name touched, forever (#133). Fresh instances must stay behaviorally interchangeable (equal
+     * state, same backing stream).
      */
-    public function testObjectStoreContextIsCachedPerBucket(): void
+    public function testObjectStoreConstructsEquivalentBucketPerCall(): void
     {
         $client = new NatsClient(new NatsOptions(), new FakeTransport());
 
@@ -342,14 +345,20 @@ final class JetStreamContextTest extends TestCase
         $b = $client->jetStream()->objectStore('assets');
         $c = $client->jetStream()->objectStore('other');
 
-        self::assertSame($a, $b);
-        self::assertNotSame($a, $c);
+        // No memoization: each call builds a new wrapper (nothing is retained on the context)...
+        self::assertNotSame($a, $b);
+        // ...and the wrappers are all-readonly value objects, so repeated calls are interchangeable.
+        self::assertEquals($a, $b);
+        self::assertSame('OBJ_assets', $a->streamName());
+        self::assertSame('OBJ_assets', $b->streamName());
+        self::assertSame('OBJ_other', $c->streamName());
     }
 
     /**
-     * Verifies key-value context is cached per bucket and typed correctly.
+     * Verifies keyValue() constructs an equivalent bucket wrapper per call instead of memoizing -
+     * same no-eviction rationale as the object store accessor (#133).
      */
-    public function testKeyValueContextIsCachedPerBucket(): void
+    public function testKeyValueConstructsEquivalentBucketPerCall(): void
     {
         $client = new NatsClient(new NatsOptions(), new FakeTransport());
 
@@ -358,8 +367,13 @@ final class JetStreamContextTest extends TestCase
         $c = $client->jetStream()->keyValue('sessions');
 
         self::assertInstanceOf(KeyValueBucket::class, $a);
-        self::assertSame($a, $b);
-        self::assertNotSame($a, $c);
+        // No memoization: each call builds a new wrapper (nothing is retained on the context)...
+        self::assertNotSame($a, $b);
+        // ...and the wrappers are all-readonly value objects, so repeated calls are interchangeable.
+        self::assertEquals($a, $b);
+        self::assertSame('KV_profiles', $a->streamName());
+        self::assertSame('KV_profiles', $b->streamName());
+        self::assertSame('KV_sessions', $c->streamName());
     }
 
     /**
