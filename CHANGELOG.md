@@ -17,6 +17,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-07-11
+
+### Fixed
+
+- `[bugfix]` Static analysis: `JsMessageMetadata::fromMessage()` rewritten with literal token
+  offsets per `count()` branch so PHPStan 2.2.5's stricter array-shape inference can prove every
+  access (the shared base-offset arithmetic tripped `offsetAccess.notFound` and failed CI's
+  `Unit + Static` jobs; CI resolves dependencies fresh and picked up 2.2.5 while the local gate
+  ran an older vendor). Byte-identical parsing behavior, pinned by the existing 9/11/12-token
+  ack-subject tests.
+
 ## [2.5.0] - 2026-07-11
 
 ### Added
