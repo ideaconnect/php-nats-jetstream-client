@@ -2780,6 +2780,23 @@ final class JetStreamContextTest extends TestCase
         self::assertSame(42, $parsed);
     }
 
+    /**
+     * A 13-token ACK subject (a future server form with tokens beyond the known 12) still yields
+     * the stream sequence at index 7 - offsets anchor from the front, extras are ignored, matching
+     * nats.go's tolerant parser (#155).
+     */
+    public function testExtractStreamSequenceParses13TokenReplySubject(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $js = $client->jetStream();
+
+        $method = new \ReflectionMethod($js, 'extractStreamSequence');
+
+        $message = new NatsMessage('s', 1, '$JS.ACK.hub.ACC123.ORDERS.CONS.1.42.2.123.0.rnd.extra', 'x');
+
+        self::assertSame(42, $method->invoke($js, $message));
+    }
+
     public function testKeyValueRejectsInvalidBucketName(): void
     {
         $client = new NatsClient(new NatsOptions(), new FakeTransport());
@@ -3720,7 +3737,9 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies subscribeOrderedConsumer delivers a message that has no $JS.ACK reply subject
-     * (no ordering metadata) best-effort to the user handler (null seq path).
+     * (no ordering metadata) best-effort to the user handler (null seq path), and does so
+     * SILENTLY - the unparseable-ack protocol error (#155) applies only to reply subjects that
+     * claim the $JS.ACK form, not to plain or absent reply subjects.
      */
     public function testSubscribeOrderedConsumerDeliversMessageWithoutAckMetadata(): void
     {
@@ -3737,9 +3756,64 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
             // A delivery with no $JS.ACK reply subject - no ordering metadata.
             "MSG _INBOX.JS.ORD.x 2 5\r\nhello\r\n",
+            // A delivery with a plain (non-$JS.ACK) reply subject - also no ordering metadata.
+            "MSG _INBOX.JS.ORD.x 2 plain.reply 6\r\nhello2\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer(
+            'EVENTS',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+        )->await();
+
+        $client->processIncoming()->await();
+        $client->processIncoming()->await();
+
+        // Best-effort delivery: the messages are forwarded despite having no ordering information,
+        // and no error is emitted for reply subjects that never claimed the $JS.ACK form.
+        self::assertSame(['hello', 'hello2'], $received);
+        self::assertSame([], $errors);
+    }
+
+    /**
+     * Verifies subscribeOrderedConsumer surfaces an unparseable $JS.ACK reply subject (an ack-form
+     * claim the parser cannot read, so gap detection and the stale-consumer filter cannot run)
+     * through the error listener while still delivering the message best-effort (#155). Silent
+     * before the fix: the null-metadata branch bypassed every ordering check without a trace.
+     */
+    public function testSubscribeOrderedConsumerEmitsErrorForUnparseableAckSubject(): void
+    {
+        $createPayload = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD_BAD_ACK',
+            'config' => ['ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+            // 10 tokens: claims the $JS.ACK form but matches neither the 9-token v1 form nor the
+            // >= 11-token v2 form, so it is unparseable even for the tolerant parser.
+            "MSG _INBOX.JS.ORD.x 2 \$JS.ACK.EVENTS.ORD_BAD_ACK.1.1.1.0.0.X 4\r\nmsg1\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
         $client->connect()->await();
 
         $received = [];
@@ -3752,8 +3826,126 @@ final class JetStreamContextTest extends TestCase
 
         $client->processIncoming()->await();
 
-        // Best-effort delivery: the message is forwarded despite having no ordering information.
-        self::assertSame(['hello'], $received);
+        // The message is still delivered best-effort (no recreate, no drop) ...
+        self::assertSame(['msg1'], $received);
+        // ... but the degradation is loud: ordering checks could not run for this delivery.
+        self::assertCount(1, $errors);
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertStringContainsString('unparseable $JS.ACK reply subject', $errors[0]->getMessage());
+        self::assertStringContainsString('EVENTS', $errors[0]->getMessage());
+        // A parse failure must NOT trigger a recreate - only the initial CREATE goes on the wire.
+        $written = implode('', $transport->writes);
+        self::assertSame(0, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'));
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'));
+    }
+
+    /**
+     * Verifies the unparseable-ack error is emitted ONCE per consumer instance, not once per
+     * message - a stream of unparseable deliveries must not become an error storm (#155). All
+     * messages are still delivered best-effort.
+     */
+    public function testSubscribeOrderedConsumerEmitsUnparseableAckErrorOncePerConsumer(): void
+    {
+        $createPayload = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD_BAD_ACK',
+            'config' => ['ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+            // Two consecutive 10-token (unparseable) ack subjects on the same consumer instance.
+            "MSG _INBOX.JS.ORD.x 2 \$JS.ACK.EVENTS.ORD_BAD_ACK.1.1.1.0.0.X 4\r\nmsg1\r\n",
+            "MSG _INBOX.JS.ORD.x 2 \$JS.ACK.EVENTS.ORD_BAD_ACK.2.2.2.0.0.X 4\r\nmsg2\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer(
+            'EVENTS',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+        )->await();
+
+        $client->processIncoming()->await();
+        $client->processIncoming()->await();
+
+        // Both messages delivered best-effort; the protocol error fired exactly once.
+        self::assertSame(['msg1', 'msg2'], $received);
+        self::assertCount(1, $errors);
+    }
+
+    /**
+     * Verifies the once-per-consumer-instance latch of the unparseable-ack error re-arms on a
+     * recreate: a new consumer epoch that again produces unparseable ack subjects emits a fresh
+     * error, so long-lived subscriptions do not go permanently silent after the first one (#155).
+     */
+    public function testSubscribeOrderedConsumerUnparseableAckErrorRearmsAfterRecreate(): void
+    {
+        $createReply = static fn (string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+        // Heartbeat reporting the server delivered up to consumer seq 3 while only seq 1 was
+        // processed in order - triggers the tail-gap recreate (a new consumer epoch).
+        $hbHeaders = NatsHeaders::toWireBlock([
+            'Status' => '100',
+            'Description' => 'Idle Heartbeat',
+            'Nats-Last-Consumer' => '3',
+        ]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+            // Unparseable (10-token) ack subject on the first epoch -> first error.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0.X 4\r\nbad1\r\n",
+            // In-order delivery (consumer seq 1 / stream seq 1) so the tail-gap heartbeat below has
+            // a processed baseline to compare against.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Tail-gap heartbeat -> recreate: delete ORD1 (sid 3), create ORD2 (sid 4).
+            sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            // Unparseable ack subject on the SECOND epoch -> the latch re-armed, second error.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.1.1.0.0.X 4\r\nbad2\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // Best-effort deliveries from both epochs plus the one in-order message.
+        self::assertSame(['bad1', 'msg1', 'bad2'], $received);
+        // One unparseable-ack error per consumer epoch: first epoch and post-recreate epoch.
+        self::assertCount(2, $errors);
+        self::assertStringContainsString('unparseable $JS.ACK reply subject', $errors[0]->getMessage());
+        self::assertStringContainsString('unparseable $JS.ACK reply subject', $errors[1]->getMessage());
     }
 
     /**

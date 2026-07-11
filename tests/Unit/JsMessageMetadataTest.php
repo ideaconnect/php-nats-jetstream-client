@@ -62,12 +62,12 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     /**
-     * When the token count is not 9, 11, or 12 (e.g. 7 tokens), fromMessage()
-     * returns null via the default branch of the match expression.
+     * When the token count matches neither the exact 9-token v1 form nor the >= 11-token
+     * v2 form (e.g. 7 tokens), fromMessage() returns null.
      */
     public function testFromMessageReturnsNullForUnrecognisedTokenCount(): void
     {
-        // "$JS.ACK" + 5 more tokens = 7 total - not 9/11/12
+        // "$JS.ACK" + 5 more tokens = 7 total - neither 9 nor >= 11
         $result = JsMessageMetadata::fromMessage($this->makeMessage('$JS.ACK.a.b.c.d.e'));
 
         self::assertNull($result);
@@ -158,6 +158,63 @@ final class JsMessageMetadataTest extends TestCase
         self::assertSame(99, $meta->streamSequence);
         self::assertSame(5, $meta->consumerSequence);
         self::assertSame(3, $meta->numPending);
+    }
+
+    // ---------------------------------------------------------------------------
+    // >= 13 token forms (trailing-token tolerance, #155)
+    // ---------------------------------------------------------------------------
+
+    /**
+     * Parses a 13-token reply subject (a future server form with one token beyond the known 12).
+     * nats.go anchors field offsets from the front and tolerates extra trailing tokens; fields at
+     * offsets 2..10 must parse identically to the 11/12-token forms (#155).
+     */
+    public function testFromMessageParses13TokenForm(): void
+    {
+        $replyTo = '$JS.ACK.hub.ACC.events.worker.5.99.5.1700000000000000000.3.RANDOMTOKEN.EXTRA';
+        $meta = JsMessageMetadata::fromMessage($this->makeMessage($replyTo));
+
+        self::assertNotNull($meta);
+        self::assertSame('hub', $meta->domain);
+        self::assertSame('events', $meta->stream);
+        self::assertSame('worker', $meta->consumer);
+        self::assertSame(5, $meta->numDelivered);
+        self::assertSame(99, $meta->streamSequence);
+        self::assertSame(5, $meta->consumerSequence);
+        self::assertSame(1700000000000000000, $meta->timestampNanos);
+        self::assertSame(3, $meta->numPending);
+    }
+
+    /**
+     * Parses a 14-token reply subject: everything after index 10 is ignored regardless of how many
+     * tokens a future server appends (#155).
+     */
+    public function testFromMessageParses14TokenForm(): void
+    {
+        $replyTo = '$JS.ACK.hub.ACC.events.worker.5.99.5.1700000000000000000.3.RANDOMTOKEN.EXTRA.MORE';
+        $meta = JsMessageMetadata::fromMessage($this->makeMessage($replyTo));
+
+        self::assertNotNull($meta);
+        self::assertSame('hub', $meta->domain);
+        self::assertSame('events', $meta->stream);
+        self::assertSame('worker', $meta->consumer);
+        self::assertSame(5, $meta->numDelivered);
+        self::assertSame(99, $meta->streamSequence);
+        self::assertSame(5, $meta->consumerSequence);
+        self::assertSame(1700000000000000000, $meta->timestampNanos);
+        self::assertSame(3, $meta->numPending);
+    }
+
+    /**
+     * A 10-token subject sits between the exact 9-token v1 form and the >= 11-token v2 form and
+     * must be rejected - the trailing-token tolerance starts at 11, it does not blur the v1 form.
+     */
+    public function testFromMessageReturnsNullFor10TokenForm(): void
+    {
+        $replyTo = '$JS.ACK.hub.ACC.events.worker.5.99.5.1700000000000000000';
+        $result = JsMessageMetadata::fromMessage($this->makeMessage($replyTo));
+
+        self::assertNull($result);
     }
 
     // ---------------------------------------------------------------------------

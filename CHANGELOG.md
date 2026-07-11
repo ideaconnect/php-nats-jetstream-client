@@ -94,6 +94,24 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   10071 and could never match a real server rejection (those carry the HTTP-like 400). The synthetic
   "Key already exists" exception now carries 400 in `getCode()` and 10071 in `getErrCode()` instead
   of minting an API err_code into the transport-code slot (#154).
+- `[bugfix]` `$JS.ACK` reply-subject parsing now tolerates trailing tokens:
+  `JsMessageMetadata::fromMessage()` and `extractStreamSequence()` accept the expanded v2 form
+  with >= 11 tokens
+  instead of exactly 11 or 12, anchoring field offsets from the front and ignoring everything
+  after index 10 - nats.go parser parity, whose comment warns the parser must not be strict about
+  trailing tokens because servers may append them (the 12th, a random suffix, was itself a later
+  addition). A future server appending a 13th token no longer nulls out every delivery's metadata.
+  The exact 9-token v1 form is unchanged. Additionally, the ordered consumer's null-metadata path
+  is no longer a silent trapdoor: a reply subject that claims the `$JS.ACK` form but cannot be
+  parsed used to route the message to the handler with BOTH the consumer-sequence gap check and
+  the stale-consumer filter bypassed and zero errors emitted - the entire ordering guarantee
+  evaporated quietly. Such a delivery now surfaces a descriptive `JetStreamException` through the
+  error listener - once per consumer instance, re-armed on recreate, so an unparseable stream
+  cannot become an error storm - and the message is still delivered best-effort (at-most-once,
+  ordering unverified), matching the previous delivery behavior. Parse failures deliberately do
+  not trigger a recreate: the replacement consumer would produce the same unparseable form, and
+  the tolerant parser makes the branch nearly unreachable. Absent or plain (non-ack) reply
+  subjects keep the silent best-effort path (#155).
 
 ## [2.5.1] - 2026-07-11
 
