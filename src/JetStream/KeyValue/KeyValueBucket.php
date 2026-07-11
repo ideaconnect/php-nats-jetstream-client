@@ -44,6 +44,12 @@ final class KeyValueBucket
     /**
      * Creates or updates the underlying KV stream for this bucket.
      *
+     * ADR-8 / nats.go CreateKeyValue parity: `deny_delete` protects revision history from
+     * STREAM.MSG.DELETE (KV delete/purge use DEL markers and Nats-Rollup, never MSG.DELETE) and
+     * `discard: new` makes a full bucket reject writes instead of silently evicting old keys.
+     * `discard: new` on a max_msgs_per_subject stream expects NATS server 2.7.2+ (nats.go gates it
+     * on that version). Both remain user-overridable via `$options`.
+     *
      * @param array<string,mixed> $options
      * @return Future<StreamInfo>
      */
@@ -55,6 +61,8 @@ final class KeyValueBucket
                 'max_msgs_per_subject' => 1,
                 'allow_direct' => true,
                 'allow_rollup_hdrs' => true,
+                'deny_delete' => true,
+                'discard' => 'new',
             ];
 
             $mapped = $this->mapKvOptions($options);
@@ -828,18 +836,25 @@ final class KeyValueBucket
     }
 
     /**
-     * Ensures key name follows basic NATS KV key constraints.
+     * Ensures key name follows the ADR-8 KV key constraints. Keys outside the ADR-8 charset are
+     * unreadable via nats.go/nats.java/the `nats` CLI (their clients reject them with ErrInvalidKey),
+     * so admitting them here would strand entries only this client can access (#132).
      */
     private function assertValidKey(string $key): void
     {
-        if ($key === '' || preg_match('/[\s*>]/', $key)) {
-            throw new JetStreamException('Invalid KV key');
+        if (preg_match('/\A[-\/_=.a-zA-Z0-9]+\z/', $key) !== 1) {
+            throw new JetStreamException('Invalid KV key: keys must be non-empty and contain only [-/_=.a-zA-Z0-9] (ADR-8)');
         }
 
         // Leading, trailing, or consecutive dots produce empty subject tokens, i.e. a malformed
         // $KV.<bucket>.<key> subject. Reject them up front with a clear KV error.
         if (str_starts_with($key, '.') || str_ends_with($key, '.') || str_contains($key, '..')) {
-            throw new JetStreamException('Invalid KV key');
+            throw new JetStreamException('Invalid KV key: leading, trailing, or consecutive dots are not allowed');
+        }
+
+        // ADR-8 reserves the "_kv" prefix for internal use.
+        if (str_starts_with($key, '_kv')) {
+            throw new JetStreamException('Invalid KV key: the "_kv" prefix is reserved (ADR-8)');
         }
     }
 }

@@ -96,6 +96,34 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
+     * Verifies create() defaults include deny_delete and discard:new (ADR-8 / nats.go parity) and
+     * that a user override wins (#132).
+     */
+    public function testBucketCreateSendsKvDefaultsAndAllowsOverride(): void
+    {
+        $createPayload = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('cfg');
+        $kv->create()->await();
+        $kv->create(['deny_delete' => false, 'discard' => 'old'])->await();
+
+        self::assertStringContainsString('"deny_delete":true', $transport->writes[3]);
+        self::assertStringContainsString('"discard":"new"', $transport->writes[3]);
+        self::assertStringContainsString('"deny_delete":false', $transport->writes[6]);
+        self::assertStringContainsString('"discard":"old"', $transport->writes[6]);
+    }
+
+    /**
      * Verifies KV put/get/delete operations map and parse values correctly.
      */
     public function testPutGetDelete(): void
@@ -759,7 +787,7 @@ final class KeyValueBucketTest extends TestCase
 
     // ─── Key Validation ─────────────────────────────────────────────
 
-    public function testPutAcceptsKeyWithDotsColonsSlashes(): void
+    public function testPutAcceptsAdr8KeyCharset(): void
     {
         $putAck = '{"stream":"KV_cfg","seq":1,"duplicate":false}';
 
@@ -772,8 +800,55 @@ final class KeyValueBucketTest extends TestCase
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
-        $ack = $client->jetStream()->keyValue('cfg')->put('config/v2:main.yaml', 'data')->await();
+        // Full ADR-8 charset: dots, hyphens, underscores, equals, slashes, mixed case, digits.
+        $ack = $client->jetStream()->keyValue('cfg')->put('config/v2=main.BAR-2_ok.yaml', 'data')->await();
         self::assertSame(1, $ack->seq);
+    }
+
+    /**
+     * Verifies keys outside the ADR-8 charset ('@', '#', non-ASCII) are rejected (#132).
+     */
+    public function testPutRejectsKeyOutsideAdr8Charset(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+        $kv = $client->jetStream()->keyValue('cfg');
+
+        foreach (['user@host', 'tag#1', "caf\u{00E9}", 'a:b'] as $key) {
+            try {
+                $kv->put($key, 'x')->await();
+                self::fail(sprintf('Key "%s" should have been rejected', $key));
+            } catch (JetStreamException $e) {
+                self::assertStringContainsString('Invalid KV key', $e->getMessage());
+            }
+        }
+
+        // Nothing beyond CONNECT+PING may reach the wire for a rejected key.
+        self::assertCount(2, $transport->writes);
+    }
+
+    /**
+     * Verifies the reserved "_kv" key prefix is rejected (ADR-8, #132).
+     */
+    public function testPutRejectsReservedKvPrefixKey(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid KV key: the "_kv" prefix is reserved');
+
+        $client->jetStream()->keyValue('cfg')->put('_kv.x', 'x')->await();
     }
 
     public function testPutRejectsKeyWithWildcard(): void

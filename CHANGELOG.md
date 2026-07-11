@@ -19,6 +19,26 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` `fetchBatch()`/`fetchNext()` no longer silently drop unrecognized `$pull` fields: an
+  unknown key now throws a `JetStreamException` naming the offending key and the supported set, so
+  a typo (or a field this client does not implement) can no longer make the caller believe the
+  option took effect - a bug-driven behavior change treated as a bugfix. The ADR-13 `idle_heartbeat`
+  field (nanoseconds) is now an accepted pull-request field and reaches the wire (the fetch loop
+  already absorbs the resulting status-100 heartbeat frames). Ordered consumers additionally pin
+  `num_replicas: 1` (ADR-17 / nats.go `ordered.go` parity), so an interest-retention stream's
+  replica count is no longer inherited by the ephemeral ordered consumer (#132).
+- `[bugfix]` Spec-conformance corrections from the July review (#132): KV `create()` defaults now
+  include `deny_delete: true` and `discard: new` (ADR-8 / nats.go `CreateKeyValue` parity; both
+  stay user-overridable, `discard: new` expects NATS server 2.7.2+), so bucket revision history can
+  no longer be deleted out from under other tooling and a full bucket rejects writes instead of
+  silently evicting old keys. KV key validation is tightened to the ADR-8 rules (charset
+  `[-/_=.a-zA-Z0-9]`, reserved `_kv` prefix rejected), so entries written from PHP can no longer be
+  unreadable via nats.go/nats.java/the `nats` CLI. Publishing with headers against a server whose
+  INFO advertises `"headers": false` now fails client-side with a clear `ConnectionException`
+  (nats.go `ErrHeadersNotSupported` parity) instead of the server killing the connection on an
+  unknown HPUB operation. The services framework `started` timestamp is now generated in UTC, so
+  its RFC3339 `Z` suffix is truthful on non-UTC hosts (ADR-32) and `nats micro` shows correct
+  uptimes.
 - `[bugfix]` JetStream stream and consumer (durable) names are now validated client-side before
   being interpolated into a `$JS.API.*` subject, rejecting empty names and names containing
   spaces, tabs, CR/LF, `.`, `*`, `>`, `/` or `\` (nats.go `checkStreamName` / `checkConsumerName`
@@ -110,6 +130,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   the create is retried up to 3 times with backoff and a terminal failure is surfaced through the
   configured `errorListener`, so the application learns the consumer went permanently silent instead of
   waiting on dead air forever (#114). Adds `NatsClient::options()` exposing the client's runtime options.
+
+### Documentation
+
+- `[docs]` The README "NATS Server Version Requirements" section now states the real server floor:
+  core NATS works against any server, but all JetStream consumer helpers use the 2.9+ named
+  `CONSUMER.CREATE` API with no fallback to the legacy `DURABLE.CREATE` form, so consumer
+  management requires NATS 2.9+ (documented in the feature table; pre-2.9 servers fail with a
+  generic 503, not an `UnsupportedFeatureException`) (#132).
 
 ## [2.4.1] - 2026-06-15
 

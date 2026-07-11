@@ -121,9 +121,11 @@ Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and 
 
 ## NATS Server Version Requirements
 
-Most of this library works against any JetStream-enabled server. Some features depend on newer NATS
-server versions; the table below lists the minimum version per feature. Detection is reactive - there
-is no per-request version probe - and depends on the feature:
+Core NATS (publish/subscribe, request/reply, headers, services) works against any server. JetStream
+consumer management requires NATS 2.9+: all consumer helpers use the named `CONSUMER.CREATE` API
+introduced in 2.9, with no fallback to the legacy `DURABLE.CREATE` form. Some features depend on
+even newer NATS server versions; the table below lists the minimum version per feature. Detection is
+reactive - there is no per-request version probe - and depends on the feature:
 
 - **Version-gated stream/consumer config fields** (for example creating a stream with `allow_atomic`
   or `allow_msg_schedules`): an older server rejects the unknown field and the request fails fast
@@ -139,6 +141,7 @@ is no per-request version probe - and depends on the feature:
 
 | Feature | API | Min NATS | Server config / header |
 | --- | --- | --- | --- |
+| Named consumer create (all consumer helpers) | `createConsumer()`, `createEphemeralConsumer()`, ordered/push/pull subscribe helpers | 2.9 | n/a |
 | Multi-subject consumer filters | `createConsumer(..., ['filter_subjects' => [...]])` | 2.10 | `filter_subjects` |
 | Per-message / KV TTL | `publish(..., ttl:)`, `KeyValueBucket::put/delete/purge(..., ttl:)` | 2.11 | `allow_msg_ttl`, `Nats-TTL` |
 | Subject delete markers | KV/Object Store `watch()`/`get()` (handled automatically) | 2.11 | `subject_delete_marker_ttl`, `Nats-Marker-Reason` |

@@ -108,6 +108,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testCreateConsumerRejectsInvalidPriorityPolicy` - createConsumer() rejects an unknown priority_policy ("must be one of") before dispatch.
 - `testFetchBatchWithPullOptions` - fetchBatch() with pull options sends group, min_pending, max_bytes, and no_wait in the pull request.
 - `testFetchBatchRejectsInvalidPriority` - fetchBatch() rejects an out-of-range priority (must be 0..9) before dispatch.
+- `testFetchBatchRejectsUnknownPullField` - fetchBatch() with an unknown $pull key throws JetStreamException naming the offending key and the supported field set before anything reaches the wire, instead of silently dropping it (#132).
+- `testFetchBatchSendsIdleHeartbeat` - fetchBatch() with idle_heartbeat (ADR-13, nanoseconds) carries the field into the pull request JSON on the wire (#132).
 - `testUnpinConsumer` - unpinConsumer() issues a CONSUMER.UNPIN request carrying the group and returns true.
 - `testPinIdOf` - pinIdOf() extracts the Nats-Pin-Id header value, returning null when absent.
 - `testDirectGetBatchCollectsUntilEob` - directGetBatch() collects multiple HMSG replies, stops at the 204 EOB, and does not consume a frame sent after EOB.
@@ -173,7 +175,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testFetchBatchThrowsTerminalStatusDescription` - fetchBatch() throws a JetStreamException with code 409 and the description for a 409 MaxAckPending terminal status.
 - `testPauseConsumerSendsCorrectPayload` - pauseConsumer() sends CONSUMER.PAUSE with the pause_until timestamp and returns the paused result.
 - `testResumeConsumerSendsEmptyBody` - resumeConsumer() uses the CONSUMER.PAUSE endpoint and returns paused=false.
-- `testSubscribeOrderedConsumerSendsCorrectConfig` - subscribeOrderedConsumer() creates a consumer with flow_control, idle_heartbeat, ack_policy none, and mem_storage set.
+- `testSubscribeOrderedConsumerSendsCorrectConfig` - subscribeOrderedConsumer() creates a consumer with flow_control, idle_heartbeat, ack_policy none, mem_storage, and num_replicas 1 (ADR-17 parity, #132) set.
 - `testPurgeStream` - purgeStream() uses STREAM.PURGE and returns the purged count.
 - `testPurgeStreamWithSubjectFilter` - purgeStream() with a filter option includes the filter in the purge payload.
 - `testListStreams` - listStreams() uses STREAM.LIST and returns parsed StreamInfo objects.
@@ -259,6 +261,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 
 - `testGetFallsBackToStreamMessageWhenDirectGetUnavailable` - when Direct Get returns 503 (no-responders), get() falls back to STREAM.MSG.GET and still returns the value (operation PUT, revision 9), emitting both DIRECT.GET and STREAM.MSG.GET requests.
 - `testBucketCreateAndDelete` - create() and deleteBucket() map to STREAM.CREATE.KV_cfg and STREAM.DELETE.KV_cfg, returning the created stream name and a true delete result.
+- `testBucketCreateSendsKvDefaultsAndAllowsOverride` - create() defaults include deny_delete:true and discard:new (ADR-8/nats.go parity) and an explicit user override (deny_delete:false, discard:old) wins (#132).
 - `testPutGetDelete` - put/get/delete round-trip parses values correctly and uses the right subjects (PUB for put, DIRECT.GET for get, HPUB with KV-Operation:DEL for delete).
 - `testCreateKeySucceedsWhenAbsent` - createKey() on an absent key publishes with Nats-Expected-Last-Subject-Sequence:0 and returns the ack (#19).
 - `testCreateKeyThrowsWhenKeyExists` - createKey() throws JetStreamException "Key already exists" when the wrong-last-sequence ack is followed by a get() showing a live value (#19).
@@ -285,7 +288,9 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testGetAllOmitsMarker` - getAll() omits a key whose latest record is a server delete-marker, returning only the live key (#5).
 - `testWatchTreatsMarkerAsTombstone` - watch() delivers a server delete-marker as a PURGE tombstone (null value), not a live empty value (#5).
 - `testCreateWithSubjectDeleteMarkerTtl` - create() forwards subject_delete_marker_ttl into the KV stream config (#5 passthrough).
-- `testPutAcceptsKeyWithDotsColonsSlashes` - put() accepts a key containing dots, colons and slashes (config/v2:main.yaml) and returns the ack.
+- `testPutAcceptsAdr8KeyCharset` - put() accepts a key using the full ADR-8 charset (dots, hyphens, underscores, equals, slashes, mixed case, digits) and returns the ack.
+- `testPutRejectsKeyOutsideAdr8Charset` - put() rejects keys outside the ADR-8 charset ('@', '#', non-ASCII, ':') with "Invalid KV key" and nothing beyond CONNECT+PING reaches the wire (#132).
+- `testPutRejectsReservedKvPrefixKey` - put() rejects a key with the reserved "_kv" prefix (ADR-8) with a message naming the reservation (#132).
 - `testPutRejectsKeyWithWildcard` - put() with a key containing '*' throws JetStreamException "Invalid KV key".
 - `testPutRejectsKeyWithLeadingTrailingOrConsecutiveDots` - put() rejects keys with leading, trailing, or consecutive dots (.theme, theme., a..b), each throwing "Invalid KV key".
 - `testPutRejectsKeyWithTab` - put() with a key containing a tab character throws JetStreamException "Invalid KV key".
@@ -479,6 +484,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testPublishRejectsOversizedPayload` - publish() throws ProtocolException when payload size exceeds server max_payload (65 > 64).
 - `testPublishAcceptsPayloadAtExactLimit` - publish() succeeds when payload size equals max_payload (64) and writes a "PUB ... 64" frame.
 - `testPublishWithHeadersRejectsOversizedTotal` - publishWithHeaders() validates headers+payload total against max_payload and throws ProtocolException when exceeded.
+- `testPublishWithHeadersThrowsWhenServerLacksHeadersSupport` - publishWithHeaders() against an INFO advertising "headers":false throws ConnectionException client-side and no HPUB reaches the wire (nats.go ErrHeadersNotSupported parity, #132).
+- `testRequestWithHeadersThrowsWhenServerLacksHeadersSupport` - requestWithHeaders() shares the HPUB capability guard: throws ConnectionException and writes no HPUB against a headers-disabled server (#132).
 - `testConnectPayloadIncludesNoResponders` - The CONNECT payload includes "no_responders":true.
 - `testRequestThrowsOnNoRespondersStatus` - request() throws NatsException ("No responders for subject ...") on a 503 No Responders HMSG.
 - `testPublishRejectsEmptySubject` - publish() with an empty subject throws ProtocolException ("Subject must not be empty").
@@ -850,6 +857,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testGroupJoinHandlesEmptySegments` - Asserts empty group prefixes / empty subjects are trimmed so subjects collapse to `echo` and `svc` rather than containing empty dot segments.
 - `testSchemaDiscoveryResponse` - Asserts the service subscribes to $SRV.SCHEMA and answers a SCHEMA discovery request with an `io.nats.micro.v1.schema_response` containing the endpoint schema.
 - `testStatsIncludeDetailedMetrics` - Asserts endpoint stats track num_requests (2), num_errors (1), last_error message, non-negative processing/average processing time, and that the `started` timestamp is stable across snapshots.
+- `testStartedTimestampIsUtcRegardlessOfDefaultTimezone` - With the process default timezone set to Pacific/Kiritimati (+14), the stats `started` timestamp still parses as UTC within a minute of now, so its hardcoded Z suffix is truthful (ADR-32, #132).
 - `testHandlerCanRespondWithCustomServiceError` - Asserts a thrown ServiceError(429,...) surfaces its code/description/body in the micro-spec error headers and body (not a generic 500) and is recorded as one error with the custom description in stats.
 - `testHandlerErrorResponseDoesNotLeakExceptionMessage` - Asserts a generic handler exception returns a sanitized "Internal server error" 500 to the requester (no raw exception text), while the real message is retained server-side in `last_error`/STATS.
 - `testStatsOmitsNonSpecAliasKeys` - Asserts endpoint stats use spec field names (`num_requests`, `num_errors`) and no longer expose the non-spec aliases (`requests`, `errors`).
