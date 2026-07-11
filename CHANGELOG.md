@@ -214,6 +214,19 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   configured `errorListener`, so the application learns the consumer went permanently silent instead of
   waiting on dead air forever (#114). Adds `NatsClient::options()` exposing the client's runtime options.
 
+### Testing & CI
+
+- `[docs]` The reconnect path is now exercised against a live server (#141): a new
+  `SeveringTransport` test decorator over the real `AmpSocketTransport` force-closes the live TCP
+  socket mid-session, and two new integration tests (severing mid-idle and mid-traffic) assert the
+  client observes the genuine EOF, reconnects, replays its subscriptions with a real SUB, and
+  delivers post-reconnect traffic published from a second independent client. The four scripted
+  "reconnect" tests that lived in the integration suite but never contacted the fixture (they ran
+  only against injected fakes, so they were skipped by the local unit gate) were relocated to
+  `tests/Unit/NatsConnectionTest.php`; one of them duplicated an existing unit test
+  (`testProcessIncomingReconnectsAndResubscribesAfterReadFailure` covers the identical FlakyTransport
+  script with stronger assertions) and was deleted instead. Dev-only - no runtime/library change.
+
 ### Documentation
 
 - `[docs]` `disconnect()` and plain `unsubscribe()` docblocks (connection and client facade) plus

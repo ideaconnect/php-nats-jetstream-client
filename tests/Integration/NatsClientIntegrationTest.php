@@ -7,7 +7,6 @@ namespace IDCT\NATS\Tests\Integration;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
-use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Auth\NkeySeedSigner;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -22,7 +21,8 @@ use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Services\BasicJsonSchemaValidator;
 use IDCT\NATS\Tests\Support\FakeTransport;
-use IDCT\NATS\Tests\Support\FlakyTransport;
+use IDCT\NATS\Tests\Support\SeveringTransport;
+use IDCT\NATS\Transport\AmpSocketTransport;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -1237,40 +1237,28 @@ final class NatsClientIntegrationTest extends TestCase
     }
 
     /**
-     * Verifies reconnect after transport loss replays subscriptions and resumes delivery.
+     * Kills a LIVE TCP session mid-idle (client-side force close of the real socket via
+     * SeveringTransport) and asserts the full client-level recovery composition against the real
+     * server: the next read observes a genuine EOF through the production AmpSocketTransport path,
+     * the reconnect dials the server pool through the same decorated transport, the subscription is
+     * replayed with a real SUB, and a publish from a SECOND independent client reaches the
+     * resubscribed handler (#141).
      */
-    public function testReconnectAfterTransportLossReplaysSubscriptions(): void
+    public function testSeveredLiveConnectionMidIdleReconnectsAndResumesDelivery(): void
     {
         $this->requireIntegrationEnabled();
 
-        $subject = 'updates';
-        $transport = new FlakyTransport(
-            readQueuesByConnection: [
-                [
-                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                    "PONG\r\n",
-                    '__THROW__',
-                ],
-                [
-                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                    "PONG\r\n",
-                    "MSG {$subject} 1 5\r\nhello\r\n",
-                ],
-            ],
-            connectFailures: 0,
-            readFailures: 0,
+        $subject = 'it.sever.idle.' . bin2hex(random_bytes(4));
+        $options = new NatsOptions(
+            servers: [$this->integrationServerUrl()],
+            reconnectEnabled: true,
+            maxReconnectAttempts: 5,
+            reconnectDelayMs: 10,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
         );
-
-        $client = new NatsClient(
-            new NatsOptions(
-                reconnectEnabled: true,
-                maxReconnectAttempts: 3,
-                reconnectDelayMs: 1,
-                reconnectJitterMs: 0,
-                pingIntervalSeconds: 0,
-            ),
-            $transport,
-        );
+        $transport = new SeveringTransport(new AmpSocketTransport($options));
+        $client = new NatsClient($options, $transport);
         $client->connect()->await();
 
         $received = [];
@@ -1278,249 +1266,114 @@ final class NatsClientIntegrationTest extends TestCase
             $received[] = $message->payload;
         })->await();
 
-        // First read fails and triggers reconnect path.
-        self::assertSame(0, $client->processIncoming()->await());
-        // Next read processes delivery on reconnected transport.
-        $client->processIncoming()->await();
+        // Force-close the live socket while the connection is idle: the next read sees a real EOF
+        // from a genuinely dead TCP connection, not a scripted fake.
+        $transport->sever();
 
-        self::assertSame(['hello'], $received);
-        self::assertCount(2, $transport->connectCalls);
+        // Drive the read loop until the client has observed the EOF and completed recovery, bounded
+        // by a monotonic deadline (no sleeps; recovery runs synchronously inside processIncoming).
+        $deadline = $this->monotonic() + 10.0;
+        while ($client->statistics()->reconnects < 1 && $this->monotonic() < $deadline) {
+            try {
+                $client->processIncoming(new TimeoutCancellation(0.5))->await();
+            } catch (CancelledException) {
+                // No bytes in this window; keep driving until the deadline.
+            }
+        }
+        self::assertGreaterThanOrEqual(1, $client->statistics()->reconnects, 'severed socket must trigger a reconnect');
 
-        $subWrites = array_values(array_filter(
-            $transport->writes,
-            static fn(string $write): bool => str_starts_with($write, 'SUB ' . $subject . ' '),
-        ));
-        self::assertCount(2, $subWrites);
+        // Round-trip a PING so the replayed SUB is registered server-side before the second client
+        // publishes; otherwise the publish could race the resubscribe.
+        $client->flush()->await();
 
+        $publisher = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $publisher->connect()->await();
+        $publisher->publish($subject, 'post-reconnect')->await();
+
+        $cancellation = new TimeoutCancellation(5.0);
+        try {
+            while ($received === []) {
+                $client->processIncoming($cancellation)->await();
+            }
+        } catch (CancelledException) {
+            // Window elapsed; the assertion below reports it.
+        }
+
+        self::assertSame(['post-reconnect'], $received, 'the replayed subscription must deliver against the real server');
+
+        $publisher->disconnect()->await();
         $client->disconnect()->await();
     }
 
     /**
-     * Verifies max outstanding pings triggers reconnect path and preserves open state.
+     * Kills a LIVE TCP session mid-traffic: after one delivered message the real socket is severed
+     * while a second client keeps publishing. Messages published between the sever and the SUB
+     * replay are lost by design (core NATS does not resend), so the test asserts recovery
+     * (reconnects >= 1) plus delivery of NEW post-reconnect traffic to the resubscribed handler,
+     * bounded by a monotonic deadline (#141).
      */
-    public function testMaxPingsOutTriggersReconnect(): void
+    public function testSeveredLiveConnectionMidTrafficRecoversAndDeliversNewTraffic(): void
     {
         $this->requireIntegrationEnabled();
 
-        $transport = new FlakyTransport(
-            readQueuesByConnection: [
-                [
-                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                    "PONG\r\n",
-                ],
-                [
-                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                    "PONG\r\n",
-                ],
-            ],
-            connectFailures: 0,
-            readFailures: 0,
+        $subject = 'it.sever.traffic.' . bin2hex(random_bytes(4));
+        $options = new NatsOptions(
+            servers: [$this->integrationServerUrl()],
+            reconnectEnabled: true,
+            maxReconnectAttempts: 5,
+            reconnectDelayMs: 10,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
         );
-
-        $client = new NatsClient(
-            new NatsOptions(
-                reconnectEnabled: true,
-                maxReconnectAttempts: 1,
-                reconnectDelayMs: 1,
-                reconnectJitterMs: 0,
-                pingIntervalSeconds: 1,
-                maxPingsOut: 0,
-            ),
-            $transport,
-        );
+        $transport = new SeveringTransport(new AmpSocketTransport($options));
+        $client = new NatsClient($options, $transport);
         $client->connect()->await();
 
-        // Let ping timer fire once; with maxPingsOut=0 this must trigger reconnect.
-        delay(1.1);
+        $received = [];
+        $deliveries = 0;
+        $client->subscribe($subject, static function (NatsMessage $message) use (&$received, &$deliveries): void {
+            $received[] = $message->payload;
+            $deliveries++;
+        })->await();
+        // Ensure the SUB is registered server-side before the publisher starts.
+        $client->flush()->await();
 
-        self::assertCount(2, $transport->connectCalls);
-        self::assertNotNull($client->serverInfo());
-        self::assertSame('S2', $client->serverInfo()->serverId);
+        $publisher = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $publisher->connect()->await();
 
-        $client->disconnect()->await();
-    }
-
-    /**
-     * Verifies reconnect attempts exhausted path surfaces connection failure after transport loss.
-     */
-    public function testReconnectAttemptsExhaustedReturnsClosed(): void
-    {
-        $this->requireIntegrationEnabled();
-
-        $transport = new class implements \IDCT\NATS\Transport\TransportInterface {
-            public int $connectAttempts = 0;
-
-            /** @var list<string> */
-            private array $readQueue = [
-                'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                "PONG\r\n",
-            ];
-
-            public function connect(string $dsn, int $timeoutMs): Future
-            {
-                return async(function (): void {
-                    $this->connectAttempts++;
-                    if ($this->connectAttempts > 1) {
-                        throw new \RuntimeException('connect failed');
-                    }
-                });
-            }
-
-            public function write(string $bytes): Future
-            {
-                return async(static function (): void {});
-            }
-
-            public function upgradeTls(): Future
-            {
-                return async(static function (): void {});
-            }
-
-            public function readLine(?\Amp\Cancellation $cancellation = null): Future
-            {
-                return async(function (): string {
-                    if ($this->readQueue !== []) {
-                        return array_shift($this->readQueue);
-                    }
-
-                    throw new \RuntimeException('read failed');
-                });
-            }
-
-            public function close(): Future
-            {
-                return async(static function (): void {});
-            }
-        };
-
-        $client = new NatsClient(
-            new NatsOptions(
-                reconnectEnabled: true,
-                maxReconnectAttempts: 2,
-                reconnectDelayMs: 1,
-                reconnectJitterMs: 0,
-                pingIntervalSeconds: 0,
-            ),
-            $transport,
-        );
-        $client->connect()->await();
-
-        $caught = false;
+        // Prove the pipeline is live before severing: one message publishes and arrives.
+        $publisher->publish($subject, 'pre-sever')->await();
+        $cancellation = new TimeoutCancellation(5.0);
         try {
-            $client->processIncoming()->await();
-        } catch (ConnectionException $e) {
-            $caught = true;
-            self::assertStringContainsString('Reconnect attempts exhausted', $e->getMessage());
+            while ($deliveries < 1) {
+                $client->processIncoming($cancellation)->await();
+            }
+        } catch (CancelledException) {
+            // Window elapsed; the assertion below reports it.
+        }
+        self::assertSame(['pre-sever'], $received);
+
+        // Kill the live TCP session while the second client's traffic continues.
+        $transport->sever();
+
+        $deadline = $this->monotonic() + 10.0;
+        $sequence = 0;
+        while ($deliveries < 2 && $this->monotonic() < $deadline) {
+            $sequence++;
+            $publisher->publish($subject, 'post-sever-' . $sequence)->await();
+            try {
+                $client->processIncoming(new TimeoutCancellation(0.25))->await();
+            } catch (CancelledException) {
+                // No delivery in this window; publish again and keep driving.
+            }
         }
 
-        self::assertTrue($caught);
+        self::assertGreaterThanOrEqual(1, $client->statistics()->reconnects, 'severed socket must trigger a reconnect');
+        self::assertGreaterThanOrEqual(2, $deliveries, 'post-reconnect traffic must reach the resubscribed handler');
+        self::assertSame('pre-sever', $received[0]);
+        self::assertStringStartsWith('post-sever-', $received[count($received) - 1]);
 
-        try {
-            $client->publish('updates', 'hello')->await();
-            self::fail('Expected closed connection after reconnect exhaustion.');
-        } catch (ConnectionException $e) {
-            self::assertStringContainsString('Connection is not open', $e->getMessage());
-        }
-    }
-
-    /**
-     * Verifies reconnect backoff delay progression contributes measurable wait before recovery.
-     */
-    public function testReconnectBackoffDelayProgression(): void
-    {
-        $this->requireIntegrationEnabled();
-
-        $transport = new class implements \IDCT\NATS\Transport\TransportInterface {
-            public int $connectAttempts = 0;
-
-            /** @var array<int, list<string>> */
-            private array $readQueues = [
-                [
-                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                    "PONG\r\n",
-                    '__THROW__',
-                ],
-                [
-                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                    "PONG\r\n",
-                ],
-            ];
-
-            private int $successfulConnects = 0;
-
-            public function connect(string $dsn, int $timeoutMs): Future
-            {
-                return async(function (): void {
-                    $this->connectAttempts++;
-
-                    // Initial connect succeeds. Reconnect attempts 2 and 3 fail, then attempt 4 succeeds.
-                    if ($this->connectAttempts === 2 || $this->connectAttempts === 3) {
-                        throw new \RuntimeException('connect failed');
-                    }
-
-                    $this->successfulConnects++;
-                });
-            }
-
-            public function write(string $bytes): Future
-            {
-                return async(static function (): void {});
-            }
-
-            public function upgradeTls(): Future
-            {
-                return async(static function (): void {});
-            }
-
-            public function readLine(?\Amp\Cancellation $cancellation = null): Future
-            {
-                return async(function (): string {
-                    $index = max(0, $this->successfulConnects - 1);
-                    if (!isset($this->readQueues[$index])) {
-                        return '';
-                    }
-
-                    $next = array_shift($this->readQueues[$index]);
-                    if ($next === null) {
-                        return '';
-                    }
-
-                    if ($next === '__THROW__') {
-                        throw new \RuntimeException('read failed');
-                    }
-
-                    return $next;
-                });
-            }
-
-            public function close(): Future
-            {
-                return async(static function (): void {});
-            }
-        };
-
-        $client = new NatsClient(
-            new NatsOptions(
-                reconnectEnabled: true,
-                maxReconnectAttempts: 5,
-                reconnectDelayMs: 20,
-                reconnectJitterMs: 0,
-                pingIntervalSeconds: 0,
-            ),
-            $transport,
-        );
-        $client->connect()->await();
-
-        self::assertSame(0, $client->processIncoming()->await());
-
-        // The read failure drives reconnect: attempts 2 and 3 fail, attempt 4 succeeds and lands on the
-        // second server. These outcomes are deterministic. The backoff-delay *magnitude* is asserted by
-        // the unit test testBackoffDelayIsExponential; we do NOT assert wall-clock elapsed here because
-        // the host clock is not guaranteed monotonic (microtime() can jump forward or backward), which
-        // made an elapsed-time bound flaky (#70).
-        self::assertSame(4, $transport->connectAttempts);
-        self::assertSame('S2', $client->serverInfo()?->serverId);
-
+        $publisher->disconnect()->await();
         $client->disconnect()->await();
     }
 

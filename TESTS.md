@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
+Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -469,6 +469,9 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testConcurrentRequestWaiterTakesOverReadPumpAfterFirstReplyArrives` - When the fiber owning the socket read completes its request, a parked waiter takes over the read pump and receives its own reply from a later chunk (no lost wakeup) (#135).
 - `testParkedRequestWaiterStillHonorsDeadlineAndCancellation` - A waiter parked behind another fiber's read still times out on its own deadline and observes an external cancellation while parked (#135).
 - `testProcessIncomingReconnectsAndResubscribesAfterReadFailure` - A read failure triggers reconnect (2 connect calls) and replays the SUB, then a later MSG is delivered.
+- `testMaxPingsOutTriggersReconnect` - With `maxPingsOut: 0` and a 1s ping interval, waits 1.1s and asserts the ping timer firing forced a reconnect (2 connect calls) landing on server "S2" (relocated from the integration suite - fake transport only, #141).
+- `testReconnectAttemptsExhaustedReturnsClosed` - Uses an anonymous transport that fails every reconnect; asserts `processIncoming` throws ConnectionException "Reconnect attempts exhausted" and a subsequent publish throws "Connection is not open" (relocated from the integration suite - fake transport only, #141).
+- `testReconnectBackoffDelayProgression` - Anonymous transport fails reconnect attempts 2 and 3 then succeeds on 4; asserts `processIncoming` returns 0, total connect attempts == 4, and the client ends on server "S2" (no wall-clock timing assertion, per #70; relocated from the integration suite - fake transport only, #141).
 - `testReconnectAfterMidFramePayloadDropSucceedsOnFirstAttempt` - A connection dying mid-MSG-payload (partial frame in the parser) reconnects on the FIRST attempt and delivers post-reconnect messages: the handshake starts from a clean parser instead of feeding INFO into the stale pending frame (#125).
 - `testExhaustedReconnectReleasesStateSoManualReconnectStartsClean` - After reconnect exhaustion, a manual connect() starts from a clean slate: a later recovery replays no SUB from the dead epoch and the old handler never fires again (#127).
 - `testDisconnectIsNotReversedByAnInFlightRecovery` - After disconnect(), an in-flight recoverConnection() is a no-op: stays Closed, no Reconnected event, no extra connect, original serverId retained (#84).
@@ -1125,10 +1128,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testJwtNonceAuthenticationFlow` - Signs the server nonce with the matching user seed (NkeySeedSigner) and asserts JWT auth connects with non-null `serverInfo()` (skips if JWT/seed fixtures absent).
 - `testStandaloneNkeyAuthenticationFlow` - Uses NkeySeedSigner for standalone NKey challenge signing and asserts the connection succeeds with non-null `serverInfo()`.
 - `testNoRespondersErrorSurface` - Requests a subject with no responder and asserts the thrown NatsException message contains "No responders" and the subject name.
-- `testReconnectAfterTransportLossReplaysSubscriptions` - With FlakyTransport that throws on first read, asserts reconnect happens (2 connect calls), the subscription is re-sent (2 SUB writes), and "hello" is delivered after reconnect.
-- `testMaxPingsOutTriggersReconnect` - With `maxPingsOut: 0` and a 1s ping interval, waits 1.1s and asserts the ping timer firing forced a reconnect (2 connect calls) landing on server "S2".
-- `testReconnectAttemptsExhaustedReturnsClosed` - Uses an anonymous transport that fails every reconnect; asserts `processIncoming` throws ConnectionException "Reconnect attempts exhausted" and a subsequent publish throws "Connection is not open".
-- `testReconnectBackoffDelayProgression` - Anonymous transport fails reconnect attempts 2 and 3 then succeeds on 4; asserts `processIncoming` returns 0, total connect attempts == 4, and the client ends on server "S2" (no wall-clock timing assertion, per #70).
+- `testSeveredLiveConnectionMidIdleReconnectsAndResumesDelivery` - Uses SeveringTransport (`tests/Support/SeveringTransport.php`, a decorator over the real AmpSocketTransport) to force-close the live TCP socket mid-idle; asserts the client observes a genuine EOF, reconnects against the real server (`statistics()->reconnects >= 1`), replays the subscription, and a publish from a second independent client is delivered post-reconnect (#141).
+- `testSeveredLiveConnectionMidTrafficRecoversAndDeliversNewTraffic` - Delivers one live message, then severs the real socket via SeveringTransport while a second client keeps publishing; asserts reconnect fires (`reconnects >= 1`) and NEW post-sever traffic reaches the resubscribed handler within a bounded monotonic deadline (messages between the sever and the SUB replay are lost by design) (#141).
 - `testQueueGroupDistributesMessages` - Two workers in the same queue group drain concurrently while 40 messages are published; asserts all 40 are received exactly once total (no duplicates) and both workers received at least one.
 - `testRequestTimeoutReturnsTimeoutError` - A responder receives but never replies; asserts `request()` with a 300ms timeout throws TimeoutException containing "Request timed out" and the subject, and the responder saw at least one message.
 - `testDrainDuringInflightDelivery` - Publishes an in-flight message then calls `drain()`; asserts the in-flight message was delivered and a post-drain publish throws ConnectionException "Connection is not open".
