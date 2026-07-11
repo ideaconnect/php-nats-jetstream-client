@@ -31,7 +31,12 @@ use function Amp\async;
  */
 final class BatchPublisher
 {
-    /** Server-enforced upper bound on the number of messages in a single atomic batch. */
+    /**
+     * Client-side cap on the number of messages staged in one batch. ADR-50's 1000 is the server
+     * DEFAULT batch limit, not a protocol constant - operators may configure other values, and the
+     * server's error reply stays authoritative for the actual limit; this cap only fails
+     * obviously oversized batches before any bytes are sent.
+     */
     public const MAX_MESSAGES = 1000;
 
     /** @var list<array{subject:string,payload:string,headers:array<string,string>}> */
@@ -96,6 +101,18 @@ final class BatchPublisher
 
             if ($this->messages === []) {
                 throw new JetStreamException('Cannot commit an empty batch');
+            }
+
+            // Pre-flight (#152): a pre-2.12 server stores batch messages as plain publishes, and
+            // the reply-shape detection below fires only AFTER the start message is durably
+            // stored - one orphan message from an all-or-nothing API. When INFO advertises a
+            // parseable version below 2.12, fail before anything reaches the wire. Unparseable
+            // versions (proxies, custom builds) and mixed-version clusters (JS leader older than
+            // the connected server) still fall through to the reply-shape detection. Nothing was
+            // sent, so the batch stays uncommitted and intact.
+            $version = self::versionComponents($this->client->serverInfo()?->version);
+            if ($version !== null && ($version[0] < 2 || ($version[0] === 2 && $version[1] < 12))) {
+                throw $this->atomicBatchUnsupported(preflight: true);
             }
 
             $this->committed = true;
@@ -189,31 +206,52 @@ final class BatchPublisher
         }
 
         // A batching-aware server answers the start with a ZERO-BYTE ack (ADR-50). A normal PubAck
-        // here means the server stored the start message as a plain publish - it does not understand
-        // Nats-Batch-* headers (pre-2.12), and continuing would store the "batch" message-by-message,
-        // silently breaking the all-or-nothing guarantee (#130). Abort loudly instead. (The start
-        // message itself was already stored by that server; the caller learns atomicity is
-        // unavailable before the rest of the batch is published.)
+        // here means the message was stored as a plain publish - the answering server does not
+        // understand Nats-Batch-* headers (pre-2.12), and continuing would store the "batch"
+        // message-by-message, silently breaking the all-or-nothing guarantee (#130). Abort loudly
+        // instead. The commit() version pre-flight keeps a directly-connected old server off this
+        // path; it still fires for unparseable versions and mixed-version clusters where the JS
+        // leader is older than the connected server - the start message is already stored by then,
+        // a residual window the pre-flight cannot close from the client (#152).
         if (isset($data['stream']) || isset($data['seq'])) {
             throw $this->atomicBatchUnsupported();
         }
     }
 
     /**
-     * Builds the "server too old for atomic batches" failure with the connected server's version.
+     * Numeric [major, minor] prefix of an INFO-advertised server version, or null when the string
+     * has no leading number (proxies and custom builds advertise arbitrary strings). Pre-release
+     * tags are ignored - a 2.12.0-beta server understands batch semantics - matching nats.go's
+     * numeric-prefix comparison rather than full semver precedence.
+     *
+     * @return array{int,int}|null
      */
-    private function atomicBatchUnsupported(): UnsupportedFeatureException
+    private static function versionComponents(?string $version): ?array
+    {
+        if ($version === null || preg_match('/^v?(\d+)(?:\.(\d+))?/', $version, $match) !== 1) {
+            return null;
+        }
+
+        return [(int) $match[1], (int) ($match[2] ?? 0)];
+    }
+
+    /**
+     * Builds the "server too old for atomic batches" failure with the connected server's version.
+     * $preflight distinguishes the version gate (nothing was sent) from the reply-shape detection
+     * (the start message was already stored by the answering server).
+     */
+    private function atomicBatchUnsupported(bool $preflight = false): UnsupportedFeatureException
     {
         $serverVersion = $this->client->serverInfo()?->version;
+        $connected = $serverVersion !== null && $serverVersion !== '' ? ' ' . $serverVersion : '';
 
         return new UnsupportedFeatureException(
             'allow_atomic',
             '2.12',
             $serverVersion,
-            sprintf(
-                'Atomic batch publish requires NATS server 2.12+ (connected server%s treated the batch as plain publishes)',
-                $serverVersion !== null && $serverVersion !== '' ? ' ' . $serverVersion : '',
-            ),
+            $preflight
+                ? sprintf('Atomic batch publish requires NATS server 2.12+ (connected server%s; nothing was published)', $connected)
+                : sprintf('Atomic batch publish requires NATS server 2.12+ (connected server%s treated the batch as plain publishes)', $connected),
         );
     }
 

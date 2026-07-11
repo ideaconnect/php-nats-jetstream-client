@@ -72,9 +72,11 @@ final class JetStreamContext
      * `allow_atomic` enabled. Pass a batch id (1..64 chars) to use your own, or omit it for a
      * generated one.
      *
-     * Requires NATS server 2.12+. A server without batch support acknowledges the batch start/commit
-     * as plain publishes; `commit()` detects that and throws an UnsupportedFeatureException instead
-     * of silently storing the batch message-by-message (#130).
+     * Requires NATS server 2.12+: `commit()` pre-flights the INFO-advertised server version and
+     * throws an UnsupportedFeatureException before anything is published to an older server (#152).
+     * A batch-incapable server that slips past that gate (unparseable version, mixed-version
+     * cluster) acknowledges the batch start/commit as plain publishes; `commit()` detects that and
+     * throws instead of silently storing the batch message-by-message (#130).
      */
     public function batch(?string $batchId = null): BatchPublisher
     {
