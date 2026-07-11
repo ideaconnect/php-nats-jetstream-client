@@ -401,6 +401,14 @@ final class KeyValueBucket
                         return;
                     }
 
+                    // The common KV put carries no headers, so this parse is a free early return. For
+                    // headered deliveries (DEL/PURGE tombstones, TTL puts) it re-parses the block the
+                    // push dispatch already parsed for its control-frame check: threading that parse
+                    // through would change the public callable(NatsMessage):void handler contract of
+                    // subscribeEphemeralPushConsumer, so the rare double parse stays (#139). The two
+                    // reply-subject parses below also stay separate: streamSequenceOf() yields null
+                    // for a malformed $JS.ACK sequence token where JsMessageMetadata (int)-casts it,
+                    // and the metadata parse only runs until the caught-up signal has fired.
                     $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
                     $operation = $this->operationFromHeaders($headers);
                     $isDelete = $operation === 'DEL' || $operation === 'PURGE';

@@ -55,6 +55,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   the wire, and the start/commit request legs (including the #130 pre-2.12 guards) are unchanged.
   Measured against a live 2.12 server: a 1000-message commit (128-byte payloads) dropped from
   ~55ms to ~21ms median wall time.
+- `[bugfix]` JetStream push deliveries (push consumers, ordered consumers, KV watches) no longer
+  pay a per-message `async()` hop and duplicate parsing (#139): the push control-frame check runs
+  synchronously in the dispatch fiber instead of spawning a fiber per message (a Future allocation,
+  an event-loop hop, and at least one added tick of delivery latency each) and skips header parsing
+  entirely for header-less data messages - the overwhelmingly common delivery; the rare
+  flow-control/stalled acks are still sent, byte-identical. The ordered consumer reads
+  `Nats-Last-Consumer` from the control frame's already-parsed headers instead of re-parsing the
+  block, NATS header blocks are split with `explode("\r\n")` instead of `preg_split` (same pieces,
+  cheaper), and a subscription's pending-message queue is now reused across drains instead of being
+  freed when emptied and reallocated on the next delivery. Measured with an ordered consumer
+  receiving 20k small messages from a live server (window includes the 20k publishes): median wall
+  2.20s -> 1.95s and CPU 2.06s -> 1.80s, ~9.1k -> ~10.3k msg/s end to end.
 
 ### Fixed
 

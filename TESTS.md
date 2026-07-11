@@ -509,7 +509,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testSubscriptionDispatchIsNotReentrantWhenHandlerAwaits` - A handler that awaits a self-pumping request() does not re-enter for the same sid; ordering is start:A,end:A,start:B,end:B (per-sid re-entrancy guard).
 - `testLoggerCapturesLifecycleEvents` - An injected PSR-3 logger records Connected/Closed/DiscoveredServers/LameDuck/Disconnected/Reconnected at info level and a per-attempt backoff warning (#69).
 - `testFlushSendsPingAndResolvesOnPong` - flush() writes a PING and resolves on the server PONG, staying Open.
-- `testDrainedSubscriptionQueuesAreNotRetained` - After delivery, the per-SID pendingMessages entry is removed rather than left as an empty queue.
+- `testDrainedSubscriptionQueueIsKeptEmptyForReuseAndDroppedWithTheSubscription` - After delivery, the per-SID pendingMessages queue is kept empty and the same instance is reused for the next delivery (no alloc/free per message, #139); it is removed with the subscription on unsubscribe.
 - `testDrainDoesNotResurrectConnectionOnReadFailure` - drain() with a read failure (EOF) during flush closes without reconnecting or re-subscribing (one CONNECT, one SUB, plus UNSUB).
 - `testDrainTerminatesViaDeadlineWhenNoFlushPongArrives` - drain() with no flush PONG ends via its deadline (yielding between empty reads) and closes rather than busy-spinning.
 - `testDrainRequiresOpenConnection` - drain() on a not-open connection throws ConnectionException ("Connection is not open").

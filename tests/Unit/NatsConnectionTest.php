@@ -3814,23 +3814,39 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(ConnectionState::Open, $connection->state());
     }
 
-    public function testDrainedSubscriptionQueuesAreNotRetained(): void
+    public function testDrainedSubscriptionQueueIsKeptEmptyForReuseAndDroppedWithTheSubscription(): void
     {
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             "MSG events 1 5\r\nhello\r\n",
+            "MSG events 1 5\r\nworld\r\n",
         ]);
 
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();
-        $connection->subscribe('events', function (): void {})->await();
+        $sid = $connection->subscribe('events', function (): void {})->await();
+
+        $pendingProp = new \ReflectionProperty(NatsConnection::class, 'pendingMessages');
+
         $connection->processIncoming()->await();
 
-        // Once delivered, the per-SID pending queue is removed rather than retained as an empty queue,
-        // so the per-chunk drain scan stays proportional to subscriptions with pending messages.
-        $pending = (new \ReflectionProperty(NatsConnection::class, 'pendingMessages'))->getValue($connection);
-        self::assertSame([], $pending);
+        // Once delivered, the per-SID queue is kept (empty) rather than freed: unset-on-empty cost a
+        // SplQueue alloc/free per delivered message in the promptly-drained common case (#139).
+        $pending = $pendingProp->getValue($connection);
+        self::assertArrayHasKey($sid, $pending);
+        self::assertTrue($pending[$sid]->isEmpty());
+        $queueAfterFirstDrain = $pending[$sid];
+
+        // The next delivery reuses the SAME queue instance - no reallocation per message.
+        $connection->processIncoming()->await();
+        $pending = $pendingProp->getValue($connection);
+        self::assertSame($queueAfterFirstDrain, $pending[$sid]);
+        self::assertTrue($pending[$sid]->isEmpty());
+
+        // The retained queue still dies with the subscription, so sid cleanup does not leak it.
+        $connection->unsubscribe($sid)->await();
+        self::assertSame([], $pendingProp->getValue($connection));
     }
 
     public function testDrainDoesNotResurrectConnectionOnReadFailure(): void

@@ -2039,6 +2039,8 @@ final class NatsConnection
         $this->receivedCounts[$sid] = ($this->receivedCounts[$sid] ?? 0) + 1;
 
         if (!isset($this->pendingMessages[$sid])) {
+            // Defensive only: subscribe() creates the queue and it persists (empty between drains,
+            // #139) until dropSubscriptionState() removes it, so a routable sid always has one.
             $this->pendingMessages[$sid] = new SplQueue();
         }
 
@@ -2512,7 +2514,8 @@ final class NatsConnection
      */
     private function drainPendingForSid(int $sid): void
     {
-        if (!isset($this->pendingMessages[$sid])) {
+        $queue = $this->pendingMessages[$sid] ?? null;
+        if ($queue === null) {
             return;
         }
 
@@ -2521,6 +2524,14 @@ final class NatsConnection
             // entry that drainAllPending() would re-scan on every chunk.
             unset($this->pendingMessages[$sid]);
 
+            return;
+        }
+
+        if ($queue->isEmpty()) {
+            // Nothing buffered. The queue persists empty until the subscription is dropped (#139) -
+            // the previous unset-on-empty meant one SplQueue alloc/free per delivered message in the
+            // promptly-drained common case - so this cheap check is the whole per-chunk scan cost
+            // for an idle subscription.
             return;
         }
 
@@ -2534,8 +2545,6 @@ final class NatsConnection
         $this->dispatchingSids[$sid] = true;
 
         try {
-            $queue = $this->pendingMessages[$sid];
-
             while (!$queue->isEmpty()) {
                 if (!array_key_exists($sid, $this->subscriptions)) {
                     break;
@@ -2559,18 +2568,13 @@ final class NatsConnection
         } finally {
             unset($this->dispatchingSids[$sid]);
 
-            // Run in finally so a handler that throws mid-drain still triggers the terminal cleanup and
-            // the empty-queue eviction rather than stranding the subscription (#112). completeAutoUnsub
-            // handles the slow-consumer case where delivered stays below max (dropped messages) but the
-            // server-side max was still reached: it drops on received>=max once the backlog is drained.
+            // Run in finally so a handler that throws mid-drain still triggers the terminal cleanup
+            // rather than stranding the subscription (#112). completeAutoUnsub handles the
+            // slow-consumer case where delivered stays below max (dropped messages) but the
+            // server-side max was still reached: it drops on received>=max once the backlog is
+            // drained. The drained queue itself is deliberately kept (empty) for reuse - see the
+            // early return above (#139); dropSubscriptionState() removes it with the subscription.
             $this->completeAutoUnsubIfSatisfied($sid);
-
-            if (isset($this->pendingMessages[$sid]) && $this->pendingMessages[$sid]->isEmpty()) {
-                // Don't retain a drained (empty) queue: keep drainAllPending()'s per-chunk scan
-                // proportional to the subscriptions that actually have pending messages, not every
-                // subscription that has ever received one.
-                unset($this->pendingMessages[$sid]);
-            }
         }
     }
 
@@ -2599,8 +2603,8 @@ final class NatsConnection
     private function cleanupRequestSubscription(int $sid): void
     {
         // Clean up based on the subscription itself, not on a pending message queue: the queue is
-        // created lazily and removed once drained, so requiring it here would skip the UNSUB for any
-        // request that actually received a reply.
+        // delivery bookkeeping that lives and dies with the subscription state (#139), and keying
+        // the UNSUB on its presence would skip cleanup whenever the entry is missing.
         if (!isset($this->subscriptionMeta[$sid], $this->subscriptions[$sid])) {
             return;
         }

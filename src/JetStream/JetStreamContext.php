@@ -986,7 +986,7 @@ final class JetStreamContext
             $this->createPushConsumer($stream, $consumer, $deliver, $filterSubject, $consumerOptions)->await();
 
             return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler): void {
-                if ($this->handlePushControlMessage($message)->await()) {
+                if ($this->handlePushControlMessage($message)) {
                     return;
                 }
 
@@ -1025,7 +1025,7 @@ final class JetStreamContext
             }
 
             return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler): void {
-                if ($this->handlePushControlMessage($message)->await()) {
+                if ($this->handlePushControlMessage($message)) {
                     return;
                 }
 
@@ -1123,12 +1123,13 @@ final class JetStreamContext
             };
 
             return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, $recreate): void {
-                if ($this->handlePushControlMessage($message)->await()) {
+                if ($this->handlePushControlMessage($message, $controlHeaders)) {
                     // Tail-gap detection: an idle heartbeat reports the server's last delivered consumer
                     // sequence. If it is ahead of what we have processed in order, deliveries at the tail
                     // were missed and no further message will arrive to expose the gap on its own -
-                    // recreate proactively from the last in-order point (#86).
-                    $lastDelivered = $this->heartbeatLastConsumerSeq($message);
+                    // recreate proactively from the last in-order point (#86). The headers were already
+                    // parsed by handlePushControlMessage (out-param) - do not re-parse the block (#139).
+                    $lastDelivered = $this->heartbeatLastConsumerSeq($controlHeaders ?? []);
                     if ($lastDelivered !== null && $lastDelivered > $expectedConsumerSeq - 1) {
                         $recreate();
                     }
@@ -1850,42 +1851,57 @@ final class JetStreamContext
     /**
      * Handles JetStream push-control messages (heartbeat/flow-control).
      *
-     * @return Future<bool> True when the message is a control message and was handled.
+     * Runs synchronously in the dispatch fiber (#139): every push delivery funnels through here, and
+     * the previous async() wrapper cost a Future allocation plus an event-loop hop per message while
+     * the only awaits inside (the rare flow-control/stalled replies below) almost never run. Those
+     * replies still await inline; suspending the dispatch fiber is safe because the connection's
+     * per-sid dispatch guard tolerates a handler that suspends mid-drain.
+     *
+     * @param array<string,string>|null $headers Out-param: receives the parsed header map when the
+     *        header block was parsed (stays null for header-less messages), so a caller that reads a
+     *        control-frame header afterwards (e.g. Nats-Last-Consumer) does not re-parse it (#139).
+     * @return bool True when the message is a control message and was handled.
      */
-    private function handlePushControlMessage(NatsMessage $message): Future
+    private function handlePushControlMessage(NatsMessage $message, ?array &$headers = null): bool
     {
-        return async(function () use ($message): bool {
-            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-            $status = (int) ($headers['Status'] ?? 0);
+        $headers = null;
 
-            if ($status !== 100) {
-                return false;
+        if ($message->rawHeaders === null) {
+            // A data message without headers - the overwhelmingly common delivery - cannot be a
+            // control frame (those always carry a status line); skip the parse entirely.
+            return false;
+        }
+
+        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+        $status = (int) ($headers['Status'] ?? 0);
+
+        if ($status !== 100) {
+            return false;
+        }
+
+        $description = strtolower(trim((string) ($headers['Description'] ?? '')));
+        $normalizedDescription = preg_replace('/\s+/', ' ', $description) ?: '';
+        $replyTo = $message->replyTo ?? '';
+
+        // A flow-control REQUEST carries its reply subject in the message reply ($JS.FC.*). A
+        // stalled idle heartbeat instead carries the flow-control reply subject in the
+        // Nats-Consumer-Stalled header VALUE and leaves the message reply empty - answer that one,
+        // otherwise the server never gets its ack and keeps the consumer stalled (delivery hangs).
+        $stalledReply = (string) ($headers['Nats-Consumer-Stalled'] ?? '');
+
+        if ($stalledReply !== '') {
+            $this->client->publish($stalledReply, '')->await();
+        } else {
+            $isFlowControl = $normalizedDescription === 'flowcontrol request'
+                || str_starts_with($replyTo, '$JS.FC.');
+
+            if ($isFlowControl && $replyTo !== '') {
+                $this->client->publish($replyTo, '')->await();
             }
+        }
 
-            $description = strtolower(trim((string) ($headers['Description'] ?? '')));
-            $normalizedDescription = preg_replace('/\s+/', ' ', $description) ?: '';
-            $replyTo = $message->replyTo ?? '';
-
-            // A flow-control REQUEST carries its reply subject in the message reply ($JS.FC.*). A
-            // stalled idle heartbeat instead carries the flow-control reply subject in the
-            // Nats-Consumer-Stalled header VALUE and leaves the message reply empty - answer that one,
-            // otherwise the server never gets its ack and keeps the consumer stalled (delivery hangs).
-            $stalledReply = (string) ($headers['Nats-Consumer-Stalled'] ?? '');
-
-            if ($stalledReply !== '') {
-                $this->client->publish($stalledReply, '')->await();
-            } else {
-                $isFlowControl = $normalizedDescription === 'flowcontrol request'
-                    || str_starts_with($replyTo, '$JS.FC.');
-
-                if ($isFlowControl && $replyTo !== '') {
-                    $this->client->publish($replyTo, '')->await();
-                }
-            }
-
-            // Status 100 control messages are not user payload deliveries.
-            return true;
-        });
+        // Status 100 control messages are not user payload deliveries.
+        return true;
     }
 
     /**
@@ -1910,11 +1926,14 @@ final class JetStreamContext
     /**
      * Reads the `Nats-Last-Consumer` sequence an idle-heartbeat control frame reports (the consumer
      * sequence of the last message the server delivered to this consumer), or null when absent/
-     * non-numeric. Used by the ordered consumer to detect a missed tail of deliveries (#86).
+     * non-numeric. Used by the ordered consumer to detect a missed tail of deliveries (#86). Takes
+     * the header map already parsed by {@see handlePushControlMessage()} instead of the message, so
+     * the control frame's header block is parsed exactly once per delivery (#139).
+     *
+     * @param array<string,string> $headers
      */
-    private function heartbeatLastConsumerSeq(NatsMessage $message): ?int
+    private function heartbeatLastConsumerSeq(array $headers): ?int
     {
-        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
         $value = trim((string) ($headers['Nats-Last-Consumer'] ?? ''));
 
         return ($value !== '' && ctype_digit($value)) ? (int) $value : null;
