@@ -18,19 +18,28 @@ use function Amp\Socket\listen;
 final class AmpSocketTransportTest extends TestCase
 {
     /**
-     * Verifies write/read/close are safe no-ops when no socket has been connected.
+     * Writing without a socket must throw: a silent no-op would confirm publishes/ACKs that never
+     * reached any socket (#124). Reads stay '' (handshake/idle polling) and close stays idempotent.
      */
-    public function testWriteReadCloseWithoutSocket(): void
+    public function testWriteWithoutSocketThrowsWhileReadAndCloseStaySafe(): void
     {
         $transport = new AmpSocketTransport();
 
-        $transport->write('PING\r\n')->await();
+        try {
+            $transport->write("PING\r\n")->await();
+            self::fail('expected TransportClosedException for a write without a socket');
+        } catch (TransportClosedException $e) {
+            self::assertSame('Transport is not connected', $e->getMessage());
+        }
+
         self::assertSame('', $transport->readLine()->await());
         $transport->close()->await();
 
-        // Ensure idempotent close also remains safe.
+        // Ensure idempotent close also remains safe, and a post-close write throws the same way.
         $transport->close()->await();
         self::assertSame('', $transport->readLine()->await());
+        $this->expectException(TransportClosedException::class);
+        $transport->write("PING\r\n")->await();
     }
 
     /**

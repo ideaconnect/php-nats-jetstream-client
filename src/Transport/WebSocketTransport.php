@@ -126,9 +126,16 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     public function write(string $bytes): Future
     {
         return async(function () use ($bytes): void {
+            $socket = $this->socket;
+            if ($socket === null) {
+                // A silent no-op here would confirm publishes/ACKs that never reached any socket
+                // (#124); throwing lets callers buffer, join the in-flight recovery, or fail loudly.
+                throw new TransportClosedException('Transport is not connected');
+            }
+
             // When permessage-deflate was negotiated, compress the payload and mark the frame (RSV1).
             $payload = $this->compressionActive ? WebSocketFrameCodec::deflate($bytes) : $bytes;
-            $this->socket?->write(WebSocketFrameCodec::encode(
+            $socket->write(WebSocketFrameCodec::encode(
                 WebSocketFrameCodec::OP_BINARY,
                 $payload,
                 rsv1: $this->compressionActive,

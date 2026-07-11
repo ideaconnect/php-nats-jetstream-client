@@ -117,7 +117,14 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
     public function write(string $bytes): Future
     {
         return async(function () use ($bytes): void {
-            $this->socket?->write($bytes);
+            $socket = $this->socket;
+            if ($socket === null) {
+                // A silent no-op here would confirm publishes/ACKs that never reached any socket
+                // (#124); throwing lets callers buffer, join the in-flight recovery, or fail loudly.
+                throw new TransportClosedException('Transport is not connected');
+            }
+
+            $socket->write($bytes);
         });
     }
 

@@ -19,6 +19,13 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Transport `write()` on a closed/never-connected socket now throws
+  `TransportClosedException` instead of silently succeeding (both TCP and WebSocket transports).
+  Previously a publish, JetStream ACK, or flow-control reply racing a reconnect (or a concurrent
+  `disconnect()`) could hit the nulled socket and report success while sending nothing - a silent
+  message loss. The connection now also leaves the `Open` state before recovery's first await, so
+  publishes issued while the dead socket is being torn down are routed into the reconnect buffer
+  and replayed after the new handshake instead of racing the closing socket (#124).
 - `[bugfix]` A reconnect-flush failure no longer silently destroys publishes accepted during the
   reconnect window: `flushReconnectBuffer()` cleared the buffer before awaiting the write, so a
   socket failure during the flush left the next (successful) attempt with nothing to replay while

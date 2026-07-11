@@ -1371,6 +1371,110 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A publish that lands while recovery is closing the dead socket must take the reconnect
+     * buffer, not race a socket that is about to disappear: the state flips off Open before
+     * recovery's first await, so the frame is replayed only after the new handshake (#124).
+     */
+    public function testPublishDuringRecoverySocketCloseBuffersInsteadOfRacingDeadSocket(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connects = 0;
+            private int $closes = 0;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // connection 0: handshake, then EOF -> reconnect
+                    [$info, "PONG\r\n"],            // connection 1: reconnect handshake
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $this->connects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $conn = max(0, $this->connects - 1);
+                    $next = array_shift($this->reads[$conn]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(function (): void {
+                    // Hold recovery's dead-socket close open so a publish lands in that window.
+                    if ($this->closes === 0) {
+                        $this->closes++;
+                        $this->release->getFuture()->await();
+
+                        return;
+                    }
+                    $this->closes++;
+                });
+            }
+        };
+
+        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection->connect()->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // recovery has started and is suspended closing the dead socket
+
+        // The recovery entry must already have routed the connection off Open.
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+
+        $connection->publish('a.b', 'buffered')->await();
+        // The frame must NOT have been written to the dying socket in this window.
+        self::assertNotContains("PUB a.b 8\r\nbuffered\r\n", $transport->writes);
+
+        $release->complete();
+        $pump->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        // The frame reaches the wire only via the post-handshake flush.
+        $pubIndex = array_search("PUB a.b 8\r\nbuffered\r\n", $transport->writes, true);
+        self::assertNotFalse($pubIndex, 'buffered publish must be flushed after reconnect');
+        $reconnectHandshakeIndex = null;
+        foreach ($transport->writes as $i => $frame) {
+            if ($i > 0 && str_starts_with($frame, 'CONNECT')) {
+                $reconnectHandshakeIndex = $i;
+            }
+        }
+        self::assertNotNull($reconnectHandshakeIndex, 'reconnect handshake CONNECT must be on the wire');
+        self::assertGreaterThan($reconnectHandshakeIndex, $pubIndex, 'flush must follow the reconnect handshake');
+    }
+
+    /**
      * When reconnect attempts are exhausted, buffered publishes cannot be delivered anymore; the
      * abandonment must surface through the error listener and the buffer must not leak into a
      * later manual connect() where a future recovery would replay frames from a dead epoch (#123).
