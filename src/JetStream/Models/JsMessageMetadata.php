@@ -52,33 +52,40 @@ final class JsMessageMetadata
         }
 
         // Two ack reply-subject shapes (plus a 12-token variant = the domain form + a trailing random
-        // token). Token offsets, where v2/12 is the domain-qualified base:
+        // token). Literal offsets per count() branch so the token-count guard provably covers every
+        // access (a shared base-offset arithmetic loses that correlation for static analysis):
         //   9 tokens:  $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>
         //  11/12 tokens: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>[.<rand>]
-        $base = match (count($parts)) {
-            9 => 2,
-            11, 12 => 4,
-            default => null,
-        };
+        $count = count($parts);
 
-        if ($base === null) {
+        if ($count === 9) {
+            return new self(
+                stream: $parts[2],
+                consumer: $parts[3],
+                numDelivered: (int) $parts[4],
+                streamSequence: (int) $parts[5],
+                consumerSequence: (int) $parts[6],
+                numPending: (int) $parts[8],
+                timestampNanos: (int) $parts[7],
+                domain: null,
+            );
+        }
+
+        if ($count !== 11 && $count !== 12) {
             return null;
         }
 
-        $domain = $base === 4 ? $parts[2] : null;
-        if ($domain === '_') {
-            // The server uses "_" as the placeholder domain when none is configured.
-            $domain = null;
-        }
+        // The server uses "_" as the placeholder domain when none is configured.
+        $domain = $parts[2] === '_' ? null : $parts[2];
 
         return new self(
-            stream: $parts[$base],
-            consumer: $parts[$base + 1],
-            numDelivered: (int) $parts[$base + 2],
-            streamSequence: (int) $parts[$base + 3],
-            consumerSequence: (int) $parts[$base + 4],
-            numPending: (int) $parts[$base + 6],
-            timestampNanos: (int) $parts[$base + 5],
+            stream: $parts[4],
+            consumer: $parts[5],
+            numDelivered: (int) $parts[6],
+            streamSequence: (int) $parts[7],
+            consumerSequence: (int) $parts[8],
+            numPending: (int) $parts[10],
+            timestampNanos: (int) $parts[9],
             domain: $domain,
         );
     }
