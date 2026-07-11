@@ -36,6 +36,15 @@ final class FakeTransport implements TlsAwareTransportInterface
     /** When set, write() throws a TransportClosedException for bytes containing this substring. */
     public ?string $throwOnWriteContaining = null;
 
+    /**
+     * Chunks appended to the read queue when write() sees bytes containing the key (each key fires
+     * at most once). Lets a test hold a reply back until the request that consumes it is actually
+     * written - e.g. so an earlier request's timeout wait cannot drain it from a static queue.
+     *
+     * @var array<string, list<string>>
+     */
+    public array $enqueueOnWriteContaining = [];
+
     public bool $closed = false;
 
     public int $upgradeTlsCalls = 0;
@@ -105,6 +114,13 @@ final class FakeTransport implements TlsAwareTransportInterface
             }
 
             $this->writes[] = $bytes;
+
+            foreach ($this->enqueueOnWriteContaining as $needle => $chunks) {
+                if (str_contains($bytes, $needle)) {
+                    array_push($this->readQueue, ...$chunks);
+                    unset($this->enqueueOnWriteContaining[$needle]);
+                }
+            }
         });
     }
 
