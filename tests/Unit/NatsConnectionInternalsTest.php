@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\DeferredFuture;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
@@ -291,16 +292,24 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->invokePrivate($connection, 'awaitInitialPong');
     }
 
-    public function testHandleFramePongResetsOutstandingPingAndDrainFlag(): void
+    public function testHandleFramePongResetsOutstandingPingAndCompletesOldestPongSlot(): void
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
         $this->setPrivate($connection, 'outstandingPings', 5);
-        $this->setPrivate($connection, 'drainFlushPending', true);
+        $first = new DeferredFuture();
+        $first->getFuture()->ignore();
+        $second = new DeferredFuture();
+        $second->getFuture()->ignore();
+        $this->setPrivate($connection, 'pongWaiters', [$first, $second]);
 
         $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(type: ProtocolFrameType::Pong));
 
+        // Any PONG resets the liveness watchdog, but flush completion is FIFO per PING (#117):
+        // the oldest slot completes and later slots keep waiting for their own pongs.
         self::assertSame(0, $this->getPrivate($connection, 'outstandingPings'));
-        self::assertFalse($this->getPrivate($connection, 'drainFlushPending'));
+        self::assertTrue($first->isComplete());
+        self::assertFalse($second->isComplete());
+        self::assertSame([$second], $this->getPrivate($connection, 'pongWaiters'));
     }
 
     public function testHandleFrameErrThrowsConnectionException(): void

@@ -7808,4 +7808,147 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertCount(2, $transport->connectCalls);
     }
+
+    /**
+     * #117 (concurrent flushes): each flush must wait for the PONG answering ITS OWN PING.
+     * Flush A times out with no PONG delivered; that abandonment must not let flush B return
+     * success having seen zero pongs, and the first (late) PONG - which answers A's PING -
+     * must not complete B either. B completes only on the second pong, the one answering B's
+     * own PING.
+     */
+    public function testConcurrentFlushWaitsForItsOwnPongAfterSiblingTimeout(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n", // handshake PONG; no pongs for the flush PINGs until released below
+        ]);
+        $transport->enqueueOnWriteContaining = [
+            'release.first' => ["PONG\r\n"],   // the pong answering flush A's PING
+            'release.second' => ["PONG\r\n"],  // the pong answering flush B's PING
+        ];
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 500),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $flushA = $connection->flush();
+        delay(0.2); // stagger so A's deadline fires while B is still within its budget
+        $flushB = $connection->flush();
+
+        try {
+            $flushA->await();
+            self::fail('flush A must time out - no PONG was delivered for it');
+        } catch (TimeoutException) {
+            // Expected: A's pong never arrived within its deadline.
+        }
+
+        self::assertFalse(
+            $flushB->isComplete(),
+            'flush B must not complete just because flush A timed out (zero pongs were seen)',
+        );
+
+        // Release the pong answering flush A's PING: FIFO attribution must consume it for A's
+        // (abandoned) slot, not complete flush B one pong early.
+        $connection->publish('release.first', 'x')->await();
+        delay(0.05);
+        self::assertFalse(
+            $flushB->isComplete(),
+            "the PONG answering flush A's PING must not complete flush B",
+        );
+
+        // The pong answering flush B's own PING completes it.
+        $connection->publish('release.second', 'x')->await();
+        $flushB->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * #117 (stale heartbeat PONG vs drain): a heartbeat PING whose bounded self-read ended
+     * without consuming its PONG leaves that PONG in flight. drain()'s flush-wait must not be
+     * satisfied by that stale PONG - messages still in flight between it and the PONG answering
+     * drain's OWN PING would be silently lost on the documented lossless path.
+     */
+    public function testDrainDeliversMessagesArrivingBetweenStaleHeartbeatPongAndItsOwnPong(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // Nothing is readable until drain()'s UNSUB hits the wire, so the heartbeat's bounded
+        // self-read finds an empty socket (its PONG still in flight). The wire then delivers:
+        // the STALE heartbeat PONG, an in-flight MSG, and the PONG answering drain's PING.
+        $transport->enqueueOnWriteContaining = [
+            'UNSUB' => [
+                "PONG\r\n",                     // stale: answers the earlier heartbeat PING
+                "MSG events 1 5\r\nhello\r\n",  // in-flight delivery drain() must not lose
+                "PONG\r\n",                     // answers drain's own flush PING
+            ],
+        ];
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0.05, maxPingsOut: 5, requestTimeoutMs: 300),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $delivered = [];
+        $connection->subscribe('events', static function (NatsMessage $message) use (&$delivered): void {
+            $delivered[] = $message->payload;
+        })->await();
+
+        // Let at least one heartbeat tick fire: it writes PING and its self-read consumes nothing.
+        delay(0.07);
+
+        $connection->drain()->await();
+
+        self::assertSame(
+            ['hello'],
+            $delivered,
+            'drain() must keep flushing past the stale heartbeat PONG until ITS pong confirms the flush',
+        );
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * #117 (epoch end mid-flush): a flush whose connection drops before the PONG arrives must
+     * error out when recovery replaces the connection - its pong can never arrive on the new
+     * socket, so idling out the flush deadline (or being completed by the new epoch's unrelated
+     * pongs) would misreport the flush.
+     */
+    public function testFlushErrorsOutWhenConnectionDropsMidFlush(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $transport = new FakeTransport([
+            $info, "PONG\r\n",  // initial connect handshake
+            FakeTransport::EOF, // the flush read hits EOF -> recovery replaces the epoch
+            $info, "PONG\r\n",  // reconnect handshake succeeds
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                requestTimeoutMs: 400,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 2,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        try {
+            $connection->flush()->await();
+            self::fail('flush must error out when the connection epoch ends mid-flush');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('before the server answered', $e->getMessage());
+        }
+
+        // The recovery itself succeeded - only the flush waiter was errored out.
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+    }
 }

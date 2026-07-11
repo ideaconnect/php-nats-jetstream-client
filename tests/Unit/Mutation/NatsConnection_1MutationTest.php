@@ -202,8 +202,8 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
     // kills MethodCallRemoval @ line 326 (drain cancels ping timer) and
     // TrueValue @ line 325 (drain latches close-intent) and
     // MethodCallRemoval @ line 335 (drain writes the flush PING) and
-    // FalseValue @ line 373 (drainFlushPending cleared at end of drain)
-    public function testDrainLatchesCloseIntentCancelsTimerWritesPingAndClearsFlushFlag(): void
+    // (#117) drain leaves no pong slot behind: its own slot is consumed by the PONG
+    public function testDrainLatchesCloseIntentCancelsTimerWritesPingAndLeavesNoPongSlot(): void
     {
         $connection = $this->openConnection(
             ["PONG\r\n"],
@@ -221,8 +221,8 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         self::assertNull(self::getProp($connection, 'pingTimerId'));
         // MethodCallRemoval @ 335: a flush PING is written during drain.
         self::assertContains("PING\r\n", array_slice($transport->writes, 2));
-        // FalseValue @ 373: the drain-flush flag is cleared at the end.
-        self::assertFalse(self::getProp($connection, 'drainFlushPending'));
+        // (#117) the PONG consumed drain's correlation slot and teardown cleared the queue.
+        self::assertSame([], self::getProp($connection, 'pongWaiters'));
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
@@ -401,8 +401,9 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         self::assertSame("PING\r\n", $transport->writes[2]);
     }
 
-    // kills UnwrapFinally @ line 591 and Finally_ @ line 603 (flushPending cleared even on timeout)
-    public function testFlushPendingClearedAfterTimeout(): void
+    // (#117) a timed-out flush must leave its slot QUEUED: its PONG is still owed and must
+    // consume that slot when it lands, not a later waiter's (FIFO alignment).
+    public function testFlushTimeoutLeavesItsPongSlotQueuedForItsLatePong(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 1), $transport);
@@ -415,18 +416,23 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
             // expected (TimeoutException)
         }
 
-        // The finally block must clear flushPending even when the timeout propagates.
-        self::assertFalse(self::getProp($connection, 'flushPending'));
+        // The abandoned slot stays at the head of the queue, incomplete, so the late PONG is
+        // attributed to THIS ping instead of releasing the next flush() one pong early.
+        $waiters = self::getProp($connection, 'pongWaiters');
+        self::assertIsArray($waiters);
+        self::assertCount(1, $waiters);
+        self::assertInstanceOf(DeferredFuture::class, $waiters[0]);
+        self::assertFalse($waiters[0]->isComplete());
     }
 
-    // kills FalseValue @ line 604 (flushPending stays false after a successful flush)
-    public function testFlushPendingFalseAfterSuccessfulFlush(): void
+    // (#117) a successful flush consumes its slot: nothing may linger in the correlation queue
+    public function testFlushLeavesNoPongSlotAfterSuccessfulFlush(): void
     {
         $connection = $this->openConnection(["PONG\r\n"]);
         $connection->flush()->await();
 
-        // After a successful flush the finally must leave flushPending false (mutant sets it true).
-        self::assertFalse(self::getProp($connection, 'flushPending'));
+        // The PONG popped and completed the flush's slot; the queue must be empty again.
+        self::assertSame([], self::getProp($connection, 'pongWaiters'));
     }
 
     // kills ReturnRemoval @ line 629 (concurrent-read guard returns 0 without reading)

@@ -395,7 +395,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testAwaitServerInfoParsesInfoLine` - asserts `awaitServerInfo` parses a raw INFO line into a `ServerInfo` with serverId `S1`.
 - `testAwaitServerInfoParsesInfoFrame` - asserts `awaitServerInfo` parses an INFO frame into a `ServerInfo` with serverId `S2`.
 - `testAwaitInitialPongThrowsOnErrLine` - asserts `awaitInitialPong` throws `ConnectionException` "Server error during connect" on a `-ERR Permissions Violation` line.
-- `testHandleFramePongResetsOutstandingPingAndDrainFlag` - asserts a Pong frame in `handleFrame` resets `outstandingPings` to 0 and clears the `drainFlushPending` flag.
+- `testHandleFramePongResetsOutstandingPingAndCompletesOldestPongSlot` - asserts a Pong frame in `handleFrame` resets `outstandingPings` to 0 and completes only the OLDEST queued pong slot (FIFO PING/PONG correlation, #117), leaving later slots waiting.
 - `testHandleFrameErrThrowsConnectionException` - asserts an Err frame in `handleFrame` throws `ConnectionException` "Server sent error frame".
 - `testHandleFrameInfoUpdatesServerInfo` - asserts an Info frame in `handleFrame` updates `serverInfo()` (serverId `S2`, maxPayload 2048).
 - `testHandleFrameRecoverableErrDoesNotThrow` - asserts a recoverable "Permissions Violation for Publish" Err frame does not throw and leaves the state Open.
@@ -623,6 +623,9 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testRecoverConnectionCoalescesConcurrentCallers` - Two concurrent recoverConnection() callers coalesce onto one in-progress reconnect (total 2 connect calls, stays Open).
 - `testRetryInitialConnectIgnoresCloseFailureBetweenAttempts` - retryInitialConnect() swallows a throwing transport.close() between attempts and the next connect attempt still succeeds to Open (>= 2 connect calls).
 - `testPerformRecoveryIgnoresCloseFailureDuringReconnect` - performRecovery() swallows a throwing transport.close() during the reconnect loop after a peer EOF and still reconnects to Open (2 connect calls).
+- `testConcurrentFlushWaitsForItsOwnPongAfterSiblingTimeout` - (#117) with two concurrent flushes, flush A's timeout must not release flush B, and the late PONG answering A's PING must not complete B either; B completes only on the pong answering its own PING.
+- `testDrainDeliversMessagesArrivingBetweenStaleHeartbeatPongAndItsOwnPong` - (#117) drain()'s flush-wait is not satisfied by a stale heartbeat PONG (self-read consumed nothing): the MSG arriving between the stale PONG and drain's own PONG is still delivered before the socket closes.
+- `testFlushErrorsOutWhenConnectionDropsMidFlush` - (#117) a flush whose socket EOFs before the PONG errors out with ConnectionException when recovery replaces the connection epoch, instead of idling out its deadline on the new socket (recovery itself succeeds, 2 connect calls).
 
 ### tests/Unit/NatsHeadersTest.php
 - `testToWireBlockEmitsRepeatedLinesForListValue` - Asserts a list-valued header (`Link` => [a.txt, b.txt]) encodes to one `Link:...\r\n` line per element plus the scalar `Nats-Msg-Id:1\r\n` line (multimap encoding, #42).
