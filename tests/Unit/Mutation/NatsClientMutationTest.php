@@ -23,18 +23,20 @@ final class NatsClientMutationTest extends TestCase
 
     /**
      * The subscribeQueue() handler closure captures $subscriptionQueue by reference and is registered
-     * with the connection BEFORE the queue object is constructed. If a message is dispatched to that
-     * handler during the window where $subscriptionQueue is still null (between handler registration
-     * and queue construction), the nullsafe `?->enqueue()` must silently no-op.
+     * with the connection BEFORE the queue object is constructed. A message dispatched to that handler
+     * during the window where $subscriptionQueue is still null must be buffered into the early queue
+     * and replayed once the SubscriptionQueue exists (#129).
      *
-     * The mutant drops the nullsafe (`$subscriptionQueue->enqueue($msg)`), which would call enqueue()
-     * on null and throw an Error that propagates out of processIncoming().
+     * Mutants killed: flipping the `$subscriptionQueue === null` guard (the handler would call
+     * enqueue() on null and throw an Error out of processIncoming()); removing the early-buffer
+     * enqueue or the post-construction replay loop (the early message would vanish and fetch()
+     * would return null).
      *
      * We force that exact window: start subscribeQueue() as a separate fiber (it registers the handler
      * and then suspends on its SUB write await, BEFORE assigning the queue), then drive processIncoming()
-     * which dispatches a pre-seeded MSG for that sid into the still-null queue.
+     * which dispatches a pre-seeded MSG for that sid while the queue is still null.
      */
-    public function testSubscribeQueueHandlerNoOpsWhenQueueNotYetConstructed(): void
+    public function testSubscribeQueueBuffersEarlyDeliveryUntilQueueConstructed(): void
     {
         $transport = new FakeTransport([
             self::INFO,
@@ -53,16 +55,17 @@ final class NatsClientMutationTest extends TestCase
 
         // Pump the loop so the subscribeQueue fiber advances to (and parks at) its write await with the
         // handler already registered, then dispatch the pending MSG into the still-null queue.
-        // kills NullSafeMethodCall @ 127 - on the mutant this call to enqueue() on null throws an Error.
         $delivered = async(static fn(): int => $client->processIncoming()->await())->await();
 
-        // Real code: the message is dispatched to the handler, the nullsafe no-ops, one frame processed.
+        // The message is dispatched to the handler (one frame processed) and buffered, not dropped.
         self::assertSame(1, $delivered);
 
-        // The queue resolves and, because the early message was dropped by the nullsafe guard, it is empty.
+        // The queue resolves with the early message replayed into it (#129).
         $queue = $queueFuture->await();
         self::assertInstanceOf(SubscriptionQueue::class, $queue);
-        self::assertNull($queue->fetch());
+        $message = $queue->fetch();
+        self::assertNotNull($message, 'the early delivery must be replayed into the queue, not dropped');
+        self::assertSame('hello', $message->payload);
     }
 
     /**

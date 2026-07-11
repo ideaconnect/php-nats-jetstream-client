@@ -4,6 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\Cancellation;
+use Amp\DeferredFuture;
+use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsOptions;
@@ -11,9 +14,11 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
+use function Amp\delay;
 
 final class SubscriptionQueueTest extends TestCase
 {
@@ -51,6 +56,81 @@ final class SubscriptionQueueTest extends TestCase
         self::assertNotNull($msg);
         self::assertSame('hello', $msg->payload);
         self::assertSame('events', $msg->subject);
+    }
+
+    /**
+     * A message dispatched for the new sid while subscribe()'s SUB write is still suspended (the
+     * handler is registered before the write, so the sid is already routable) must reach the
+     * returned queue instead of being silently dropped in the pre-construction window (#129).
+     */
+    public function testMessageDeliveredDuringSubscribeAwaitReachesTheQueue(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            /** @var list<string> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [$info, "PONG\r\n", "MSG updates 1 5\r\nearly\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+                    // Hold the SUB write open: the handler is registered before the write, so a
+                    // concurrent read can deliver for the new sid while subscribeQueue() is still
+                    // suspended here and its SubscriptionQueue object does not exist yet.
+                    if (str_starts_with($bytes, 'SUB ')) {
+                        $this->release->getFuture()->await();
+                    }
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    return array_shift($this->reads) ?? '';
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $queueFuture = $client->subscribeQueue('updates');
+        delay(0.01); // subscribeQueue() is now suspended on the held SUB write
+
+        // A concurrent read dispatches the message for sid 1; the queue object does not exist yet.
+        $client->processIncoming()->await();
+
+        $release->complete();
+        $queue = $queueFuture->await();
+
+        $message = $queue->fetch();
+        self::assertNotNull($message, 'a delivery during the construction window must not be dropped');
+        self::assertSame('early', $message->payload);
     }
 
     public function testFetchReturnsNullWhenNoMessages(): void

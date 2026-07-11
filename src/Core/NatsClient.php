@@ -121,10 +121,21 @@ final class NatsClient
         return async(function () use ($subject, $queue): SubscriptionQueue {
             /** @var SubscriptionQueue|null $subscriptionQueue */
             $subscriptionQueue = null;
+            /** @var \SplQueue<NatsMessage> $early */
+            $early = new \SplQueue();
             $sid = $this->connection->subscribe(
                 $subject,
-                static function (NatsMessage $msg) use (&$subscriptionQueue): void {
-                    $subscriptionQueue?->enqueue($msg);
+                static function (NatsMessage $msg) use (&$subscriptionQueue, $early): void {
+                    // The sid is routable the moment SUB hits the wire - before the queue object
+                    // exists. A delivery in that window (a concurrent read or the heartbeat
+                    // self-read) must be buffered, not silently dropped (#129).
+                    if ($subscriptionQueue === null) {
+                        $early->enqueue($msg);
+
+                        return;
+                    }
+
+                    $subscriptionQueue->enqueue($msg);
                 },
                 $queue,
             )->await();
@@ -134,6 +145,11 @@ final class NatsClient
                 $this->options->maxPendingMessagesPerSubscription,
                 $this->options->slowConsumerPolicy,
             );
+
+            // Replay through enqueue() so the cap and slow-consumer policy apply as usual.
+            while (!$early->isEmpty()) {
+                $subscriptionQueue->enqueue($early->dequeue());
+            }
 
             return $subscriptionQueue;
         });
