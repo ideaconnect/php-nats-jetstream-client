@@ -43,6 +43,9 @@ use function Amp\Future\awaitFirst;
  */
 final class NatsConnection
 {
+    /** Cap on the validated-subject memo (#136); hitting it resets the memo to stay bounded. */
+    private const VALIDATED_SUBJECTS_MAX = 512;
+
     private ConnectionState $state = ConnectionState::Idle;
     private ?ServerInfo $serverInfo = null;
     private ProtocolParser $parser;
@@ -146,6 +149,15 @@ final class NatsConnection
     private int $reconnectCount = 0;
     /** Encoded publishes buffered while reconnecting (flushed on a successful reconnect); see #49. */
     private string $reconnectBuffer = '';
+    /**
+     * Subjects that already passed publish-path validation (#136), so repeat publishes skip the
+     * regex + per-token scan. Bounded by {@see self::VALIDATED_SUBJECTS_MAX} with a full reset at
+     * the cap: unique $JS.ACK reply subjects flow through here as ack publish subjects and would
+     * otherwise grow it without limit.
+     *
+     * @var array<string,true>
+     */
+    private array $validatedSubjects = [];
     /**
      * Configured servers in dial order - shuffled once when {@see NatsOptions::$randomizeServers} is
      * set (#55), otherwise the configured order. Discovered peers are appended in {@see serverPool()}.
@@ -465,8 +477,10 @@ final class NatsConnection
     public function publish(string $subject, string $payload, ?string $replyTo = null): Future
     {
         return async(function () use ($subject, $payload, $replyTo): void {
-            $this->validateSubject($subject);
+            $this->validateSubjectCached($subject);
             if ($replyTo !== null) {
+                // Not cached: a publish replyTo is typically a per-request unique inbox, so caching
+                // it would only churn the memo (see validateSubjectCached()).
                 $this->validateSubject($replyTo);
             }
             $this->enforceMaxPayload(strlen($payload));
@@ -509,8 +523,10 @@ final class NatsConnection
         ?string $replyTo = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $replyTo): void {
-            $this->validateSubject($subject);
+            $this->validateSubjectCached($subject);
             if ($replyTo !== null) {
+                // Not cached: a publish replyTo is typically a per-request unique inbox, so caching
+                // it would only churn the memo (see validateSubjectCached()).
                 $this->validateSubject($replyTo);
             }
             // A server that does not advertise the `headers` capability treats HPUB as an unknown
@@ -878,7 +894,9 @@ final class NatsConnection
         ?Cancellation $cancellation = null,
     ): Future {
         return async(function () use ($subject, $payload, $timeoutMs, $cancellation): NatsMessage {
-            $this->validateSubject($subject);
+            // Cached: request targets repeat (unlike the per-request inbox, which is validated
+            // uncached as publish()'s replyTo).
+            $this->validateSubjectCached($subject);
 
             return $this->requestInternal($subject, $payload, null, $timeoutMs, $cancellation);
         });
@@ -899,7 +917,9 @@ final class NatsConnection
         ?Cancellation $cancellation = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $timeoutMs, $cancellation): NatsMessage {
-            $this->validateSubject($subject);
+            // Cached: request targets repeat (unlike the per-request inbox, which is validated
+            // uncached as publish()'s replyTo).
+            $this->validateSubjectCached($subject);
 
             return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation);
         });
@@ -1038,7 +1058,9 @@ final class NatsConnection
         ?Cancellation $cancellation = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $maxResponses, $totalTimeoutMs, $stallMs, $cancellation): array {
-            $this->validateSubject($subject);
+            // Cached: request targets repeat (unlike the per-request inbox, which is validated
+            // uncached as publish()'s replyTo).
+            $this->validateSubjectCached($subject);
 
             if ($maxResponses !== null && $maxResponses < 1) {
                 throw new \InvalidArgumentException('maxResponses must be at least 1 when provided');
@@ -2316,6 +2338,31 @@ final class NatsConnection
                 throw new ProtocolException('Wildcards must occupy an entire token');
             }
         }
+    }
+
+    /**
+     * Validates a publish-path subject, memoizing subjects that already passed (#136).
+     *
+     * Validation is pure (protocol rules on the string only), so a subject that passed once never
+     * needs re-scanning - repeat publishes and request targets skip the regex + token walk. Must
+     * NOT be used for per-request reply inboxes (unique per request - pure cache pollution) nor
+     * for subscribe subjects (those validate with allowWildcards, a laxer rule set that must not
+     * leak into publish validation). Unique $JS.ACK reply subjects do flow through here as ack
+     * publish subjects and churn the memo; the full reset at the cap bounds that churn.
+     */
+    private function validateSubjectCached(string $subject): void
+    {
+        if (isset($this->validatedSubjects[$subject])) {
+            return;
+        }
+
+        $this->validateSubject($subject);
+
+        if (count($this->validatedSubjects) >= self::VALIDATED_SUBJECTS_MAX) {
+            $this->validatedSubjects = [];
+        }
+
+        $this->validatedSubjects[$subject] = true;
     }
 
     /**

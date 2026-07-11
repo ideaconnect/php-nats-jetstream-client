@@ -1831,17 +1831,20 @@ final class JetStreamContext
     /**
      * Publishes an ACK protocol token to a message reply subject.
      *
+     * Runs inline in the caller's fiber (#136): the only synchronous work is the replyTo guard, so
+     * an async() wrapper here stacked a third fiber hop on every ack/nak/term/inProgress. The
+     * guard failure is returned as Future::error - not thrown - so callers (which return or await
+     * this future) keep the exact same error surface as the previous async() shape.
+     *
      * @return Future<void>
      */
     private function publishAckToken(NatsMessage $message, string $token): Future
     {
-        return async(function () use ($message, $token): void {
-            if ($message->replyTo === null || $message->replyTo === '') {
-                throw new JetStreamException('JetStream ACK requires a reply subject on the delivered message');
-            }
+        if ($message->replyTo === null || $message->replyTo === '') {
+            return Future::error(new JetStreamException('JetStream ACK requires a reply subject on the delivered message'));
+        }
 
-            $this->client->publish($message->replyTo, $token)->await();
-        });
+        return $this->client->publish($message->replyTo, $token);
     }
 
     /**

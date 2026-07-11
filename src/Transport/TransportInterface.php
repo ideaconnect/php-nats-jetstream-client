@@ -32,7 +32,14 @@ interface TransportInterface
     /**
      * Writes raw protocol bytes to the transport.
      *
-     * @return Future<void>
+     * Contract (#136): implementations may perform the write inline in the calling fiber and
+     * return an already-resolved future, so the call may suspend the calling fiber (e.g. on socket
+     * backpressure) - callers must await the returned future immediately. Failures MUST surface
+     * through the returned future (Future::error), never as a synchronous throw, so fire-and-forget
+     * callers still observe them the same way.
+     *
+     * @return Future<null> Completes with null on success (Future<null>, not <void>, so an inline
+     *                      implementation can return the already-resolved Future::complete()).
      */
     public function write(string $bytes): Future;
 

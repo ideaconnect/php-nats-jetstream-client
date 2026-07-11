@@ -122,17 +122,23 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
     /**
      * Writes NATS protocol bytes as a masked WebSocket binary frame.
+     *
+     * Runs inline in the caller's fiber and returns an already-resolved future (#136): every
+     * caller awaits immediately, so an async() wrapper only added a Future allocation plus a fiber
+     * suspend/resume per write. The underlying socket write may suspend this fiber on
+     * backpressure, which the immediate-await contract makes safe. Failures surface through the
+     * returned future - never a synchronous throw - so callers observe them exactly as before.
      */
     public function write(string $bytes): Future
     {
-        return async(function () use ($bytes): void {
-            $socket = $this->socket;
-            if ($socket === null) {
-                // A silent no-op here would confirm publishes/ACKs that never reached any socket
-                // (#124); throwing lets callers buffer, join the in-flight recovery, or fail loudly.
-                throw new TransportClosedException('Transport is not connected');
-            }
+        $socket = $this->socket;
+        if ($socket === null) {
+            // A silent no-op here would confirm publishes/ACKs that never reached any socket
+            // (#124); erroring lets callers buffer, join the in-flight recovery, or fail loudly.
+            return Future::error(new TransportClosedException('Transport is not connected'));
+        }
 
+        try {
             // When permessage-deflate was negotiated, compress the payload and mark the frame (RSV1).
             $payload = $this->compressionActive ? WebSocketFrameCodec::deflate($bytes) : $bytes;
             $socket->write(WebSocketFrameCodec::encode(
@@ -140,7 +146,11 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 $payload,
                 rsv1: $this->compressionActive,
             ));
-        });
+        } catch (\Throwable $e) {
+            return Future::error($e);
+        }
+
+        return Future::complete();
     }
 
     /**
