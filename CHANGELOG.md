@@ -19,6 +19,25 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Pull-consumer robustness (#153): the 409 pull statuses "Message Size Exceeds
+  MaxBytes" and "Batch Completed" are now classified as pull-completion statuses instead of
+  terminal errors, so an infinite `consume()` loop with `setMaxBytes()` survives an oversized
+  pending head message and keeps pulling (nats.go excludes `ErrMaxBytesExceeded`/
+  `ErrBatchCompleted` from terminal handling); genuinely terminal 409s (Consumer Deleted,
+  Consumer is push based) still stop the loop. Infinite mode also paces immediately answered
+  empty pulls - a `setNoWait(true)` loop against an idle consumer used to busy-poll the server
+  with an unthrottled 404/re-pull storm, and the non-terminal 409s re-pulled just as hot. Each
+  consecutive empty window now backs off with an escalating delay (10ms doubling, capped at
+  500ms, reset on delivery), settling an idle consumer at about 2 pulls per second.
+- `[bugfix]` Pull idle heartbeats (#153): `fetchBatch()`/`fetchNext()` now validate the ADR-13
+  rule `idle_heartbeat <= 50% of expires` client-side and reject violations (and non-positive
+  values) with a clear `InvalidArgumentException` instead of forwarding a value the server
+  refuses. When idle heartbeats are requested, the fetch loop now tracks frame arrivals on the
+  reply inbox (heartbeats included) and fails fast with a "missed idle heartbeats"
+  `JetStreamException` once two heartbeat intervals pass in silence (nats.go `ErrNoHeartbeat`
+  parity) - previously status-100 frames were discarded untracked and a dead server/route left
+  the fetch waiting out the full `expires`+grace deadline. A partial batch collected before the
+  silence is still returned.
 - `[bugfix]` A reconnect now stays in `Connecting` until the subscription replay and the
   reconnect-buffer flush have completed, and flips `Open` (arming the ping timer) only then -
   nats.go RECONNECTING parity. Previously `connectOnce()` flipped `Open` before the replay ran,

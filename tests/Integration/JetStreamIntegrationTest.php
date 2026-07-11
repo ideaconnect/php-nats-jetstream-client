@@ -757,6 +757,76 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies an infinite consume loop with setMaxBytes() survives an oversized pending head
+     * message: the server answers the pull with a 409 "Message Size Exceeds MaxBytes" completion
+     * status, and the loop must keep (paced) pulling instead of stopping permanently, delivering
+     * a fitting message once the oversized one is removed (#153).
+     */
+    public function testJetStreamInfiniteConsumeWithMaxBytesSurvivesOversizedPendingMessage(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.pull.maxbytes';
+        $consumer = 'C_' . strtoupper(bin2hex(random_bytes(2)));
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, $consumer, $subject)->await();
+
+        // The head message exceeds the pull max_bytes cap by an order of magnitude.
+        $oversizedAck = $js->publish($subject, str_repeat('x', 4096))->await();
+
+        // Contract check: a direct capped fetch against the oversized head surfaces the 409
+        // completion status (this is the status the iterator must keep polling through).
+        try {
+            $js->fetchBatch($stream, $consumer, 1, 500, ['max_bytes' => 512])->await();
+            self::fail('Expected a 409 MaxBytes status for an oversized pending head message.');
+        } catch (JetStreamException $e) {
+            self::assertSame(409, $e->getCode());
+            self::assertStringContainsStringIgnoringCase('maxbytes', $e->getMessage());
+        }
+
+        $iter = $js->pullConsumer($stream, $consumer)
+            ->setBatching(1)
+            ->setExpiresMs(500)
+            ->setMaxBytes(512)
+            ->setIterations(null); // infinite
+
+        $received = [];
+        $future = $iter->handle(static function (NatsMessage $message, $context) use (&$received, $iter): void {
+            $received[] = $message->payload;
+            if ($message->replyTo !== null && $message->replyTo !== '') {
+                $context->ack($message)->await();
+            }
+            $iter->stop();
+        });
+
+        // Let the loop face the 409 window at least once, then clear the oversized head and
+        // publish a message that fits: a loop that (wrongly) stopped on the 409 never delivers it.
+        delay(0.25);
+        $js->deleteMessage($stream, $oversizedAck->seq)->await();
+        $js->publish($subject, '{"n":"fits"}')->await();
+
+        try {
+            $total = $future->await(new TimeoutCancellation(10));
+        } catch (CancelledException) {
+            $iter->stop();
+            self::fail('Infinite consume loop did not deliver the follow-up message after the MaxBytes 409 window.');
+        }
+
+        self::assertSame(1, $total);
+        self::assertSame(['{"n":"fits"}'], $received);
+
+        $js->deleteConsumer($stream, $consumer)->await();
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies durable push helper delivers live payloads to subscribed handlers.
      */
     public function testJetStreamPushConsumerHelperDelivery(): void

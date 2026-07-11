@@ -350,6 +350,148 @@ final class PullConsumerIteratorTest extends TestCase
         self::assertSame(['job-7'], $processed);
     }
 
+    /**
+     * Verifies a 409 "Message Size Exceeds MaxBytes" is a pull-COMPLETION status, not a terminal
+     * error: an infinite consume loop with setMaxBytes() must survive an oversized pending head
+     * message and keep pulling (nats.go excludes ErrMaxBytesExceeded from terminal handling) (#153).
+     */
+    public function testHandleInfiniteModeContinuesPastMaxBytes409(): void
+    {
+        $maxBytes = "NATS/1.0 409 Message Size Exceeds MaxBytes\r\nStatus: 409\r\n\r\n"; // completion -> keep polling
+        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";                // terminal   -> stop
+        $hMax = strlen($maxBytes);
+        $hDel = strlen($deleted);
+        $body = 'fits-now';
+
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            // iter 1 (sid 1): the pending head message exceeds max_bytes - the pull completes empty.
+            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hMax, $hMax, $maxBytes),
+            // iter 2 (sid 2): a message that fits arrives on the next pull.
+            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
+            // iter 3 (sid 3): a terminal 409 (consumer deleted) stops the loop.
+            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $hDel, $hDel, $deleted),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $processed = [];
+        $total = $client->jetStream()
+            ->pullConsumer('ORDERS', 'PROC')
+            ->setBatching(1)
+            ->setExpiresMs(100)
+            ->setMaxBytes(1024)
+            ->setIterations(null) // infinite
+            ->handle(function (NatsMessage $msg) use (&$processed): void {
+                $processed[] = $msg->payload;
+            })->await();
+
+        // Old code treated the MaxBytes 409 as terminal: the worker stopped permanently with total 0.
+        self::assertSame(1, $total);
+        self::assertSame(['fits-now'], $processed);
+    }
+
+    /**
+     * Verifies a 409 "Batch Completed" is a pull-COMPLETION status, not a terminal error: the
+     * infinite loop re-pulls instead of stopping (nats.go excludes ErrBatchCompleted from terminal
+     * handling) (#153).
+     */
+    public function testHandleInfiniteModeContinuesPastBatchCompleted409(): void
+    {
+        $completed = "NATS/1.0 409 Batch Completed\r\nStatus: 409\r\n\r\n"; // completion -> keep polling
+        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";  // terminal   -> stop
+        $hCom = strlen($completed);
+        $hDel = strlen($deleted);
+        $body = 'next-batch';
+
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            // iter 1 (sid 1): the server closes the pull early with "Batch Completed" and no message.
+            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hCom, $hCom, $completed),
+            // iter 2 (sid 2): the next pull delivers a message.
+            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
+            // iter 3 (sid 3): a terminal 409 (consumer deleted) stops the loop.
+            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $hDel, $hDel, $deleted),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $processed = [];
+        $total = $client->jetStream()
+            ->pullConsumer('ORDERS', 'PROC')
+            ->setBatching(1)
+            ->setExpiresMs(100)
+            ->setIterations(null) // infinite
+            ->handle(function (NatsMessage $msg) use (&$processed): void {
+                $processed[] = $msg->payload;
+            })->await();
+
+        // Old code treated the Batch Completed 409 as terminal: total would be 0.
+        self::assertSame(1, $total);
+        self::assertSame(['next-batch'], $processed);
+    }
+
+    /**
+     * Verifies no_wait infinite mode paces consecutive empty pulls instead of busy-polling: an
+     * empty consumer answers each no_wait pull with an immediate 404, and the iterator must apply
+     * its escalating idle backoff (10ms doubling, capped at 500ms) between them so an idle stream
+     * is not hammered with an unthrottled re-pull storm (#153). Event-driven: the scripted 404s
+     * answer instantly, so any elapsed time is exactly the iterator's own pacing.
+     */
+    public function testNoWaitInfiniteModePacesConsecutiveEmptyPulls(): void
+    {
+        $noMessages = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
+        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";
+        $h404 = strlen($noMessages);
+        $h409 = strlen($deleted);
+        $body = 'queued';
+
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            // iters 1-3 (sids 1-3): the empty consumer answers each no_wait pull with an immediate 404.
+            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
+            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
+            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
+            // iter 4 (sid 4): a message finally arrives.
+            sprintf("MSG _INBOX.JS.FETCH.any 4 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
+            // iter 5 (sid 5): a terminal 409 (consumer deleted) stops the loop.
+            sprintf("HMSG _INBOX.JS.FETCH.any 5 %d %d\r\n%s\r\n", $h409, $h409, $deleted),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $startNs = hrtime(true);
+        $processed = [];
+        $total = $client->jetStream()
+            ->pullConsumer('ORDERS', 'PROC')
+            ->setBatching(1)
+            ->setExpiresMs(100)
+            ->setNoWait(true)
+            ->setIterations(null) // infinite
+            ->handle(function (NatsMessage $msg) use (&$processed): void {
+                $processed[] = $msg->payload;
+            })->await();
+        $elapsedNs = hrtime(true) - $startNs;
+
+        // The loop kept pulling through the empty windows and delivered the message...
+        self::assertSame(1, $total);
+        self::assertSame(['queued'], $processed);
+
+        // ...issuing exactly one pull per scripted response (5 responses -> 5 pulls, no storm)...
+        $pullWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
+        ));
+        self::assertCount(5, $pullWrites);
+
+        // ...and the three consecutive empty pulls were paced by the escalating idle backoff
+        // (10ms + 20ms + 40ms = 70ms minimum; the old code re-pulled instantly, elapsed ~0ms).
+        self::assertGreaterThanOrEqual(65_000_000, $elapsedNs, 'consecutive empty no_wait pulls must be paced');
+    }
+
     // ── setGroup / setPriority / setMinPending / setMinAckPending / setMaxBytes / setNoWait ──────
 
     /**

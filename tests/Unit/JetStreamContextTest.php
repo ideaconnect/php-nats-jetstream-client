@@ -853,6 +853,115 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * Verifies ADR-13 client-side validation: an idle_heartbeat above 50% of expires is rejected
+     * with a clear InvalidArgumentException before anything reaches the wire, instead of being
+     * forwarded for the server to reject (or silently misbehave) (#153).
+     */
+    public function testFetchBatchRejectsIdleHeartbeatAboveHalfOfExpires(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('must not exceed 50% of expires');
+
+        try {
+            // 150ms heartbeat against a 200ms expiry: above the ADR-13 50% ceiling (100ms).
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 200, ['idle_heartbeat' => 150_000_000])->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies a non-positive (or non-integer) idle_heartbeat is rejected client-side before
+     * dispatch (#153).
+     */
+    public function testFetchBatchRejectsNonPositiveIdleHeartbeat(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('idle_heartbeat must be a positive integer');
+
+        try {
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500, ['idle_heartbeat' => 0])->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies the ADR-13 boundary: an idle_heartbeat of exactly 50% of expires is accepted and
+     * reaches the wire (#153).
+     */
+    public function testFetchBatchAcceptsIdleHeartbeatAtExactlyHalfOfExpires(): void
+    {
+        $msg = '{"event":"x"}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        // 1250ms heartbeat against a 2500ms expiry: exactly the 50% ceiling - allowed.
+        $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500, [
+            'idle_heartbeat' => 1_250_000_000,
+        ])->await();
+
+        self::assertCount(1, $messages);
+        self::assertStringContainsString('"idle_heartbeat":1250000000', $transport->writes[3]);
+    }
+
+    /**
+     * Verifies missed pull idle heartbeats are detected: with idle_heartbeat requested and a
+     * silent transport (no message, no status-100 heartbeat frame), fetchBatch() fails within
+     * ~2 heartbeat intervals with a heartbeat-miss error instead of sitting out the full
+     * expires+slack deadline (nats.go ErrNoHeartbeat semantics) (#153).
+     */
+    public function testFetchBatchFailsFastOnMissedIdleHeartbeats(): void
+    {
+        $transport = new FakeTransport(
+            readQueue: [
+                'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                "PONG\r\n",
+            ],
+            blockWhenEmpty: true,
+        );
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $startNs = hrtime(true);
+        try {
+            // 50ms heartbeat, 2000ms expiry: the server should heartbeat every 50ms, so silence
+            // for 2 intervals (100ms) means it is gone.
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2000, ['idle_heartbeat' => 50_000_000])->await();
+            self::fail('Expected a heartbeat-miss JetStreamException.');
+        } catch (JetStreamException $e) {
+            $elapsedNs = hrtime(true) - $startNs;
+            self::assertStringContainsString('missed idle heartbeats', $e->getMessage());
+            // ~2 heartbeat intervals (100ms), far below the expires+slack deadline (3000ms).
+            self::assertLessThan(1_000_000_000, $elapsedNs, 'a heartbeat miss must fail fast, not wait out expires');
+        }
+    }
+
+    /**
      * Verifies unpinConsumer issues the UNPIN request with the group (issue #7).
      */
     public function testUnpinConsumer(): void
