@@ -19,6 +19,20 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` A reconnect now stays in `Connecting` until the subscription replay and the
+  reconnect-buffer flush have completed, and flips `Open` (arming the ping timer) only then -
+  nats.go RECONNECTING parity. Previously `connectOnce()` flipped `Open` before the replay ran,
+  with three consequences (#148): a publish from a concurrent fiber during the replay wrote
+  straight to the wire ahead of the buffered earlier publishes, inverting per-publisher ordering
+  and breaking JetStream `Nats-Expected-Last-Subject-Sequence` chains; a replay-leg failure left
+  `state = Open` plus an armed ping timer on a dead socket for the whole backoff window, so user
+  publishes surfaced spurious write errors instead of buffering; and the replay's own poll reads
+  could collide with a user read admitted by the premature `Open` (Amp `PendingReadError`),
+  aborting an otherwise-successful attempt. Publishes issued during the replay window keep
+  buffering and the flush now drains in a loop, so frames appended mid-flush still go out - in
+  publish order - before the connection opens. The heartbeat self-read additionally re-checks the
+  state after its PING write, so a tick that raced into a recovery cannot read against the
+  recovery's socket (#148).
 - `[bugfix]` Ordered consumer: a `TimeoutException` or `ConnectionException` from the best-effort
   `deleteConsumer()` leg of a recreate (sequence-gap or heartbeat tail-gap recovery) no longer
   bypasses the create-retry loop and permanently silences the consumer. Those exceptions extend

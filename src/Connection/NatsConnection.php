@@ -313,6 +313,7 @@ final class NatsConnection
 
             try {
                 $this->connectOnce();
+                $this->markConnectionOpen();
                 $this->emitEvent(ConnectionEvent::Connected);
             } catch (AuthenticationException $e) {
                 // An auth failure will not resolve by retrying: fail fast instead of entering reconnect.
@@ -1426,6 +1427,12 @@ final class NatsConnection
 
     /**
      * Establishes a fresh connection against the next available server.
+     *
+     * Leaves state Connecting: the caller flips Open via {@see markConnectionOpen()}. The initial
+     * connect paths flip immediately after the handshake; recovery flips only after the
+     * subscription replay and reconnect-buffer flush complete, so nothing that keys off
+     * state === Open (publish routing, user reads, the ping timer) treats the connection as live
+     * while the replay is still in progress (#148, nats.go RECONNECTING parity).
      */
     private function connectOnce(): void
     {
@@ -1481,6 +1488,16 @@ final class NatsConnection
         if ($this->serverInfo !== null && $this->serverInfo->connectUrls !== []) {
             $this->knownConnectUrls = $this->serverInfo->connectUrls;
         }
+    }
+
+    /**
+     * Flips the connection live: publishes stop buffering and route to the socket, user reads are
+     * admitted, and the heartbeat starts. Must run only once the socket is fully usable - after
+     * the handshake on the initial connect paths, and after the subscription replay plus
+     * reconnect-buffer flush on the recovery path (#148).
+     */
+    private function markConnectionOpen(): void
+    {
         $this->state = ConnectionState::Open;
         $this->startPingTimer();
     }
@@ -1588,6 +1605,7 @@ final class NatsConnection
 
             try {
                 $this->connectOnce();
+                $this->markConnectionOpen();
                 $this->emitEvent(ConnectionEvent::Connected);
 
                 return true;
@@ -1672,9 +1690,28 @@ final class NatsConnection
                     return;
                 }
 
+                // The replay window: state stays Connecting through the subscription replay and
+                // the buffered-publish flush, so a concurrent publish keeps buffering (and flushes
+                // in order below) instead of jumping the queue on the wire, and a failed leg falls
+                // to the catch with no Open state / armed ping timer on a dead socket (#148).
                 $this->resubscribeAll();
                 $this->reconnectCount++;
                 $this->flushReconnectBuffer();
+
+                // Re-check close-intent after the replay's suspension points: flipping Open here
+                // would resurrect a connection disconnect()/drain() just closed (#84).
+                if ($this->closing) {
+                    try {
+                        $this->transport->close()->await();
+                    } catch (\Throwable) {
+                        // Already gone; the Closed state below is what matters.
+                    }
+                    $this->state = ConnectionState::Closed;
+
+                    return;
+                }
+
+                $this->markConnectionOpen();
                 $this->emitEvent(ConnectionEvent::Reconnected);
 
                 return;
@@ -1731,21 +1768,26 @@ final class NatsConnection
 
     /**
      * Writes any publishes buffered while the connection was down, then clears the buffer (#49).
+     *
+     * Drains in a loop: the flush runs while state is still Connecting (#148), so a concurrent
+     * fiber's publish can append to the buffer while a write below is suspended - those frames
+     * must also reach the wire, in publish order, before the connection flips Open.
      */
     private function flushReconnectBuffer(): void
     {
-        if ($this->reconnectBuffer === '') {
-            return;
-        }
+        while ($this->reconnectBuffer !== '') {
+            $pending = $this->reconnectBuffer;
 
-        // Clear only after the write succeeds: publish() already reported success for these
-        // frames when they were buffered, so a flush failure must leave them in place for the
-        // next reconnect attempt to replay - clearing first silently lost every publish
-        // accepted during the reconnect window (#123). A partially transmitted flush can
-        // duplicate frames on the retry; duplication beats loss (nats.go pending-buffer
-        // semantics).
-        $this->transport->write($this->reconnectBuffer)->await();
-        $this->reconnectBuffer = '';
+            // Remove the transmitted prefix only after the write succeeds: publish() already
+            // reported success for these frames when they were buffered, so a flush failure must
+            // leave them in place for the next reconnect attempt to replay - clearing first
+            // silently lost every publish accepted during the reconnect window (#123). A
+            // partially transmitted flush can duplicate frames on the retry; duplication beats
+            // loss (nats.go pending-buffer semantics). Frames appended while the write was
+            // suspended survive as the remainder and go out on the next iteration.
+            $this->transport->write($pending)->await();
+            $this->reconnectBuffer = substr($this->reconnectBuffer, strlen($pending));
+        }
     }
 
     /**
@@ -1807,10 +1849,17 @@ final class NatsConnection
      * responses do not leave the connection open with silently rejected subscriptions.
      *
      * It deliberately does NOT drain message deliveries to user callbacks: this runs inside the
-     * reconnect critical section (with state already Open and `reconnecting` set), and a callback that
+     * reconnect critical section (state still Connecting, `reconnecting` set), and a callback that
      * publishes and hits a write failure would re-enter recoverConnection(), await the in-progress
      * reconnect deferred, and deadlock. Message frames captured here are buffered via handleFrame() and
      * delivered by the normal processIncoming()/heartbeat drain once recovery has completed.
+     *
+     * These reads run without taking the shared read slot, which is safe because state is not Open
+     * for the whole replay window (#148): every reader that takes the slot is state-gated -
+     * processIncoming() requires Open/Draining and consumeHeartbeatResponse() requires Open - so no
+     * user or heartbeat read can start against the new socket until the recovery flips Open. (The
+     * slot may even be legitimately held here: a read-failure-triggered recovery runs inside
+     * processIncoming()'s catch, before its finally releases the slot.)
      */
     private function drainImmediateServerFrames(): void
     {
@@ -2316,6 +2365,13 @@ final class NatsConnection
      */
     private function consumeHeartbeatResponse(): void
     {
+        // The tick's entry guard checked Open, but the PING write above is a suspension point: a
+        // recovery entered meanwhile owns the socket (possibly mid-handshake/replay on a fresh
+        // one), and a heartbeat read here would collide with its reads (#148).
+        if ($this->state !== ConnectionState::Open) {
+            return;
+        }
+
         if ($this->readInProgress) {
             return;
         }
