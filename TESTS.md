@@ -443,6 +443,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testRequestCanBeCancelledAndCleansUpSubscription` - request() with a pre-cancelled token throws CancelledException and still emits UNSUB.
 - `testProcessIncomingReconnectsAndResubscribesAfterReadFailure` - A read failure triggers reconnect (2 connect calls) and replays the SUB, then a later MSG is delivered.
 - `testReconnectAfterMidFramePayloadDropSucceedsOnFirstAttempt` - A connection dying mid-MSG-payload (partial frame in the parser) reconnects on the FIRST attempt and delivers post-reconnect messages: the handshake starts from a clean parser instead of feeding INFO into the stale pending frame (#125).
+- `testExhaustedReconnectReleasesStateSoManualReconnectStartsClean` - After reconnect exhaustion, a manual connect() starts from a clean slate: a later recovery replays no SUB from the dead epoch and the old handler never fires again (#127).
 - `testDisconnectIsNotReversedByAnInFlightRecovery` - After disconnect(), an in-flight recoverConnection() is a no-op: stays Closed, no Reconnected event, no extra connect, original serverId retained (#84).
 - `testPerformRecoveryBailsWhenClosing` - With close-intent already latched, performRecovery() bails without reopening: stays Closed, no Reconnected event, single connect (#84).
 - `testDisconnectReleasesSubscriptionAndBufferState` - disconnect() clears subscriptions, subscriptionMeta, pendingMessages, reconnectBuffer, and replaces the parser with a fresh instance (#85).

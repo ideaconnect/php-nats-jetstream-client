@@ -19,6 +19,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Every terminal transition to `Closed` now releases per-connection runtime state
+  (subscription registry and handler closures, queued messages, counters, parser bytes, reconnect
+  buffer) - previously only user `disconnect()`/`drain()` did. An exhausted reconnect or a
+  terminal auth failure left everything referenced; worse, calling `connect()` again on the same
+  instance silently believed it was subscribed (nothing was re-SUBbed) and a later automatic
+  recovery would resurrect the dead epoch's sids as ghost subscriptions, duplicating deliveries
+  into stale handler closures. Subscriptions now never survive a terminal close: re-`connect()`
+  starts from a clean slate and the application re-creates its subscriptions (nats.go parity,
+  documented on `connect()`) (#127).
 - `[bugfix]` A `NatsConnection` abandoned without `disconnect()`/`drain()` is now garbage-collectable:
   the ping timer's repeat closure previously bound `$this` strongly, so the event loop rooted the
   whole connection graph forever - the open socket, every subscription handler closure, and all

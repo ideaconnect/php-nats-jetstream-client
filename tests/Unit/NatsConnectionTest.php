@@ -2161,6 +2161,113 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A terminally closed connection (exhausted reconnect) must not strand its subscription
+     * state: a later manual connect() starts clean, and a future recovery must not resurrect the
+     * dead epoch's sids as ghost subscriptions delivering to stale handlers (#127).
+     */
+    public function testExhaustedReconnectReleasesStateSoManualReconnectStartsClean(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
+        $transport = new class ($info) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connectAttempts = 0;
+            private int $successfulConnects = 0;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            public function __construct(string $info)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'],                      // epoch 0: sub made here, then EOF
+                    [$info, "PONG\r\n", '__EOF__'],                      // epoch 1: manual reconnect, then EOF
+                    [$info, "PONG\r\n", "MSG updates 1 5\r\nghost\r\n"], // epoch 2: recovery; stray MSG for dead sid
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $attempt = $this->connectAttempts++;
+                    // Attempts 1 and 2 are the automatic recovery after epoch 0: fail them both so
+                    // the reconnect budget (maxReconnectAttempts: 2) exhausts terminally.
+                    if ($attempt === 1 || $attempt === 2) {
+                        throw new TransportClosedException('dial failed');
+                    }
+                    $this->successfulConnects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $conn = max(0, $this->successfulConnects - 1);
+                    $next = array_shift($this->reads[$conn]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Epoch 0 dies; both recovery attempts fail; the connection closes terminally.
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected ConnectionException after reconnect exhaustion');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect attempts exhausted', $e->getMessage());
+        }
+        self::assertSame(ConnectionState::Closed, $connection->state());
+
+        // Manual reconnect starts a clean epoch; its EOF then forces an automatic recovery.
+        $connection->connect()->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $writesBeforeRecovery = count($transport->writes);
+        $connection->processIncoming()->await(); // EOF -> recovery -> epoch 2 + resubscribeAll()
+
+        // The dead epoch's sid must not be resurrected: no SUB replay, no delivery to old handler.
+        $replayed = array_filter(
+            array_slice($transport->writes, $writesBeforeRecovery),
+            static fn(string $frame): bool => str_starts_with($frame, 'SUB '),
+        );
+        self::assertSame([], array_values($replayed), 'recovery must not replay sids from a terminally closed epoch');
+
+        $connection->processIncoming()->await(); // the stray MSG for the dead sid arrives here
+        self::assertSame([], $received, 'a handler from a dead epoch must never fire again');
+    }
+
+    /**
      * Verifies a recovery that races a user disconnect() does NOT re-open the connection: once
      * close-intent is set, recoverConnection() is a no-op even though a healthy server is reachable
      * (#84). Simulates the race by invoking recovery (as an in-flight heartbeat/read path would) after

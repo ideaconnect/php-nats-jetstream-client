@@ -265,6 +265,10 @@ final class NatsConnection
     /**
      * Opens a transport connection and completes NATS CONNECT/PING handshake.
      *
+     * Subscriptions do not survive a terminal close (user disconnect()/drain(), auth failure, or
+     * an exhausted reconnect): connecting the same instance again starts from a clean slate, and
+     * the application must re-create its subscriptions (nats.go parity, #127).
+     *
      * @return Future<void>
      */
     public function connect(): Future
@@ -283,6 +287,7 @@ final class NatsConnection
             } catch (AuthenticationException $e) {
                 // An auth failure will not resolve by retrying: fail fast instead of entering reconnect.
                 $this->state = ConnectionState::Closed;
+                $this->releaseRuntimeState();
                 $this->emitEvent(ConnectionEvent::Closed, $e);
 
                 throw $e;
@@ -303,6 +308,7 @@ final class NatsConnection
                 }
 
                 $this->state = ConnectionState::Closed;
+                $this->releaseRuntimeState();
                 $this->emitEvent(ConnectionEvent::Closed, $e);
                 throw new ConnectionException($e->getMessage(), (int) $e->getCode(), $e);
             }
@@ -327,17 +333,29 @@ final class NatsConnection
             // Release per-connection state so a long-lived/pooled client (or one disconnect()ed and
             // later reused) does not retain handler closures, buffered messages, parser bytes, or the
             // reconnect buffer until the whole object is GC'd (#85). Mirrors drain()'s teardown.
-            $this->subscriptions = [];
-            $this->subscriptionMeta = [];
-            $this->pendingMessages = [];
-            $this->receivedCounts = [];
-            $this->deliveredCounts = [];
-            $this->autoUnsubMax = [];
-            $this->reconnectBuffer = '';
-            $this->parser = new ProtocolParser();
+            $this->releaseRuntimeState();
 
             $this->emitEvent(ConnectionEvent::Closed);
         });
+    }
+
+    /**
+     * Releases per-connection runtime state: subscription registry and handler closures, queued
+     * messages, delivery counters, parser bytes, and the reconnect buffer. Must run on every
+     * terminal transition to Closed - not just user disconnect() - so payloads and closures never
+     * outlive the connection, and a later manual connect() starts from a clean slate instead of
+     * resurrecting sids from a dead epoch when a future recovery replays subscriptionMeta (#127).
+     */
+    private function releaseRuntimeState(): void
+    {
+        $this->subscriptions = [];
+        $this->subscriptionMeta = [];
+        $this->pendingMessages = [];
+        $this->receivedCounts = [];
+        $this->deliveredCounts = [];
+        $this->autoUnsubMax = [];
+        $this->reconnectBuffer = '';
+        $this->parser = new ProtocolParser();
     }
 
     /**
@@ -399,12 +417,7 @@ final class NatsConnection
             $this->drainAllPending();
 
             // Clear subscription state.
-            $this->subscriptions = [];
-            $this->subscriptionMeta = [];
-            $this->pendingMessages = [];
-            $this->receivedCounts = [];
-            $this->deliveredCounts = [];
-            $this->autoUnsubMax = [];
+            $this->releaseRuntimeState();
             $this->drainFlushPending = false;
 
             $this->transport->close()->await();
@@ -1379,6 +1392,7 @@ final class NatsConnection
                 // Credentials will not become valid by retrying: stop the reconnect loop immediately
                 // rather than hammering the server until attempts are exhausted (#46).
                 $this->state = ConnectionState::Closed;
+                $this->releaseRuntimeState();
                 $this->emitError($e);
                 $this->emitEvent(ConnectionEvent::Closed, $e);
 
@@ -1406,6 +1420,11 @@ final class NatsConnection
                 sprintf('Reconnect exhausted: %d bytes of buffered publishes were discarded', $abandonedBytes),
             ));
         }
+
+        // The connection is terminally closed: subscriptions do not survive it. Releasing here
+        // keeps handler closures/payloads from outliving the connection and stops a later manual
+        // connect() + recovery from resurrecting this epoch's sids as ghost subscriptions (#127).
+        $this->releaseRuntimeState();
 
         $this->emitEvent(ConnectionEvent::Closed, $lastError);
         throw new ConnectionException(
