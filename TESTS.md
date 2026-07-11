@@ -769,6 +769,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 ### tests/Unit/ProtocolParserTest.php
 - `testRejectsOverflowingSizeField` - asserts a 20-digit MSG size field (exceeding PHP_INT_MAX) is rejected with ProtocolException instead of saturating.
 - `testParsesControlFrames` - asserts a stream of PING/PONG/+OK/-ERR parses into four frames with correct types and the -ERR error string `'boom'`.
+- `testParsesControlLinesWithMultiSpaceAndEmbeddedTabSeparators` - asserts the #140 explode() fast path defers to the whitespace-tolerant split: multi-space-separated MSG/HMSG lines tokenize, and a tab hidden inside a space-separated token (making a 4-token-looking MSG line really the 5-token reply-to form) still yields the reply-to.
 - `testParsesFragmentedMsgFrame` - asserts an MSG split across two pushes yields no frame on the first and a complete frame (subject, sid 17, payload `hello`) on the second.
 - `testParsesHmsgFrame` - asserts an HMSG (no replyTo) parses with subject, sid, headerBytes 12, totalBytes 17, and the combined header+payload bytes.
 - `testParsesHmsgFrameWithReplyTo` - asserts an HMSG with a reply subject parses replyTo `inbox.reply` along with subject, sid, byte counts, and payload.
@@ -780,6 +781,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testPropertyStyleFragmentedMsgReassembly` - asserts an MSG wire reassembles to one correct frame across many deterministic fragmentation patterns.
 - `testPropertyStyleFragmentedHmsgReassembly` - asserts an HMSG wire (with a Status header) reassembles to one correct frame across many fragmentation patterns.
 - `testParsesLargeFragmentedMsgWithEmbeddedCrlf` - asserts a 6000-byte MSG payload containing embedded CRLF bytes reassembles correctly when fed one byte at a time.
+- `testParsesLargePayloadDeliveredInTransportSizedChunks` - asserts a 300000-byte MSG payload (embedded CRLFs) delivered in 8 KiB chunks reassembles byte-identically via the #140 pending chunk-list accumulation, a mid-accumulation empty push emits nothing, and a PING arriving in the completing chunk parses as the next frame.
 - `testCompletedPendingFrameLeavesTrailingBytesForNextFrame` - asserts a pending MSG payload completes and a trailing PONG in the same push parses as a second frame.
 - `testRejectsMsgFrameExceedingMaxSize` - asserts a MSG payload exceeding the configured maxFrameSize throws ProtocolException ("MSG frame payload size is invalid").
 - `testRejectsHmsgFrameExceedingMaxSize` - asserts an HMSG payload exceeding the configured maxFrameSize throws ProtocolException ("HMSG frame payload size is invalid").
@@ -877,6 +879,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testResetClearsStats` - Asserts reset() zeroes num_requests, num_errors, processing_time, average_processing_time and nulls last_error in the stats snapshot.
 - `testRequestValidatorCanRejectRequests` - Asserts a request validator returning an error string blocks the handler, publishes a VALIDATION_ERROR `io.nats.micro.v1.error` envelope with the message, and counts the request as one request and one error.
 - `testObserversReceiveLifecycleEvents` - Asserts observers receive request_start then request_end events carrying the correlation id (from X-Request-Id header) and the request subject.
+- `testSuccessfulRequestWithHeadersAndNoObserversRepliesCorrectly` - Asserts a successful request carrying headers on a service with zero observers still publishes the correct reply and counts one request / zero errors; pins the #140 path where the observer context (header parse) is skipped entirely (no counting seam exists, so behavior is the observable).
 - `testWithSchemaValidatorUsesAdapter` - Asserts withSchemaValidator(BasicJsonSchemaValidator) validates the payload against the endpoint schema and emits a VALIDATION_ERROR with a type-mismatch message (`$.id must be integer, got string`).
 - `testErrorEnvelopeIncludesCorrelationIdFromHeaders` - Asserts a handler error's JSON envelope carries `"code":"HANDLER_ERROR"` and the `correlation_id` taken from the request's X-Request-Id header.
 - `testEndpointAcceptsObjectHandlerAdapter` - Asserts an endpoint handler object implementing ServiceEndpointHandlerInterface is invoked (reply contains `obj:hello`).

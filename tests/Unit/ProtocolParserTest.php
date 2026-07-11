@@ -77,6 +77,49 @@ final class ProtocolParserTest extends TestCase
     }
 
     /**
+     * The fast-path tokenization (#140) must defer to the whitespace-tolerant split whenever a
+     * control line is not canonically single-space separated: doubled spaces produce empty
+     * explode() tokens, and a tab hidden inside a space-separated token changes the real token
+     * count (turning a 4-token-looking MSG line into the 5-token reply-to form).
+     */
+    public function testParsesControlLinesWithMultiSpaceAndEmbeddedTabSeparators(): void
+    {
+        $parser = new ProtocolParser();
+
+        // Multi-space separators between every field (documented server leniency).
+        $frames = $parser->push("MSG  updates   7  5\r\nhello\r\n");
+        self::assertCount(1, $frames);
+        self::assertSame(ProtocolFrameType::Msg, $frames[0]->type);
+        self::assertSame('updates', $frames[0]->subject);
+        self::assertSame(7, $frames[0]->sid);
+        self::assertNull($frames[0]->replyTo);
+        self::assertSame('hello', $frames[0]->payload);
+
+        // A tab between sid and reply-to keeps the space-split token count plausible (4) while the
+        // real whitespace token count is 5 - the reply-to must still be recognized.
+        $tabbed = $parser->push("MSG updates 9\t_INBOX.r 6\r\nworld!\r\n");
+        self::assertCount(1, $tabbed);
+        self::assertSame(ProtocolFrameType::Msg, $tabbed[0]->type);
+        self::assertSame(9, $tabbed[0]->sid);
+        self::assertSame('_INBOX.r', $tabbed[0]->replyTo);
+        self::assertSame('world!', $tabbed[0]->payload);
+
+        // HMSG with multi-space separators tokenizes identically.
+        $headers = "NATS/1.0\r\n\r\n";
+        $hmsg = $parser->push(sprintf(
+            "HMSG  orders  4  %d  %d\r\n%shey\r\n",
+            strlen($headers),
+            strlen($headers) + 3,
+            $headers,
+        ));
+        self::assertCount(1, $hmsg);
+        self::assertSame(ProtocolFrameType::HMsg, $hmsg[0]->type);
+        self::assertSame('orders', $hmsg[0]->subject);
+        self::assertSame(4, $hmsg[0]->sid);
+        self::assertSame($headers . 'hey', $hmsg[0]->payload);
+    }
+
+    /**
      * Verifies parser reassembles MSG payload from fragmented chunks.
      */
     public function testParsesFragmentedMsgFrame(): void
@@ -297,6 +340,38 @@ final class ProtocolParserTest extends TestCase
         self::assertSame('big', $frames[0]->subject);
         self::assertSame(7, $frames[0]->sid);
         self::assertSame($payload, $frames[0]->payload);
+    }
+
+    /**
+     * Verifies a multi-hundred-KiB payload delivered in 8 KiB transport-sized reads reassembles
+     * byte-identically, including bytes for a following frame arriving in the completing chunk
+     * (exercises the pending chunk-list accumulation path, #140). The interleaved empty push
+     * covers polling the parser while chunks are diverted to the accumulation list.
+     */
+    public function testParsesLargePayloadDeliveredInTransportSizedChunks(): void
+    {
+        // Embedded CRLFs ensure reassembly cannot rely on line scanning inside the payload.
+        $payload = str_repeat("abcdef\r\nGH", 30000); // 300000 bytes
+        $wire = 'MSG big 5 ' . strlen($payload) . "\r\n" . $payload . "\r\nPING\r\n";
+
+        $parser = new ProtocolParser();
+        $frames = [];
+        foreach (str_split($wire, 8192) as $index => $chunk) {
+            $frames = array_merge($frames, $parser->push($chunk));
+
+            if ($index === 1) {
+                // Mid-accumulation empty push: must emit nothing and must not disturb the
+                // pending frame's buffered bytes.
+                self::assertSame([], $parser->push(''));
+            }
+        }
+
+        self::assertCount(2, $frames);
+        self::assertSame(ProtocolFrameType::Msg, $frames[0]->type);
+        self::assertSame('big', $frames[0]->subject);
+        self::assertSame(5, $frames[0]->sid);
+        self::assertSame($payload, $frames[0]->payload);
+        self::assertSame(ProtocolFrameType::Ping, $frames[1]->type);
     }
 
     /**

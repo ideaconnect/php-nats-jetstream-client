@@ -804,6 +804,46 @@ final class ServiceTest extends TestCase
     }
 
     /**
+     * Verifies a successful request that carries headers on a service with NO observers still
+     * replies correctly. Since #140 this path skips building the observer context entirely (no
+     * header parse); there is no counting seam to assert the skip directly (NatsHeaders is a
+     * static utility and NatsMessage is final), so this pins the observable behavior: headers
+     * present, zero observers, correct success reply.
+     */
+    public function testSuccessfulRequestWithHeadersAndNoObserversRepliesCorrectly(): void
+    {
+        $headerPayload = "NATS/1.0\r\nX-Request-Id:req-77\r\n\r\n";
+        $bodyPayload = 'ping';
+        $merged = $headerPayload . $bodyPayload;
+        $headerBytes = strlen($headerPayload);
+        $totalBytes = strlen($merged);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => 'pong:' . $message->payload);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('PUB _INBOX.req', $writes);
+        self::assertStringContainsString('pong:ping', $writes);
+
+        $stats = $service->statsSnapshot();
+        $endpoint = $stats['endpoints'][0] ?? [];
+        self::assertSame(1, $endpoint['num_requests'] ?? null);
+        self::assertSame(0, $endpoint['num_errors'] ?? null);
+    }
+
+    /**
      * Verifies built-in schema validator adapter is applied through convenience API.
      */
     public function testWithSchemaValidatorUsesAdapter(): void

@@ -67,6 +67,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   freed when emptied and reallocated on the next delivery. Measured with an ordered consumer
   receiving 20k small messages from a live server (window includes the 20k publishes): median wall
   2.20s -> 1.95s and CPU 2.06s -> 1.80s, ~9.1k -> ~10.3k msg/s end to end.
+- `[bugfix]` Inbound micro-overheads roundup (#140), behavior-identical: MSG/HMSG control lines are
+  tokenized with a plain `explode(' ')` fast path instead of `preg_split('/\s+/')` per message
+  (~5-10% of a core at 100k msg/s), falling back to the regex whenever the space-split result shows
+  an empty token, a wrong token count, or embedded non-space whitespace - so tab/multi-space
+  leniency is preserved bit-for-bit; the per-frame `strtoupper()` verb fold is skipped when the verb
+  already matches a canonical upper-case form. While a large MSG/HMSG payload is incomplete,
+  subsequent socket chunks accumulate in a list joined once on completion instead of growing the
+  buffer with a copy per 8 KiB read (measured ~2-3x constant-factor overhead on multi-MB frames).
+  Service endpoints no longer parse request headers (observer context / correlation id) on every
+  request: the context is resolved lazily and memoized, so a service with no observers and a
+  successful handler skips the parse entirely, while observer events and error-reply correlation
+  ids are unchanged.
 
 ### Fixed
 

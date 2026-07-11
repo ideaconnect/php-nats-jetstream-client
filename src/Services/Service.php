@@ -213,9 +213,18 @@ final class Service
                         function (NatsMessage $message) use ($subject, $endpoint): void {
                             $endpoint->requests++;
                             $started = hrtime(true);
-                            $context = $this->buildObserverContext($message, $subject);
 
-                            $this->notifyObservers('request_start', $endpoint, $message, $context);
+                            // The observer context costs a header parse (see buildObserverContext)
+                            // but is only consumed by observers and by error replies (correlation
+                            // id), so it is resolved lazily and memoized: with no observers and a
+                            // successful handler it is never built at all (#140), and every
+                            // consumer on a request shares the single parse.
+                            $context = null;
+                            $resolveContext = function () use ($message, $subject, &$context): array {
+                                return $context ??= $this->buildObserverContext($message, $subject);
+                            };
+
+                            $this->notifyObservers('request_start', $endpoint, $message, $resolveContext);
 
                             if ($endpoint->schema !== null && $this->requestValidator !== null) {
                                 $validationError = ($this->requestValidator)($message, $endpoint->schema);
@@ -225,7 +234,7 @@ final class Service
                                     $endpoint->lastError = $validationError;
                                     $endpoint->processingTimeNs += $duration;
 
-                                    $this->notifyObservers('request_error', $endpoint, $message, $context + [
+                                    $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
                                         'code' => 'VALIDATION_ERROR',
                                         'error' => $validationError,
                                     ]);
@@ -235,9 +244,7 @@ final class Service
                                         $this->errorPayload(
                                             code: 'VALIDATION_ERROR',
                                             message: $validationError,
-                                            correlationId: is_string($context['correlation_id'] ?? null)
-                                                ? $context['correlation_id']
-                                                : null,
+                                            correlationId: $this->contextCorrelationId($resolveContext()),
                                         ),
                                         $this->serviceErrorHeaders('400', $validationError),
                                     );
@@ -245,7 +252,7 @@ final class Service
                                     // Emit the terminal request_end on the rejection path too, so an
                                     // observer that opened a span/timer/gauge on request_start does not
                                     // leak it for schema-rejected (often hostile) traffic.
-                                    $this->notifyObservers('request_end', $endpoint, $message, $context + [
+                                    $this->notifyObservers('request_end', $endpoint, $message, $resolveContext, [
                                         'duration_ns' => $duration,
                                     ]);
 
@@ -263,7 +270,7 @@ final class Service
                                 // reply, not an internal fault, so the chosen detail IS sent to the caller.
                                 $endpoint->errors++;
                                 $endpoint->lastError = $serviceError->description;
-                                $this->notifyObservers('request_error', $endpoint, $message, $context + [
+                                $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
                                     'code' => $serviceError->serviceErrorCode,
                                     'error' => $serviceError->description,
                                 ]);
@@ -271,9 +278,7 @@ final class Service
                                 $response = $serviceError->body ?? $this->errorPayload(
                                     code: $serviceError->serviceErrorCode,
                                     message: $serviceError->description,
-                                    correlationId: is_string($context['correlation_id'] ?? null)
-                                        ? $context['correlation_id']
-                                        : null,
+                                    correlationId: $this->contextCorrelationId($resolveContext()),
                                 );
                                 $errorHeaders = $this->serviceErrorHeaders(
                                     $serviceError->serviceErrorCode,
@@ -282,7 +287,7 @@ final class Service
                             } catch (\Throwable $e) {
                                 $endpoint->errors++;
                                 $endpoint->lastError = $e->getMessage();
-                                $this->notifyObservers('request_error', $endpoint, $message, $context + [
+                                $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
                                     'code' => 'HANDLER_ERROR',
                                     'error' => $e->getMessage(),
                                 ]);
@@ -294,16 +299,14 @@ final class Service
                                 $response = $this->errorPayload(
                                     code: 'HANDLER_ERROR',
                                     message: 'Internal server error',
-                                    correlationId: is_string($context['correlation_id'] ?? null)
-                                        ? $context['correlation_id']
-                                        : null,
+                                    correlationId: $this->contextCorrelationId($resolveContext()),
                                 );
                                 $errorHeaders = $this->serviceErrorHeaders('500', 'Internal server error');
                             } finally {
                                 $duration = (int) max(0, hrtime(true) - $started);
                                 $endpoint->processingTimeNs += $duration;
 
-                                $this->notifyObservers('request_end', $endpoint, $message, $context + [
+                                $this->notifyObservers('request_end', $endpoint, $message, $resolveContext, [
                                     'duration_ns' => $duration,
                                 ]);
                             }
@@ -323,7 +326,7 @@ final class Service
                                 // payload is plain strings, so it always encodes.
                                 $endpoint->errors++;
                                 $endpoint->lastError = $e->getMessage();
-                                $this->notifyObservers('request_error', $endpoint, $message, $context + [
+                                $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
                                     'code' => 'HANDLER_ERROR',
                                     'error' => $e->getMessage(),
                                 ]);
@@ -334,9 +337,7 @@ final class Service
                                         $this->errorPayload(
                                             code: 'HANDLER_ERROR',
                                             message: 'Internal server error',
-                                            correlationId: is_string($context['correlation_id'] ?? null)
-                                                ? $context['correlation_id']
-                                                : null,
+                                            correlationId: $this->contextCorrelationId($resolveContext()),
                                         ),
                                         $this->serviceErrorHeaders('500', 'Internal server error'),
                                     );
@@ -673,6 +674,11 @@ final class Service
     }
 
     /**
+     * Builds the per-request observer context, including the correlation id extracted from the
+     * request headers. Parsing the header block is the expensive part, so callers resolve this
+     * lazily (memoized per request): a no-observer service with a successful handler never
+     * invokes it (#140).
+     *
      * @return array<string,mixed>
      */
     private function buildObserverContext(NatsMessage $message, string $subject): array
@@ -695,10 +701,22 @@ final class Service
     }
 
     /**
-     * @param array<string,mixed> $context
+     * Notifies registered observers of a request lifecycle event. The base context is passed as
+     * a deferred resolver so its header parse only runs when at least one observer will consume
+     * it - services without observers skip it entirely (#140).
+     *
+     * @param callable():array<string,mixed> $resolveContext Memoized base-context resolver.
+     * @param array<string,mixed> $extra Event-specific keys; the base context wins on key clashes
+     *        (mirrors the previous `$context + [...]` merge, though the key sets are disjoint).
      */
-    private function notifyObservers(string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context): void
+    private function notifyObservers(string $event, ServiceEndpoint $endpoint, NatsMessage $message, callable $resolveContext, array $extra = []): void
     {
+        if ($this->observers === []) {
+            return;
+        }
+
+        $context = $resolveContext() + $extra;
+
         foreach ($this->observers as $observer) {
             try {
                 $observer($event, $endpoint, $message, $context);
@@ -706,6 +724,20 @@ final class Service
                 // Observer failures must not impact service request handling.
             }
         }
+    }
+
+    /**
+     * Extracts the correlation id from a resolved observer context for error replies. A missing
+     * or non-string value yields null so {@see errorPayload()} omits the field, matching the
+     * previous inline `is_string(...) ? ... : null` guards.
+     *
+     * @param array<string,mixed> $context
+     */
+    private function contextCorrelationId(array $context): ?string
+    {
+        $correlationId = $context['correlation_id'] ?? null;
+
+        return is_string($correlationId) ? $correlationId : null;
     }
 
     /**
