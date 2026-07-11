@@ -45,6 +45,22 @@ final class ProtocolParser
     private ?array $pending = null;
 
     /**
+     * Chunks received while $pending's payload is still incomplete. While a frame is pending no
+     * frame boundary can be found before its required bytes arrive, so chunks accumulate here
+     * and are joined into $buffer with a single implode once the frame is completable, instead
+     * of growing $buffer with a `.=` copy per 8 KiB transport read (#140: ~2-3x constant-factor
+     * overhead on multi-MB frames). Invariant: non-empty only while $pending !== null and still
+     * short of its required bytes; always flushed into $buffer before the parse loop runs, so
+     * the loop's offsets and the pending payloadOffset rebase never see these bytes.
+     *
+     * @var list<string>
+     */
+    private array $pendingChunks = [];
+
+    /** Total byte length of $pendingChunks, tracked so completion is detected without joining. */
+    private int $pendingChunksLength = 0;
+
+    /**
      * Creates a parser for line and payload frames produced by the NATS server.
      *
      * @param int $maxFrameSize Maximum total MSG/HMSG bytes accepted per frame to limit memory usage.
@@ -62,7 +78,28 @@ final class ProtocolParser
     public function push(string $chunk): array
     {
         if ($chunk !== '') {
-            $this->buffer .= $chunk;
+            if ($this->pending === null) {
+                $this->buffer .= $chunk;
+            } else {
+                // A pending payload is incomplete (a pending frame only survives a push while
+                // short of its required bytes), so no frame can complete before those bytes
+                // arrive: collect chunks aside and join once instead of copying $buffer per push.
+                $this->pendingChunks[] = $chunk;
+                $this->pendingChunksLength += strlen($chunk);
+
+                $required = $this->pending['payloadOffset'] + $this->pending['totalBytes'] + 2;
+                if (strlen($this->buffer) + $this->pendingChunksLength < $required) {
+                    // Still short: nothing is parseable, keep accumulating. Bounded by $required,
+                    // which parseDataFrameHeader() already capped at maxFrameSize.
+                    return [];
+                }
+
+                // Frame completable: materialize the buffer with a single join (one copy of every
+                // byte) and let the loop below consume the frame plus anything after it.
+                $this->buffer = implode('', [$this->buffer, ...$this->pendingChunks]);
+                $this->pendingChunks = [];
+                $this->pendingChunksLength = 0;
+            }
         }
 
         $frames = [];
@@ -110,9 +147,16 @@ final class ProtocolParser
 
                 // Operation verbs are matched case-insensitively and separated from their arguments by any
                 // whitespace (space or tab), matching the NATS wire spec; argument separators within the
-                // line are already whitespace-tolerant (preg_split('/\s+/')). Real servers always send
-                // upper-case verbs, so this only adds leniency.
-                $verb = strtoupper(substr($line, 0, strcspn($line, " \t")));
+                // line are also whitespace-tolerant (see splitControlLine()). Real servers always send
+                // upper-case verbs, so the case fold below only adds leniency - and is skipped when the
+                // verb already matches a canonical form, avoiding a strtoupper() per frame (#140).
+                $verb = substr($line, 0, strcspn($line, " \t"));
+                if (
+                    $verb !== 'MSG' && $verb !== 'HMSG' && $verb !== 'PING' && $verb !== 'PONG'
+                    && $verb !== '+OK' && $verb !== '-ERR' && $verb !== 'INFO'
+                ) {
+                    $verb = strtoupper($verb);
+                }
 
                 if ($verb === 'MSG' || $verb === 'HMSG') {
                     // Consume the control line first so a malformed header resyncs past it on throw.
@@ -164,7 +208,8 @@ final class ProtocolParser
         }
 
         // PING/PONG/+OK carry no arguments - require the whole (case-insensitive) line to be the verb.
-        $normalized = strtoupper($line);
+        // $verb is already upper-cased, so when the line equals it the fold is a proven no-op (#140).
+        $normalized = $line === $verb ? $verb : strtoupper($line);
         if ($normalized === 'PING') {
             return new ProtocolFrame(type: ProtocolFrameType::Ping);
         }
@@ -196,12 +241,54 @@ final class ProtocolParser
     }
 
     /**
+     * Tokenizes a MSG/HMSG control line on whitespace.
+     *
+     * Fast path: real servers separate arguments with single spaces (see the leniency note in
+     * push()), so a plain explode() covers virtually every frame without the per-message regex
+     * cost (#140). The whitespace-tolerant preg_split fallback must engage whenever explode()
+     * could disagree with it: an empty token (doubled/trailing spaces), a token count outside
+     * the frame's valid range, or a token containing non-space whitespace (tab/LF/VT/FF/CR)
+     * that the regex would treat as a separator - e.g. a tab can hide an extra field inside a
+     * space-separated token and silently change which fields the tokens map to.
+     *
+     * @param int $minParts Minimum valid token count for the frame type (caller re-validates).
+     * @param int $maxParts Maximum valid token count for the frame type (caller re-validates).
+     * @return list<string>
+     */
+    private function splitControlLine(string $line, int $minParts, int $maxParts): array
+    {
+        $parts = explode(' ', $line);
+        $count = count($parts);
+
+        if ($count >= $minParts && $count <= $maxParts) {
+            $canonical = true;
+            foreach ($parts as $part) {
+                if ($part === '' || strpbrk($part, "\t\n\v\f\r") !== false) {
+                    $canonical = false;
+                    break;
+                }
+            }
+
+            if ($canonical) {
+                return $parts;
+            }
+        }
+
+        $parts = preg_split('/\s+/', $line);
+
+        // preg_split() only returns false on a compile/backtrack error, which the constant
+        // pattern cannot hit; an empty list fails the caller's count check exactly like the
+        // previous `$parts === false ||` guard did.
+        return $parts === false ? [] : $parts;
+    }
+
+    /**
      * @return array{type: ProtocolFrameType, subject: string, sid: int, replyTo: ?string, headerBytes: ?int, totalBytes: int, payloadOffset: int}
      */
     private function parseMsgHeader(string $line, int $payloadOffset): array
     {
-        $parts = preg_split('/\s+/', $line);
-        if ($parts === false || count($parts) < 4 || count($parts) > 5) {
+        $parts = $this->splitControlLine($line, 4, 5);
+        if (count($parts) < 4 || count($parts) > 5) {
             throw new ProtocolException('Invalid MSG frame line: ' . $line);
         }
 
@@ -227,8 +314,8 @@ final class ProtocolParser
      */
     private function parseHMsgHeader(string $line, int $payloadOffset): array
     {
-        $parts = preg_split('/\s+/', $line);
-        if ($parts === false || count($parts) < 5 || count($parts) > 6) {
+        $parts = $this->splitControlLine($line, 5, 6);
+        if (count($parts) < 5 || count($parts) > 6) {
             throw new ProtocolException('Invalid HMSG frame line: ' . $line);
         }
 
