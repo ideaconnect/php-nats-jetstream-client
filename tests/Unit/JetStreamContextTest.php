@@ -3155,6 +3155,135 @@ final class JetStreamContextTest extends TestCase
         self::assertSame([], $errors);
     }
 
+    /**
+     * Verifies a deleteConsumer TimeoutException during gap recovery is treated as best-effort
+     * cleanup: control still reaches the create-retry loop, the consumer is recreated, and
+     * delivery resumes (#151). TimeoutException extends NatsException, NOT JetStreamException,
+     * so a delete-leg-only catch would bypass the #114 retry loop entirely.
+     */
+    public function testSubscribeOrderedConsumerRecreatesWhenDeleteConsumerTimesOut(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $recreateReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD2',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        // The delete request (sid 3) gets NO reply: its wait loop spins on an empty read queue
+        // until the 25 ms request deadline fires -> TimeoutException. The recreate reply and the
+        // resumed delivery are enqueued only when the recreate CREATE request is actually written
+        // (its payload is the only one carrying opt_start_seq 2), so the delete's timeout wait
+        // cannot drain them from the queue first.
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Gap (consumer seq 3) triggers recovery; the queue is empty from here on.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+        ]);
+        $transport->enqueueOnWriteContaining = [
+            '"opt_start_seq":2' => [
+                sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
+                "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+            ],
+        ];
+
+        $errors = [];
+        $options = new NatsOptions(requestTimeoutMs: 25, errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 6; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // The timed-out delete fell through to the create-retry loop: the consumer was recreated
+        // as ORD2, its first in-order message was delivered, and no terminal recreate failure was
+        // reported (the create leg was never exhausted).
+        self::assertSame(['msg1', 'msg4'], $received);
+        self::assertSame([], $errors);
+
+        $written = implode('', $transport->writes);
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'));
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'));
+    }
+
+    /**
+     * Verifies a deleteConsumer ConnectionException during gap recovery is treated as best-effort
+     * cleanup: control still reaches the create-retry loop, the consumer is recreated, and
+     * delivery resumes (#151). ConnectionException extends NatsException, NOT JetStreamException,
+     * so a delete-leg-only catch would bypass the #114 retry loop entirely.
+     */
+    public function testSubscribeOrderedConsumerRecreatesWhenDeleteConsumerFailsWithConnectionError(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $recreateReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD2',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Gap (consumer seq 3) triggers recovery. The delete request's (sid 3) reply wait
+            // reads the next chunk: a fatal -ERR frame, which handleFrame() raises as a
+            // ConnectionException out of deleteConsumer() without closing the connection.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+            "-ERR 'Stale Connection'\r\n",
+            // The create-retry loop still runs and succeeds (sid 4) as ORD2; delivery resumes.
+            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // The failed delete fell through to the create-retry loop: the consumer was recreated as
+        // ORD2, its first in-order message was delivered, and no terminal recreate failure was
+        // reported (the create leg was never exhausted).
+        self::assertSame(['msg1', 'msg4'], $received);
+        self::assertSame([], $errors);
+
+        $written = implode('', $transport->writes);
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'));
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'));
+    }
+
     public function testSubscribeOrderedConsumerDeliversFilteredMessagesWithoutSpuriousRecreate(): void
     {
         $createReply = json_encode([

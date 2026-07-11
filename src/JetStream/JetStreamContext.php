@@ -1084,8 +1084,11 @@ final class JetStreamContext
                 try {
                     try {
                         $this->deleteConsumer($stream, $consumerName)->await();
-                    } catch (JetStreamException) {
-                        // Best-effort cleanup for ephemeral consumers that may already be gone.
+                    } catch (\Throwable) {
+                        // Best-effort cleanup for ephemeral consumers that may already be gone. Any
+                        // failure must fall through: TimeoutException/ConnectionException are NOT
+                        // JetStreamExceptions, and only the create leg below restores delivery - a
+                        // timed-out delete may well have succeeded server-side (#151).
                     }
 
                     // Retry the create: after a successful delete, a failed create leaves NOTHING that

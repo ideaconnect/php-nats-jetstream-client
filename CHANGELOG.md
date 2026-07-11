@@ -17,6 +17,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` Ordered consumer: a `TimeoutException` or `ConnectionException` from the best-effort
+  `deleteConsumer()` leg of a recreate (sequence-gap or heartbeat tail-gap recovery) no longer
+  bypasses the create-retry loop and permanently silences the consumer. Those exceptions extend
+  `NatsException`, not `JetStreamException`, so the delete-leg catch missed them and the failure
+  fell straight into the outer containment - the terminal "recreate failed" error was emitted with
+  zero create attempts made, and no consumer, heartbeat, or message would ever arrive on the
+  deliver inbox again. The delete leg now tolerates any failure (a timed-out delete may well have
+  succeeded server-side), so control always proceeds to the create attempts and the terminal error
+  is emitted only when the create leg itself is exhausted (#151).
+
 ## [2.5.1] - 2026-07-11
 
 ### Fixed
