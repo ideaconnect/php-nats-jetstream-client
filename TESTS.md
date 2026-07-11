@@ -201,6 +201,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testGetStreamMessage` - getStreamMessage() uses STREAM.MSG.GET with seq and base64-decodes the stored subject/data.
 - `testExtractStreamSequenceParsesReplySubject` - (reflection) extractStreamSequence() parses the stream sequence from a 9-token $JS.ACK reply subject.
 - `testExtractStreamSequenceParsesDomainQualifiedReplySubject` - (reflection) extractStreamSequence() parses the stream sequence from a 12-token domain-qualified $JS.ACK subject.
+- `testExtractStreamSequenceParses13TokenReplySubject` - (reflection) extractStreamSequence() parses the stream sequence (index 7) from a 13-token $JS.ACK subject - offsets anchor from the front and trailing tokens are ignored, nats.go parity (#155).
 - `testKeyValueRejectsInvalidBucketName` - keyValue() rejects a dotted bucket name ("Invalid bucket name").
 - `testObjectStoreRejectsInvalidBucketName` - objectStore() rejects a slashed bucket name ("Invalid bucket name").
 - `testExtractSequencesParseElevenTokenDomainReplySubject` - (reflection) extractStreamSequence() parses the stream sequence from an 11-token domain $JS.ACK subject without a trailing random token.
@@ -233,7 +234,10 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testConsumerNamesWithMissingConsumersKeyReturnsEmpty` - consumerNames() returns an empty list when the response has no consumers key.
 - `testSubscribeEphemeralPushConsumerIgnoresControlMessages` - subscribeEphemeralPushConsumer() absorbs a status-100 flow-control frame (PUBs the FC reply, does not forward) and delivers the subsequent real message.
 - `testSubscribeOrderedConsumerIgnoresControlMessages` - subscribeOrderedConsumer() absorbs a status-100 idle-heartbeat without forwarding it to the handler.
-- `testSubscribeOrderedConsumerDeliversMessageWithoutAckMetadata` - subscribeOrderedConsumer() best-effort delivers a message that has no $JS.ACK reply (no ordering metadata).
+- `testSubscribeOrderedConsumerDeliversMessageWithoutAckMetadata` - subscribeOrderedConsumer() best-effort delivers messages with an absent or plain (non-$JS.ACK) reply subject SILENTLY - the unparseable-ack error (#155) applies only to reply subjects claiming the ack form.
+- `testSubscribeOrderedConsumerEmitsErrorForUnparseableAckSubject` - subscribeOrderedConsumer() surfaces an ack-form reply subject the parser cannot read (10 tokens) through the error listener ("unparseable $JS.ACK reply subject") while still delivering the message best-effort, without triggering a recreate (#155).
+- `testSubscribeOrderedConsumerEmitsUnparseableAckErrorOncePerConsumer` - the unparseable-ack error fires once per consumer instance, not once per message: two unparseable deliveries produce two best-effort deliveries but a single error (#155).
+- `testSubscribeOrderedConsumerUnparseableAckErrorRearmsAfterRecreate` - the once-per-instance unparseable-ack error latch re-arms on a recreate: an unparseable delivery on the post-recreate consumer epoch emits a second error (#155).
 - `testSubscribeOrderedConsumerToleratesDeleteConsumerFailure` - subscribeOrderedConsumer() absorbs a deleteConsumer error during gap recovery, still recreates, and delivers only the in-order message.
 - `testUnpinConsumerRejectsEmptyGroup` - unpinConsumer() rejects an empty priority group name ("must not be empty").
 - `testPublishWithLastSubjectSequenceHeaderMismatchThrowsImmediately` - publish() with expectedLastSubjectSequence (HPUB path) immediately re-throws a precondition-mismatch JetStreamException without retrying.
@@ -265,11 +269,14 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testFromMessageReturnsNullWhenReplyToIsNull` - `fromMessage()` returns null when the message has no reply subject.
 - `testFromMessageReturnsNullWhenFirstTokenIsNotJs` - `fromMessage()` returns null when the first reply-subject token is not "$JS".
 - `testFromMessageReturnsNullWhenSecondTokenIsNotAck` - `fromMessage()` returns null when the second token is not "ACK" (e.g. "NAK").
-- `testFromMessageReturnsNullForUnrecognisedTokenCount` - `fromMessage()` returns null for a reply subject whose token count is not 9, 11, or 12 (7 tokens hits the default match branch).
+- `testFromMessageReturnsNullForUnrecognisedTokenCount` - `fromMessage()` returns null for a reply subject whose token count matches neither the exact 9-token v1 form nor the >= 11-token v2 form (7 tokens).
 - `testFromMessageParses9TokenForm` - Parses a canonical 9-token `$JS.ACK` subject and asserts stream, consumer, numDelivered=3, streamSequence=42, consumerSequence=7, timestampNanos, numPending=5, and domain=null.
 - `testFromMessageParses11TokenFormWithRealDomain` - Parses the 11-token domain-prefixed subject and asserts domain="hub" plus all numeric/stream/consumer fields including numPending=0.
 - `testFromMessageNormalizesUnderscoreDomainToNull` - When the domain token is "_" (server placeholder), the parsed `domain` is normalized to null.
 - `testFromMessageParses12TokenForm` - Parses the 12-token form (domain + trailing random token), silently ignoring the 12th token while all other fields parse correctly.
+- `testFromMessageParses13TokenForm` - Parses a 13-token subject (a future server form beyond the known 12 tokens): offsets 2..10 anchor from the front and parse identically, extras ignored - nats.go tolerant-parser parity (#155).
+- `testFromMessageParses14TokenForm` - Parses a 14-token subject: any number of trailing tokens beyond index 10 is ignored (#155).
+- `testFromMessageReturnsNullFor10TokenForm` - A 10-token subject (between the 9-token v1 form and the >= 11-token v2 form) is rejected; the trailing-token tolerance starts at 11 (#155).
 - `testTimestampReturnsCorrectUtcDatetime` - `timestamp()` converts a nanosecond epoch to a `DateTimeImmutable` with zero UTC offset and the expected "2023-11-14 22:13:20" date/time.
 - `testTimestampPreservesMicrosecondPrecision` - `timestamp()` preserves sub-second precision, formatting 500_000 ns as microseconds "000500".
 - `testTimestampHandlesZeroNanoseconds` - `timestamp()` returns a `DateTimeImmutable` of "1970-01-01 00:00:00" for a zero-nanosecond value.

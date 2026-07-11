@@ -51,11 +51,14 @@ final class JsMessageMetadata
             return null;
         }
 
-        // Two ack reply-subject shapes (plus a 12-token variant = the domain form + a trailing random
-        // token). Literal offsets per count() branch so the token-count guard provably covers every
+        // Two ack reply-subject shapes. The v1 form is exactly 9 tokens; the expanded v2 form is
+        // matched with >= 11 tokens - field offsets anchor from the front and everything after
+        // index 10 is ignored, because servers may append tokens (the 12th, a random suffix, was
+        // itself a later addition) and nats.go's parser deliberately tolerates extras (#155).
+        // Literal offsets per count() branch so the token-count guard provably covers every
         // access (a shared base-offset arithmetic loses that correlation for static analysis):
         //   9 tokens:  $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>
-        //  11/12 tokens: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>[.<rand>]
+        //  >= 11 tokens: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>[.<extra>...]
         $count = count($parts);
 
         if ($count === 9) {
@@ -71,7 +74,7 @@ final class JsMessageMetadata
             );
         }
 
-        if ($count !== 11 && $count !== 12) {
+        if ($count < 11) {
             return null;
         }
 

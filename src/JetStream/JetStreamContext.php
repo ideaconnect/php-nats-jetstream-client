@@ -1070,6 +1070,10 @@ final class JetStreamContext
             // only as the restart point when a push is missed.
             $expectedConsumerSeq = 1;
             $lastStreamSeq = 0;
+            // Latch for the unparseable-$JS.ACK protocol error: emitted once per consumer instance
+            // (re-armed on recreate), not once per message, so a stream of unparseable deliveries
+            // cannot become an error storm (#155).
+            $ackParseErrorEmitted = false;
 
             $consumerOptions = [
                 'flow_control' => true,
@@ -1092,7 +1096,7 @@ final class JetStreamContext
             // and no recreate storm. A failed recreate (stream pruned/deleted, leadership change,
             // transient timeout) is CONTAINED here so it cannot throw out of the shared subscription
             // dispatch loop and abort delivery for every other subscription on the connection.
-            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, $stream, $deliver, $filterSubject): void {
+            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, $stream, $deliver, $filterSubject): void {
                 $consumerOptions['deliver_policy'] = 'by_start_sequence';
                 $consumerOptions['opt_start_seq'] = $lastStreamSeq + 1;
 
@@ -1114,6 +1118,7 @@ final class JetStreamContext
                             $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
                             $consumerName = $consumer->name;
                             $expectedConsumerSeq = 1;
+                            $ackParseErrorEmitted = false;
 
                             return;
                         } catch (\Throwable $e) {
@@ -1140,7 +1145,7 @@ final class JetStreamContext
                 }
             };
 
-            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, $recreate): void {
+            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$ackParseErrorEmitted, $stream, $recreate): void {
                 if ($this->handlePushControlMessage($message, $controlHeaders)) {
                     // Tail-gap detection: an idle heartbeat reports the server's last delivered consumer
                     // sequence. If it is ahead of what we have processed in order, deliveries at the tail
@@ -1158,6 +1163,24 @@ final class JetStreamContext
                 $metadata = JsMessageMetadata::fromMessage($message);
 
                 if ($metadata === null) {
+                    if ($message->replyTo !== null && str_starts_with($message->replyTo, '$JS.ACK.')) {
+                        // The reply subject claims the $JS.ACK form but does not parse (an unknown
+                        // future server shape - the tolerant >= 11-token parser makes this nearly
+                        // unreachable). The gap check and the stale-consumer filter below CANNOT run,
+                        // so this delivery's ordering is unverified. Surface that loudly instead of
+                        // silently dropping every ordering guarantee (#155), then still deliver
+                        // best-effort below. No recreate: it would recover nothing (the replacement
+                        // consumer would produce the same unparseable form) and costs a round trip.
+                        if (!$ackParseErrorEmitted) {
+                            $ackParseErrorEmitted = true;
+                            $this->emitClientError(new JetStreamException(sprintf(
+                                'Ordered consumer on stream "%s": unparseable $JS.ACK reply subject "%s"; delivering without ordering checks (ordering unverified)',
+                                $stream,
+                                $message->replyTo,
+                            )));
+                        }
+                    }
+
                     // No JetStream ACK metadata to order on; deliver best-effort.
                     $handler($message);
 
@@ -2275,14 +2298,16 @@ final class JetStreamContext
             return null;
         }
 
-        // Three ACK reply-subject shapes exist:
+        // Two ACK reply-subject shapes exist:
         //   9 tokens:  $JS.ACK.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>
-        //  11 tokens:  $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>
-        //  12 tokens:  ...the 11-token domain form plus a trailing random token.
-        // The stream sequence sits at index 5 in the short form and index 7 in both domain forms.
-        $streamSeqIndex = match (count($parts)) {
-            9 => 5,
-            11, 12 => 7,
+        //  >= 11 tokens: $JS.ACK.<domain>.<account>.<stream>.<consumer>.<delivered>.<sseq>.<cseq>.<ts>.<pending>[.<extra>...]
+        // Offsets anchor from the front and trailing tokens are ignored - servers may append them
+        // (nats.go parser parity, #155). The stream sequence sits at index 5 in the short form and
+        // index 7 in the domain form.
+        $count = count($parts);
+        $streamSeqIndex = match (true) {
+            $count === 9 => 5,
+            $count >= 11 => 7,
             default => null,
         };
 
