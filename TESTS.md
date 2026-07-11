@@ -233,6 +233,14 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testDirectGetBatchDelaysOnZeroFrames` - directGetBatch() enters the delay-on-zero-frames path on a non-blocking empty transport and returns an empty array after the timeout cancellation, having issued the DIRECT.GET request.
 - `testJsRequestRethrowsNonNoRespondersNatsException` - jsRequest() (via incrementCounter) re-throws a non-"No responders" NatsException (a TimeoutException) unchanged.
 - `testPublishWithRetryRethrowsWhenRetriesExhausted` - publishWithRetry() re-throws a 503 JetStreamException ("No JetStream responder") after all configured retry attempts are exhausted on transient no-responder failures.
+- `testCreateStreamRejectsDottedStreamNameBeforeDispatch` - createStream() rejects a dotted stream name ("Invalid stream name") before any $JS.API write reaches the wire (#131).
+- `testCreateConsumerRejectsDottedConsumerName` - createConsumer() rejects a dotted consumer name before dispatch, which the server would otherwise misroute as the filtered-create form (#131).
+- `testGetConsumerRejectsDottedConsumerName` - getConsumer() rejects a dotted consumer name before dispatch instead of surfacing a misleading 503 from a non-existent API route (#131).
+- `testDeleteConsumerRejectsDottedConsumerName` - deleteConsumer() rejects a dotted consumer name before dispatch (#131).
+- `testDirectGetStreamMessageRejectsDottedStreamName` - directGetStreamMessage() rejects a dotted stream name before dispatch, closing the silent sibling-stream Direct Get read (#131).
+- `testCreateStreamRejectsEmptyStreamName` - createStream() rejects an empty stream name ("must be non-empty") before dispatch (#131).
+- `testGetStreamRejectsWildcardStreamName` - getStream() rejects a wildcard '*' stream name before dispatch (#131).
+- `testCreateStreamAcceptsValidNameWithHyphenAndUnderscore` - createStream() accepts a valid name containing '-' and '_' (ORDERS-2_prod) and produces the expected STREAM.CREATE subject on the wire (#131).
 
 ### tests/Unit/JsMessageMetadataTest.php
 - `testFromMessageReturnsNullWhenReplyToIsNull` - `fromMessage()` returns null when the message has no reply subject.
