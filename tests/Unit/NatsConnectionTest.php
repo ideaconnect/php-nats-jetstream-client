@@ -1666,6 +1666,479 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A publish issued by a concurrent fiber while the reconnect replay is still running (after
+     * the new handshake, before the buffered publishes are flushed) must land AFTER the buffered
+     * publishes on the wire: flipping Open before the replay let it jump the queue, inverting
+     * per-publisher ordering and breaking JetStream expected-last-sequence chains (#148).
+     */
+    public function testPublishDuringReplayWindowLandsAfterBufferedPublishes(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $connectGate = new DeferredFuture();
+        $replayGate = new DeferredFuture();
+
+        $transport = new class ($info, $connectGate, $replayGate) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connects = 0;
+            private bool $replayHeld = false;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /**
+             * @param DeferredFuture<void> $connectGate
+             * @param DeferredFuture<void> $replayGate
+             */
+            public function __construct(
+                string $info,
+                private DeferredFuture $connectGate,
+                private DeferredFuture $replayGate,
+            ) {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // connection 0: handshake, then EOF -> reconnect
+                    [$info, "PONG\r\n"],            // connection 1: reconnect handshake
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    if ($this->connects === 1) {
+                        // Hold the reconnect dial open so a publish can buffer during the outage.
+                        $this->connectGate->getFuture()->await();
+                    }
+                    $this->connects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    if ($this->connects === 2 && !$this->replayHeld && str_contains($bytes, 'SUB ')) {
+                        // Hold the replay's SUB write open: recovery is suspended INSIDE the
+                        // replay window - handshake done, buffered publishes not yet flushed.
+                        $this->replayHeld = true;
+                        $this->replayGate->getFuture()->await();
+                    }
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $conn = max(0, $this->connects - 1);
+                    $next = array_shift($this->reads[$conn]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection->connect()->await();
+        $connection->subscribe('s.x', static function (): void {})->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // EOF read; recovery suspended on the held reconnect dial
+
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $connection->publish('a.1', 'p1')->await(); // buffered during the outage
+
+        $connectGate->complete();
+        delay(0.05); // handshake done; recovery suspended inside the SUB replay write
+
+        // The replay window: p1 has NOT been flushed yet. A publish from a concurrent fiber
+        // here must not overtake it on the wire.
+        $connection->publish('a.2', 'p2')->await();
+        self::assertNotContains(
+            "PUB a.2 2\r\np2\r\n",
+            $transport->writes,
+            'a publish during the replay window must not hit the wire ahead of the buffered publishes',
+        );
+
+        $replayGate->complete();
+        $pump->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $wire = implode('', $transport->writes);
+        $p1 = strpos($wire, "PUB a.1 2\r\np1\r\n");
+        $p2 = strpos($wire, "PUB a.2 2\r\np2\r\n");
+        self::assertNotFalse($p1, 'the publish buffered during the outage must be flushed on reconnect');
+        self::assertNotFalse($p2, 'the replay-window publish must reach the wire');
+        self::assertLessThan($p2, $p1, 'the publish buffered during the outage must precede the replay-window publish');
+    }
+
+    /**
+     * When the replay leg of a reconnect attempt fails (the socket died again after the
+     * handshake), the backoff window must not present an Open connection on a dead socket:
+     * state stays off Open, no ping timer runs against the corpse, and a user publish joins
+     * the reconnect buffer instead of writing to the dead socket (#148).
+     */
+    public function testFailedReplayLegKeepsConnectionRecoveringDuringBackoff(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
+        $transport = new class ($info) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connects = 0;
+            private bool $subFailedOnce = false;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            public function __construct(string $info)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // connection 0: handshake, then EOF -> reconnect
+                    [$info, "PONG\r\n"],            // connection 1: attempt 1 (its SUB replay fails)
+                    [$info, "PONG\r\n"],            // connection 2: attempt 2 (replay succeeds)
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $this->connects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    if ($this->connects === 2 && !$this->subFailedOnce && str_contains($bytes, 'SUB ')) {
+                        // The socket dies again during attempt 1's subscription replay.
+                        $this->subFailedOnce = true;
+                        throw new TransportClosedException('socket died during replay');
+                    }
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $conn = max(0, $this->connects - 1);
+                    $next = array_shift($this->reads[$conn]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 150,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0.01,
+                maxPingsOut: 1000,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('s.x', static function (): void {})->await();
+
+        $countPings = static fn(array $writes): int => count(array_filter(
+            $writes,
+            static fn(string $w): bool => $w === "PING\r\n",
+        ));
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.03); // EOF -> attempt 1 handshake OK, SUB replay failed -> 150ms backoff underway
+
+        // The attempt failed after its handshake: the connection must NOT present as Open on
+        // the dead socket during the backoff window.
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $pingsBefore = $countPings($transport->writes);
+
+        // A user publish during the backoff joins the reconnect buffer, not the dead socket.
+        $connection->publish('b.1', 'p1')->await();
+        self::assertNotContains(
+            "PUB b.1 2\r\np1\r\n",
+            $transport->writes,
+            'a publish during the backoff window must buffer, not write to the dead socket',
+        );
+
+        delay(0.05); // still inside the 150ms backoff window
+        self::assertSame(
+            $pingsBefore,
+            $countPings($transport->writes),
+            'no ping timer may run against the dead socket during the backoff window',
+        );
+
+        $pump->await(); // attempt 2 reconnects and flushes the buffer
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $wire = implode('', $transport->writes);
+        $lastConnect = strrpos($wire, 'CONNECT ');
+        $pub = strpos($wire, "PUB b.1 2\r\np1\r\n");
+        self::assertNotFalse($lastConnect);
+        self::assertNotFalse($pub, 'the publish buffered during the backoff must be flushed on reconnect');
+        self::assertGreaterThan($lastConnect, $pub, 'the flush must follow the successful reconnect handshake');
+    }
+
+    /**
+     * A user read racing the recovery's own replay read (the post-SUB poll for prompt -ERR
+     * frames) must not start an overlapping transport read - on a real socket that is Amp's
+     * PendingReadError, aborting an otherwise-successful reconnect (#148). The user read is
+     * refused (connection not open) until the replay completes.
+     */
+    public function testUserReadDuringReplayWindowDoesNotOverlapRecoveryRead(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $drainGate = new DeferredFuture();
+
+        $transport = new class ($info, $drainGate) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            public int $maxConcurrentReads = 0;
+            private int $inFlightReads = 0;
+            private int $connects = 0;
+            private bool $publishFailedOnce = false;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $drainGate */
+            public function __construct(string $info, private DeferredFuture $drainGate)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n"], // connection 0: handshake (dies on a publish write)
+                    [$info, "PONG\r\n"], // connection 1: reconnect handshake
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $this->connects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    if (!$this->publishFailedOnce && str_contains($bytes, 'PUB t.fail')) {
+                        // Fail the publish write once: recovery starts from a WRITE path, so no
+                        // read-path fiber holds the read slot while the replay runs.
+                        $this->publishFailedOnce = true;
+                        throw new TransportClosedException('write failed');
+                    }
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $this->inFlightReads++;
+                    $this->maxConcurrentReads = max($this->maxConcurrentReads, $this->inFlightReads);
+
+                    try {
+                        $conn = max(0, $this->connects - 1);
+                        $next = array_shift($this->reads[$conn]) ?? null;
+                        if ($next !== null) {
+                            return $next;
+                        }
+
+                        if ($conn === 1) {
+                            // The replay's post-SUB poll: hold it open so the test can race a
+                            // user read against the recovery's own in-flight read.
+                            $this->drainGate->getFuture()->await();
+                        }
+
+                        return '';
+                    } finally {
+                        $this->inFlightReads--;
+                    }
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection->connect()->await();
+        $connection->subscribe('s.x', static function (): void {})->await();
+
+        // The failed write starts a recovery inside the publish fiber; it runs up to the
+        // replay's held drain poll and suspends there with its transport read in flight.
+        $pubFuture = $connection->publish('t.fail', 'x');
+        delay(0.05);
+
+        // A user read lands mid-replay.
+        $userRead = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.02);
+
+        $drainGate->complete();
+        $pubFuture->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        self::assertSame(
+            1,
+            $transport->maxConcurrentReads,
+            'a user read during the replay window must not overlap the recovery\'s own read',
+        );
+
+        $threw = null;
+        try {
+            $userRead->await();
+        } catch (ConnectionException $e) {
+            $threw = $e;
+        }
+        self::assertNotNull($threw, 'a user read during the replay window is refused: the connection is not open yet');
+
+        // The failed publish was retried onto the new socket after recovery.
+        self::assertContains("PUB t.fail 1\r\nx\r\n", $transport->writes);
+    }
+
+    /**
+     * A publish that buffers while the reconnect-buffer flush write is itself suspended (the
+     * flush now runs before the state flips Open, so concurrent fibers can append mid-flush)
+     * must still reach the wire - in order - before the connection opens (#148).
+     */
+    public function testPublishBufferedMidFlushIsFlushedBeforeConnectionOpens(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $connectGate = new DeferredFuture();
+        $flushGate = new DeferredFuture();
+
+        $transport = new class ($info, $connectGate, $flushGate) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connects = 0;
+            private bool $flushHeld = false;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /**
+             * @param DeferredFuture<void> $connectGate
+             * @param DeferredFuture<void> $flushGate
+             */
+            public function __construct(
+                string $info,
+                private DeferredFuture $connectGate,
+                private DeferredFuture $flushGate,
+            ) {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // connection 0: handshake, then EOF -> reconnect
+                    [$info, "PONG\r\n"],            // connection 1: reconnect handshake
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    if ($this->connects === 1) {
+                        // Hold the reconnect dial open so a publish can buffer during the outage.
+                        $this->connectGate->getFuture()->await();
+                    }
+                    $this->connects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    if ($this->connects === 2 && !$this->flushHeld && str_contains($bytes, 'PUB a.1')) {
+                        // Hold the reconnect-buffer flush write open so a publish lands mid-flush.
+                        $this->flushHeld = true;
+                        $this->flushGate->getFuture()->await();
+                    }
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $conn = max(0, $this->connects - 1);
+                    $next = array_shift($this->reads[$conn]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection->connect()->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // EOF read; recovery suspended on the held reconnect dial
+
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $connection->publish('a.1', 'p1')->await(); // buffered during the outage
+
+        $connectGate->complete();
+        delay(0.05); // handshake done; recovery suspended inside the flush write of p1
+
+        // Mid-flush publish: must buffer and still flush - in order - before Open flips.
+        $connection->publish('a.2', 'p2')->await();
+        self::assertNotContains(
+            "PUB a.2 2\r\np2\r\n",
+            $transport->writes,
+            'a publish while the flush write is in flight must buffer, not overtake it on the wire',
+        );
+
+        $flushGate->complete();
+        $pump->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $wire = implode('', $transport->writes);
+        $p1 = strpos($wire, "PUB a.1 2\r\np1\r\n");
+        $p2 = strpos($wire, "PUB a.2 2\r\np2\r\n");
+        self::assertNotFalse($p1, 'the publish buffered during the outage must be flushed on reconnect');
+        self::assertNotFalse($p2, 'a publish buffered mid-flush must still be flushed before the connection opens');
+        self::assertLessThan($p2, $p1, 'mid-flush buffered publishes must flush after the earlier buffered block');
+    }
+
+    /**
      * Verifies HMSG frames preserve raw headers and payload separation.
      */
     public function testProcessIncomingDispatchesHmsgWithRawHeaders(): void
