@@ -17,6 +17,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` The reconnect-disabled terminal path in `performRecovery()` now closes the transport
+  best-effort and releases runtime state, matching every other terminal transition to Closed
+  (the #127/#133 invariant). Previously the socket stayed pinned open and
+  `subscriptions`/`subscriptionMeta`/`pendingMessages` (handler closures and payload bytes)
+  survived the close, so a later manual `connect()` could deliver frames carrying the dead
+  epoch's sids to stale handlers. The `Reconnect is disabled` exception and Closed-event
+  semantics are unchanged (#146).
+
 ## [2.5.1] - 2026-07-11
 
 ### Fixed

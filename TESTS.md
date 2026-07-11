@@ -480,6 +480,8 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testProcessIncomingRecoversOnPeerEof` - A graceful peer EOF triggers reconnect + SUB replay, and the next frame is delivered (2 connect calls).
 - `testProcessIncomingRecoversOnPeerEofWithPingsDisabled` - With pings disabled, a peer EOF on the read path still triggers reconnect to a healthy server (2 connect calls, stays Open).
 - `testProcessIncomingMovesToClosedOnPeerEofWhenReconnectDisabled` - A peer EOF with reconnect disabled leaves the connection Closed with only the single original connect.
+- `testReconnectDisabledEofClosesTransportAndReleasesRuntimeState` - A peer EOF with reconnect disabled closes the transport best-effort and clears subscriptions/subscriptionMeta/pendingMessages, keeping the Closed event and the "Reconnect is disabled" exception (#146, #127/#133 invariant).
+- `testReconnectDisabledTerminalCloseLetsManualConnectStartClean` - After a reconnect-disabled terminal close, a manual connect() starts clean: a stray MSG carrying the dead epoch's sid is discarded as unknown, never delivered to the stale handler (#146).
 - `testConsumeHeartbeatResponseRecoversOnPeerEof` - The heartbeat self-read hitting EOF triggers recovery (2 connect calls, stays Open).
 - `testConsumeHeartbeatResponseDoesNotRecoverWithoutEof` - A non-EOF empty heartbeat read is swallowed without triggering reconnect (single connect, stays Open).
 - `testConnectRotatesServersOnReconnectAttempts` - A failed first connect rotates to the next configured server on the retry, dialing both pool members in order.

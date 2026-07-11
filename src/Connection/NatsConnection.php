@@ -1589,6 +1589,10 @@ final class NatsConnection
 
         if (!$this->options->reconnectEnabled) {
             $this->state = ConnectionState::Closed;
+            // Terminal close: same invariant as the exhaustion/auth paths - release the socket and
+            // runtime state so a later manual connect() starts clean (#127/#133, missed here: #146).
+            $this->closeTransportBestEffort();
+            $this->releaseRuntimeState();
             $this->emitEvent(ConnectionEvent::Closed);
             throw new ConnectionException('Reconnect is disabled');
         }
