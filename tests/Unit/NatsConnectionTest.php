@@ -3218,6 +3218,141 @@ final class NatsConnectionTest extends TestCase
         self::assertCount(1, $transport->connectCalls);
     }
 
+    /**
+     * The reconnect-disabled terminal path must honor the same invariant as every other terminal
+     * transition to Closed (#127/#133): close the transport best-effort and release runtime state,
+     * while keeping the Closed event and the 'Reconnect is disabled' exception (#146).
+     */
+    public function testReconnectDisabledEofClosesTransportAndReleasesRuntimeState(): void
+    {
+        $events = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            FakeTransport::EOF,
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $e) use (&$events): void {
+                    $events[] = $e;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (): void {})->await();
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected ConnectionException when reconnect is disabled');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect is disabled', $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertContains(ConnectionEvent::Closed, $events);
+        self::assertTrue($transport->closed, 'a terminal reconnect-disabled close must not leave the socket open');
+        self::assertSame([], (new \ReflectionProperty(NatsConnection::class, 'subscriptions'))->getValue($connection));
+        self::assertSame([], (new \ReflectionProperty(NatsConnection::class, 'subscriptionMeta'))->getValue($connection));
+        self::assertSame([], (new \ReflectionProperty(NatsConnection::class, 'pendingMessages'))->getValue($connection));
+    }
+
+    /**
+     * A terminal reconnect-disabled close must not strand the dead epoch's handlers: after a later
+     * manual connect(), a frame carrying the dead epoch's sid must be discarded as unknown, never
+     * delivered to the stale handler (#146, mirrors the #127 exhaustion-path guarantee).
+     */
+    public function testReconnectDisabledTerminalCloseLetsManualConnectStartClean(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $transport = new FakeTransport([
+            $info, "PONG\r\n", FakeTransport::EOF,             // epoch 0: subscribe (sid 1), then EOF -> terminal close
+            $info, "PONG\r\n", "MSG updates 1 5\r\nghost\r\n", // epoch 1: manual connect; stray MSG for the dead sid
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected ConnectionException when reconnect is disabled');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect is disabled', $e->getMessage());
+        }
+
+        $connection->connect()->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        $connection->processIncoming()->await(); // the stray MSG for the dead sid arrives here
+
+        self::assertSame([], $received, 'a handler from a dead epoch must never fire again');
+    }
+
+    /**
+     * A publish that races a terminal close (state already Closed, the recovery fiber suspended in
+     * the transport-close await, $reconnecting still set) must fail loudly: accepting it into the
+     * reconnect buffer would report success for bytes releaseRuntimeState() is about to discard
+     * silently, violating the #123 loud-abandonment invariant (#146).
+     */
+    public function testPublishRacingTerminalCloseThrowsInsteadOfBufferingSilently(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            FakeTransport::EOF,
+        ]);
+        $transport->closeDelay = 0.01;
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $pump = async(static fn (): int => $connection->processIncoming()->await());
+
+        // Let the pump hit EOF and enter the terminal path; it suspends inside the close await
+        // with state already Closed. Bounded spin so a regression cannot hang the suite.
+        for ($i = 0; $i < 50 && $connection->state() !== ConnectionState::Closed; $i++) {
+            delay(0.001);
+        }
+        self::assertSame(ConnectionState::Closed, $connection->state(), 'pump never reached the terminal close');
+        self::assertFalse($transport->closed, 'the race window requires a still-pending transport close');
+
+        try {
+            $connection->publish('updates', 'lost')->await();
+            self::fail('a publish racing the terminal close must not report success');
+        } catch (ConnectionException $e) {
+            self::assertSame('Connection is not open', $e->getMessage());
+        }
+
+        try {
+            $pump->await();
+        } catch (ConnectionException) {
+            // 'Reconnect is disabled' - the terminal path's own exception.
+        }
+
+        self::assertSame(
+            '',
+            (new \ReflectionProperty(NatsConnection::class, 'reconnectBuffer'))->getValue($connection),
+            'nothing may linger in the reconnect buffer after a terminal close',
+        );
+        foreach ($transport->writes as $write) {
+            self::assertStringNotContainsString('lost', $write, 'the racing publish must never reach the wire');
+        }
+    }
+
     public function testConsumeHeartbeatResponseRecoversOnPeerEof(): void
     {
         $transport = new FlakyTransport(

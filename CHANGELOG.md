@@ -28,6 +28,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   deliver inbox again. The delete leg now tolerates any failure (a timed-out delete may well have
   succeeded server-side), so control always proceeds to the create attempts and the terminal error
   is emitted only when the create leg itself is exhausted (#151).
+- `[bugfix]` The reconnect-disabled terminal path in `performRecovery()` now closes the transport
+  best-effort and releases runtime state, matching every other terminal transition to Closed
+  (the #127/#133 invariant). Previously the socket stayed pinned open and
+  `subscriptions`/`subscriptionMeta`/`pendingMessages` (handler closures and payload bytes)
+  survived the close, so a later manual `connect()` could deliver frames carrying the dead
+  epoch's sids to stale handlers. The `Reconnect is disabled` exception and Closed-event
+  semantics are unchanged. `bufferFrame()` additionally refuses publishes once the state is
+  Closed, so a publish racing a terminal path's transport-close await fails loudly with
+  `Connection is not open` instead of buffering bytes the state release would silently
+  discard (#146).
 
 ## [2.5.1] - 2026-07-11
 

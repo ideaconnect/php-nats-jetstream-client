@@ -677,6 +677,14 @@ final class NatsConnection
             return false;
         }
 
+        // A terminal path can flip to Closed and then suspend in its transport-close await while
+        // $reconnecting is still set; accepting bytes there would report success for a publish
+        // that releaseRuntimeState() is about to discard with no error signal (#146). Refusing
+        // keeps the failure loud and immediate on every terminal path (#123 invariant).
+        if ($this->state === ConnectionState::Closed) {
+            return false;
+        }
+
         if (strlen($this->reconnectBuffer) + strlen($frame) > $this->options->reconnectBufferSize) {
             return false;
         }
@@ -1589,6 +1597,10 @@ final class NatsConnection
 
         if (!$this->options->reconnectEnabled) {
             $this->state = ConnectionState::Closed;
+            // Terminal close: same invariant as the exhaustion/auth paths - release the socket and
+            // runtime state so a later manual connect() starts clean (#127/#133, missed here: #146).
+            $this->closeTransportBestEffort();
+            $this->releaseRuntimeState();
             $this->emitEvent(ConnectionEvent::Closed);
             throw new ConnectionException('Reconnect is disabled');
         }
