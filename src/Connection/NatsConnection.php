@@ -36,6 +36,7 @@ use SplQueue;
 
 use function Amp\async;
 use function Amp\delay;
+use function Amp\Future\awaitFirst;
 
 /**
  * Manages low-level NATS protocol connection lifecycle and frame processing.
@@ -107,6 +108,13 @@ final class NatsConnection
     /** Guards against two overlapping socket reads (user read vs heartbeat self-read). */
     private bool $readInProgress = false;
     /**
+     * Completed and rotated whenever the shared read slot frees, so request waiters parked behind
+     * another fiber's read wake to take over pumping instead of polling on 1ms timers (#135).
+     *
+     * @var DeferredFuture<null>
+     */
+    private DeferredFuture $readSlotReleased;
+    /**
      * Set by disconnect()/drain() to signal user close-intent. The reconnect paths bail when it is set
      * so an in-flight heartbeat/read-path recovery cannot re-open a connection the user just closed
      * (#84). Cleared on a fresh connect().
@@ -163,6 +171,8 @@ final class NatsConnection
         private readonly ProtocolCodec $codec = new ProtocolCodec(),
     ) {
         $this->parser = new ProtocolParser();
+        $this->readSlotReleased = new DeferredFuture();
+        $this->readSlotReleased->getFuture()->ignore();
 
         $servers = $this->options->servers;
         if ($this->options->randomizeServers && count($servers) > 1) {
@@ -782,6 +792,7 @@ final class NatsConnection
                 return 0;
             } finally {
                 $this->readInProgress = false;
+                $this->signalReadSlotFree();
             }
 
             if ($chunk === '') {
@@ -839,6 +850,19 @@ final class NatsConnection
         if ($firstError !== null) {
             throw $firstError;
         }
+    }
+
+    /**
+     * Wakes request waiters parked behind another fiber's socket read (#135): the current
+     * broadcast future completes (all parked waiters resume, re-check their completion, and one
+     * takes over the read slot) and a fresh one is armed for the next read cycle.
+     */
+    private function signalReadSlotFree(): void
+    {
+        $released = $this->readSlotReleased;
+        $this->readSlotReleased = new DeferredFuture();
+        $this->readSlotReleased->getFuture()->ignore();
+        $released->complete();
     }
 
     /**
@@ -945,6 +969,22 @@ final class NatsConnection
                     throw new TimeoutException('Request timed out for subject ' . $subject);
                 }
 
+                if ($this->readInProgress) {
+                    // Another fiber owns the socket read. Park on our reply or the read slot
+                    // freeing instead of re-polling on a 1ms timer: N concurrent requests used to
+                    // burn O(N x 1000/s) wakeups, each allocating a Future (#135). The slot future
+                    // is captured before the re-check inside awaitFirst, so a release between the
+                    // flag check and the await completes it immediately - no lost wakeup.
+                    try {
+                        awaitFirst([$deferred->getFuture(), $this->readSlotReleased->getFuture()], $waitCancellation);
+                    } catch (CancelledException) {
+                        // Deadline or external cancellation while parked; the top-of-loop checks
+                        // return the reply delivered in the same tick or throw.
+                    }
+
+                    continue;
+                }
+
                 try {
                     $frames = $this->processIncoming($waitCancellation)->await();
                 } catch (CancelledException $e) {
@@ -1041,17 +1081,26 @@ final class NatsConnection
         $lastAt = null;
         $noResponders = false;
 
-        $sid = $this->subscribe($inbox, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders): void {
+        // Rotated on every delivery so a waiter parked behind another fiber's read wakes to
+        // re-evaluate its termination conditions (count/stall/no-responders) (#135).
+        /** @var DeferredFuture<null> $replyTick */
+        $replyTick = new DeferredFuture();
+        $replyTick->getFuture()->ignore();
+
+        $sid = $this->subscribe($inbox, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick): void {
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
                 $noResponders = true;
-
-                return;
+            } else {
+                $messages[] = $message;
+                $lastAt = $this->monotonicSeconds();
             }
 
-            $messages[] = $message;
-            $lastAt = $this->monotonicSeconds();
+            $tick = $replyTick;
+            $replyTick = new DeferredFuture();
+            $replyTick->getFuture()->ignore();
+            $tick->complete();
         })->await();
 
         try {
@@ -1102,6 +1151,18 @@ final class NatsConnection
                     $waitCancellation,
                     new TimeoutCancellation(max(0.001, $slice)),
                 );
+
+                if ($this->readInProgress) {
+                    // Another fiber owns the socket read: park on the next delivery or the read
+                    // slot freeing, bounded by the same slice so stall/total still fire (#135).
+                    try {
+                        awaitFirst([$replyTick->getFuture(), $this->readSlotReleased->getFuture()], $sliceCancellation);
+                    } catch (CancelledException) {
+                        // Slice/total deadline while parked; loop re-evaluates at the top.
+                    }
+
+                    continue;
+                }
 
                 try {
                     $frames = $this->processIncoming($sliceCancellation)->await();
@@ -2075,6 +2136,7 @@ final class NatsConnection
             return;
         } finally {
             $this->readInProgress = false;
+            $this->signalReadSlotFree();
         }
 
         if ($closed) {

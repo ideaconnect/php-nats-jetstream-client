@@ -2288,6 +2288,155 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * Two concurrent requests share one socket: when the fiber owning the read completes, a
+     * parked waiter must take over the read pump and receive its own reply from a later chunk.
+     * Guards the #135 park-instead-of-poll rework against lost wakeups (a broken handoff would
+     * leave request B waiting for its full timeout and fail this test).
+     */
+    public function testConcurrentRequestWaiterTakesOverReadPumpAfterFirstReplyArrives(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
+        $transport = new class ($info) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            /** @var list<string> */
+            private array $chunks;
+            /** @var ?DeferredFuture<null> */
+            private ?DeferredFuture $waiting = null;
+
+            public function __construct(string $info)
+            {
+                $this->chunks = [$info, "PONG\r\n"];
+            }
+
+            public function feed(string $chunk): void
+            {
+                $this->chunks[] = $chunk;
+                $waiting = $this->waiting;
+                $this->waiting = null;
+                $waiting?->complete();
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function () use ($cancellation): string {
+                    while ($this->chunks === []) {
+                        // Model a live idle socket: park until data is fed or the read is cancelled.
+                        $this->waiting = new DeferredFuture();
+                        $this->waiting->getFuture()->await($cancellation);
+                    }
+
+                    return array_shift($this->chunks);
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $a = async(static fn(): NatsMessage => $connection->request('svc.a', 'x', 2_000)->await());
+        delay(0.01); // request A owns the read pump and is parked on the idle socket
+        $b = async(static fn(): NatsMessage => $connection->request('svc.b', 'x', 2_000)->await());
+        delay(0.01); // request B sees the read slot taken and parks
+
+        // Extract each request's reply inbox from its PUB frame ("PUB <subject> <inbox> <len>").
+        $inboxOf = static function (array $writes, string $subject): string {
+            foreach ($writes as $frame) {
+                if (str_starts_with($frame, 'PUB ' . $subject . ' ')) {
+                    return explode(' ', $frame)[2];
+                }
+            }
+
+            return '';
+        };
+        $inboxA = $inboxOf($transport->writes, 'svc.a');
+        $inboxB = $inboxOf($transport->writes, 'svc.b');
+        self::assertNotSame('', $inboxA);
+        self::assertNotSame('', $inboxB);
+
+        // A's reply arrives first; B's follows in a separate chunk that only a handed-over
+        // pump can read (request inbox sids are 1 and 2).
+        $transport->feed("MSG {$inboxA} 1 2\r\nra\r\n");
+        $transport->feed("MSG {$inboxB} 2 2\r\nrb\r\n");
+
+        self::assertSame('ra', $a->await()->payload);
+        self::assertSame('rb', $b->await()->payload);
+    }
+
+    /**
+     * A request waiter parked behind another fiber's read still honors its own deadline and an
+     * external cancellation while parked (the awaitFirst park must not outlive them) (#135).
+     */
+    public function testParkedRequestWaiterStillHonorsDeadlineAndCancellation(): void
+    {
+        $transport = new FakeTransport(
+            [
+                'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                "PONG\r\n",
+            ],
+            blockWhenEmpty: true,
+        );
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        // Request A owns the read pump (parked on the idle blocking socket until its deadline).
+        $a = async(static fn(): NatsMessage => $connection->request('svc.a', 'x', 400)->await());
+        delay(0.01);
+
+        // Request B parks behind A's read; its shorter deadline must still fire while parked.
+        try {
+            $connection->request('svc.b', 'x', 100)->await();
+            self::fail('expected request B to time out while parked behind the read owner');
+        } catch (TimeoutException $e) {
+            self::assertStringContainsString('svc.b', $e->getMessage());
+        }
+
+        // Request C parks behind A's read; an external cancellation must still fire while parked.
+        $deferredCancellation = new DeferredCancellation();
+        $c = async(static fn(): NatsMessage => $connection->request('svc.c', 'x', 2_000, $deferredCancellation->getCancellation())->await());
+        delay(0.01);
+        $deferredCancellation->cancel();
+
+        try {
+            $c->await();
+            self::fail('expected request C to observe its external cancellation while parked');
+        } catch (CancelledException) {
+            // Expected.
+        }
+
+        try {
+            $a->await();
+            self::fail('expected request A to time out on the idle socket');
+        } catch (TimeoutException) {
+            // Expected.
+        }
+    }
+
+    /**
      * Verifies processIncoming reconnects after read failure and replays subscriptions.
      */
     public function testProcessIncomingReconnectsAndResubscribesAfterReadFailure(): void

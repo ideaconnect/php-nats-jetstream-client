@@ -463,6 +463,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testRequestUsesConfiguredInboxPrefix` - request() uses the configured inbox prefix for both the SUB and the PUB reply subject.
 - `testRequestRejectsNonPositiveTimeout` - request() with timeout 0 throws TimeoutException ("Request timeout must be greater than zero").
 - `testRequestCanBeCancelledAndCleansUpSubscription` - request() with a pre-cancelled token throws CancelledException and still emits UNSUB.
+- `testConcurrentRequestWaiterTakesOverReadPumpAfterFirstReplyArrives` - When the fiber owning the socket read completes its request, a parked waiter takes over the read pump and receives its own reply from a later chunk (no lost wakeup) (#135).
+- `testParkedRequestWaiterStillHonorsDeadlineAndCancellation` - A waiter parked behind another fiber's read still times out on its own deadline and observes an external cancellation while parked (#135).
 - `testProcessIncomingReconnectsAndResubscribesAfterReadFailure` - A read failure triggers reconnect (2 connect calls) and replays the SUB, then a later MSG is delivered.
 - `testReconnectAfterMidFramePayloadDropSucceedsOnFirstAttempt` - A connection dying mid-MSG-payload (partial frame in the parser) reconnects on the FIRST attempt and delivers post-reconnect messages: the handshake starts from a clean parser instead of feeding INFO into the stale pending frame (#125).
 - `testExhaustedReconnectReleasesStateSoManualReconnectStartsClean` - After reconnect exhaustion, a manual connect() starts from a clean slate: a later recovery replays no SUB from the dead epoch and the old handler never fires again (#127).
