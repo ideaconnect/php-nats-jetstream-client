@@ -19,6 +19,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` The reconnect handshake now starts from a clean protocol parser. Previously the new
+  connection's INFO/PONG bytes were fed into the parser state left by the dead connection; after a
+  drop mid-message-payload the pending frame swallowed each attempt's INFO as phantom payload
+  bytes, so every reconnect attempt failed with "Expected INFO during connect" and the client
+  closed permanently against a healthy server once the attempt budget was exhausted (#125).
 - `[bugfix]` Transport `write()` on a closed/never-connected socket now throws
   `TransportClosedException` instead of silently succeeding (both TCP and WebSocket transports).
   Previously a publish, JetStream ACK, or flow-control reply racing a reconnect (or a concurrent

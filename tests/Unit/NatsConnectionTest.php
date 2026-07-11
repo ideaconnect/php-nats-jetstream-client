@@ -2107,6 +2107,60 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A connection that dies mid-MSG-payload leaves the parser expecting the rest of the frame.
+     * The reconnect handshake must start from a clean parser: with the stale one, the new server's
+     * INFO is swallowed as phantom payload bytes and every attempt fails against a healthy server
+     * until the reconnect budget exhausts (#125).
+     */
+    public function testReconnectAfterMidFramePayloadDropSucceedsOnFirstAttempt(): void
+    {
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    // The server dies while streaming a large message: the control line promises
+                    // 500000 payload bytes but only a fragment arrives before the read fails.
+                    "MSG updates 1 500000\r\npartial-payload-then-the-server-died",
+                    '__THROW__',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 1 5\r\nhello\r\n",
+                ],
+            ],
+        );
+
+        $options = new NatsOptions(
+            reconnectEnabled: true,
+            maxReconnectAttempts: 2,
+            reconnectDelayMs: 1,
+            reconnectJitterMs: 0,
+            connectTimeoutMs: 250,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Reads the partial frame + read failure, reconnects, and replays the subscription.
+        $connection->processIncoming()->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        $connection->processIncoming()->await();
+
+        self::assertSame(['hello'], $received, 'post-reconnect delivery must work after a mid-frame drop');
+        // Exactly one reconnect dial: the stale-parser bug burns extra attempts eating INFO as payload.
+        self::assertCount(2, $transport->connectCalls);
+        self::assertSame(1, $connection->statistics()->reconnects);
+    }
+
+    /**
      * Verifies a recovery that races a user disconnect() does NOT re-open the connection: once
      * close-intent is set, recoverConnection() is a no-op even though a healthy server is reachable
      * (#84). Simulates the race by invoking recovery (as an in-flight heartbeat/read path would) after
