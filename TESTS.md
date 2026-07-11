@@ -523,6 +523,10 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testDrainDeliversBufferedMessagesBeforeClosing` - drain() flushes the in-flight delivery ("hello") to the handler before closing.
 - `testRequestTimeoutPreservesOriginalExceptionDuringCleanup` - A request() timeout surfaces TimeoutException ("Request timed out") even though cleanup emits UNSUB.
 - `testMalformedHmsgTriggersRecoveryInsteadOfEscaping` - A corrupt HMSG (headerBytes > totalBytes) routes through the recovery path; with reconnect disabled it surfaces as ConnectionException and closes.
+- `testParseFailureDeliversSiblingFramesEmitsErrorAndRecovers` - A single chunk of `[valid MSG][garbage line]` delivers the parsed MSG to its handler before recovery, surfaces the ProtocolException through the error listener, and still reconnects with the SUB written exactly twice (initial subscribe + replay) (#147).
+- `testHandlerThrowOnRecoveredSiblingFrameStillEmitsErrorAndRecovers` - A handler that throws while the recovered sibling MSG is delivered does not suppress the ProtocolException recovery path: the error listener still observes the parse failure, the connection still reconnects, and the handler's own exception propagates to the caller afterwards (#147).
+- `testHeartbeatReadParseFailureDeliversSiblingFramesAndSurfacesError` - The corrupt `[valid MSG][garbage line]` chunk arriving during the heartbeat self-read still delivers the parsed MSG and surfaces the ProtocolException via the error listener, without triggering recovery from the heartbeat path (#147).
+- `testReplayParseFailureRetainsSiblingFramesForPostRecoveryDelivery` - A corrupt chunk read by the reconnect subscription-replay poll fails that attempt but enqueues the parsed MSG before the retry replaces the parser, so the post-recovery drain delivers it once the retry succeeds (#147).
 - `testBackoffDelayIsExponential` - backoffDelayMs() doubles per attempt (100,200,400,800,1600,3200) and caps at reconnectMaxDelayMs (5000).
 - `testRequestWithHeadersReturnsReply` - requestWithHeaders() emits an HPUB carrying the header and returns the first reply payload.
 - `testProcessIncomingRequiresOpenConnection` - processIncoming() on a not-open connection throws ConnectionException ("Connection is not open").
@@ -800,6 +804,9 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testBuffersSubCapControlLineWithoutCrlf` - asserts a 1000-byte partial control line with no CRLF is buffered (returns no frames), not rejected.
 - `testRejectsUnterminatedControlLineExceedingBound` - asserts a control line over 1 MiB with no CRLF throws ProtocolException ("Control line exceeds maximum length") as an OOM guard.
 - `testResyncsPastMalformedControlLineInsteadOfPoisoning` - asserts after a malformed `BADOP` line throws, the offending line is consumed so a subsequent `PING\r\n` parses normally.
+- `testRetainsFramesParsedBeforeMidChunkFailureForCatchSiteDrain` - asserts a chunk of `[valid MSG][garbage line]` throws but retains the parsed MSG (subject/sid/payload intact) for `takeParsedFrames()`, and a second take returns empty (draining is destructive) (#147).
+- `testUndrainedRetainedFramesArePrependedToNextPushResult` - asserts retained frames a catch site never drained are returned by the next push ahead of newly parsed frames (MSG then PING), preserving wire order (#147).
+- `testTakeParsedFramesIsEmptyAfterSuccessfulPush` - asserts a clean push returns all frames via its normal return, leaving nothing in `takeParsedFrames()` to duplicate into a later drain.
 
 ### tests/Unit/PullConsumerIteratorTest.php
 - `testFluentBuilderSetsProperties` - verifies the fluent builder (`setBatching`/`setExpiresMs`/`setIterations`) returns a `PullConsumerIterator` and stores 10/5000/3 via the getters.

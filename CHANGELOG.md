@@ -38,6 +38,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   Closed, so a publish racing a terminal path's transport-close await fails loudly with
   `Connection is not open` instead of buffering bytes the state release would silently
   discard (#146).
+- `[bugfix]` A parse failure no longer silently discards valid sibling frames from the same
+  chunk: `ProtocolParser::push()` retains frames parsed before a mid-chunk `ProtocolException`
+  (drained via `takeParsedFrames()`, or prepended to the next `push()` result), and every read
+  path that can hit one - `processIncoming()`, the heartbeat self-read, and the reconnect
+  subscription-replay poll - now delivers them to their handlers instead of dropping them: their
+  bytes are already consumed, and core NATS never resends, so they were permanently lost. The
+  `ProtocolException` surfaces through the error listener on each of those paths instead of
+  vanishing, and on `processIncoming()` the error emission and the recovery both run even when a
+  handler throws while the recovered frames are delivered (the handler's exception still
+  propagates afterwards, matching #128's containment semantics) (#147).
 
 ## [2.5.1] - 2026-07-11
 
