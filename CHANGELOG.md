@@ -19,6 +19,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` `NatsClient::subscribeQueue()` no longer silently drops messages delivered between
+  the SUB hitting the wire and the `SubscriptionQueue` object being constructed: the subscription
+  handler is registered before the SUB write (so the sid is immediately routable, and a concurrent
+  read or the heartbeat self-read can dispatch for it while `subscribeQueue()` is still suspended),
+  but the handler discarded anything arriving before the queue existed. Early deliveries are now
+  buffered and replayed into the queue (through the normal cap and slow-consumer policy) (#129).
 - `[bugfix]` An exception while handling one inbound frame no longer discards the frames already
   parsed from the same chunk. The parser has consumed the bytes, so an undispatched trailing frame
   was silently and permanently lost (core NATS does not resend) - e.g. a slow-consumer overflow on

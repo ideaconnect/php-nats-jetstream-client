@@ -896,6 +896,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 
 ### tests/Unit/SubscriptionQueueTest.php
 - `testSubscribeQueueReturnsSidAndFetchesMessage` - `subscribeQueue('events')` returns a `SubscriptionQueue` with sid 1 and `fetch()` returns the message with payload 'hello' and subject 'events'.
+- `testMessageDeliveredDuringSubscribeAwaitReachesTheQueue` - A message dispatched while the SUB write is still suspended (queue object not constructed yet) is buffered and reaches the returned queue instead of being silently dropped (#129).
 - `testFetchReturnsNullWhenNoMessages` - `fetch()` returns null when no message is available.
 - `testNextReturnsBufferedMessageImmediately` - after `processIncoming()` pre-buffers a message, `next()` returns it immediately (payload 'abc').
 - `testNextReturnsNullOnTimeout` - with a 0.01s timeout and no messages, `next()` returns null.
