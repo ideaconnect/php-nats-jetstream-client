@@ -939,6 +939,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testFetchAllDoesNotBailOnTransientEmptyReadWithinTimeout` - a transient 0-frame read between two deliveries does not end `fetchAll(2)` early while timeout remains; both 'msg1' and 'msg2' are collected.
 - `testEnqueueBoundsBacklogWithDropOldest` - with cap 2 and DropOldest policy, a third enqueue drops the oldest ('a'); fetchAll yields `['b','c']`.
 - `testEnqueueDropsNewestWhenPolicyIsDropNewest` - with cap 2 and DropNewest policy, a third enqueue drops the newest ('c'); fetchAll yields `['a','b']`.
+- `testEnqueueDropOldestIncrementsDroppedCountAndNotifiesErrorListener` - with cap 2 and DropOldest, each overflow increments `droppedCount()` monotonically (0 -> 1 -> 2) and invokes the client's errorListener with "Slow consumer on sid 99: dropped oldest message" (#134).
+- `testEnqueueDropNewestIncrementsDroppedCountAndNotifiesErrorListener` - with cap 2 and DropNewest, the discarded (never-enqueued) third message increments `droppedCount()` to 1 and invokes the client's errorListener with "Slow consumer on sid 99: dropped newest message" (#134).
 - `testUnsubscribeSendsUnsubForOwnSid` - `unsubscribe()` writes `UNSUB {sid}` for the queue's own sid.
 - `testEnqueueThrowsOnOverflowWhenPolicyIsError` - with cap 2 and Error policy, the third enqueue throws `NatsException` with message "Subscription queue overflow for sid 99".
 - `testCloseSendsUnsubForOwnSid` - `close()` (alias of unsubscribe) writes `UNSUB {sid}` for the queue's own sid.
