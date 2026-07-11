@@ -199,8 +199,10 @@ final class ProtocolParser
     /**
      * Drains frames that parsed successfully before a push() threw mid-chunk. The throw aborts
      * push() before its normal return, but the finally-block resync has already consumed those
-     * frames' bytes, so the catch site must collect them here - a frame left undrained is only
-     * deferred (the next push() returns it first), never dropped (#147).
+     * frames' bytes, so the catch site must collect them here. Retention holds only per parser
+     * instance: an undrained frame is returned first by the next push(), but replacing the
+     * instance (a reconnect attempt creates a fresh parser) drops it - so every catch site that
+     * can precede a parser replacement must drain before recovery runs (#147).
      *
      * @return list<ProtocolFrame>
      */

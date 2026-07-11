@@ -4254,7 +4254,156 @@ final class NatsConnectionTest extends TestCase
         );
         self::assertCount(2, $transport->connectCalls, 'the corrupt stream must still trigger recovery');
         self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertContains("SUB a 1\r\n", $transport->writes, 'recovery must replay the subscription');
+        $subWrites = 0;
+        foreach ($transport->writes as $write) {
+            $subWrites += substr_count($write, "SUB a 1\r\n");
+        }
+        self::assertSame(2, $subWrites, 'the initial subscribe and the recovery replay must each write the SUB exactly once');
+    }
+
+    public function testHandlerThrowOnRecoveredSiblingFrameStillEmitsErrorAndRecovers(): void
+    {
+        // Same corrupt chunk as above, but the handler receiving the recovered sibling MSG throws.
+        // The pre-#147 invariant that a ProtocolException ALWAYS triggers recovery must hold: the
+        // error listener still observes the parse failure, the connection still reconnects (it must
+        // not stay Open on a corrupt stream), and the handler's own exception still propagates to
+        // the caller afterwards (#128's rethrow-after-containment semantics).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG a 1 2\r\nhi\r\nBOGUS LINE\r\n",
+            // Recovery handshake (epoch 2).
+            'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                errorListener: static function (\Throwable $err) use (&$errors): void {
+                    $errors[] = $err;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('a', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+
+            throw new \RuntimeException('handler failure');
+        })->await();
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('Expected the handler exception to propagate after recovery');
+        } catch (\RuntimeException $handlerError) {
+            self::assertSame('handler failure', $handlerError->getMessage());
+        }
+
+        self::assertSame(['hi'], $received, 'the recovered sibling MSG must reach its handler');
+        self::assertNotEmpty(
+            array_filter($errors, static fn (\Throwable $err): bool => $err instanceof ProtocolException),
+            'the parse failure must surface through the error listener even when a handler throws',
+        );
+        self::assertCount(2, $transport->connectCalls, 'a throwing handler must not suppress recovery of the corrupt stream');
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    public function testHeartbeatReadParseFailureDeliversSiblingFramesAndSurfacesError(): void
+    {
+        // The corrupt chunk arrives during the heartbeat self-read instead of processIncoming().
+        // The MSG parsed before the garbage line must still reach its handler and the
+        // ProtocolException must surface via the error listener; escalation (recovery) stays with
+        // the ping watchdog / next user read, so no reconnect happens here (#147).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG a 1 2\r\nhi\r\nBOGUS LINE\r\n",
+        ]);
+
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                reconnectEnabled: false,
+                errorListener: static function (\Throwable $err) use (&$errors): void {
+                    $errors[] = $err;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('a', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(['hi'], $received, 'the MSG parsed before the garbage line must survive the heartbeat read');
+        self::assertNotEmpty(
+            array_filter($errors, static fn (\Throwable $err): bool => $err instanceof ProtocolException),
+            'the heartbeat-read parse failure must surface through the error listener',
+        );
+        self::assertCount(1, $transport->connectCalls, 'the heartbeat read must not trigger recovery itself');
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    public function testReplayParseFailureRetainsSiblingFramesForPostRecoveryDelivery(): void
+    {
+        // The corrupt chunk arrives during the reconnect subscription replay (epoch 2): the parse
+        // failure fails that recovery attempt, and the retry's connectOnce() replaces the parser.
+        // The MSG parsed before the garbage line must be enqueued before the replacement so the
+        // post-recovery drain delivers it once the retry (epoch 3) succeeds (#147).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            FakeTransport::EOF,
+            // Recovery attempt 1 (epoch 2): handshake, then the replay poll reads the corrupt chunk.
+            'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG a 1 2\r\nhi\r\nBOGUS LINE\r\n",
+            // Recovery attempt 2 (epoch 3): clean handshake, replay poll reads nothing.
+            'INFO {"server_id":"S3","server_name":"n3","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                errorListener: static function (\Throwable $err) use (&$errors): void {
+                    $errors[] = $err;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('a', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // The EOF read triggers recovery; attempt 1 fails on the corrupt replay chunk, attempt 2
+        // succeeds, and recoverConnection()'s post-recovery drain delivers the retained MSG.
+        $connection->processIncoming()->await();
+
+        self::assertSame(['hi'], $received, 'the MSG retained by the failed replay attempt must survive the parser replacement');
+        self::assertCount(3, $transport->connectCalls, 'attempt 1 fails on the corrupt replay chunk; attempt 2 reconnects');
+        self::assertSame(ConnectionState::Open, $connection->state());
     }
 
     // ─── Exponential Backoff ────────────────────────────────────────────

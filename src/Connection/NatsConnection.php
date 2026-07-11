@@ -931,10 +931,25 @@ final class NatsConnection
                 $recovered = $this->parser->takeParsedFrames();
 
                 try {
-                    $this->dispatchFrames($recovered);
+                    try {
+                        $this->dispatchFrames($recovered);
+                    } finally {
+                        // Deliver the enqueued messages even when a frame failed to dispatch,
+                        // mirroring the clean-path drain below.
+                        $this->drainAllPending();
+                    }
                 } finally {
-                    $this->drainAllPending();
-                    $this->emitError($parseError);
+                    // A handler that throws while the recovered frames are delivered must not leave
+                    // the connection Open on a corrupt stream with the failure unobservable: the
+                    // error emission and the recovery run regardless, and the handler's own
+                    // exception then propagates to the caller (#128 rethrow-after-containment).
+                    try {
+                        $this->emitError($parseError);
+                    } catch (\Throwable) {
+                        // emitError() swallows listener throws, but a user-supplied logger can
+                        // still throw; recovery must run regardless.
+                    }
+
                     $this->recoverConnection();
                 }
 
@@ -1804,7 +1819,22 @@ final class NatsConnection
             // Per-frame containment (#128): a prompt -ERR still aborts this reconnect attempt (the
             // first failure rethrows after the loop), but sibling MSG frames from the same chunk
             // are enqueued first instead of being discarded. handleFrame() ignores +OK frames.
-            $this->dispatchFrames($this->parser->push($chunk));
+            try {
+                $this->dispatchFrames($this->parser->push($chunk));
+            } catch (ProtocolException $parseError) {
+                // A mid-chunk parse failure fails this attempt, and the retry's connectOnce()
+                // replaces the parser - which would drop the frames it retained (#147). Enqueue
+                // them first (the post-recovery drainAllPending() delivers them), then rethrow so
+                // attempt-failure semantics stay unchanged.
+                try {
+                    $this->dispatchFrames($this->parser->takeParsedFrames());
+                } catch (\Throwable) {
+                    // The rethrow below already fails this attempt; dispatchFrames() enqueued the
+                    // recovered MSG frames per frame before rethrowing (#128).
+                }
+
+                throw $parseError;
+            }
         }
     }
 
@@ -2330,9 +2360,27 @@ final class NatsConnection
             // Deliver any message frames captured during the heartbeat read instead of leaving
             // them buffered until the next processIncoming(), mirroring processIncoming().
             $this->drainAllPending();
+        } catch (ProtocolException $parseError) {
+            // A mid-chunk parse failure: frames parsed before it are already consumed from the
+            // wire and would otherwise vanish (#147). Deliver them through the normal
+            // enqueue/dispatch path and surface the failure; escalation (recovery) stays with the
+            // ping watchdog / next user read, not with the event-loop timer.
+            try {
+                try {
+                    $this->dispatchFrames($this->parser->takeParsedFrames());
+                } finally {
+                    $this->drainAllPending();
+                }
+            } catch (\Throwable $e) {
+                // Contained like the clean-path dispatch above: surfaced below, never thrown
+                // out of the timer.
+                $dispatchError = $e;
+            }
+
+            $this->emitError($parseError);
         } catch (\Throwable) {
-            // A parse failure or a handler error during the drain; leave escalation to the next
-            // user read / tick rather than throwing out of the event-loop timer.
+            // A handler error during the drain; leave escalation to the next user read / tick
+            // rather than throwing out of the event-loop timer.
         }
 
         if ($dispatchError !== null) {
