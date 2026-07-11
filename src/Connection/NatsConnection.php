@@ -132,6 +132,18 @@ final class NatsConnection
      * @var ?DeferredFuture<void>
      */
     private ?DeferredFuture $connecting = null;
+    /**
+     * The fiber running the in-flight user connect()'s performConnect(). Lifecycle/error listeners
+     * fire synchronously inside that fiber, so a listener-initiated connect() would run on it too: a
+     * join of the still-pending $connecting deferred (or a fresh dial after the deferred was settled)
+     * awaits an outcome only the suspended emitting fiber can produce - a permanent deadlock. connect()
+     * compares its caller's fiber against this to refuse such a re-entry loudly, mirroring the
+     * recovery-fiber guard. Held until connect()'s finally so the refusal stays armed through the
+     * terminal Closed emission, where $connecting has already been settled (#145).
+     *
+     * @var ?\Fiber<mixed, mixed, mixed, mixed>
+     */
+    private ?\Fiber $connectFiber = null;
     /** Guards against two overlapping socket reads (user read vs heartbeat self-read). */
     private bool $readInProgress = false;
     /**
@@ -352,7 +364,9 @@ final class NatsConnection
                     throw new ConnectionException(
                         'connect() cannot join the in-flight recovery from a connection/error listener: '
                         . 'the listener runs inside the recovery fiber, and awaiting the join there '
-                        . 'deadlocks. Schedule supervision reconnects with Revolt\EventLoop::queue() instead.',
+                        . 'deadlocks. Schedule supervision reconnects with Revolt\EventLoop::queue() and '
+                        . 'do not await the scheduled connect from inside the listener (that only moves '
+                        . 'the same dependency cycle one fiber away).',
                     );
                 }
 
@@ -360,6 +374,21 @@ final class NatsConnection
                 $this->throwUnlessOpenAfterJoin('Recovery was aborted before the connection opened');
 
                 return;
+            }
+
+            // A user connect()'s performConnect() emits lifecycle events (Connected/Closed)
+            // synchronously on its own fiber, and a listener that calls connect() from there runs on
+            // that same fiber. Joining the still-pending $connecting deferred - or dialing afresh once
+            // it was settled - would await an outcome only the suspended emitting fiber can produce: a
+            // permanent deadlock. Refuse loudly, mirroring the recovery-fiber guard above (#145).
+            if ($caller !== null && $caller === $this->connectFiber) {
+                throw new ConnectionException(
+                    'connect() cannot be re-entered from a connection/error listener: the listener runs '
+                    . 'inside the connecting fiber, and awaiting the re-entrant connect there deadlocks. '
+                    . 'Schedule supervision reconnects with Revolt\EventLoop::queue() and do not await '
+                    . 'the scheduled connect from inside the listener (that only moves the same '
+                    . 'dependency cycle one fiber away).',
+                );
             }
 
             if ($this->state === ConnectionState::Draining) {
@@ -381,6 +410,10 @@ final class NatsConnection
             // receive the error from await().
             $deferred->getFuture()->ignore();
             $this->connecting = $deferred;
+            // The fiber that runs performConnect() below, so the caller-fiber guard above can refuse a
+            // listener-initiated re-entry. Held until the finally (not settleConnecting()) so it stays
+            // armed through the terminal Closed emission, where $connecting is already settled (#145).
+            $this->connectFiber = \Fiber::getCurrent();
 
             // A fresh connect re-arms the recovery paths after a prior disconnect()/drain() (#84).
             // Only this fresh-dial path resets close-intent: the joining paths above must not
@@ -389,14 +422,24 @@ final class NatsConnection
 
             try {
                 $this->performConnect();
-                $deferred->complete();
             } catch (\Throwable $e) {
-                $deferred->error($e);
+                // performConnect() settles $connecting before each of its own emissions; this covers
+                // the owned-recovery hand-off, whose failure leaves $connecting pending. Idempotent.
+                $this->settleConnecting($e);
 
                 throw $e;
             } finally {
-                $this->connecting = null;
+                $this->connectFiber = null;
             }
+
+            // A direct success already settled $connecting before emitting Connected; a completed
+            // owned recovery hand-off leaves it pending until here.
+            $this->settleConnecting(null);
+            // The dial can RESOLVE without the connection opening: an owned recovery aborted by a
+            // concurrent disconnect()/drain() returns without throwing, leaving state Closed. Callers
+            // treat a resolved connect() as "connected", so a not-Open outcome must surface as a
+            // failure - for the owner exactly as it already does for joiners (#145).
+            $this->throwUnlessOpenAfterJoin('Connect was aborted before the connection opened');
         });
     }
 
@@ -426,12 +469,19 @@ final class NatsConnection
         try {
             $this->connectOnce();
             $this->markConnectionOpen();
+            // Settle $connecting before running the listener: the deferred must never be pending
+            // while user code runs, or a listener-initiated connect() join would await an outcome
+            // only this (now suspended-in-the-listener) fiber can produce - a deadlock - and a
+            // concurrent live-epoch failure could be swallowed by recoverConnection()'s guard (#145).
+            $this->settleConnecting(null);
             $this->emitEvent(ConnectionEvent::Connected);
         } catch (AuthenticationException $e) {
             // An auth failure will not resolve by retrying: fail fast instead of entering reconnect.
             $this->state = ConnectionState::Closed;
             $this->closeTransportBestEffort();
             $this->releaseRuntimeState();
+            // Settle before emitting Closed so the deferred is never pending under a listener (#145).
+            $this->settleConnecting($e);
             $this->emitEvent(ConnectionEvent::Closed, $e);
 
             throw $e;
@@ -456,8 +506,35 @@ final class NatsConnection
             $this->state = ConnectionState::Closed;
             $this->closeTransportBestEffort();
             $this->releaseRuntimeState();
+            // Settle before emitting Closed (deferred never pending under a listener, #145) and with
+            // the SAME wrapped exception the direct caller receives, so joiners see one error type.
+            $wrapped = new ConnectionException($e->getMessage(), (int) $e->getCode(), $e);
+            $this->settleConnecting($wrapped);
             $this->emitEvent(ConnectionEvent::Closed, $e);
-            throw new ConnectionException($e->getMessage(), (int) $e->getCode(), $e);
+            throw $wrapped;
+        }
+    }
+
+    /**
+     * Resolves and clears the in-flight connect() deferred exactly once. Called before every
+     * synchronous lifecycle emission on a direct performConnect() exit path so the deferred is never
+     * pending while user code (a connection/error listener) runs: a pending $connecting under a
+     * listener re-opens the join deadlock (a listener's connect() awaiting a deferred only the
+     * suspended emitting fiber can complete) and the swallowed-recovery window (#145). Idempotent -
+     * the owned-recovery hand-off leaves it for connect() to settle after performConnect() returns.
+     */
+    private function settleConnecting(?\Throwable $error): void
+    {
+        $deferred = $this->connecting;
+        if ($deferred === null) {
+            return;
+        }
+
+        $this->connecting = null;
+        if ($error === null) {
+            $deferred->complete();
+        } else {
+            $deferred->error($error);
         }
     }
 
@@ -1675,7 +1752,11 @@ final class NatsConnection
         // close and resumed failing after connect() started dialing) must not start a recovery
         // here: its first attempt would close the fresh dial's socket - the #145 race in reverse.
         // Only the connect fiber's own failure policy (performConnect()) may hand off to recovery.
-        if ($this->connecting !== null && !$ownedByConnect) {
+        // The state !== Open clause keeps this from swallowing a GENUINE current-epoch failure: once
+        // the connection is Open, a $connecting deferred still pending (a Connected listener parked
+        // mid-emission) is stale bookkeeping, and a live publish/heartbeat/read failure there must
+        // start a recovery rather than be dropped onto a dead socket (#145).
+        if ($this->connecting !== null && !$ownedByConnect && $this->state !== ConnectionState::Open) {
             return;
         }
 
@@ -1752,12 +1833,17 @@ final class NatsConnection
             try {
                 $this->connectOnce();
                 $this->markConnectionOpen();
+                // Settle the in-flight connect() before the listener runs: this retry loop is still
+                // inside performConnect() (the deferred is set), so a pending $connecting under the
+                // Connected/Closed listener would re-open the join deadlock (#145).
+                $this->settleConnecting(null);
                 $this->emitEvent(ConnectionEvent::Connected);
 
                 return true;
             } catch (AuthenticationException $e) {
                 $this->state = ConnectionState::Closed;
                 $this->closeTransportBestEffort();
+                $this->settleConnecting($e);
                 $this->emitEvent(ConnectionEvent::Closed, $e);
 
                 throw $e;

@@ -51,17 +51,23 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   (a runtime repro observed 4 dials for one outage). `connect()` now joins the in-flight recovery
   and shares its outcome, a concurrent `connect()` awaits the first dial instead of dialing in
   parallel, and `connect()` during `drain()` throws `ConnectionException`
-  (`Cannot connect: drain in progress`) instead of dialing into the teardown. Join semantics:
-  a `connect()` called from a connection/error listener while a recovery is in flight throws
-  `ConnectionException` instead of joining - the listener runs inside the recovery fiber, so
-  awaiting the join there could never complete (a permanent deadlock); schedule supervision
-  reconnects with `Revolt\EventLoop::queue()` instead. A join whose dial ends without the
-  connection Open (a recovery or coalesced connect aborted by a concurrent
-  `disconnect()`/`drain()`) throws `ConnectionException` ("aborted before the connection opened")
-  instead of resolving as success on a Closed connection. The reverse direction is guarded too:
-  `recoverConnection()` ignores recovery requests from stale failure continuations (a write/read
-  that suspended before a terminal close and resumed failing later) while a user `connect()` is
-  dialing, so they can no longer close the fresh dial's socket. The `closing = false` reset also
+  (`Cannot connect: drain in progress`) instead of dialing into the teardown. Re-entry semantics:
+  a `connect()` called from a connection/error listener throws `ConnectionException` instead of
+  joining - the listener runs inside the connecting/recovery fiber, so awaiting the join there
+  could never complete (a permanent deadlock, including when the terminal `Closed` event is emitted
+  by a failed initial connect); schedule supervision reconnects with `Revolt\EventLoop::queue()`
+  and do not await the scheduled connect from inside the listener. The in-flight `connect()`
+  deferred is now settled (and cleared) before every synchronous lifecycle emission
+  (`Connected`/`Closed`), so it is never pending while a listener runs - closing the deadlock at its
+  source in addition to the fiber guard. A dial that ends without the connection Open (a recovery or
+  coalesced connect aborted by a concurrent `disconnect()`/`drain()`) throws `ConnectionException`
+  ("aborted before the connection opened") - for the OWNER `connect()` (whose owned recovery was
+  aborted mid-flight) exactly as for joiners, so an aborted owner no longer resolves as success on a
+  Closed connection. The reverse direction is guarded too: `recoverConnection()` ignores recovery
+  requests from stale failure continuations (a write/read that suspended before a terminal close and
+  resumed failing later) while a user `connect()` is dialing - but that guard now also requires the
+  state not be Open, so a genuine live-epoch failure while a `Connected` listener is still parked
+  starts a recovery instead of being swallowed onto a dead socket. The `closing = false` reset also
   moved onto the fresh-dial path only, so a `connect()` racing a concurrent `disconnect()` can no
   longer disarm the user's close intent and let the recovery re-open a connection the user just
   closed - close intent wins and the connection stays Closed. A manual `connect()` after a

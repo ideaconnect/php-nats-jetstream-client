@@ -8307,4 +8307,281 @@ final class NatsConnectionTest extends TestCase
         self::assertCount(2, $transport->connectCalls, 'exactly one dial for the manual reconnect');
         self::assertSame(1, $transport->closeCalls);
     }
+
+    /**
+     * Verifies connect()->await() from a Closed connection listener during a TERMINAL connect
+     * (reconnect disabled, dial refused) throws instead of deadlocking. performConnect() emits Closed
+     * synchronously on the connect fiber; the listener's re-entrant connect() runs on that same
+     * fiber, so joining the still-pending connecting deferred would await an outcome only the
+     * suspended emitting fiber can produce - a permanent wedge. The connecting deferred is now
+     * settled before the emission and the connect-fiber guard refuses the re-entry loudly (#145).
+     */
+    public function testConnectFromClosedListenerAfterTerminalDialFailureThrowsInsteadOfDeadlocking(): void
+    {
+        $transport = new class implements TransportInterface {
+            public int $dials = 0;
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $this->dials++;
+
+                    throw new TransportClosedException('dial refused');
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(static fn(): string => '');
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        /** @var list<\Throwable> $captured */
+        $captured = [];
+        $attempted = false;
+        $connection = null;
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+                // Application supervision: reconnect from the Closed listener.
+                connectionListener: static function (ConnectionEvent $event) use (&$connection, &$captured, &$attempted): void {
+                    if ($event !== ConnectionEvent::Closed || $attempted || $connection === null) {
+                        return;
+                    }
+                    $attempted = true;
+
+                    try {
+                        $connection->connect()->await();
+                    } catch (\Throwable $e) {
+                        $captured[] = $e;
+                    }
+                },
+            ),
+            $transport,
+        );
+
+        // The bounded await turns a regression (permanent deadlock) into a test failure instead of
+        // hanging the suite.
+        try {
+            $connection->connect()->await(new TimeoutCancellation(5));
+            self::fail('expected the terminal dial failure to surface as ConnectionException');
+        } catch (CancelledException) {
+            self::fail('connect() deadlocked: the Closed listener joined the still-pending connect deferred');
+        } catch (ConnectionException) {
+            // Terminal dial failure surfaced as expected.
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(1, $transport->dials, 'the refused re-entrant connect() must not dial a second time');
+
+        self::assertCount(1, $captured);
+        self::assertInstanceOf(ConnectionException::class, $captured[0]);
+        self::assertStringContainsString('cannot be re-entered from a connection/error listener', $captured[0]->getMessage());
+    }
+
+    /**
+     * Verifies a genuine live-epoch failure while a Connected listener is still parked starts a
+     * recovery instead of being swallowed. The connection is already Open (markConnectionOpen ran),
+     * and a publish on another fiber hits a write failure on the live socket. Settling the connecting
+     * deferred before the Connected emission (plus the state !== Open clause on recoverConnection()'s
+     * in-flight-connect guard) keeps that failure from being dropped onto a dead socket (#145).
+     */
+    public function testLiveEpochFailureWhileConnectedListenerParkedStartsRecoveryNotSwallowed(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $gate = new DeferredFuture();
+
+        $transport = new class ($info) implements TransportInterface {
+            public int $dials = 0;
+            /** @var list<string> */
+            private array $reads;
+
+            public function __construct(string $info)
+            {
+                $this->reads = [$info, "PONG\r\n", $info, "PONG\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $this->dials++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static function () use ($bytes): void {
+                    // The socket died right after the handshake: every publish write fails.
+                    if (str_starts_with($bytes, 'PUB ')) {
+                        throw new TransportClosedException('broken pipe');
+                    }
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(fn(): string => array_shift($this->reads) ?? '');
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        /** @var list<ConnectionEvent> $events */
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 5,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event) use (&$events, $gate): void {
+                    $events[] = $event;
+                    if ($event === ConnectionEvent::Connected && !$gate->isComplete()) {
+                        // Realistic supervision work that awaits (announce, warm-up, etc.).
+                        $gate->getFuture()->await();
+                    }
+                },
+            ),
+            $transport,
+        );
+
+        // The Connected listener parks on the gate: state is Open but the connect() closure is
+        // still suspended inside the emission.
+        $connect = $connection->connect();
+        delay(0.05);
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        // A publish on the LIVE epoch fails - a genuine current failure, not a stale continuation.
+        // It may throw (the transport rejects every PUB), but it must trigger a recovery.
+        try {
+            $connection->publish('orders.new', 'payload')->await(new TimeoutCancellation(5));
+        } catch (\Throwable) {
+            // Acceptable: the socket rejects every publish; only the recovery attempt is asserted.
+        }
+
+        $gate->complete();
+        $connect->await(new TimeoutCancellation(5));
+        delay(0.05);
+
+        self::assertContains(
+            ConnectionEvent::Disconnected,
+            $events,
+            'a live-epoch failure while the Connected listener was parked must not be swallowed',
+        );
+        self::assertContains(ConnectionEvent::Reconnected, $events);
+        self::assertSame(2, $transport->dials, 'the swallowed recovery would have left dials at 1 on a dead socket');
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * Verifies an OWNER connect() whose owned recovery is aborted by a concurrent disconnect() throws
+     * instead of resolving as success on a Closed connection. The initial dial fails, performConnect()
+     * hands off to recoverConnection(ownedByConnect: true); a disconnect() sets close-intent, so the
+     * resumed recovery bails and returns without throwing. connect() must then apply the not-Open
+     * invariant to the owner exactly as it does to joiners, surfacing the abort as ConnectionException
+     * rather than a successful connect on a dead connection (#145).
+     */
+    public function testOwnerConnectAbortedByConcurrentDisconnectThrowsInsteadOfResolvingSuccess(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $gate = new DeferredFuture();
+
+        $transport = new class ($info, $gate) implements TransportInterface {
+            public int $dials = 0;
+            /** @var list<string> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $gate */
+            public function __construct(string $info, private DeferredFuture $gate)
+            {
+                $this->reads = [$info, "PONG\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    $attempt = $this->dials++;
+                    if ($attempt === 0) {
+                        throw new TransportClosedException('dial refused'); // initial dial fails -> owned recovery
+                    }
+                    if ($attempt === 1) {
+                        $this->gate->getFuture()->await(); // hold recovery attempt 1 so disconnect lands mid-recovery
+                    }
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(fn(): string => array_shift($this->reads) ?? '');
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 5,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+
+        $connect = $connection->connect();
+        delay(0.05); // recovery attempt 1 is parked inside the held dial
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        self::assertSame(2, $transport->dials);
+
+        $connection->disconnect()->await(); // user close-intent mid-recovery
+        $gate->complete();                  // recovery attempt resumes and must bail on close-intent
+
+        try {
+            $connect->await(new TimeoutCancellation(5));
+            self::fail('expected the aborted owner connect() to throw, not resolve as success');
+        } catch (CancelledException) {
+            self::fail('owner connect() hung: the aborted owned recovery never resolved');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('aborted before the connection opened', $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
 }
