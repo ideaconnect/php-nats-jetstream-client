@@ -13,7 +13,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 ## Unit Tests (`tests/Unit/`)
 
 ### tests/Unit/AmpSocketTransportTest.php
-- `testWriteReadCloseWithoutSocket` - Asserts write/read/close are safe no-ops with no connected socket: write resolves, readLine() returns '', and close() is idempotent and safe to repeat.
+- `testWriteWithoutSocketThrowsWhileReadAndCloseStaySafe` - Asserts write() without a connected socket throws TransportClosedException (a silent no-op would confirm frames that never reached any socket, #124), while readLine() still returns '' and close() stays idempotent.
 - `testUpgradeTlsIsNoOpWhenTlsNotConfigured` - Asserts upgradeTls() short-circuits (no handshake) when no socket and no TLS context are configured, leaving readLine() returning ''.
 - `testWithTlsContextReturnsOriginalContextWhenTlsNotRequired` - Asserts withTlsContext() returns the same ConnectContext unchanged for a non-TLS nats:// DSN with tlsRequired=false.
 - `testWithTlsContextBuildsTlsContextFromTlsScheme` - Asserts a tls:// DSN makes withTlsContext() return a new (different) ConnectContext with TLS enabled.
@@ -420,6 +420,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testReconnectBufferFlushesMultiplePublishesInOrderBeforeLivePublishes` - Multiple publishes buffered during reconnect are flushed as one ordered block that precedes any post-reconnect live publish (hardening 3b).
 - `testReconnectFlushFailureRetainsBufferedPublishesForNextAttempt` - A flush write failure on one reconnect attempt keeps the buffered publishes in place so the next attempt replays them; the frame reaches the wire instead of being silently lost (#123).
 - `testReconnectExhaustionReportsAbandonedBufferedPublishes` - Exhausting reconnect attempts with a non-empty reconnect buffer surfaces the abandonment through the errorListener and clears the buffer so a later manual connect() cannot replay a dead epoch (#123).
+- `testPublishDuringRecoverySocketCloseBuffersInsteadOfRacingDeadSocket` - A publish landing while recovery is closing the dead socket takes the reconnect buffer (state flips off Open before recovery's first await) and reaches the wire only after the new handshake (#124).
 - `testProcessIncomingDispatchesHmsgWithRawHeaders` - An HMSG frame is delivered with rawHeaders and payload kept separate.
 - `testProcessIncomingRespondsToServerPing` - A server PING is answered with a protocol PONG (1 frame processed).
 - `testSlowConsumerDropOldestPolicy` - With maxPending=1 and DropOldest, only the newest message ("second") is delivered.
@@ -936,6 +937,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 ### tests/Unit/WebSocketTransportTest.php
 - `testIsTlsAwareAndInactiveBeforeConnect` - Asserts the transport implements TlsAwareTransportInterface and reports tlsActive()=false before connecting.
 - `testReadLineReturnsEmptyWithoutSocket` - Asserts readLine() resolves to '' (not EOF) when no socket is connected yet.
+- `testWriteWithoutSocketThrowsTransportClosed` - Asserts write() without a connected socket throws TransportClosedException instead of silently succeeding (#124).
 - `testUpgradeTlsIsNoOp` - Asserts upgradeTls() resolves without error and leaves TLS inactive (wss negotiates TLS during connect, not via upgrade).
 - `testBuildUpgradeRequestWithCustomHeadersAndCompression` - Asserts the built upgrade request contains the GET line, Host with port, Sec-WebSocket-Key, the permessage-deflate extension offer, both custom headers, and ends with the blank-line terminator.
 - `testBuildUpgradeRequestRejectsReservedAndStripsCrLf` - Asserts a custom Host override is ignored (real Host kept, "evil" absent), CR/LF is stripped from custom values so no header is smuggled, and no compression offer appears when disabled.

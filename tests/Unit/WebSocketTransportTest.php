@@ -44,6 +44,19 @@ final class WebSocketTransportTest extends TestCase
     }
 
     /**
+     * Writing without a socket must throw: a silent no-op would confirm publishes/ACKs that never
+     * reached any socket (#124).
+     */
+    public function testWriteWithoutSocketThrowsTransportClosed(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions());
+
+        $this->expectException(TransportClosedException::class);
+        $this->expectExceptionMessage('Transport is not connected');
+        $transport->write("PING\r\n")->await();
+    }
+
+    /**
      * Verifies upgradeTls() is a no-op for WebSocket (TLS is done at connect) (#31).
      */
     public function testUpgradeTlsIsNoOp(): void

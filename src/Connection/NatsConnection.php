@@ -1323,6 +1323,11 @@ final class NatsConnection
             throw new ConnectionException('Reconnect is disabled');
         }
 
+        // Leave Open before the first await: the state check is what routes concurrent publishes
+        // into the reconnect buffer, so staying Open across the transport close would let them
+        // race a socket that is about to disappear (#124).
+        $this->state = ConnectionState::Connecting;
+
         $this->cancelPingTimer();
         $this->emitEvent(ConnectionEvent::Disconnected);
 
