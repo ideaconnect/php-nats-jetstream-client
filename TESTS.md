@@ -280,6 +280,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testCreateKeyThrowsWhenKeyExists` - createKey() throws JetStreamException "Key already exists" when the wrong-last-sequence ack is followed by a get() showing a live value (#19).
 - `testCreateKeyDetectsWrongLastSequenceByErrCode` - createKey() detects the wrong-last-sequence rejection by err_code 10071 even when the description shares no wording with "wrong last sequence" (#154).
 - `testCreateKeyDetectsWrongLastSequenceWithoutErrCode` - createKey() still detects wrong-last-sequence via the description substring when the envelope carries no err_code (old servers) (#154).
+- `testCreateKeyRethrowsWhenErrCodeIsNotWrongLastSequence` - An envelope whose err_code is present but not 10071 is rethrown as-is even when the description misleadingly says "wrong last sequence" - a present err_code wins over wording (#154).
 - `testCreateKeyExistsExceptionCarriesBothCodes` - the "Key already exists" collision exception carries the HTTP-like 400 in getCode() and the API err_code 10071 in getErrCode() (#154).
 - `testCreateWithMirrorTranslatesBucketName` - create() with a mirror translates the mirror bucket name to KV_src, emits an empty subjects list, and targets STREAM.CREATE.KV_dst (#62).
 - `testCreateWithSourcesAndExtendedConfig` - create() with sources translates each source name to KV_b1/KV_b2 and passes through compression and placement config (#62).

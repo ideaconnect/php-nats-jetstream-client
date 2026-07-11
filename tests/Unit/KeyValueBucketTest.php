@@ -256,6 +256,33 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
+     * Verifies a present err_code wins over a misleading description: an envelope whose err_code is
+     * NOT 10071 must be rethrown as-is even when the description says "wrong last sequence", so a
+     * different API error can never be misread as a key collision (#154).
+     */
+    public function testCreateKeyRethrowsWhenErrCodeIsNotWrongLastSequence(): void
+    {
+        $errAck = '{"error":{"code":400,"err_code":10052,"description":"wrong last sequence wording, different error"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
+            self::fail('a non-10071 err_code must be rethrown, not treated as a key collision');
+        } catch (JetStreamException $e) {
+            self::assertSame(10052, $e->getErrCode());
+            self::assertStringNotContainsString('Key already exists', $e->getMessage());
+        }
+    }
+
+    /**
      * Verifies the "Key already exists" collision exception keeps the server taxonomy: the HTTP-like
      * 400 in getCode() and the API err_code 10071 in getErrCode() (#154).
      */

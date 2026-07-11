@@ -16,12 +16,16 @@ final class ApiErrCode
 
     /**
      * Extracts `err_code` from a decoded error envelope, or null when absent (a server predating the
-     * field).
+     * field). A zero is treated as absent: real servers never emit `err_code: 0` (Go omitempty), so
+     * it can only come from a malformed proxy - taking it as authoritative would disable the
+     * description fallback and silently break error discrimination.
      *
      * @param array<string,mixed> $error
      */
     public static function fromEnvelope(array $error): ?int
     {
-        return isset($error['err_code']) ? (int) $error['err_code'] : null;
+        $code = isset($error['err_code']) ? (int) $error['err_code'] : 0;
+
+        return $code !== 0 ? $code : null;
     }
 }
