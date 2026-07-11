@@ -1138,6 +1138,11 @@ final class NatsConnection
         $this->state = ConnectionState::Connecting;
         // A fresh connection is not (yet) draining; allow a new lame-duck signal to be observed.
         $this->lameDuckAnnounced = false;
+        // Framing state is per TCP connection: a previous connection that died mid-frame leaves the
+        // parser expecting the rest of a payload, which would swallow this handshake's INFO/PONG as
+        // phantom payload bytes and fail every reconnect attempt against a healthy server (#125).
+        // The post-handshake reset below still re-couples the bound to the negotiated max_payload.
+        $this->parser = new ProtocolParser();
 
         $server = $this->nextServer();
         $this->connectedServer = $server;
