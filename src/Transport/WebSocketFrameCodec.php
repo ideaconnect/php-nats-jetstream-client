@@ -29,6 +29,9 @@ final class WebSocketFrameCodec
     /** Hard cap on a single frame's declared payload length, to bound memory on a hostile/garbled stream. */
     private const MAX_FRAME_PAYLOAD = 64 * 1024 * 1024;
 
+    /** Longest possible frame header: 2 base bytes + 8 extended-length bytes + 4 mask-key bytes. */
+    public const HEADER_MAX_BYTES = 14;
+
     /**
      * Encodes a single final ({@code FIN=1}) frame. When $mask is true (the default - required for
      * client->server frames) the payload is masked with a fresh 4-byte key.
@@ -144,6 +147,129 @@ final class WebSocketFrameCodec
         }
 
         return $frames;
+    }
+
+    /**
+     * Returns the full wire size (header plus declared payload) of the frame starting at the head of
+     * $buffer, or null while too few header bytes have arrived to know it. Reads at most the leading
+     * {@see HEADER_MAX_BYTES} bytes and allocates nothing but the int - it sizes the pending frame on
+     * the transport's per-read hot path (#164). Enforces the same declared-length bound as
+     * {@see decode()}, and does so before the mask-key bytes arrive, so a hostile length is rejected
+     * the moment its length bytes are in.
+     */
+    public static function frameRequiredBytes(string $buffer): ?int
+    {
+        $available = strlen($buffer);
+        if ($available < 2) {
+            return null;
+        }
+
+        $byte2 = ord($buffer[1]);
+        $length = $byte2 & 0x7F;
+
+        $offset = 2;
+        if ($length === 126) {
+            if ($available < 4) {
+                return null;
+            }
+            /** @var array{1:int} $unpacked */
+            $unpacked = unpack('n', substr($buffer, 2, 2));
+            $length = $unpacked[1];
+            $offset = 4;
+        } elseif ($length === 127) {
+            if ($available < 10) {
+                return null;
+            }
+            /** @var array{1:int} $unpacked */
+            $unpacked = unpack('J', substr($buffer, 2, 8));
+            $length = $unpacked[1];
+            $offset = 10;
+        }
+
+        if ($length < 0 || $length > self::MAX_FRAME_PAYLOAD) {
+            throw new ProtocolException('WebSocket frame payload length out of bounds: ' . $length);
+        }
+
+        if (($byte2 & 0x80) !== 0) {
+            $offset += 4; // mask key
+        }
+
+        return $offset + $length;
+    }
+
+    /**
+     * Parses the frame header (and mask key, when present) from a prefix of the frame's bytes, or
+     * returns null while too few bytes have arrived. A prefix of {@see HEADER_MAX_BYTES} bytes is
+     * always sufficient. Lets the transport consume a frame that spans accumulated read chunks
+     * without joining its payload tail (#164). Enforces the same declared-length bound as
+     * {@see decode()} - and does so before requiring the mask-key bytes, so a hostile length is
+     * rejected the moment its length bytes arrive.
+     *
+     * @return array{fin: bool, rsv1: bool, opcode: int, masked: bool, maskKey: string, headerBytes: int, payloadLength: int}|null
+     */
+    public static function parseFrameHeader(string $prefix): ?array
+    {
+        $available = strlen($prefix);
+        if ($available < 2) {
+            return null;
+        }
+
+        $byte1 = ord($prefix[0]);
+        $byte2 = ord($prefix[1]);
+        $masked = ($byte2 & 0x80) !== 0;
+        $length = $byte2 & 0x7F;
+
+        $offset = 2;
+        if ($length === 126) {
+            if ($available < 4) {
+                return null;
+            }
+            /** @var array{1:int} $unpacked */
+            $unpacked = unpack('n', substr($prefix, 2, 2));
+            $length = $unpacked[1];
+            $offset = 4;
+        } elseif ($length === 127) {
+            if ($available < 10) {
+                return null;
+            }
+            /** @var array{1:int} $unpacked */
+            $unpacked = unpack('J', substr($prefix, 2, 8));
+            $length = $unpacked[1];
+            $offset = 10;
+        }
+
+        if ($length < 0 || $length > self::MAX_FRAME_PAYLOAD) {
+            throw new ProtocolException('WebSocket frame payload length out of bounds: ' . $length);
+        }
+
+        $maskKey = '';
+        if ($masked) {
+            if ($available < $offset + 4) {
+                return null;
+            }
+            $maskKey = substr($prefix, $offset, 4);
+            $offset += 4;
+        }
+
+        return [
+            'fin' => ($byte1 & 0x80) !== 0,
+            'rsv1' => ($byte1 & 0x40) !== 0,
+            'opcode' => $byte1 & 0x0F,
+            'masked' => $masked,
+            'maskKey' => $maskKey,
+            'headerBytes' => $offset,
+            'payloadLength' => $length,
+        ];
+    }
+
+    /**
+     * Removes a client mask from a payload (masking is its own XOR inverse). Companion to
+     * {@see parseFrameHeader()} for callers that extract a spanning frame's payload themselves;
+     * {@see decode()} keeps unmasking inline.
+     */
+    public static function unmask(string $payload, string $key): string
+    {
+        return self::applyMask($payload, $key);
     }
 
     /**

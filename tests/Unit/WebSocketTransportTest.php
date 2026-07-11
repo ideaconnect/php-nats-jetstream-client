@@ -10,6 +10,7 @@ use Amp\Socket\TlsException;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\ProtocolException;
+use IDCT\NATS\Tests\Support\ScriptedChunkSocket;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\WebSocketFrameCodec;
@@ -343,6 +344,219 @@ final class WebSocketTransportTest extends TestCase
             $serverSocket->close();
             $server->close();
         }
+    }
+
+    /**
+     * Verifies readLine() reassembles a large frame delivered in many small socket writes into the
+     * byte-identical payload (#164 pins the chunk-accumulation join on the inbound path).
+     */
+    public function testReadLineReassemblesLargeFrameDeliveredInSmallChunks(): void
+    {
+        [$transport, $server, $serverSocket] = $this->connectedWebSocketTransport();
+
+        try {
+            // 256 KiB of distinct 32-bit counters so any join/ordering defect changes the bytes.
+            $payload = pack('N*', ...range(0, 65535));
+            $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
+
+            $writer = async(static function () use ($serverSocket, $frame): void {
+                foreach (str_split($frame, 8192) as $piece) {
+                    $serverSocket->write($piece);
+                }
+            });
+
+            $received = '';
+            while (strlen($received) < strlen($payload)) {
+                $received .= $transport->readLine(new \Amp\TimeoutCancellation(5.0))->await();
+            }
+            $writer->await();
+
+            self::assertSame($payload, $received);
+        } finally {
+            $transport->close()->await();
+            $serverSocket->close();
+            $server->close();
+        }
+    }
+
+    /**
+     * Verifies readLine() returns a complete frame while retaining a partially received next frame,
+     * then returns that frame once its remaining bytes arrive (#164 pins head-frame completion
+     * tracking across reads).
+     */
+    public function testReadLineKeepsPartialNextFrameAcrossReads(): void
+    {
+        [$transport, $server, $serverSocket] = $this->connectedWebSocketTransport();
+
+        try {
+            $frameA = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'FIRST', false);
+            $frameB = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'SECOND', false);
+            $half = intdiv(strlen($frameB), 2);
+
+            $serverSocket->write($frameA . substr($frameB, 0, $half));
+            self::assertSame('FIRST', $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+
+            $serverSocket->write(substr($frameB, $half));
+            self::assertSame('SECOND', $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+        } finally {
+            $transport->close()->await();
+            $serverSocket->close();
+            $server->close();
+        }
+    }
+
+    /**
+     * Verifies a PING interleaved between fragments of a fragmented message is still answered with a
+     * PONG while the fragments reassemble intact (#164 pins control handling under fragment
+     * accumulation).
+     */
+    public function testReadLineAnswersPingBetweenFragmentsAndReassembles(): void
+    {
+        [$transport, $server, $serverSocket] = $this->connectedWebSocketTransport();
+
+        try {
+            $serverSocket->write(
+                $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'HEL', fin: false)
+                . WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'hb', false)
+                . $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'LO', fin: true),
+            );
+
+            self::assertSame('HELLO', $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+
+            // The server received the client's masked PONG carrying the ping payload.
+            $buffer = (string) $serverSocket->read(new \Amp\TimeoutCancellation(2.0));
+            $frames = WebSocketFrameCodec::decode($buffer);
+            self::assertNotSame([], $frames);
+            self::assertSame(WebSocketFrameCodec::OP_PONG, $frames[0]['opcode']);
+            self::assertSame('hb', $frames[0]['payload']);
+        } finally {
+            $transport->close()->await();
+            $serverSocket->close();
+            $server->close();
+        }
+    }
+
+    /**
+     * White-box pin for the #164 spill gate (both paths deliver identical bytes, so only internal
+     * state proves which engaged): an incomplete frame carrying a 64-bit length must be sized for
+     * chunk-list spill (`readFrameRequired` = full wire size), while an incomplete 16-bit-length
+     * frame (<= 65535 bytes) must never be sized - it stays on the batch-decode `.=` path.
+     */
+    public function testDrainSizesLarge64BitFrameForSpillButLeaves16BitFrameOnBuffer(): void
+    {
+        $required = new \ReflectionProperty(WebSocketTransport::class, 'readFrameRequired');
+        $buffer = new \ReflectionProperty(WebSocketTransport::class, 'readBuffer');
+        $drain = new \ReflectionMethod(WebSocketTransport::class, 'drainDataFrames');
+
+        // 64-bit-length frame (100000-byte payload), only its 10-byte header + 10 payload bytes buffered.
+        $large = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, str_repeat('L', 100000), false);
+        self::assertSame(127, ord($large[1]) & 0x7F);
+        $big = new WebSocketTransport(new NatsOptions());
+        $buffer->setValue($big, substr($large, 0, 20));
+        self::assertSame('', $drain->invoke($big));
+        self::assertSame(strlen($large), $required->getValue($big)); // sized -> spill engaged
+
+        // 16-bit-length frame (1000-byte payload), partially buffered: must stay unsized.
+        $medium = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, str_repeat('s', 1000), false);
+        self::assertSame(126, ord($medium[1]) & 0x7F);
+        $small = new WebSocketTransport(new NatsOptions());
+        $buffer->setValue($small, substr($medium, 0, 20));
+        self::assertSame('', $drain->invoke($small));
+        self::assertNull($required->getValue($small)); // never sized -> batch-decode path
+    }
+
+    /**
+     * Torture pin for frame-header assembly across read boundaries (#164): a 64-bit-extended-length
+     * frame (65536-byte payload, 10-byte header) delivered in one-byte reads must be returned
+     * byte-identical. A ScriptedChunkSocket guarantees the transport really observes 65546 one-byte
+     * reads (loopback TCP would coalesce them).
+     */
+    public function testReadLineAssembles64BitLengthFrameDeliveredInOneByteReads(): void
+    {
+        // Distinct 32-bit counters so any join/ordering defect changes the bytes.
+        $payload = pack('N*', ...range(0, 16383));
+        self::assertSame(65536, strlen($payload));
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
+        self::assertSame(0x7F, ord($frame[1]) & 0x7F); // 64-bit extended length form
+
+        $transport = $this->transportReadingChunks(str_split($frame, 1));
+
+        $received = '';
+        while (strlen($received) < strlen($payload)) {
+            $received .= $transport->readLine()->await();
+        }
+
+        self::assertSame($payload, $received);
+    }
+
+    /**
+     * Torture pin for continuation-frame headers split across read boundaries (#164): a fragmented
+     * message whose middle (masked, 16-bit-length) continuation header is cut inside the extended
+     * length bytes and inside the mask key, whose payload spans enough further reads to exercise the
+     * chunk-list consume path, and whose final continuation header is cut between its two bytes,
+     * must still reassemble byte-identically.
+     */
+    public function testReadLineReassemblesFragmentsWithHeadersSplitAcrossReads(): void
+    {
+        $mid = pack('N*', ...range(1000, 1074)); // 300 bytes, distinct
+        $f1 = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'HEAD-', fin: false);
+        // Masked continuation: 2 base + 2 extended-length + 4 mask-key header bytes before the payload.
+        $f2 = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CONTINUATION, $mid, true, 'MKEY');
+        $f2 = (chr(ord($f2[0]) & 0x7F)) . substr($f2, 1); // clear FIN: mid fragment
+        $f3 = $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'TAIL', fin: true);
+
+        $transport = $this->transportReadingChunks([
+            $f1 . substr($f2, 0, 1),                  // f2 header cut after its first byte
+            substr($f2, 1, 2),                        // ...inside the 16-bit extended length
+            substr($f2, 3, 3),                        // ...inside the mask key
+            substr($f2, 6, 2) . substr($f2, 8, 100),  // rest of header + payload bytes 0-99
+            substr($f2, 108, 100),                    // payload bytes 100-199
+            substr($f2, 208) . substr($f3, 0, 1),     // payload tail + f3 header cut between its 2 bytes
+            substr($f3, 1),
+        ]);
+
+        self::assertSame('HEAD-' . $mid . 'TAIL', $transport->readLine()->await());
+    }
+
+    /**
+     * Torture pin for a large masked frame delivered in one-byte reads (#164): the payload needs a
+     * 64-bit length, so the frame spills to chunk-list accumulation and is sized from its length
+     * bytes before the mask key has arrived - the mask key itself therefore spans the queued reads
+     * and must be assembled by the spanning-consume path before the payload is unmasked.
+     * Byte-identical delivery required. (Server frames are unmasked in production; this pins the
+     * codec's masked-decode symmetry on the spill path.)
+     */
+    public function testReadLineAssemblesLargeMaskedFrameDeliveredInOneByteReads(): void
+    {
+        // 70 000 distinct bytes: a 64-bit-length masked frame (> 65 535) that spills to the chunk path.
+        $payload = pack('N*', ...range(0, 17499));
+        self::assertSame(70000, strlen($payload));
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, true, "\xA5\x01\xFE\x42");
+        self::assertSame(127, ord($frame[1]) & 0x7F); // 64-bit extended length form
+        self::assertSame(0x80, ord($frame[1]) & 0x80); // mask bit set
+
+        $transport = $this->transportReadingChunks(str_split($frame, 1));
+
+        $received = '';
+        while (strlen($received) < strlen($payload)) {
+            $received .= $transport->readLine()->await();
+        }
+
+        self::assertSame($payload, $received);
+    }
+
+    /**
+     * Builds a transport whose injected socket hands out exactly the given chunks, one per read.
+     *
+     * @param list<string> $chunks
+     */
+    private function transportReadingChunks(array $chunks): WebSocketTransport
+    {
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))
+            ->setValue($transport, new ScriptedChunkSocket($chunks));
+
+        return $transport;
     }
 
     /**

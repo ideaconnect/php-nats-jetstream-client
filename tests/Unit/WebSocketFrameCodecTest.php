@@ -271,6 +271,143 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
+     * Verifies frameRequiredBytes() returns the exact full wire size for every length form (7-bit
+     * unmasked, 7-bit masked, 16-bit, 64-bit), the last two from a header prefix alone - including a
+     * masked frame whose mask-key bytes have not arrived yet (the size only needs the length bytes),
+     * so the transport can size a pending frame as early as possible (#164).
+     */
+    public function testFrameRequiredBytesComputesFullWireSizePerLengthForm(): void
+    {
+        // 7-bit unmasked: 2-byte header + 5 payload bytes.
+        $small = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'hello', false);
+        self::assertSame(strlen($small), WebSocketFrameCodec::frameRequiredBytes($small));
+
+        // 7-bit masked: header + 4-byte mask key + payload.
+        $masked = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'hello', true, 'ABCD');
+        self::assertSame(strlen($masked), WebSocketFrameCodec::frameRequiredBytes($masked));
+
+        // 16-bit length (126 marker), sized from its 4 header bytes with the mask key still in flight.
+        $medium = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, str_repeat('m', 300), true, 'ABCD');
+        self::assertSame(strlen($medium), WebSocketFrameCodec::frameRequiredBytes(substr($medium, 0, 4)));
+
+        // 64-bit length (127 marker): a 10-byte header prefix is enough to size the whole frame.
+        $large = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, str_repeat('l', 65536), false);
+        self::assertSame(strlen($large), WebSocketFrameCodec::frameRequiredBytes(substr($large, 0, 10)));
+    }
+
+    /**
+     * Verifies frameRequiredBytes() returns null while the length bytes are incomplete (#164).
+     */
+    public function testFrameRequiredBytesReturnsNullOnIncompleteHeader(): void
+    {
+        self::assertNull(WebSocketFrameCodec::frameRequiredBytes(''));
+        self::assertNull(WebSocketFrameCodec::frameRequiredBytes(chr(0x82)));
+        // 126 marker with only 1 of its 2 extended-length bytes.
+        self::assertNull(WebSocketFrameCodec::frameRequiredBytes(pack('CC', 0x82, 126) . "\x01"));
+        // 127 marker with only 7 of its 8 extended-length bytes.
+        self::assertNull(WebSocketFrameCodec::frameRequiredBytes(pack('CC', 0x82, 127) . str_repeat("\x00", 7)));
+    }
+
+    /**
+     * Verifies frameRequiredBytes() enforces the same declared-length bound as decode(), throwing
+     * the moment the hostile length bytes arrive (#164).
+     */
+    public function testFrameRequiredBytesRejectsOversizedDeclaredLength(): void
+    {
+        $tooLarge = 64 * 1024 * 1024 + 1; // MAX_FRAME_PAYLOAD + 1
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/payload length out of bounds/');
+        WebSocketFrameCodec::frameRequiredBytes(pack('CC', 0x82, 127) . pack('J', $tooLarge));
+    }
+
+    /**
+     * Verifies parseFrameHeader() sizes a frame from its header alone for every length form
+     * (7-bit, 16-bit, 64-bit; masked and unmasked): headerBytes + payloadLength equals the frame's
+     * full wire size, and the flag/opcode/mask fields match what was encoded (#164).
+     */
+    public function testParseFrameHeaderComputesFullWireSizePerLengthForm(): void
+    {
+        // 7-bit unmasked: 2-byte header + 5 payload bytes.
+        $small = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'hello', false);
+        $header = WebSocketFrameCodec::parseFrameHeader($small);
+        self::assertNotNull($header);
+        self::assertSame(strlen($small), $header['headerBytes'] + $header['payloadLength']);
+        self::assertSame(WebSocketFrameCodec::OP_BINARY, $header['opcode']);
+        self::assertTrue($header['fin']);
+        self::assertFalse($header['rsv1']);
+        self::assertFalse($header['masked']);
+
+        // 7-bit masked: header + 4-byte mask key + payload; the key is surfaced for unmask().
+        $masked = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'hello', true, 'ABCD');
+        $header = WebSocketFrameCodec::parseFrameHeader($masked);
+        self::assertNotNull($header);
+        self::assertSame(strlen($masked), $header['headerBytes'] + $header['payloadLength']);
+        self::assertTrue($header['masked']);
+        self::assertSame('ABCD', $header['maskKey']);
+
+        // 16-bit length (126 marker).
+        $medium = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, str_repeat('m', 300), false);
+        $header = WebSocketFrameCodec::parseFrameHeader($medium);
+        self::assertNotNull($header);
+        self::assertSame(strlen($medium), $header['headerBytes'] + $header['payloadLength']);
+        self::assertSame(300, $header['payloadLength']);
+
+        // 64-bit length (127 marker): a 10-byte header prefix is enough to size the whole frame.
+        $large = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, str_repeat('l', 65536), false);
+        $header = WebSocketFrameCodec::parseFrameHeader(substr($large, 0, 10));
+        self::assertNotNull($header);
+        self::assertSame(strlen($large), $header['headerBytes'] + $header['payloadLength']);
+        self::assertSame(65536, $header['payloadLength']);
+    }
+
+    /**
+     * Verifies parseFrameHeader() returns null while the header itself is incomplete, including a
+     * masked frame whose mask-key bytes have not fully arrived (#164).
+     */
+    public function testParseFrameHeaderReturnsNullOnIncompleteHeader(): void
+    {
+        self::assertNull(WebSocketFrameCodec::parseFrameHeader(''));
+        self::assertNull(WebSocketFrameCodec::parseFrameHeader(chr(0x82)));
+        // 126 marker with only 1 of its 2 extended-length bytes.
+        self::assertNull(WebSocketFrameCodec::parseFrameHeader(pack('CC', 0x82, 126) . "\x01"));
+        // 127 marker with only 7 of its 8 extended-length bytes.
+        self::assertNull(WebSocketFrameCodec::parseFrameHeader(pack('CC', 0x82, 127) . str_repeat("\x00", 7)));
+        // Masked 7-bit frame with only 3 of its 4 mask-key bytes.
+        self::assertNull(WebSocketFrameCodec::parseFrameHeader(pack('CC', 0x82, 0x80 | 5) . 'ABC'));
+    }
+
+    /**
+     * Verifies parseFrameHeader() enforces the same declared-length bound as decode(), and does so
+     * the moment the length bytes arrive - even on a masked frame whose mask key is still in flight -
+     * rather than after accumulating payload bytes (#164).
+     */
+    public function testParseFrameHeaderRejectsOversizedDeclaredLength(): void
+    {
+        $tooLarge = 64 * 1024 * 1024 + 1; // MAX_FRAME_PAYLOAD + 1
+        $maskedHeaderWithoutKey = pack('CC', 0x82, 0x80 | 127) . pack('J', $tooLarge);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/payload length out of bounds/');
+        WebSocketFrameCodec::parseFrameHeader($maskedHeaderWithoutKey);
+    }
+
+    /**
+     * Verifies unmask() inverts the masking encode() applies: the masked payload bytes taken from an
+     * encoded client frame unmask back to the original payload with the frame's key (#164).
+     */
+    public function testUnmaskInvertsEncodeMasking(): void
+    {
+        $payload = random_bytes(133);
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, true, "\x01\x7F\xAA\x00");
+
+        // 16-bit length form: 4 header bytes + 4 mask-key bytes precede the masked payload.
+        $maskedPayload = substr($frame, 8);
+        self::assertNotSame($payload, $maskedPayload);
+        self::assertSame($payload, WebSocketFrameCodec::unmask($maskedPayload, "\x01\x7F\xAA\x00"));
+    }
+
+    /**
      * #100: a well-behaved error handler (one that respects the @ operator via error_reporting()) must
      * NOT observe the native inflate_add() warning, so an application that promotes warnings to
      * exceptions still receives the typed ProtocolException rather than an ErrorException leaking from
