@@ -17,6 +17,31 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` `unsubscribe($sid, $max)` (auto-unsubscribe) sent `UNSUB <sid> <max>` but dropped the local
+  handler immediately, so every message the server legitimately kept delivering up to the max was
+  silently discarded. The handler now stays registered until `$max` total messages have been received
+  (nats.go `AutoUnsubscribe` parity), a reconnect re-arms the server with the remaining allowance, and
+  reaching the max removes the subscription locally (#112). The accounting is anchored to messages
+  **received** (not delivered), so a message dropped by the slow-consumer policy still advances toward
+  the max exactly as the server counts it - without this, under the default `DropOldest` policy the
+  subscription could stall below its max forever (a permanent leak) and a reconnect would re-arm and
+  over-deliver live messages past the intended max. Handler delivery is separately capped at the max so
+  a batched-in or replayed extra frame is never over-delivered, and arming while a reconnect is in
+  flight now defers to recovery instead of destroying the subscription (which would have silently lost
+  the remaining armed deliveries).
+- `[bugfix]` Subscription state no longer leaks on failure paths: `unsubscribe()` releases local state
+  even when the connection is not open or the UNSUB write fails (previously it threw first, leaking the
+  entry and its handler closure, and `resubscribeAll()` would revive dead inboxes as ghost
+  subscriptions), and `subscribe()` rolls its registry entry back when the SUB write fails.
+  `unsubscribe()` on a connection that is not open now cleans up silently instead of throwing
+  `ConnectionException` - a bug-driven behavior change treated as a bugfix (#116).
+- `[bugfix]` A failed ordered-consumer recreate (after a sequence gap) is no longer silently swallowed:
+  the create is retried up to 3 times with backoff and a terminal failure is surfaced through the
+  configured `errorListener`, so the application learns the consumer went permanently silent instead of
+  waiting on dead air forever (#114). Adds `NatsClient::options()` exposing the client's runtime options.
+
 ## [2.4.1] - 2026-06-15
 
 ### Testing & CI

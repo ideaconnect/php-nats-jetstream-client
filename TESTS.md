@@ -196,7 +196,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testSubscribeOrderedConsumerRecreatesOnSequenceGap` - subscribeOrderedConsumer() discards an out-of-order delivery, deletes the old consumer once, recreates exactly once from opt_start_seq (last in-order+1), and delivers only the in-order message.
 - `testSubscribeOrderedConsumerIgnoresStaleDeliveryFromPreviousConsumerInstance` - a stale delivery from a different consumer instance name is ignored (no recreate) even when its consumer sequence matches the expected next.
 - `testSubscribeOrderedConsumerRecreatesOnHeartbeatTailGap` - an idle heartbeat reporting Nats-Last-Consumer ahead of what was processed triggers exactly one recreate from the last in-order point (opt_start_seq).
-- `testSubscribeOrderedConsumerContainsRecreateFailure` - a failed recreate (404) during gap recovery is contained and does not escape the shared dispatch loop; only the in-order message is delivered.
+- `testSubscribeOrderedConsumerContainsRecreateFailure` - a recreate whose every attempt fails during gap recovery is contained (does not escape the shared dispatch loop); only the in-order message is delivered and the terminal failure surfaces once via the error listener as a JetStreamException mentioning "after 3 attempts" (#114).
+- `testSubscribeOrderedConsumerRecreateRetriesThroughTransientFailure` - a transient recreate failure during gap recovery is retried: the second create attempt succeeds as a new consumer instance, delivery resumes from it, and nothing reaches the error listener (#114).
 - `testSubscribeOrderedConsumerDeliversFilteredMessagesWithoutSpuriousRecreate` - consecutive consumer sequences with non-contiguous stream sequences (filtered consumer) are all delivered in order with no delete/recreate.
 - `testCreateOrUpdateStreamRethrowsNonAlreadyInUseError` - createOrUpdateStream() re-throws a non-"already in use" CREATE error ("JetStream not enabled") instead of falling back to UPDATE.
 - `testStreamNamesWithNullStreamsKeyReturnsEmpty` - streamNames() returns an empty list when the response has no streams key.
@@ -389,6 +390,17 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testPublishRequiresOpenConnection` - publish() on a not-open connection throws ConnectionException ("Connection is not open").
 - `testDisconnectClosesTransportAndState` - disconnect() closes the transport and sets state to Closed.
 - `testSubscribeAndUnsubscribeSendProtocolCommands` - subscribe()/unsubscribe() return SID 1 and emit "SUB orders.created 1" then "UNSUB 1".
+- `testUnsubscribeWithMaxDeliversRemainingMessagesThenRemoves` - unsubscribe(sid, 3) after one delivery emits "UNSUB 1 3" and keeps delivering the remaining allowance (m2, m3) to the handler instead of discarding it; the frame past the max (m4) is not delivered (#112).
+- `testUnsubscribeWithMaxAlreadyReachedRemovesImmediately` - unsubscribe(sid, 2) after 2 deliveries still emits "UNSUB 1 2" (server-side accounting) but removes the subscription at once, so later frames for the sid are discarded.
+- `testReconnectReplaysRemainingAutoUnsubscribeAllowance` - after arming max=3 with 1 delivered, a reconnect replays the SUB and re-arms auto-unsubscribe with the remaining allowance ("UNSUB 1 2", mirroring nats.go resendSubscriptions), so exactly 3 total messages reach the handler (#112).
+- `testSubscribeRollsBackStateWhenSubWriteFails` - a failed SUB write rethrows and rolls back the registry entry for the consumed sid: frames for that sid are discarded, and the next subscribe gets sid 2 (#116).
+- `testUnsubscribeDropsLocalStateWhenUnsubWriteFails` - a failed UNSUB write rethrows but still drops the local subscription state, so no ghost entry survives for resubscribeAll() to revive after recovery (#116).
+- `testAutoUnsubscribeCompletesAndCleansUpEvenWhenSlowConsumerDropsMessages` - with maxPending=2 and DropOldest, a single-chunk burst of 4 frames armed at max=4 delivers only the 2 kept messages, yet the subscription is fully torn down because all 4 were received (counting at receive, not at delivery) (#112).
+- `testAutoUnsubscribeCapsHandlerDeliveryAtMaxEvenIfServerOverSends` - even when more frames than the armed max arrive on the sid, the handler is invoked at most max times (2) and the subscriptionMeta entry is removed (#112).
+- `testAutoUnsubscribeOnNonOpenConnectionDefersArmingInsteadOfDestroyingSubscription` - unsubscribe(sid, max) while state is not Open (mid-reconnect) neither throws nor destroys the subscription; the max is armed so recovery re-arms it via resubscribeAll (#112).
+- `testAutoUnsubscribeArmWriteFailureKeepsSubscriptionArmedForRecovery` - a failed arming UNSUB write propagates but keeps both the subscription and the armed max, so the next recovery can re-arm it (#112/#116).
+- `testPlainUnsubscribeOnClosedConnectionDropsStateWithoutThrowing` - plain unsubscribe(sid) for a known sid on a Closed connection releases local state silently instead of throwing (#116).
+- `testAutoUnsubscribeCleansUpEvenWhenHandlerThrowsOnMaxDelivery` - a handler that throws on its final (max-th) delivery still leaves the subscription torn down; the terminal cleanup runs in a finally rather than after the handler returns (#112).
 - `testSubscribeWithQueueGroupSendsSubFrameAndDeliversToHandler` - subscribe() with a queue group emits "SUB tasks.process workers 1" and dispatches a matching MSG to the handler.
 - `testLargeInboundMessageReceivedWhenServerAdvertisesLargeMaxPayload` - A 9 MiB inbound MSG is delivered intact when the server advertises a 16 MiB max_payload and the connection stays Open (#94).
 - `testProcessIncomingDispatchesMsgToSubscriber` - processIncoming() dispatches a MSG to its subscriber, returning 1 frame with correct subject/payload.
@@ -471,7 +483,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testBackoffDelayIsExponential` - backoffDelayMs() doubles per attempt (100,200,400,800,1600,3200) and caps at reconnectMaxDelayMs (5000).
 - `testRequestWithHeadersReturnsReply` - requestWithHeaders() emits an HPUB carrying the header and returns the first reply payload.
 - `testProcessIncomingRequiresOpenConnection` - processIncoming() on a not-open connection throws ConnectionException ("Connection is not open").
-- `testUnsubscribeRequiresOpenConnection` - unsubscribe() on a not-open connection throws ConnectionException ("Connection is not open").
+- `testUnsubscribeOnUnopenedConnectionIsSilentNoOp` - unsubscribe() on a not-open connection is a silent no-op (state stays Idle, nothing thrown): finally-based inbox cleanup runs on broken connections, and a throw here would leak the entry and mask the caller's original error (#116).
 - `testPublishWithHeadersRequiresOpenConnection` - publishWithHeaders() on a not-open connection throws ConnectionException ("Connection is not open").
 - `testProcessIncomingThrowsOnErrFrame` - A fatal -ERR frame during processIncoming() throws ConnectionException ("Server sent error frame").
 - `testConnectUsesDefaultServerWhenListEmpty` - With an empty servers list, connect() dials the default tcp://127.0.0.1:4222.
@@ -844,7 +856,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testAddEndpointRejectsEmptyName` - Asserts adding an endpoint with a blank/whitespace name throws InvalidArgumentException ("name must not be empty").
 - `testAddEndpointRejectsEmptySubject` - Asserts adding an endpoint with an empty subject throws InvalidArgumentException ("subject must not be empty").
 - `testClassHandlerWithRequiredConstructorArgIsRejected` - Asserts a class-string handler requiring a constructor argument is rejected with InvalidArgumentException ("could not be instantiated") rather than a raw ArgumentCountError.
-- `testStopToleratesClosedConnection` - Asserts stop() after the connection is disconnected swallows per-SID unsubscribe failures and still clears subscriptionSids.
+- `testStopToleratesClosedConnection` - Asserts stop() after the connection is disconnected completes without aborting (unsubscribe() releases local state silently on a closed connection per #116) and still clears subscriptionSids.
 - `testRunStopsWhenConnectionIsUnrecoverable` - Asserts run() with no timeout returns (within a 2s bound) once the connection becomes unrecoverable (EOF, reconnect disabled) instead of busy-spinning.
 - `testDiscoveryHandlerSwallowsEncodeFailure` - Asserts an INFO discovery payload that fails to JSON-encode (invalid-UTF-8 description) is swallowed inside the discovery handler so processIncoming still completes (1 frame).
 - `testStartIsIdempotentWhenAlreadyStarted` - Asserts calling start() on an already-started service is a no-op, producing no additional writes/SUB frames.
@@ -859,8 +871,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testRunWithOnlyTimeoutUsesTimeoutCancellation` - Asserts run() with only a timeout and no external cancellation returns via the TimeoutCancellation path and stops the service (UNSUB emitted).
 - `testStatsHandlerExceptionIsSwallowed` - Asserts a stats supplier that throws is swallowed: the endpoint entry is present (has num_requests) but omits the `data` key.
 - `testRunBreaksImmediatelyWhenCancellationAlreadyRequested` - Asserts run() exits promptly without hanging when given an already-cancelled cancellation, still stopping the service (UNSUB emitted).
-- `testStartRollbackSwallowsUnsubscribeFailureOnClosedConnection` - Asserts start() failing on a closed connection rolls back already-subscribed SIDs while swallowing the secondary unsubscribe failures, leaving subscriptionSids empty and started false.
-- `testDrainToleratesClosedConnectionDuringUnsubscribe` - Asserts drain() over a closed connection swallows per-SID unsubscribe exceptions and still clears subscriptionSids and the started flag.
+- `testStartRollbackSwallowsUnsubscribeFailureOnClosedConnection` - Asserts start() failing on a bad endpoint subject rolls back already-subscribed SIDs while swallowing the rollback unsubscribe failures (forced via failing UNSUB writes, since #116 made unsubscribe() a silent no-op on a not-open connection), leaving subscriptionSids empty and started false.
+- `testDrainSwallowsUnsubscribeWriteFailure` - Asserts drain() swallows per-SID unsubscribe exceptions (forced via failing UNSUB writes on an otherwise-open connection, since #116 removed the closed-connection throw) and still clears subscriptionSids and the started flag.
 - `testDrainToleratesFlushFailureOnClosedConnection` - Asserts drain() swallows a flush() failure caused by a closed connection and still clears state (started false, subscriptionSids empty).
 - `testRunWithBothTimeoutAndExternalCancellationUsesCompositeCancellation` - Asserts run() given both a timeout and an external cancellation uses the CompositeCancellation branch, stopping the service when the external cancel fires first (UNSUB emitted).
 
@@ -1045,6 +1057,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 ### tests/Integration/NatsClientIntegrationTest.php
 - `testConnectAndDisconnect` - Connects to a live server, asserts `serverInfo()` is non-null, then disconnects cleanly.
 - `testPublishAndSubscribeRoundTrip` - Subscribes to a random subject, publishes "hello", event-pumps `processIncoming` with a 2s cancellation, and asserts the received message payload is "hello".
+- `testAutoUnsubscribeDeliversUpToMaxThenStops` - Receives one message, arms `unsubscribe($sid, 3)`, publishes three more, and asserts exactly m1-m3 reach the handler while m4 never arrives within a bounded settle window (auto-unsubscribe delivers the remaining allowance instead of discarding it, #112).
 - `testRequestReply` - Sets up a server that replies "world" to a subject, pumps it concurrently, and asserts the client's `request()` returns "world" and the handler ran.
 - `testPublishWithHeadersRoundTrip` - Publishes with custom headers via `publishWithHeaders`, asserts the subscriber's parsed wire headers contain X-Request-Id and Content-Type "text/plain" with payload "hello".
 - `testRequestWithHeadersPropagatesHeaders` - Sends `requestWithHeaders` carrying X-Request-Id, asserts the responder saw that header value and the reply payload is "ok".
@@ -1157,6 +1170,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - Drain flushes in-flight delivery before closing the connection - drains a subscriber after publishing an in-flight message and asserts draining flushes the in-flight message and closes the client.
 - Wildcard subscriptions only receive matching subjects - subscribes to a wildcard pattern and publishes matching and non-matching subjects, asserting only the matching wildcard subjects and payloads are received.
 - Oversized publish is rejected before writing to the server - publishes a payload larger than the server max payload and asserts the oversized publish is rejected client-side.
+- Auto-unsubscribe delivers remaining messages up to the maximum then stops - subscribes, arms unsubscribe with a maximum of 2 messages, publishes 3 messages, and asserts exactly 2 are delivered with none arriving after the maximum (#112).
 
 ### features/services/grouped_endpoints.feature
 - Dispatch requests across grouped echo endpoints - starts a grouped echo service, requests both grouped endpoints with payload "hello", and asserts the replies are "v1:hello" and "v2:hello" and the service stats list both grouped subjects.

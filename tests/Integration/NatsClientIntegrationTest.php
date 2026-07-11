@@ -85,6 +85,70 @@ final class NatsClientIntegrationTest extends TestCase
     }
 
     /**
+     * Verifies auto-unsubscribe semantics against a live server: after `unsubscribe($sid, $max)` the
+     * remaining deliveries up to $max total still reach the handler (previously they were silently
+     * discarded), and nothing past the max arrives (#112).
+     */
+    public function testAutoUnsubscribeDeliversUpToMaxThenStops(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $subject = 'it.autounsub.' . bin2hex(random_bytes(4));
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $received = [];
+        $deliveries = 0;
+        $sid = $client->subscribe($subject, static function (NatsMessage $message) use (&$received, &$deliveries): void {
+            $received[] = $message->payload;
+            $deliveries++;
+        })->await();
+
+        $client->publish($subject, 'm1')->await();
+
+        $cancellation = new TimeoutCancellation(2.0);
+        try {
+            while ($deliveries < 1) {
+                $client->processIncoming($cancellation)->await();
+            }
+        } catch (CancelledException) {
+            // No message within the window; the assertion below reports it.
+        }
+        self::assertSame(['m1'], $received);
+
+        // One message already delivered: allow two more (3 total), then the server stops sending.
+        $client->unsubscribe($sid, 3)->await();
+
+        $client->publish($subject, 'm2')->await();
+        $client->publish($subject, 'm3')->await();
+        $client->publish($subject, 'm4')->await();
+
+        $cancellation = new TimeoutCancellation(2.0);
+        try {
+            while ($deliveries < 3) {
+                $client->processIncoming($cancellation)->await();
+            }
+        } catch (CancelledException) {
+            // Fewer than three within the window; the assertion below reports it.
+        }
+        self::assertSame(['m1', 'm2', 'm3'], $received);
+
+        // Bounded settle window: m4 must never arrive - the server stopped at the max and the client
+        // dropped the subscription after the third delivery.
+        $settle = new TimeoutCancellation(0.3);
+        try {
+            while (!$settle->isRequested()) {
+                $client->processIncoming($settle)->await();
+            }
+        } catch (CancelledException) {
+            // Window elapsed with no further delivery.
+        }
+        self::assertSame(['m1', 'm2', 'm3'], $received);
+
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies request/reply end-to-end using two live clients.
      */
     public function testRequestReply(): void

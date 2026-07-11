@@ -1138,10 +1138,11 @@ final class ServiceTest extends TestCase
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
         $service->start()->await();
 
-        // The connection is gone before stop(): unsubscribe() would throw "not open".
+        // The connection is gone before stop(): unsubscribe() releases local state without throwing
+        // on a closed connection (#116), and stop() clears its own per-SID tracking regardless.
         $client->disconnect()->await();
 
-        // stop() must not abort on the first failure; it swallows per-SID and clears state.
+        // stop() must not abort; it unsubscribes per-SID (best-effort) and clears state.
         $service->stop()->await();
 
         $sids = new \ReflectionProperty($service, 'subscriptionSids');
@@ -1548,15 +1549,16 @@ final class ServiceTest extends TestCase
             ->addEndpoint('good', 'svc.good', static fn(NatsMessage $m): string => 'ok')
             ->addEndpoint('bad', 'bad subject', static fn(NatsMessage $m): string => 'no');
 
-        // Close the connection so that when start() rolls back the already-subscribed SIDs,
-        // unsubscribe() throws (line 326 catch fires) but must be swallowed.
-        $client->disconnect()->await();
+        // Make every UNSUB write fail so the rollback of the already-subscribed SIDs throws and must be
+        // swallowed (the line-357 catch). A failing write - not a closed connection - is now what makes
+        // unsubscribe() throw, since #116 made unsubscribe() a silent no-op on a not-open connection.
+        $transport->throwOnWriteContaining = 'UNSUB';
 
         try {
             $service->start()->await();
             self::fail('Expected start() to throw');
         } catch (\Throwable) {
-            // expected: the subscribe or rollback itself throws; what matters is no secondary exception.
+            // expected: the bad-subject subscribe throws; the rollback unsubscribe failures are swallowed.
         }
 
         // Service must remain not-started and SIDs must be cleared (rollback complete despite unsubscribe failures).
@@ -1565,10 +1567,11 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies drain() silently swallows unsubscribe failures when the connection is already gone
-     * (line 398: catch block inside the foreach in drain()).
+     * Verifies drain() silently swallows unsubscribe failures (the catch block inside the foreach in
+     * drain()). Since #116 unsubscribe() no longer throws on a closed connection, the failure is now
+     * triggered by a failing UNSUB write on an otherwise-open connection.
      */
-    public function testDrainToleratesClosedConnectionDuringUnsubscribe(): void
+    public function testDrainSwallowsUnsubscribeWriteFailure(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1578,8 +1581,8 @@ final class ServiceTest extends TestCase
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
         $service->start()->await();
 
-        // Drop the connection before draining so unsubscribe() throws for every SID (line 398 catch).
-        $client->disconnect()->await();
+        // Make every UNSUB write fail so unsubscribe() throws for each SID during drain (the catch).
+        $transport->throwOnWriteContaining = 'UNSUB';
 
         // drain() must complete without rethrowing any unsubscribe exceptions.
         $service->drain()->await();
