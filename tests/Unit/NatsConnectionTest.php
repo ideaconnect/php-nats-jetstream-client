@@ -3936,6 +3936,63 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * The #144 containment must hold even when the user-supplied PSR logger throws while the
+     * contained handler error is being reported: emitError() logs BEFORE its listener-throw guard,
+     * so an unguarded emitError call in the containment would re-open the exact escape (#144).
+     */
+    public function testPostRecoveryContainmentSurvivesThrowingLogger(): void
+    {
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    '__EOF__',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 1 5\r\nboom!\r\n",
+                ],
+            ],
+            connectFailures: 0,
+            readFailures: 0,
+        );
+
+        // Throws only while the containment reports the handler error - a logger throwing on every
+        // call would already fail the connect() handshake logging and miss the point of the test.
+        $throwingLogger = new class extends \Psr\Log\AbstractLogger {
+            public function log($level, \Stringable|string $message, array $context = []): void
+            {
+                if (str_contains((string) $message, 'handler failed')) {
+                    throw new \RuntimeException('logger failed');
+                }
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                logger: $throwingLogger,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->subscribe('updates', static function (NatsMessage $message): void {
+            throw new \RuntimeException('handler failed on ' . $message->payload);
+        })->await();
+
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a throwing logger must not fail a successful recovery');
+        self::assertCount(2, $transport->connectCalls);
+    }
+
+    /**
      * Same containment for the ping watchdog's maxPingsOut escalation: pingTimerTick()'s catch
      * treated the escaping handler exception as a failed recovery and closed a healthy, fully
      * recovered connection (#144).

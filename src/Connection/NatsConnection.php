@@ -1592,7 +1592,12 @@ final class NatsConnection
             // unrelated exception for a frame that was never written (#144). Report it as an async
             // error instead (nats.go parity: handler errors during post-reconnect delivery are
             // reported, not fatal).
-            $this->emitError($handlerError);
+            try {
+                $this->emitError($handlerError);
+            } catch (\Throwable) {
+                // emitError() swallows listener throws but logs BEFORE that guard: a throwing
+                // user-supplied logger would otherwise re-open the exact escape this catch closes.
+            }
         }
     }
 
