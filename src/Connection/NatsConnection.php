@@ -116,6 +116,13 @@ final class NatsConnection
      * @var ?DeferredFuture<void>
      */
     private ?DeferredFuture $reconnecting = null;
+    /**
+     * In-progress user connect(), so a concurrent connect() shares its outcome instead of starting
+     * a parallel dial chain against the same transport and parser (#145).
+     *
+     * @var ?DeferredFuture<void>
+     */
+    private ?DeferredFuture $connecting = null;
     /** Guards against two overlapping socket reads (user read vs heartbeat self-read). */
     private bool $readInProgress = false;
     /**
@@ -299,6 +306,10 @@ final class NatsConnection
      * an exhausted reconnect): connecting the same instance again starts from a clean slate, and
      * the application must re-create its subscriptions (nats.go parity, #127).
      *
+     * There is exactly one owner of any dial chain (nats.go conn.mu parity, #145): connect()
+     * during an in-flight recovery joins the recovery and shares its outcome, connect() while
+     * another connect() is dialing awaits that dial, and connect() during drain() throws.
+     *
      * @return Future<void>
      */
     public function connect(): Future
@@ -308,44 +319,97 @@ final class NatsConnection
                 return;
             }
 
+            // An in-flight recovery owns the dial loop: join it and share its outcome instead of
+            // racing it with a second connectOnce() chain - the recovery closes the transport at
+            // the start of every attempt, which would tear down the socket a concurrent connect()
+            // just established and silently drop subscriptions created on that epoch (#145).
+            // Checked before the state checks because a concurrent disconnect() may already have
+            // moved state to Closed while the recovery fiber is still winding down.
+            $recovery = $this->reconnecting;
+            if ($recovery !== null) {
+                $recovery->getFuture()->await();
+
+                return;
+            }
+
+            if ($this->state === ConnectionState::Draining) {
+                throw new ConnectionException('Cannot connect: drain in progress');
+            }
+
+            // Coalesce concurrent user connects the same way recoverConnection() coalesces
+            // recoveries: the second caller awaits the first dial's outcome (#145).
+            $inFlight = $this->connecting;
+            if ($inFlight !== null) {
+                $inFlight->getFuture()->await();
+
+                return;
+            }
+
+            $deferred = new DeferredFuture();
+            // Suppress unhandled-error reporting for the no-waiter case; awaiting callers still
+            // receive the error from await().
+            $deferred->getFuture()->ignore();
+            $this->connecting = $deferred;
+
             // A fresh connect re-arms the recovery paths after a prior disconnect()/drain() (#84).
+            // Only this fresh-dial path resets close-intent: the joining paths above must not
+            // disarm a concurrent disconnect() (#145).
             $this->closing = false;
 
             try {
-                $this->connectOnce();
-                $this->markConnectionOpen();
-                $this->emitEvent(ConnectionEvent::Connected);
-            } catch (AuthenticationException $e) {
-                // An auth failure will not resolve by retrying: fail fast instead of entering reconnect.
-                $this->state = ConnectionState::Closed;
-                $this->closeTransportBestEffort();
-                $this->releaseRuntimeState();
-                $this->emitEvent(ConnectionEvent::Closed, $e);
+                $this->performConnect();
+                $deferred->complete();
+            } catch (\Throwable $e) {
+                $deferred->error($e);
 
                 throw $e;
-            } catch (\Throwable $e) {
-                if ($this->options->reconnectEnabled && $this->options->maxReconnectAttempts > 0) {
-                    $this->recoverConnection();
-
-                    return;
-                }
-
-                // retry-on-failed-initial-connect (#56): keep retrying the first connect even when
-                // ongoing reconnect is disabled.
-                if ($this->options->retryOnFailedInitialConnect
-                    && $this->options->maxReconnectAttempts > 0
-                    && $this->retryInitialConnect()
-                ) {
-                    return;
-                }
-
-                $this->state = ConnectionState::Closed;
-                $this->closeTransportBestEffort();
-                $this->releaseRuntimeState();
-                $this->emitEvent(ConnectionEvent::Closed, $e);
-                throw new ConnectionException($e->getMessage(), (int) $e->getCode(), $e);
+            } finally {
+                $this->connecting = null;
             }
         });
+    }
+
+    /**
+     * Runs one user-initiated connect - dial + handshake with the standing failure policy (auth
+     * failures fail fast; other failures hand off to recovery or the initial-connect retry loop;
+     * otherwise the connection closes terminally). Serialized by {@see connect()}.
+     */
+    private function performConnect(): void
+    {
+        try {
+            $this->connectOnce();
+            $this->markConnectionOpen();
+            $this->emitEvent(ConnectionEvent::Connected);
+        } catch (AuthenticationException $e) {
+            // An auth failure will not resolve by retrying: fail fast instead of entering reconnect.
+            $this->state = ConnectionState::Closed;
+            $this->closeTransportBestEffort();
+            $this->releaseRuntimeState();
+            $this->emitEvent(ConnectionEvent::Closed, $e);
+
+            throw $e;
+        } catch (\Throwable $e) {
+            if ($this->options->reconnectEnabled && $this->options->maxReconnectAttempts > 0) {
+                $this->recoverConnection();
+
+                return;
+            }
+
+            // retry-on-failed-initial-connect (#56): keep retrying the first connect even when
+            // ongoing reconnect is disabled.
+            if ($this->options->retryOnFailedInitialConnect
+                && $this->options->maxReconnectAttempts > 0
+                && $this->retryInitialConnect()
+            ) {
+                return;
+            }
+
+            $this->state = ConnectionState::Closed;
+            $this->closeTransportBestEffort();
+            $this->releaseRuntimeState();
+            $this->emitEvent(ConnectionEvent::Closed, $e);
+            throw new ConnectionException($e->getMessage(), (int) $e->getCode(), $e);
+        }
     }
 
     /**

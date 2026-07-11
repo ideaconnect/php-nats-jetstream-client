@@ -7808,4 +7808,303 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertCount(2, $transport->connectCalls);
     }
+
+    /**
+     * Verifies connect() called while a recovery is in flight JOINS the recovery instead of starting
+     * a second concurrent connectOnce() dial chain. Without the join, the recovery loop's
+     * transport->close() at the start of its next attempt tears down the healthy socket the user's
+     * connect() just established and silently drops every subscription created on that epoch (#145).
+     */
+    public function testConnectDuringInFlightRecoveryJoinsInsteadOfSecondDialChain(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            /** @var list<string> */
+            public array $writes = [];
+            private int $epoch = -1;
+            private bool $msgEnqueued = false;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // epoch 0: initial connect, then EOF -> recovery
+                    [$info, "PONG\r\n"],            // epoch 1: joined recovery's successful attempt
+                    [$info, "PONG\r\n"],            // epoch 2: only consumed by a rogue parallel dial chain
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $attempt = count($this->connectCalls);
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+
+                    // Recovery attempt 1 fails so the loop backs off and retries.
+                    if ($attempt === 1) {
+                        throw new TransportClosedException('dial failed');
+                    }
+
+                    // Hold recovery attempt 2 open so a user connect() lands mid-recovery.
+                    if ($attempt === 2) {
+                        $this->release->getFuture()->await();
+                    }
+
+                    $this->epoch++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+
+                    // Model the server delivering a message for the post-connect() subscription on
+                    // whichever socket the SUB was actually written to (fires once).
+                    if (!$this->msgEnqueued && str_contains($bytes, 'SUB updates')) {
+                        $this->msgEnqueued = true;
+                        $this->reads[max(0, $this->epoch)][] = "MSG updates 1 5\r\nhello\r\n";
+                    }
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads[max(0, $this->epoch)]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 5,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await(); // dial 1
+
+        // Drive the read loop: it reads EOF, recovery attempt 1 (dial 2) fails, attempt 2 (dial 3)
+        // suspends inside the held transport connect - recovery is now mid-flight.
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05);
+
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        self::assertCount(3, $transport->connectCalls);
+
+        // A user connect() during the in-flight recovery must join it, not dial a 4th time.
+        $join = $connection->connect();
+        delay(0.01); // give a rogue parallel dial the chance to surface
+        self::assertCount(
+            3,
+            $transport->connectCalls,
+            'connect() during an in-flight recovery must join it, not start a second dial chain',
+        );
+
+        $release->complete(); // let the recovery attempt finish
+        $join->await();
+        $pump->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(1, $connection->statistics()->reconnects);
+
+        // A subscription created right after the joined connect() returns must survive: nothing may
+        // close its socket out from under it.
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+        $connection->processIncoming()->await();
+
+        self::assertSame(['hello'], $received, 'subscription made after the joined connect() must survive');
+        self::assertCount(3, $transport->connectCalls, 'exactly one dial chain for the whole outage');
+    }
+
+    /**
+     * Verifies connect() called while drain() is mid-flush throws ConnectionException without
+     * dialing: drain owns the teardown, and a parallel dial would both race the flush loop and
+     * disarm drain's close-intent (#145).
+     */
+    public function testConnectDuringDrainThrowsWithoutDialing(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                connectTimeoutMs: 160,
+                requestTimeoutMs: 200,
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // No PONG is queued for drain's flush PING, so drain() stays in its bounded flush loop
+        // (state Draining) until the requestTimeoutMs deadline - a stable mid-drain window.
+        $drain = $connection->drain();
+        delay(0.02);
+        self::assertSame(ConnectionState::Draining, $connection->state());
+
+        try {
+            $connection->connect()->await();
+            self::fail('expected ConnectionException for connect() during drain');
+        } catch (ConnectionException) {
+            // Drain in progress: connect() must refuse rather than dial into the teardown.
+        }
+
+        self::assertCount(1, $transport->connectCalls, 'connect() during drain must not dial');
+
+        $drain->await();
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * Verifies a connect() racing a disconnect() during an in-flight recovery does not disarm the
+     * disconnect's close-intent: the joined recovery bails on `closing` and the connection stays
+     * Closed - previously connect() reset closing=false and dialed, letting the recovery re-open a
+     * connection the user had just closed (#145).
+     */
+    public function testConnectDuringRecoveryDoesNotDisarmConcurrentDisconnectCloseIntent(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $release = new DeferredFuture();
+        $events = [];
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            private int $epoch = -1;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // epoch 0: initial connect, then EOF -> recovery
+                    [$info, "PONG\r\n"],            // epoch 1: the held recovery attempt's handshake
+                    [$info, "PONG\r\n"],            // epoch 2: manual reconnect after the close settles
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $attempt = count($this->connectCalls);
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+
+                    // Hold recovery attempt 1 open so disconnect() and connect() land mid-recovery.
+                    if ($attempt === 1) {
+                        $this->release->getFuture()->await();
+                    }
+
+                    $this->epoch++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads[max(0, $this->epoch)]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 5,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $e) use (&$events): void {
+                    $events[] = $e;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await(); // dial 1
+
+        // EOF -> recovery; attempt 1 (dial 2) suspends inside the held transport connect.
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05);
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+
+        // The user closes mid-recovery, then supervision logic immediately calls connect().
+        $connection->disconnect()->await();
+        self::assertSame(ConnectionState::Closed, $connection->state());
+
+        $join = $connection->connect();
+        delay(0.01); // give a rogue dial the chance to surface
+        self::assertCount(
+            2,
+            $transport->connectCalls,
+            'a connect() racing disconnect() during recovery must join, not dial with close-intent disarmed',
+        );
+
+        $release->complete(); // the recovery attempt resumes and must bail on close-intent
+        $join->await();
+        $pump->await();
+
+        self::assertSame(
+            ConnectionState::Closed,
+            $connection->state(),
+            'the user close-intent must win over a racing connect()',
+        );
+        self::assertNotContains(ConnectionEvent::Reconnected, $events);
+        self::assertContains(ConnectionEvent::Closed, $events);
+
+        // The recovery has fully wound down: a later manual connect() still starts a clean epoch.
+        $connection->connect()->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(3, $transport->connectCalls);
+    }
 }

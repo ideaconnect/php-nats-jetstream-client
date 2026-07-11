@@ -43,6 +43,20 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `recoverConnection()` and reported through the error listener (nats.go parity: handler errors
   during post-reconnect delivery are async errors, not connection failures); genuine recovery
   failures (exhaustion, auth, reconnect disabled) still throw unchanged (#144).
+- `[bugfix]` `connect()` no longer races an in-flight recovery: there is now exactly one owner of
+  any dial chain (nats.go `conn.mu` parity). Calling `connect()` while a recovery was mid-flight
+  (backoff, dial, or handshake) started a second concurrent `connectOnce()` chain against the same
+  transport and parser; the recovery loop's next attempt then closed the healthy socket the user's
+  `connect()` had just established and replayed only the pre-outage subscriptions, silently losing
+  every subscription created on the new epoch (a runtime repro observed 4 dials for one outage).
+  `connect()` now joins the in-flight recovery and shares its outcome, a concurrent `connect()`
+  awaits the first dial instead of dialing in parallel, and `connect()` during `drain()` throws
+  `ConnectionException` (`Cannot connect: drain in progress`) instead of dialing into the teardown.
+  The `closing = false` reset also moved onto the fresh-dial path only, so a `connect()` racing a
+  concurrent `disconnect()` can no longer disarm the user's close intent and let the recovery
+  re-open a connection the user just closed - close intent wins and the connection stays Closed.
+  A manual `connect()` after a terminal close (exhaustion, reconnect disabled, auth failure, user
+  close) still starts a clean epoch exactly as before (#145).
 - `[bugfix]` Ordered consumer: a `TimeoutException` or `ConnectionException` from the best-effort
   `deleteConsumer()` leg of a recreate (sequence-gap or heartbeat tail-gap recovery) no longer
   bypasses the create-retry loop and permanently silences the consumer. Those exceptions extend
