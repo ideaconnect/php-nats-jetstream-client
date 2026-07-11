@@ -457,6 +457,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testProcessIncomingUpdatesServerInfoFromAsyncInfoFrame` - An async INFO refreshes serverInfo (max_payload 64->128, version bump) during an open connection.
 - `testProcessIncomingIgnoresRecoverableServerErrFrame` - A recoverable publish-permissions -ERR is processed without closing the connection.
 - `testPingTimerSendsPingAtInterval` - The ping timer writes a "PING" frame after the configured interval elapses.
+- `testAbandonedOpenConnectionIsCollectedAndClosesItsSocket` - Dropping the last reference to an Open connection frees the object graph (the ping timer holds it only weakly) and the destructor closes the socket best-effort (#126).
 - `testPingTimerDisabledWhenIntervalIsZero` - With pingIntervalSeconds 0, no PING is written after connect.
 - `testDisconnectCancelsPingTimer` - disconnect() cancels the ping timer so no PING is sent afterward and state is Closed.
 - `testPingTimerClosesWhenMaxPingsExceededAndReconnectFails` - With maxPingsOut 0 and reconnect disabled, exceeding outstanding pings closes the connection.

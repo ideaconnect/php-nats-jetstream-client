@@ -2620,6 +2620,37 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A connection abandoned without disconnect()/drain() must be collectable: the ping timer's
+     * repeat closure holds $this only weakly, so dropping the last application reference frees
+     * the whole graph (previously the event loop rooted it forever - open socket, handler
+     * closures, buffers - while the timer kept PINGing) and the destructor closes the socket (#126).
+     */
+    public function testAbandonedOpenConnectionIsCollectedAndClosesItsSocket(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+        // Register a handler whose closure captures state, as real applications do.
+        $connection->subscribe('updates', static function (NatsMessage $message): void {
+        })->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        $weak = \WeakReference::create($connection);
+        unset($connection);
+        gc_collect_cycles();
+
+        self::assertNull($weak->get(), 'an abandoned Open connection must be freed, not rooted by its ping timer');
+
+        // The destructor defers the socket close to the event loop; let it run one tick.
+        delay(0);
+        self::assertTrue($transport->closed, 'the abandoned connection\'s socket must be closed best-effort');
+    }
+
+    /**
      * Verifies ping timer is not started when pingIntervalSeconds is zero.
      */
     public function testPingTimerDisabledWhenIntervalIsZero(): void

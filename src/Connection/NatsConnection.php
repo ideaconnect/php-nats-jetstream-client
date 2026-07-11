@@ -1873,45 +1873,90 @@ final class NatsConnection
             return;
         }
 
-        $this->pingTimerId = EventLoop::repeat($intervalSeconds, function (): void {
-            if ($this->state !== ConnectionState::Open) {
-                $this->cancelPingTimer();
+        // The repeat closure must not bind $this strongly: Revolt's driver holds it until cancel,
+        // and none of the cancel paths fire for a healthy connection the application simply stops
+        // referencing - the timer would root the whole connection graph (open socket, handler
+        // closures, buffers) in the event loop forever, PINGing and even delivering messages to
+        // abandoned handlers (#126).
+        $weakSelf = \WeakReference::create($this);
+        $this->pingTimerId = EventLoop::repeat($intervalSeconds, static function (string $timerId) use ($weakSelf): void {
+            $self = $weakSelf->get();
+            if ($self === null) {
+                EventLoop::cancel($timerId);
 
                 return;
             }
 
-            $this->outstandingPings++;
+            $self->pingTimerTick();
+        });
+    }
 
-            if ($this->outstandingPings > $this->options->maxPingsOut) {
-                $this->cancelPingTimer();
+    /**
+     * One heartbeat tick: verify the liveness budget, send PING, and consume the PONG.
+     */
+    private function pingTimerTick(): void
+    {
+        if ($this->state !== ConnectionState::Open) {
+            $this->cancelPingTimer();
 
-                try {
-                    $this->recoverConnection();
-                } catch (\Throwable) {
-                    $this->state = ConnectionState::Closed;
-                }
+            return;
+        }
 
-                return;
-            }
+        $this->outstandingPings++;
+
+        if ($this->outstandingPings > $this->options->maxPingsOut) {
+            $this->cancelPingTimer();
 
             try {
-                $this->transport->write($this->codec->encodePing())->await();
+                $this->recoverConnection();
             } catch (\Throwable) {
-                $this->cancelPingTimer();
-
-                try {
-                    $this->recoverConnection();
-                } catch (\Throwable) {
-                    $this->state = ConnectionState::Closed;
-                }
-
-                return;
+                $this->state = ConnectionState::Closed;
             }
 
-            // Consume the server PONG ourselves so liveness detection does not depend on the
-            // application actively calling processIncoming(). If a user read is already running,
-            // it will consume the PONG instead and reset the counter.
-            $this->consumeHeartbeatResponse();
+            return;
+        }
+
+        try {
+            $this->transport->write($this->codec->encodePing())->await();
+        } catch (\Throwable) {
+            $this->cancelPingTimer();
+
+            try {
+                $this->recoverConnection();
+            } catch (\Throwable) {
+                $this->state = ConnectionState::Closed;
+            }
+
+            return;
+        }
+
+        // Consume the server PONG ourselves so liveness detection does not depend on the
+        // application actively calling processIncoming(). If a user read is already running,
+        // it will consume the PONG instead and reset the counter.
+        $this->consumeHeartbeatResponse();
+    }
+
+    /**
+     * Safety net for clients abandoned without disconnect()/drain(): stop the heartbeat and close
+     * the socket best-effort. Only reachable because the ping timer holds $this weakly (#126);
+     * transport teardown is deferred via EventLoop::queue because spawning fibers inside a
+     * destructor (possibly during GC) is unsafe.
+     */
+    public function __destruct()
+    {
+        $this->cancelPingTimer();
+
+        if ($this->state !== ConnectionState::Open) {
+            return;
+        }
+
+        $transport = $this->transport;
+        EventLoop::queue(static function () use ($transport): void {
+            try {
+                $transport->close()->await();
+            } catch (\Throwable) {
+                // Best-effort teardown of an abandoned connection.
+            }
         });
     }
 
