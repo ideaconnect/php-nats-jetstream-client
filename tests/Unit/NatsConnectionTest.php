@@ -1722,6 +1722,125 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * One sid overflowing under SlowConsumerPolicy::Error must not discard frames for OTHER
+     * healthy subscriptions parsed from the same chunk: the parser already consumed the bytes and
+     * core NATS never resends them (#128). The overflow still surfaces after full dispatch.
+     */
+    public function testSlowConsumerErrorOnOneSidDoesNotDiscardSiblingFrames(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // sid 1 gets two messages (second overflows with maxPending=1); sid 2's message follows.
+            "MSG a 1 2\r\nm1\r\nMSG a 1 2\r\nm2\r\nMSG b 2 2\r\nm3\r\n",
+        ]);
+
+        $options = new NatsOptions(
+            maxPendingMessagesPerSubscription: 1,
+            slowConsumerPolicy: SlowConsumerPolicy::Error,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $receivedA = [];
+        $receivedB = [];
+        $connection->subscribe('a', static function (NatsMessage $message) use (&$receivedA): void {
+            $receivedA[] = $message->payload;
+        })->await();
+        $connection->subscribe('b', static function (NatsMessage $message) use (&$receivedB): void {
+            $receivedB[] = $message->payload;
+        })->await();
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the overflow to surface after dispatch');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('Subscription queue overflow for sid 1', $e->getMessage());
+        }
+
+        self::assertSame(['m1'], $receivedA, 'frames before the overflow must be delivered');
+        self::assertSame(['m3'], $receivedB, 'a healthy sibling subscription must not lose its frame');
+    }
+
+    /**
+     * A failing PONG reply to a server PING must not discard the MSG frames parsed from the same
+     * chunk: dispatch completes (messages enqueued and drained) before the failure surfaces (#128).
+     */
+    public function testServerPingWithFailingPongWriteStillDeliversCoChunkedMessages(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "PING\r\nMSG updates 1 5\r\nhello\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Fail the PONG reply write (only the reply contains "PONG"; the handshake writes CONNECT+PING).
+        $transport->throwOnWriteContaining = 'PONG';
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the PONG write failure to surface after dispatch');
+        } catch (TransportClosedException $e) {
+            self::assertSame('Simulated write failure', $e->getMessage());
+        }
+
+        self::assertSame(['hello'], $received, 'the co-chunked MSG must be delivered despite the PONG failure');
+    }
+
+    /**
+     * A fatal -ERR observed during the heartbeat self-read was previously swallowed whole,
+     * discarding co-chunked messages with it. The messages must be delivered and the fatal error
+     * surfaced through the error listener (escalation stays with the next user read) (#128).
+     */
+    public function testHeartbeatReadSurfacesFatalErrAndDeliversCoChunkedMessages(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "-ERR 'Unknown Protocol Operation'\r\nMSG updates 1 5\r\nhello\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(
+            pingIntervalSeconds: 1,
+            maxPingsOut: 3,
+            reconnectEnabled: false,
+            errorListener: static function (\Throwable $err) use (&$errors): void {
+                $errors[] = $err;
+            },
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Let the ping timer fire; its heartbeat self-read consumes the -ERR + MSG chunk.
+        delay(1.1);
+
+        self::assertSame(['hello'], $received, 'the co-chunked MSG must be delivered despite the fatal -ERR');
+        $fatal = array_filter(
+            $errors,
+            static fn(\Throwable $err): bool => str_contains($err->getMessage(), 'Server sent error frame'),
+        );
+        self::assertNotSame([], $fatal, 'the fatal -ERR must surface via the error listener, not vanish');
+
+        $connection->disconnect()->await();
+    }
+
+    /**
      * Verifies request/reply returns the first received response message.
      */
     public function testRequestReturnsFirstReplyMessage(): void
