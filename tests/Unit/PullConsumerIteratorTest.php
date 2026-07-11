@@ -353,7 +353,7 @@ final class PullConsumerIteratorTest extends TestCase
     // ── setGroup / setPriority / setMinPending / setMinAckPending / setMaxBytes / setNoWait ──────
 
     /**
-     * Covers line 114: setGroup() throws on an invalid group name.
+     * Verifies setGroup() throws on an invalid group name.
      */
     public function testSetGroupRejectsInvalidName(): void
     {
@@ -365,7 +365,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers line 114: setGroup() accepts null (clearing the group).
+     * Verifies setGroup() accepts null (clearing the group).
      */
     public function testSetGroupAcceptsNull(): void
     {
@@ -377,7 +377,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 129-130: setPriority() throws when priority < 0.
+     * Verifies setPriority() throws when priority < 0.
      */
     public function testSetPriorityRejectsNegative(): void
     {
@@ -389,7 +389,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 129-130: setPriority() throws when priority > 9.
+     * Verifies setPriority() throws when priority > 9.
      */
     public function testSetPriorityRejectsAboveNine(): void
     {
@@ -401,7 +401,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 133,135: setPriority() sets the priority and returns $this.
+     * Verifies setPriority() sets the priority and returns $this.
      */
     public function testSetPriorityAcceptsValidValues(): void
     {
@@ -417,7 +417,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 133,135: setPriority(null) clears the priority.
+     * Verifies setPriority(null) clears the priority.
      */
     public function testSetPriorityAcceptsNull(): void
     {
@@ -427,7 +427,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 146,148: setMinPending() stores the value and returns $this.
+     * Verifies setMinPending() stores the value and returns $this.
      */
     public function testSetMinPendingStoresValue(): void
     {
@@ -439,7 +439,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 146,148: setMinPending(null) clears the threshold.
+     * Verifies setMinPending(null) clears the threshold.
      */
     public function testSetMinPendingAcceptsNull(): void
     {
@@ -449,7 +449,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 158,160: setMinAckPending() stores the value and returns $this.
+     * Verifies setMinAckPending() stores the value and returns $this.
      */
     public function testSetMinAckPendingStoresValue(): void
     {
@@ -461,7 +461,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 158,160: setMinAckPending(null) clears the threshold.
+     * Verifies setMinAckPending(null) clears the threshold.
      */
     public function testSetMinAckPendingAcceptsNull(): void
     {
@@ -471,7 +471,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 170,172: setMaxBytes() stores the value and returns $this.
+     * Verifies setMaxBytes() stores the value and returns $this.
      */
     public function testSetMaxBytesStoresValue(): void
     {
@@ -483,7 +483,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 170,172: setMaxBytes(null) clears the cap.
+     * Verifies setMaxBytes(null) clears the cap.
      */
     public function testSetMaxBytesAcceptsNull(): void
     {
@@ -493,7 +493,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 182,184: setNoWait() sets the flag and returns $this.
+     * Verifies setNoWait() sets the flag and returns $this.
      */
     public function testSetNoWaitStoresValue(): void
     {
@@ -508,7 +508,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 182,184: setNoWait() defaults to true when called with no argument.
+     * Verifies setNoWait() defaults to true when called with no argument.
      */
     public function testSetNoWaitDefaultsToTrue(): void
     {
@@ -519,11 +519,11 @@ final class PullConsumerIteratorTest extends TestCase
         self::assertSame($iter, $result);
     }
 
-    // ── buildPull() branches (lines 372, 376, 380, 384, 388) via actual pull wire output ──────────
+    // ── buildPull() optional-field branches via actual pull wire output ──────────
 
     /**
-     * Covers line 372 (priority), 376 (min_pending), 380 (min_ack_pending), 384 (max_bytes),
-     * 388 (no_wait): verifies all optional pull fields appear in the NATS PUB payload when set.
+     * Covers the priority, min_pending, min_ack_pending, max_bytes, and no_wait branches of
+     * buildPull(): verifies all optional pull fields appear in the NATS PUB payload when set.
      */
     public function testBuildPullIncludesAllOptionalFields(): void
     {
@@ -570,7 +570,7 @@ final class PullConsumerIteratorTest extends TestCase
     }
 
     /**
-     * Covers lines 372, 376, 380, 384, 388 negative path: when the optional fields are NOT set,
+     * Covers the buildPull() optional-field branches' negative path: when the optional fields are NOT set,
      * they must be absent from the pull payload.
      */
     public function testBuildPullOmitsUnsetOptionalFields(): void

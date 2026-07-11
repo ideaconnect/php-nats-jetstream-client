@@ -1155,7 +1155,7 @@ final class KeyValueBucketTest extends TestCase
         $client->jetStream()->keyValue('cfg')->delete('theme')->await();
     }
 
-    // ─── kvSourceConfig: array source with 'bucket' key (lines 95-97, 100) ──
+    // ─── kvSourceConfig: array source with 'bucket' key ──
 
     /**
      * Verifies that create() with a mirror given as an array with a 'bucket' key
@@ -1218,7 +1218,7 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringNotContainsString('"bucket"', $create);
     }
 
-    // ─── purge() with TTL + expectedRevision (lines 193, 196) ───────────────
+    // ─── purge() with TTL + expectedRevision ───────────────
 
     /**
      * Verifies purge() with both a tombstone TTL and an expected revision emits both headers.
@@ -1244,10 +1244,10 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringContainsString('Nats-Expected-Last-Subject-Sequence:6', $transport->writes[3]);
     }
 
-    // ─── getRevision() guards (lines 259, 264-266, 269) ─────────────────────
+    // ─── getRevision() guards ─────────────────────
 
     /**
-     * Verifies getRevision() throws when revision is zero or negative (line 259).
+     * Verifies getRevision() throws when revision is zero or negative.
      */
     public function testGetRevisionThrowsOnNonPositiveRevision(): void
     {
@@ -1265,7 +1265,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies getRevision() returns null when the server replies with a 404 (lines 264-266).
+     * Verifies getRevision() returns null when the server replies with a 404.
      */
     public function testGetRevisionReturnsNullOnNotFound(): void
     {
@@ -1287,7 +1287,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies getRevision() re-throws non-404 errors from the server (line 269).
+     * Verifies getRevision() re-throws non-404 errors from the server.
      */
     public function testGetRevisionPropagatesNon404Error(): void
     {
@@ -1307,10 +1307,10 @@ final class KeyValueBucketTest extends TestCase
         $client->jetStream()->keyValue('cfg')->getRevision('theme', 5)->await();
     }
 
-    // ─── getViaStreamMessage() branches (lines 323-325, 328, 334, 340, 346-348) ──
+    // ─── getViaStreamMessage() branches ──
 
     /**
-     * Verifies the STREAM.MSG.GET fallback returns null when the API returns a 404 error (lines 323-325).
+     * Verifies the STREAM.MSG.GET fallback returns null when the API returns a 404 error.
      */
     public function testGetFallbackReturnsNullOnStreamMessage404(): void
     {
@@ -1332,7 +1332,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies the STREAM.MSG.GET fallback propagates a non-404 API error (line 328).
+     * Verifies the STREAM.MSG.GET fallback propagates a non-404 API error.
      */
     public function testGetFallbackPropagatesNon404StreamMessageError(): void
     {
@@ -1354,7 +1354,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies the STREAM.MSG.GET fallback returns null when the reply has no 'message' field (line 334).
+     * Verifies the STREAM.MSG.GET fallback returns null when the reply has no 'message' field.
      */
     public function testGetFallbackReturnsNullWhenMessageFieldMissing(): void
     {
@@ -1376,7 +1376,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies the STREAM.MSG.GET fallback decodes base64-encoded headers from the 'hdrs' field (lines 346-348).
+     * Verifies the STREAM.MSG.GET fallback decodes base64-encoded headers from the 'hdrs' field.
      */
     public function testGetFallbackDecodesEncodedHeaders(): void
     {
@@ -1410,7 +1410,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies the STREAM.MSG.GET fallback throws when message.data contains invalid base64 (line 340).
+     * Verifies the STREAM.MSG.GET fallback throws when message.data contains invalid base64.
      */
     public function testGetFallbackThrowsOnMalformedBase64Data(): void
     {
@@ -1432,11 +1432,11 @@ final class KeyValueBucketTest extends TestCase
         $client->jetStream()->keyValue('cfg')->get('theme')->await();
     }
 
-    // ─── watch() callback: non-KV subject (line 386) ────────────────────────
+    // ─── watch() callback: non-KV subject ────────────────────────
 
     /**
      * Verifies that watch() silently skips messages whose subject does not belong to the KV bucket
-     * prefix, i.e. keyFromSubject() returns null for them (line 386).
+     * prefix, i.e. keyFromSubject() returns null for them.
      */
     public function testWatchIgnoresMessagesOnNonKvSubject(): void
     {
@@ -1464,10 +1464,10 @@ final class KeyValueBucketTest extends TestCase
         self::assertFalse($called);
     }
 
-    // ─── createKey() non-wrong-seq error re-throw (line 438) ─────────────────
+    // ─── createKey() non-wrong-seq error re-throw ─────────────────
 
     /**
-     * Verifies createKey() re-throws errors that are not "wrong last sequence" (line 438).
+     * Verifies createKey() re-throws errors that are not "wrong last sequence".
      */
     public function testCreateKeyRethrowsNonWrongLastSequenceError(): void
     {
@@ -1490,7 +1490,7 @@ final class KeyValueBucketTest extends TestCase
 
     /**
      * Verifies createKey() succeeds when the key was previously deleted (tombstone entry)
-     * by publishing against the tombstone's revision; tests lines 449 (null-entry revision=0)
+     * by publishing against the tombstone's revision; tests the null-entry revision=0 branch
      * when get() returns null after a wrong-last-sequence error.
      */
     public function testCreateKeySucceedsAfterKeyDeletedEntryIsNull(): void
@@ -1523,7 +1523,7 @@ final class KeyValueBucketTest extends TestCase
 
     /**
      * Verifies createKey() succeeds after a tombstone (DEL) entry by publishing against
-     * the tombstone revision (lines 449, 451).
+     * the tombstone revision.
      */
     public function testCreateKeySucceedsAfterTombstoneRevision(): void
     {
@@ -1550,7 +1550,7 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringContainsString('Nats-Expected-Last-Subject-Sequence:5', $transport->writes[9]);
     }
 
-    // ─── mapKvOptions: description and max_bytes (lines 795-796) ─────────────
+    // ─── mapKvOptions: description and max_bytes ─────────────
 
     /**
      * Verifies create() passes through 'description' and 'max_bytes' KV options to the stream config.
@@ -1578,10 +1578,10 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringContainsString('"max_bytes":10485760', $written);
     }
 
-    // ─── assertValidKey: empty key and '>' wildcard (lines 795-796 in task = 809+815 in source) ─
+    // ─── assertValidKey: empty key and '>' wildcard ─────────────────────────
 
     /**
-     * Verifies assertValidKey() throws on an empty key (line 809/810 in source, listed as 795 target).
+     * Verifies assertValidKey() throws on an empty key.
      */
     public function testPutRejectsEmptyKey(): void
     {
@@ -1599,7 +1599,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies assertValidKey() throws on a key containing '>' (line 809/810 in source, listed as 795 target).
+     * Verifies assertValidKey() throws on a key containing '>'.
      */
     public function testPutRejectsKeyWithGreaterThan(): void
     {
@@ -1616,10 +1616,10 @@ final class KeyValueBucketTest extends TestCase
         $client->jetStream()->keyValue('cfg')->put('foo>bar', 'value')->await();
     }
 
-    // ─── getAll(): empty subjects short-circuit (line 548) ───────────────────
+    // ─── getAll(): empty subjects short-circuit ───────────────────
 
     /**
-     * Verifies getAll() returns an empty array immediately when STREAM.INFO reports no subjects (line 548).
+     * Verifies getAll() returns an empty array immediately when STREAM.INFO reports no subjects.
      */
     public function testGetAllReturnsEmptyWhenNoSubjects(): void
     {
@@ -1642,7 +1642,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies getAll() propagates non-404 errors from Direct Get (line 571).
+     * Verifies getAll() propagates non-404 errors from Direct Get.
      */
     public function testGetAllPropagatesNon404DirectGetError(): void
     {
@@ -1667,10 +1667,10 @@ final class KeyValueBucketTest extends TestCase
         $client->jetStream()->keyValue('cfg')->getAll()->await();
     }
 
-    // ─── putExpectingSubjectSeq() with TTL (line 740) ────────────────────────
+    // ─── putExpectingSubjectSeq() with TTL ────────────────────────
 
     /**
-     * Verifies createKey() with a TTL passes Nats-TTL alongside the expected-sequence header (line 740).
+     * Verifies createKey() with a TTL passes Nats-TTL alongside the expected-sequence header.
      */
     public function testCreateKeyWithTtlPassesTtlHeader(): void
     {
@@ -1693,11 +1693,11 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringContainsString('Nats-TTL:3600s', $transport->writes[3]);
     }
 
-    // ─── getAll(): subjects with non-KV prefix are skipped (line 558) ───────
+    // ─── getAll(): subjects with non-KV prefix are skipped ───────
 
     /**
      * Verifies getAll() skips subjects from STREAM.INFO that do not match the bucket's KV prefix,
-     * i.e. keyFromSubject() returns null and the continue branch (line 558) is taken.
+     * i.e. keyFromSubject() returns null and the continue branch is taken.
      */
     public function testGetAllSkipsSubjectsWithNonKvPrefix(): void
     {
@@ -1727,10 +1727,10 @@ final class KeyValueBucketTest extends TestCase
         self::assertSame(['theme' => 'dark'], $all);
     }
 
-    // ─── watch() updatesOnly deliver policy (line 558) ───────────────────────
+    // ─── watch() updatesOnly deliver policy ───────────────────────
 
     /**
-     * Verifies watch() with updatesOnly option uses deliver_policy=new (line 558 KeyWatchOptions).
+     * Verifies watch() with updatesOnly option uses deliver_policy=new (KeyWatchOptions::toConsumerConfig()).
      */
     public function testWatchUpdatesOnlyUsesNewDeliverPolicy(): void
     {

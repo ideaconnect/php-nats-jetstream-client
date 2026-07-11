@@ -413,7 +413,7 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
-     * Verifies that adding more than MAX_MESSAGES messages to a batch throws (line 59).
+     * Verifies that adding more than MAX_MESSAGES messages to a batch throws.
      */
     public function testAddExceedingMaxMessagesThrows(): void
     {
@@ -442,7 +442,7 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
-     * Verifies the count() method returns the number of staged messages (line 72).
+     * Verifies the count() method returns the number of staged messages.
      */
     public function testCountReturnsNumberOfStagedMessages(): void
     {
@@ -466,7 +466,7 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
-     * Verifies the batchId() method returns the batch id passed at construction (line 80).
+     * Verifies the batchId() method returns the batch id passed at construction.
      */
     public function testBatchIdReturnsConstructedId(): void
     {
@@ -484,7 +484,7 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
-     * Verifies that calling commit() a second time on an already-committed batch throws (line 92).
+     * Verifies that calling commit() a second time on an already-committed batch throws.
      */
     public function testDoubleCommitThrows(): void
     {
@@ -561,7 +561,7 @@ final class BatchPublisherTest extends TestCase
 
     /**
      * Verifies that a non-JSON (but non-empty) reply to the batch-start request is treated as
-     * accepted and publish continues (lines 156-158 in assertStartAccepted).
+     * accepted and publish continues (in assertStartAccepted).
      */
     public function testNonJsonStartReplyTreatedAsAccepted(): void
     {
@@ -594,8 +594,8 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
-     * Verifies that a malformed (non-JSON) commit ack throws a JetStreamException (lines 199-200
-     * in parseCommitAck).
+     * Verifies that a malformed (non-JSON) commit ack throws a JetStreamException
+     * (in parseCommitAck).
      */
     public function testMalformedCommitAckThrows(): void
     {

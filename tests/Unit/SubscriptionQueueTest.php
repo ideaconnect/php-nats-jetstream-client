@@ -526,7 +526,7 @@ final class SubscriptionQueueTest extends TestCase
     }
 
     /**
-     * Line 66: SlowConsumerPolicy::Error throws NatsException when the queue is full.
+     * SlowConsumerPolicy::Error throws NatsException when the queue is full.
      */
     public function testEnqueueThrowsOnOverflowWhenPolicyIsError(): void
     {
@@ -545,7 +545,7 @@ final class SubscriptionQueueTest extends TestCase
     }
 
     /**
-     * Line 92: close() is an alias of unsubscribe() and sends UNSUB for the queue's own sid.
+     * close() is an alias of unsubscribe() and sends UNSUB for the queue's own sid.
      */
     public function testCloseSendsUnsubForOwnSid(): void
     {
@@ -559,15 +559,15 @@ final class SubscriptionQueueTest extends TestCase
     }
 
     /**
-     * Line 169: next() with a positive timeout times out (CancelledException caught) and returns null.
+     * next() with a positive timeout times out (CancelledException caught) and returns null.
      *
      * The blocking transport means processIncoming() suspends the fiber until the TimeoutCancellation
-     * fires, which exercises the catch(CancelledException) clause on line 169.
+     * fires, which exercises the catch(CancelledException) clause.
      */
     public function testNextWithTimeoutReturnsNullWhenNoMessageArrivesBeforeDeadline(): void
     {
         // blockWhenEmpty suspends processIncoming() so the TimeoutCancellation fires inside it,
-        // propagates as CancelledException caught at line 169, and next() returns null.
+        // propagates as CancelledException caught, and next() returns null.
         $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
         $client = $this->makeConnectedClient($transport);
         $queue = $client->subscribeQueue('idle')->await();
@@ -579,14 +579,14 @@ final class SubscriptionQueueTest extends TestCase
     }
 
     /**
-     * Line 231: the final-drain body in fetchAll() collects a message that was enqueued into the
+     * the final-drain body in fetchAll() collects a message that was enqueued into the
      * queue by a concurrent fiber while fetchAll() was blocked inside processIncoming().
      *
      * Flow:
      *  1. fetchAll() blocks in processIncoming() (blockWhenEmpty transport).
      *  2. A parallel async fiber waits briefly then calls enqueue() directly.
-     *  3. The TimeoutCancellation fires; processIncoming() throws CancelledException (line 225).
-     *  4. The final drain loop (line 231) finds the concurrently-enqueued message and returns it.
+     *  3. The TimeoutCancellation fires; processIncoming() throws CancelledException.
+     *  4. The final drain loop finds the concurrently-enqueued message and returns it.
      */
     public function testFetchAllFinalDrainCollectsConcurrentlyEnqueuedMessage(): void
     {

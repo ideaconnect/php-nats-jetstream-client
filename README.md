@@ -1954,7 +1954,7 @@ _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`test
 | `reconnectDelayMs` | `int` | `100` | Base reconnect backoff delay. |
 | `reconnectMaxDelayMs` | `int` | `10000` | Maximum reconnect delay (caps exponential backoff). |
 | `reconnectJitterMs` | `int` | `50` | Random jitter added to reconnect delay. |
-| `pingIntervalSeconds` | `int` | `30` | Client heartbeat interval setting. |
+| `pingIntervalSeconds` | `int\|float` | `30` | Client heartbeat interval in seconds; fractional values allowed, `0` disables. |
 | `maxPingsOut` | `int` | `2` | Max outstanding pings before failure. |
 | `verbose` | `bool` | `false` | NATS verbose protocol mode. |
 | `pedantic` | `bool` | `false` | NATS pedantic protocol mode. |

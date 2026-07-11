@@ -1502,7 +1502,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 392: get() returns null when info() finds no object (Direct Get returns 404).
+     * get() returns null when info() finds no object (Direct Get returns 404).
      */
     public function testGetReturnsNullWhenObjectNotFound(): void
     {
@@ -1521,7 +1521,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 401/405: get() returns null for a deleted (tombstoned) object.
+     * get() returns null for a deleted (tombstoned) object.
      */
     public function testGetReturnsNullForDeletedObject(): void
     {
@@ -1542,7 +1542,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 387: get() throws after too many link hops (MAX_LINK_HOPS = 8, so depth 9 triggers).
+     * get() throws after too many link hops (MAX_LINK_HOPS = 8, so depth 9 triggers).
      * We chain 9 self-referential links; on the 9th recursion depth > 8 and the exception is thrown.
      */
     public function testGetThrowsOnTooManyLinkHops(): void
@@ -1571,7 +1571,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 426: get() throws when a bucket link is followed (link has no 'name' key).
+     * get() throws when a bucket link is followed (link has no 'name' key).
      */
     public function testGetThrowsOnBucketLink(): void
     {
@@ -1591,7 +1591,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 460: getToCallback() throws after too many link hops.
+     * getToCallback() throws after too many link hops.
      */
     public function testGetToCallbackThrowsOnTooManyLinkHops(): void
     {
@@ -1615,7 +1615,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 465: getToCallback() returns null when object is not found.
+     * getToCallback() returns null when object is not found.
      */
     public function testGetToCallbackReturnsNullWhenNotFound(): void
     {
@@ -1641,7 +1641,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Lines 469+471: getToCallback() follows an object link and streams the target's content.
+     * getToCallback() follows an object link and streams the target's content.
      */
     public function testGetToCallbackFollowsObjectLink(): void
     {
@@ -1675,7 +1675,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Lines 525-527: streamChunks single-chunk path throws "Incomplete object download" on 404.
+     * streamChunks single-chunk path throws "Incomplete object download" on 404.
      */
     public function testGetSingleChunkThrowsIncompleteDownloadOnNotFound(): void
     {
@@ -1703,7 +1703,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Lines 530-531: streamChunks single-chunk path rethrows non-404, non-503 Direct Get errors.
+     * streamChunks single-chunk path rethrows non-404, non-503 Direct Get errors.
      */
     public function testGetSingleChunkRethrowsNonNotFoundNonUnavailableError(): void
     {
@@ -1731,7 +1731,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 530 (503 fall-through): single-chunk object, Direct Get returns 503 -> falls through to
+     * streamChunks() 503 fall-through: single-chunk object, Direct Get returns 503 -> falls through to
      * the ephemeral consumer path and successfully downloads the chunk.
      */
     public function testGetSingleChunkFallsThrough503ToEphemeralConsumer(): void
@@ -1766,7 +1766,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 614: verifyDigest returns early (no throw) when the object's stored digest is empty.
+     * verifyDigest returns early (no throw) when the object's stored digest is empty.
      * The downloaded content digest does not match what was stored (but stored is ''), so no throw.
      */
     public function testGetSucceedsWhenStoredDigestIsEmpty(): void
@@ -1797,7 +1797,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 638: decodeDigest returns null for a non-"SHA-256=" prefixed digest, causing verifyDigest
+     * decodeDigest returns null for a non-"SHA-256=" prefixed digest, causing verifyDigest
      * to throw a mismatch exception even though the bytes match.
      */
     public function testGetThrowsOnUnknownDigestPrefix(): void
@@ -1829,7 +1829,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 679: info() rethrows non-404, non-503 errors from Direct Get.
+     * info() rethrows non-404, non-503 errors from Direct Get.
      */
     public function testInfoRethrowsNonNotFoundNonUnavailableError(): void
     {
@@ -1848,7 +1848,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 695: info() returns null when the Direct Get body is not valid JSON.
+     * info() returns null when the Direct Get body is not valid JSON.
      */
     public function testInfoReturnsNullWhenPayloadIsNotJson(): void
     {
@@ -1873,7 +1873,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 721: fetchInfo (used as info() fallback via 503) rethrows a non-404 error when
+     * fetchInfo (used as info() fallback via 503) rethrows a non-404 error when
      * swallowErrors=false (i.e. when called from the 503 fallback path in info()).
      */
     public function testInfoFallbackRethrowsNon404Error(): void
@@ -1897,7 +1897,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 732: fetchInfo returns null when decodeMetadataFromApiMessage returns null (empty data field).
+     * fetchInfo returns null when decodeMetadataFromApiMessage returns null (empty data field).
      * Triggered via info() 503 fallback -> fetchInfo(name, false); response has no 'data' key.
      */
     public function testInfoFallbackReturnsNullWhenMessageDataIsEmpty(): void
@@ -1921,7 +1921,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 797: updateMeta() throws 404 when the object is deleted (tombstoned).
+     * updateMeta() throws 404 when the object is deleted (tombstoned).
      */
     public function testUpdateMetaThrowsWhenObjectIsDeleted(): void
     {
@@ -1942,7 +1942,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 797: updateMeta() throws 404 when the object does not exist at all.
+     * updateMeta() throws 404 when the object does not exist at all.
      */
     public function testUpdateMetaThrowsWhenObjectNotFound(): void
     {
@@ -1961,7 +1961,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 805: updateMeta() throws when renaming onto an existing non-deleted object.
+     * updateMeta() throws when renaming onto an existing non-deleted object.
      */
     public function testUpdateMetaThrowsWhenRenameTargetExists(): void
     {
@@ -1983,7 +1983,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 900: list() returns an empty array when there are no meta subjects in the bucket.
+     * list() returns an empty array when there are no meta subjects in the bucket.
      */
     public function testListReturnsEmptyArrayWhenBucketIsEmpty(): void
     {
@@ -2005,7 +2005,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 922: list() skips a meta subject whose Direct Get reply body is not valid JSON.
+     * list() skips a meta subject whose Direct Get reply body is not valid JSON.
      */
     public function testListSkipsSubjectWithNonJsonBody(): void
     {
@@ -2044,7 +2044,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Lines 960-973: getStatus() returns the correct mapped fields from stream state.
+     * getStatus() returns the correct mapped fields from stream state.
      */
     public function testGetStatusReturnsMappedStreamState(): void
     {
@@ -2078,7 +2078,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 963: getStatus() defaults state fields to zero/empty when state is missing.
+     * getStatus() defaults state fields to zero/empty when state is missing.
      */
     public function testGetStatusDefaultsWhenStateIsAbsent(): void
     {
@@ -2102,7 +2102,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 314: putStream() skips empty-string blocks from the producer without hashing or buffering them.
+     * putStream() skips empty-string blocks from the producer without hashing or buffering them.
      */
     public function testPutStreamSkipsEmptyBlocks(): void
     {
@@ -2135,7 +2135,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 360: putStream() purges previous revision's chunks when a previous nuid exists.
+     * putStream() purges previous revision's chunks when a previous nuid exists.
      */
     public function testPutStreamPurgesPreviousChunks(): void
     {
@@ -2172,7 +2172,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 1160: decodeMetadataFromApiMessage returns null (covered via fetchInfo 503 path)
+     * decodeMetadataFromApiMessage returns null (covered via fetchInfo 503 path)
      * when the STREAM.MSG.GET response has no 'message' key at all.
      */
     public function testInfoFallbackReturnsNullWhenMessageKeyAbsent(): void
@@ -2196,7 +2196,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 1165: decodeMetadataFromApiMessage returns null when base64 decodes to empty.
+     * decodeMetadataFromApiMessage returns null when base64 decodes to empty.
      * This happens via the fetchInfo/503 fallback path when the message data field is not valid base64.
      */
     public function testInfoFallbackReturnsNullWhenDataIsInvalidBase64(): void
@@ -2220,7 +2220,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 1069: purgeChunks swallows JetStreamException (the surrounding operation succeeds).
+     * purgeChunks swallows JetStreamException (the surrounding operation succeeds).
      * Already covered by testDeleteToleratesPurgeFailure. This additional test verifies the same
      * behaviour via put() overwrite path: purge failure does NOT propagate.
      */
@@ -2251,7 +2251,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 805 complement: updateMeta() succeeds when rename target exists but IS deleted (tombstoned).
+     * Complement of the rename-conflict guard: updateMeta() succeeds when rename target exists but IS deleted (tombstoned).
      */
     public function testUpdateMetaSucceedsWhenRenameTargetIsDeleted(): void
     {
@@ -2279,7 +2279,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 426 complement: linkTargetBucket throws when the link object has an explicit empty name.
+     * Complement of the bucket-link guard: linkTargetBucket throws when the link object has an explicit empty name.
      * An options.link = {bucket:'b', name:''} is treated the same as a bucket link (name absent).
      */
     public function testGetThrowsOnBucketLinkWithEmptyName(): void
@@ -2302,7 +2302,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 530 (503 path in streamChunks): getToCallback on a single-chunk object where Direct Get
+     * The 503 path in streamChunks(): getToCallback on a single-chunk object where Direct Get
      * returns 503 falls through to ephemeral consumer and delivers to the callback.
      */
     public function testGetToCallbackSingleChunkFallsThrough503(): void
@@ -2344,7 +2344,7 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
-     * Line 900 variant: list() with an empty state (no 'state' key) returns empty array.
+     * Empty-subjects variant: list() with an empty state (no 'state' key) returns empty array.
      */
     public function testListReturnsEmptyWhenStateKeyAbsent(): void
     {

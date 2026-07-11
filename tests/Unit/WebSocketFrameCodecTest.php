@@ -157,8 +157,8 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
-     * Verifies encode() uses a 64-bit length header for payloads > 65535 bytes (line 51),
-     * and that decode() correctly reassembles the same frame (lines 104-106).
+     * Verifies encode() uses a 64-bit length header for payloads > 65535 bytes,
+     * and that decode() correctly reassembles the same frame.
      */
     public function testEncode64BitLengthFrameRoundTrips(): void
     {
@@ -182,8 +182,8 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
-     * Verifies decode() halts and preserves the buffer when a 64-bit length header is incomplete
-     * (lines 100-101): the first 2 bytes say length=127 but fewer than 10 bytes are available.
+     * Verifies decode() halts and preserves the buffer when a 64-bit length header is
+     * incomplete: the first 2 bytes say length=127 but fewer than 10 bytes are available.
      */
     public function testDecode64BitLengthHeaderIncompleteWaits(): void
     {
@@ -200,8 +200,8 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
-     * Verifies decode() halts and preserves the buffer when a 16-bit length header is incomplete
-     * (line 93): the first 2 bytes say length=126 but only one of the two length bytes is present.
+     * Verifies decode() halts and preserves the buffer when a 16-bit length header is
+     * incomplete: the first 2 bytes say length=126 but only one of the two length bytes is present.
      */
     public function testDecode16BitLengthHeaderIncompleteWaits(): void
     {
@@ -216,7 +216,7 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
-     * Verifies decode() throws when the declared payload length exceeds MAX_FRAME_PAYLOAD (line 110).
+     * Verifies decode() throws when the declared payload length exceeds MAX_FRAME_PAYLOAD.
      * We craft a 64-bit-length frame header with a length value of 64 MiB + 1.
      */
     public function testDecodePayloadLengthOutOfBoundsThrows(): void
@@ -235,7 +235,7 @@ final class WebSocketFrameCodecTest extends TestCase
 
     /**
      * Verifies decode() halts and preserves the buffer when a masked frame has a complete header
-     * but its 4-byte mask key is not yet fully buffered (lines 115-116).
+     * but its 4-byte mask key is not yet fully buffered.
      */
     public function testDecodeMaskedFrameWaitsForMaskKey(): void
     {
@@ -252,7 +252,7 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
-     * Verifies inflate() throws a ProtocolException when the input is not valid DEFLATE data (line 175).
+     * Verifies inflate() throws a ProtocolException when the input is not valid DEFLATE data.
      *
      * PHPUnit's error handler is disabled so that the native PHP E_WARNING emitted by inflate_add()
      * on a corrupt stream does not short-circuit into a test error; the ProtocolException thrown

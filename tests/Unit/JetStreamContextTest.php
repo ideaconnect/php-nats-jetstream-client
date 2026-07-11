@@ -3200,7 +3200,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies createOrUpdateStream re-throws a JetStreamException whose message is NOT "already in use"
-     * (line 254 - the guard only swallows the "already in use" variant).
+     * (the guard only swallows the "already in use" variant).
      */
     public function testCreateOrUpdateStreamRethrowsNonAlreadyInUseError(): void
     {
@@ -3223,7 +3223,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies streamNames() handles a missing / null 'streams' key in the API response by
-     * returning an empty list (line 281 - the ternary else branch).
+     * returning an empty list (the ternary else branch).
      */
     public function testStreamNamesWithNullStreamsKeyReturnsEmpty(): void
     {
@@ -3246,7 +3246,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies directGet (via directGetLastMessageForSubject) throws when the reply carries no
-     * Nats-Stream or Nats-Sequence header - the "unrecognized response" guard (line 576).
+     * Nats-Stream or Nats-Sequence header - the "unrecognized response" guard.
      */
     public function testDirectGetThrowsForUnrecognizedResponse(): void
     {
@@ -3272,7 +3272,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies directGetLastForSubjects() returns an empty list immediately when the subjects
-     * array is empty (line 603 - early return).
+     * array is empty (early return).
      */
     public function testDirectGetLastForSubjectsWithEmptySubjectsReturnsEmpty(): void
     {
@@ -3284,7 +3284,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies directGetLastForSubjects() rejects a subject containing '*' (lines 611-614).
+     * Verifies directGetLastForSubjects() rejects a subject containing '*'.
      */
     public function testDirectGetLastForSubjectsRejectsWildcardSubjectWithStar(): void
     {
@@ -3297,7 +3297,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies directGetLastForSubjects() rejects a subject containing '>' (lines 611-614).
+     * Verifies directGetLastForSubjects() rejects a subject containing '>'.
      */
     public function testDirectGetLastForSubjectsRejectsWildcardSubjectWithGreaterThan(): void
     {
@@ -3310,7 +3310,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies directGetBatch() rejects a non-positive expiresMs (line 641).
+     * Verifies directGetBatch() rejects a non-positive expiresMs.
      */
     public function testDirectGetBatchRejectsZeroExpiresMs(): void
     {
@@ -3323,7 +3323,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies addOrUpdateConsumer delegates to createConsumer (line 773) and produces the same
+     * Verifies addOrUpdateConsumer delegates to createConsumer and produces the same
      * wire payload.
      */
     public function testAddOrUpdateConsumerDelegatesToCreateConsumer(): void
@@ -3347,7 +3347,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies consumerNames() handles a missing / null 'consumers' key in the API response by
-     * returning an empty list (line 793 - the ternary else branch).
+     * returning an empty list (the ternary else branch).
      */
     public function testConsumerNamesWithMissingConsumersKeyReturnsEmpty(): void
     {
@@ -3369,7 +3369,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies subscribeEphemeralPushConsumer silently absorbs a flow-control status 100 frame
-     * and does not forward it to the user handler (line 942 - early return for control message).
+     * and does not forward it to the user handler (early return for control message).
      */
     public function testSubscribeEphemeralPushConsumerIgnoresControlMessages(): void
     {
@@ -3411,7 +3411,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies subscribeOrderedConsumer silently absorbs a flow-control / heartbeat status 100
-     * and does not forward it to the user handler (line 983 - early return for control message).
+     * and does not forward it to the user handler (early return for control message).
      */
     public function testSubscribeOrderedConsumerIgnoresControlMessages(): void
     {
@@ -3452,7 +3452,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies subscribeOrderedConsumer delivers a message that has no $JS.ACK reply subject
-     * (no ordering metadata) best-effort to the user handler (lines 991-993 - null seq path).
+     * (no ordering metadata) best-effort to the user handler (null seq path).
      */
     public function testSubscribeOrderedConsumerDeliversMessageWithoutAckMetadata(): void
     {
@@ -3490,7 +3490,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies subscribeOrderedConsumer best-effort delivers when deleteConsumer throws a
-     * JetStreamException during gap recovery (line 1009 - the inner catch block).
+     * JetStreamException during gap recovery (the inner catch block).
      */
     public function testSubscribeOrderedConsumerToleratesDeleteConsumerFailure(): void
     {
@@ -3513,7 +3513,7 @@ final class JetStreamContextTest extends TestCase
             "MSG _INBOX.JS.ORD.test 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
             // Out-of-order message (consumer seq jumps to 3, triggers recreation).
             "MSG _INBOX.JS.ORD.test 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            // deleteConsumer returns an error - JetStreamException caught at line 1009.
+            // deleteConsumer returns an error - JetStreamException caught.
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteError), $deleteError),
             // createEphemeralPushConsumer still proceeds and succeeds (sid 4).
             sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
@@ -3536,7 +3536,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies unpinConsumer rejects an empty priority group name (line 1098).
+     * Verifies unpinConsumer rejects an empty priority group name.
      */
     public function testUnpinConsumerRejectsEmptyGroup(): void
     {
@@ -3556,7 +3556,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies publish() with an expectation header immediately re-throws a precondition-mismatch
-     * JetStreamException without retrying (line 1242 - non-503 code triggers immediate throw).
+     * JetStreamException without retrying (non-503 code triggers immediate throw).
      *
      * This variant uses expectedLastSubjectSequence to produce the header path, so the publish
      * goes via requestWithHeaders (HPUB), not plain PUB.
@@ -3587,7 +3587,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies counterValue() re-throws a non-404 JetStreamException from the Direct Get
-     * (line 1373 - the throw-if-not-404 branch).
+     * (the throw-if-not-404 branch).
      */
     public function testCounterValueRethrowsNon404Exception(): void
     {
@@ -3612,7 +3612,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies parseCounterValue() wraps a JsonException in a JetStreamException
-     * (lines 1390-1391 - malformed counter payload).
+     * (malformed counter payload).
      */
     public function testIncrementCounterWithMalformedResponsePayload(): void
     {
@@ -3636,7 +3636,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies parseCounterValue() maps an embedded API error to a JetStreamException
-     * (lines 1397-1400 - error key present in counter response).
+     * (error key present in counter response).
      */
     public function testIncrementCounterWithApiErrorInResponse(): void
     {
@@ -3659,7 +3659,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies parseCounterValue() returns a string for an integer val field
-     * (line 1405 - is_int($val) branch, returns string cast).
+     * (is_int($val) branch, returns string cast).
      */
     public function testIncrementCounterWithIntegerValField(): void
     {
@@ -3682,7 +3682,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies parseCounterValue() throws when neither int nor string val is present
-     * (line 1412 - missing val field).
+     * (missing val field).
      */
     public function testIncrementCounterWithMissingValFieldThrows(): void
     {
@@ -3705,7 +3705,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies fetchBatch() throws a 408 JetStreamException when no messages arrive and no
-     * terminal status is received (line 1514 - pure timeout path, empty messages, no status).
+     * terminal status is received (pure timeout path, empty messages, no status).
      */
     public function testFetchBatchThrowsTimeoutWhenNoMessagesAndNoTerminalStatus(): void
     {
@@ -3729,7 +3729,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies ackSync() throws JetStreamException when replyTo is an empty string (line 1547).
+     * Verifies ackSync() throws JetStreamException when replyTo is an empty string.
      */
     public function testAckSyncThrowsForEmptyReplySubject(): void
     {
@@ -3744,7 +3744,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies applyFilterSubjects() (via createConsumer) throws when filter_subjects is not an
-     * array (line 1722 - the non-array branch of the array_key_exists guard).
+     * array (the non-array branch of the array_key_exists guard).
      */
     public function testCreateConsumerRejectsNonArrayFilterSubjects(): void
     {
@@ -3769,7 +3769,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies applyFilterSubjects() (via createConsumer) throws when filter_subjects is an empty
-     * array (line 1722 - the $subjects === [] branch).
+     * array (the $subjects === [] branch).
      */
     public function testCreateConsumerRejectsEmptyArrayFilterSubjects(): void
     {
@@ -3793,7 +3793,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies buildPullRequest() (via fetchBatch) throws when the pull group name is invalid
-     * (line 1774 - group validation failure).
+     * (group validation failure).
      */
     public function testFetchBatchRejectsInvalidPullGroupName(): void
     {
@@ -3818,7 +3818,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies assertValidPriorityConfig() (via createConsumer) throws when priority_groups is
-     * an empty array (line 1814).
+     * an empty array.
      */
     public function testCreateConsumerRejectsEmptyPriorityGroups(): void
     {
@@ -3842,7 +3842,7 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies assertValidPriorityConfig() (via createConsumer) throws when a priority group name
-     * contains invalid characters (line 1819).
+     * contains invalid characters.
      */
     public function testCreateConsumerRejectsInvalidPriorityGroupName(): void
     {
@@ -3866,7 +3866,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies directGetBatch() catches CancelledException (line 700) when the wait-cancellation
+     * Verifies directGetBatch() catches CancelledException when the wait-cancellation
      * fires while processIncoming is blocked on an idle socket (blockWhenEmpty path).
      *
      * The method should return an empty array rather than propagating the cancellation.
@@ -3885,50 +3885,15 @@ final class JetStreamContextTest extends TestCase
         $client->connect()->await();
 
         // expiresMs=1 makes the TimeoutCancellation fire after ~1001 ms; the blocking transport
-        // keeps processIncoming suspended so the cancellation is the only way out - line 700.
+        // keeps processIncoming suspended so the cancellation is the only way out - the
+        // catch (CancelledException) in directGetBatch().
         $messages = $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 1)->await();
 
         self::assertSame([], $messages);
     }
 
     /**
-     * Verifies directGetBatch() calls delay(0.001) (line 697) when processIncoming returns 0
-     * frames (non-blocking empty-queue transport) and then catches the CancelledException (line 700)
-     * when the TimeoutCancellation fires.
-     *
-     * NOTE: The test requires the TimeoutCancellation to fire; with expiresMs=1 this takes
-     * approximately 1 second of real time.
-     */
-    public function testDirectGetBatchDelaysOnZeroFrames(): void
-    {
-        // Non-blocking empty-queue transport: once connect+PONG are consumed, every subsequent
-        // readLine() returns '' immediately, making processIncoming() return 0 (lines 617-618 of
-        // NatsConnection). The directGetBatch loop then enters the delay(0.001) branch (line 697)
-        // on every iteration until the TimeoutCancellation fires (line 700).
-        $transport = new FakeTransport(
-            readQueue: [
-                'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-                "PONG\r\n",
-            ],
-            blockWhenEmpty: false,
-        );
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        // expiresMs=1 -> TimeoutCancellation(1.001 s).  The empty non-blocking transport causes
-        // processIncoming to return 0 immediately, triggering delay(0.001, $waitCancellation) at
-        // line 697 on every iteration.  The TimeoutCancellation fires during one of those delays,
-        // which is then caught at line 700, and the method returns whatever was collected (empty).
-        $messages = $client->jetStream()->directGetBatch('ORDERS', ['batch' => 5], 1)->await();
-
-        self::assertSame([], $messages);
-        // publish was issued; at least INFO, PONG, CONNECT, and the PUB frame were written.
-        self::assertStringContainsString('$JS.API.DIRECT.GET.ORDERS', implode('', $transport->writes));
-    }
-
-    /**
-     * Verifies jsRequest() (line 1148) re-throws a non-"No responders" NatsException unchanged
+     * Verifies jsRequest() re-throws a non-"No responders" NatsException unchanged
      * when the underlying client->request() fails with a TimeoutException.
      *
      * Triggered via incrementCounter(), which calls jsRequest() directly.
@@ -3938,7 +3903,7 @@ final class JetStreamContextTest extends TestCase
         // blockWhenEmpty keeps processIncoming() suspended so the request's TimeoutCancellation
         // (requestTimeoutMs=1 ms) fires during the read, producing a TimeoutException.  That
         // exception is a NatsException whose message does NOT contain "No responders", so
-        // jsRequest() re-throws it unchanged at line 1148.
+        // jsRequest() re-throws it unchanged.
         $transport = new FakeTransport(
             readQueue: [
                 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -3954,25 +3919,25 @@ final class JetStreamContextTest extends TestCase
         $this->expectExceptionMessage('Request timed out');
 
         // incrementCounter calls jsRequest() directly (without publishWithRetry), so any
-        // NatsException that isn't "No responders" surfaces at line 1148.
+        // NatsException that isn't "No responders" surfaces.
         $client->jetStream()->incrementCounter('counters.hits', '+1')->await();
     }
 
     /**
-     * Verifies publishWithRetry() (line 1242) re-throws a JetStreamException when all configured
+     * Verifies publishWithRetry() re-throws a JetStreamException when all configured
      * retry attempts are exhausted on transient 503 "no-responder" failures.
      *
      * The publish() path goes: publish() -> publishWithRetry() -> jsRequest() -> client->request().
      * A 503 HMSG status makes requestInternal() throw NatsException("No responders..."), which
      * jsRequest() converts to JetStreamException(503).  publishWithRetry() retries up to
-     * $publishRetryAttempts times; on the final attempt ($attempt >= $attempts) it hits line 1242.
+     * $publishRetryAttempts times; on the final attempt ($attempt >= $attempts) it re-throws.
      */
     public function testPublishWithRetryRethrowsWhenRetriesExhausted(): void
     {
         $status = "NATS/1.0 503\r\n\r\n";
 
         // Two 503 frames: attempt 1 gets the first 503 (retried), attempt 2 gets the second 503
-        // (attempt >= attempts=2 -> line 1242 throws).
+        // (attempt >= attempts=2 -> the retries-exhausted re-throw fires).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",

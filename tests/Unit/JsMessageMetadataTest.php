@@ -28,11 +28,11 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------
-    // null / guard branches (lines 46, 51, 64-65)
+    // null / guard branches
     // ---------------------------------------------------------------------------
 
     /**
-     * When a message has no reply subject, fromMessage() returns null (line 46).
+     * When a message has no reply subject, fromMessage() returns null.
      */
     public function testFromMessageReturnsNullWhenReplyToIsNull(): void
     {
@@ -42,7 +42,7 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     /**
-     * When the first token is not "$JS", fromMessage() returns null (line 51).
+     * When the first token is not "$JS", fromMessage() returns null.
      */
     public function testFromMessageReturnsNullWhenFirstTokenIsNotJs(): void
     {
@@ -52,7 +52,7 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     /**
-     * When the second token is not "ACK", fromMessage() returns null (line 51).
+     * When the second token is not "ACK", fromMessage() returns null.
      */
     public function testFromMessageReturnsNullWhenSecondTokenIsNotAck(): void
     {
@@ -63,7 +63,7 @@ final class JsMessageMetadataTest extends TestCase
 
     /**
      * When the token count is not 9, 11, or 12 (e.g. 7 tokens), fromMessage()
-     * returns null via the default branch of the match expression (lines 61, 64-65).
+     * returns null via the default branch of the match expression.
      */
     public function testFromMessageReturnsNullForUnrecognisedTokenCount(): void
     {
@@ -74,12 +74,12 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------
-    // 9-token form (line 59, plus 92-93, 95-99, 103 via timestamp())
+    // 9-token form (the base=2 branch, the constructor, and timestamp())
     // ---------------------------------------------------------------------------
 
     /**
      * Parses a canonical 9-token $JS.ACK reply subject and verifies every field.
-     * Exercises the base=2 branch (line 59) and the constructor (lines 74-84).
+     * Exercises the base=2 branch and the constructor.
      */
     public function testFromMessageParses9TokenForm(): void
     {
@@ -99,12 +99,12 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------
-    // 11-token domain form (line 60)
+    // 11-token domain form
     // ---------------------------------------------------------------------------
 
     /**
      * Parses the 11-token domain-prefixed reply subject and populates the domain field.
-     * Covers the base=4 branch (line 60) and $domain = $parts[2] (line 68).
+     * Covers the base=4 branch and $domain = $parts[2].
      */
     public function testFromMessageParses11TokenFormWithRealDomain(): void
     {
@@ -124,7 +124,7 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     /**
-     * When the domain token is "_" the placeholder is normalized to null (lines 69-72).
+     * When the domain token is "_" the placeholder is normalized to null.
      */
     public function testFromMessageNormalizesUnderscoreDomainToNull(): void
     {
@@ -137,7 +137,7 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------
-    // 12-token form (line 60 - trailing random token)
+    // 12-token form (trailing random token)
     // ---------------------------------------------------------------------------
 
     /**
@@ -161,12 +161,11 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     // ---------------------------------------------------------------------------
-    // timestamp() method (lines 92-93, 95-99, 103)
+    // timestamp() method
     // ---------------------------------------------------------------------------
 
     /**
-     * timestamp() converts a nanosecond epoch value to the correct UTC DateTimeImmutable
-     * (lines 92-93, 95-99).
+     * timestamp() converts a nanosecond epoch value to the correct UTC DateTimeImmutable.
      */
     public function testTimestampReturnsCorrectUtcDatetime(): void
     {
@@ -185,7 +184,7 @@ final class JsMessageMetadataTest extends TestCase
     }
 
     /**
-     * timestamp() preserves sub-second precision down to microseconds (lines 95-99).
+     * timestamp() preserves sub-second precision down to microseconds.
      */
     public function testTimestampPreservesMicrosecondPrecision(): void
     {
@@ -204,7 +203,7 @@ final class JsMessageMetadataTest extends TestCase
 
     /**
      * timestamp() still returns a DateTimeImmutable for a zero nanosecond value
-     * (exercises the happy path and the fallback guard on line 103).
+     * (exercises the happy path and the fallback guard).
      */
     public function testTimestampHandlesZeroNanoseconds(): void
     {
