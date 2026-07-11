@@ -17,7 +17,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
-## [2.5.1] - 2026-07-11
+### Fixed
+
+- `[bugfix]` A parse failure no longer silently discards valid sibling frames from the same
+  chunk: `ProtocolParser::push()` retains frames parsed before a mid-chunk `ProtocolException`
+  (drained via `takeParsedFrames()`, or prepended to the next `push()` result), and
+  `processIncoming()` dispatches them to their handlers before entering recovery - their bytes
+  are already consumed, and core NATS never resends, so they were permanently lost. The
+  `ProtocolException` recovery path also emits the error through the error listener instead of
+  reconnecting with no observable signal (#147).
 
 ### Fixed
 

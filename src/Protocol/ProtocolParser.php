@@ -61,6 +61,18 @@ final class ProtocolParser
     private int $pendingChunksLength = 0;
 
     /**
+     * Frames parsed by the current push() call, held on the instance rather than in a local so a
+     * ProtocolException thrown while parsing a LATER frame of the same chunk cannot discard
+     * already-parsed siblings: the finally-block resync has consumed their bytes, so dropping them
+     * would lose them permanently - core NATS never resends, and a reconnect replays SUBs, not
+     * missed messages (#147). Drained by push()'s normal return, by {@see takeParsedFrames()} at
+     * the catch site after a throw, or - failing that - prepended to the next push()'s result.
+     *
+     * @var list<ProtocolFrame>
+     */
+    private array $parsedFrames = [];
+
+    /**
      * Creates a parser for line and payload frames produced by the NATS server.
      *
      * @param int $maxFrameSize Maximum total MSG/HMSG bytes accepted per frame to limit memory usage.
@@ -102,7 +114,6 @@ final class ProtocolParser
             }
         }
 
-        $frames = [];
         $offset = 0;
         $bufferLength = strlen($this->buffer);
 
@@ -122,7 +133,7 @@ final class ProtocolParser
                     // Consume the frame's bytes and clear the pending header before/while building,
                     // so a malformed payload (bad trailing CRLF) cannot leave the bytes buffered.
                     try {
-                        $frames[] = $this->buildPendingFrame();
+                        $this->parsedFrames[] = $this->buildPendingFrame();
                     } finally {
                         $offset = $required;
                         $this->pending = null;
@@ -169,7 +180,7 @@ final class ProtocolParser
 
                 // Consume the control line first so an unsupported/invalid line resyncs past it.
                 $offset = $nextOffset;
-                $frames[] = $this->parseControlFrame($verb, $line);
+                $this->parsedFrames[] = $this->parseControlFrame($verb, $line);
             }
         } finally {
             if ($offset > 0) {
@@ -181,6 +192,22 @@ final class ProtocolParser
                 }
             }
         }
+
+        return $this->takeParsedFrames();
+    }
+
+    /**
+     * Drains frames that parsed successfully before a push() threw mid-chunk. The throw aborts
+     * push() before its normal return, but the finally-block resync has already consumed those
+     * frames' bytes, so the catch site must collect them here - a frame left undrained is only
+     * deferred (the next push() returns it first), never dropped (#147).
+     *
+     * @return list<ProtocolFrame>
+     */
+    public function takeParsedFrames(): array
+    {
+        $frames = $this->parsedFrames;
+        $this->parsedFrames = [];
 
         return $frames;
     }

@@ -921,13 +921,24 @@ final class NatsConnection
 
             try {
                 $frames = $this->parser->push($chunk);
-            } catch (ProtocolException) {
+            } catch (ProtocolException $parseError) {
                 // An unparseable/corrupt stream is a transport-level failure: reconnect rather than
                 // letting the exception escape the caller's processing loop. The parser has already
                 // resynced past the offending bytes, so a recovery-disabled retry will not re-throw.
-                $this->recoverConnection();
+                // Frames that parsed before the failure are dispatched first - their bytes are
+                // consumed, so recovery would lose them permanently (#147, parse-layer twin of #128)
+                // - and the failure surfaces via the error listener before recovery runs.
+                $recovered = $this->parser->takeParsedFrames();
 
-                return 0;
+                try {
+                    $this->dispatchFrames($recovered);
+                } finally {
+                    $this->drainAllPending();
+                    $this->emitError($parseError);
+                    $this->recoverConnection();
+                }
+
+                return count($recovered);
             }
 
             // Note: the outstanding-ping counter is reset only when an actual PONG is handled (see

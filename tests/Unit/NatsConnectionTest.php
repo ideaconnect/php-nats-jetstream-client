@@ -4209,6 +4209,54 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
+    public function testParseFailureDeliversSiblingFramesEmitsErrorAndRecovers(): void
+    {
+        // One chunk: a complete valid MSG followed by a garbage control line (#147). The MSG's
+        // bytes are consumed by the parser resync, so it must reach its handler before recovery
+        // (core NATS never resends; a reconnect replays SUBs, not missed messages), and the
+        // ProtocolException must surface through the error listener instead of vanishing.
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG a 1 2\r\nhi\r\nBOGUS LINE\r\n",
+            // Recovery handshake (epoch 2).
+            'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                errorListener: static function (\Throwable $err) use (&$errors): void {
+                    $errors[] = $err;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('a', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $connection->processIncoming()->await();
+
+        self::assertSame(['hi'], $received, 'the MSG parsed before the garbage line must reach its handler');
+        self::assertNotEmpty(
+            array_filter($errors, static fn (\Throwable $err): bool => $err instanceof ProtocolException),
+            'the parse failure must surface through the error listener',
+        );
+        self::assertCount(2, $transport->connectCalls, 'the corrupt stream must still trigger recovery');
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertContains("SUB a 1\r\n", $transport->writes, 'recovery must replay the subscription');
+    }
+
     // ─── Exponential Backoff ────────────────────────────────────────────
 
     public function testBackoffDelayIsExponential(): void

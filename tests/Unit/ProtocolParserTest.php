@@ -515,4 +515,62 @@ final class ProtocolParserTest extends TestCase
         self::assertCount(1, $frames);
         self::assertSame(ProtocolFrameType::Ping, $frames[0]->type);
     }
+
+    public function testRetainsFramesParsedBeforeMidChunkFailureForCatchSiteDrain(): void
+    {
+        $parser = new ProtocolParser();
+
+        // The chunk carries a complete, valid MSG followed by a garbage control line. The throw
+        // must not discard the MSG: its bytes are consumed by the resync, so the catch site must
+        // be able to drain it (#147).
+        try {
+            $parser->push("MSG a 1 2\r\nhi\r\nBOGUS LINE\r\n");
+            self::fail('Expected ProtocolException for the bogus control line');
+        } catch (ProtocolException) {
+            // Expected: the garbage line is rejected.
+        }
+
+        $frames = $parser->takeParsedFrames();
+
+        self::assertCount(1, $frames);
+        self::assertSame(ProtocolFrameType::Msg, $frames[0]->type);
+        self::assertSame('a', $frames[0]->subject);
+        self::assertSame(1, $frames[0]->sid);
+        self::assertSame('hi', $frames[0]->payload);
+
+        // Draining is destructive: a second take must not replay the same frame.
+        self::assertSame([], $parser->takeParsedFrames());
+    }
+
+    public function testUndrainedRetainedFramesArePrependedToNextPushResult(): void
+    {
+        $parser = new ProtocolParser();
+
+        try {
+            $parser->push("MSG a 1 2\r\nhi\r\nBOGUS LINE\r\n");
+            self::fail('Expected ProtocolException for the bogus control line');
+        } catch (ProtocolException) {
+            // Expected.
+        }
+
+        // A catch site that does not drain explicitly must still receive the retained MSG: the
+        // next push returns it ahead of newly parsed frames, preserving wire order (#147).
+        $frames = $parser->push("PING\r\n");
+
+        self::assertCount(2, $frames);
+        self::assertSame(ProtocolFrameType::Msg, $frames[0]->type);
+        self::assertSame('hi', $frames[0]->payload);
+        self::assertSame(ProtocolFrameType::Ping, $frames[1]->type);
+    }
+
+    public function testTakeParsedFramesIsEmptyAfterSuccessfulPush(): void
+    {
+        $parser = new ProtocolParser();
+
+        $frames = $parser->push("MSG a 1 2\r\nhi\r\nPING\r\n");
+        self::assertCount(2, $frames);
+
+        // A clean push returns everything; nothing may linger to duplicate into a later drain.
+        self::assertSame([], $parser->takeParsedFrames());
+    }
 }
