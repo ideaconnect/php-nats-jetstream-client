@@ -37,6 +37,9 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 ### tests/Unit/BatchPublisherTest.php
 - `testCommitSendsBatchHeadersAndParsesAck` - Commits a 3-message batch and asserts the parsed ack (batchCount=3, batchId="batch-xyz"), that exactly 3 writes carry `Nats-Batch-Id:batch-xyz`, the START (seq 1) is a request with no commit marker, the intermediate (seq 2) is fire-and-forget, and the commit (seq 3) is a request carrying `Nats-Batch-Commit:1`.
 - `testCommitRejectedAtStart` - When the batch-start request gets an error JSON reply, `commit()` throws `JetStreamException` ("atomic publish not enabled") and no commit marker nor seq-3 message is written (publish aborts at start).
+- `testCommitAbortsWhenBatchStartIsAcknowledgedAsPlainPublish` - A batch START acknowledged with a normal PubAck (pre-2.12 server storing it as a plain publish) aborts with UnsupportedFeatureException (feature allow_atomic, server version reported) before any further batch message is published (#130).
+- `testCommitRejectsMultiMessageAckWithoutBatchFields` - A multi-message commit acknowledged by a PubAck without batch id/count (nothing was committed as a batch) throws UnsupportedFeatureException instead of reporting success (#130).
+- `testSingleMessageBatchAcceptsPlainPubAck` - A single-message batch (trivially atomic) accepts a plain PubAck commit ack without batch fields (#130).
 - `testCommitEmptyBatchThrows` - Committing a batch with no staged messages throws `JetStreamException` ("Cannot commit an empty batch").
 - `testBatchRejectsOversizedId` - Constructing a batch with a 65-character id throws `JetStreamException` ("Batch id must be between 1 and 64 characters").
 - `testAddAfterCommitThrows` - Calling `add()` after a successful `commit()` throws `JetStreamException` ("Cannot add to an already-committed batch").

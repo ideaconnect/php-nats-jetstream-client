@@ -122,11 +122,20 @@ Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and 
 ## NATS Server Version Requirements
 
 Most of this library works against any JetStream-enabled server. Some features depend on newer NATS
-server versions; the table below lists the minimum version per feature. **You do not need to check the
-version yourself** - if you use a feature against a server that is too old, the request fails fast with
-an `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) carrying the
-feature name, the required version, and the version the server reported. The check is reactive (derived
-from the server's own error response), so there is no per-request version probe.
+server versions; the table below lists the minimum version per feature. Detection is reactive - there
+is no per-request version probe - and depends on the feature:
+
+- **Version-gated stream/consumer config fields** (for example creating a stream with `allow_atomic`
+  or `allow_msg_schedules`): an older server rejects the unknown field and the request fails fast
+  with an `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`)
+  carrying the feature name, the required version, and the version the server reported.
+- **Atomic batch publish**: a server without batch support acknowledges the batch start/commit as
+  plain publishes; `commit()` detects that and throws an `UnsupportedFeatureException` instead of
+  silently storing the batch message-by-message.
+- **Other data-path calls** (for example `publish(..., ttl:)` or `directGetBatch()`) against a server
+  or stream without the feature surface a plain `JetStreamException` built from the server's error
+  response - or the server may silently ignore an unknown header - so consult the table before
+  relying on them against older servers.
 
 | Feature | API | Min NATS | Server config / header |
 | --- | --- | --- | --- |
@@ -146,7 +155,7 @@ use IDCT\NATS\Exception\UnsupportedFeatureException;
 try {
     $js->batch()->add('orders.created', $payload)->commit()->await();
 } catch (UnsupportedFeatureException $e) {
-    // e.g. "The "allow_atomic" feature requires NATS server 2.12+, but the connected server reports 2.10.5."
+    // e.g. "Atomic batch publish requires NATS server 2.12+ (connected server 2.10.5 treated the batch as plain publishes)"
     echo "{$e->feature} needs NATS {$e->requiredVersion}; server is {$e->serverVersion}\n";
 }
 ```

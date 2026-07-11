@@ -7,6 +7,7 @@ namespace IDCT\NATS\JetStream;
 use Amp\Future;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\Models\PubAck;
 
 use function Amp\async;
@@ -135,7 +136,9 @@ final class BatchPublisher
                 $this->batchHeaders($final['headers'], $total, true),
             )->await();
 
-            return $this->parseCommitAck($reply->payload);
+            // A single-message batch is trivially atomic, so a plain PubAck (no batch fields) is
+            // acceptable there; a multi-message commit MUST carry the batch acknowledgement.
+            return $this->parseCommitAck($reply->payload, requireBatchAck: $total > 1);
         });
     }
 
@@ -166,6 +169,34 @@ final class BatchPublisher
                 (int) ($error['code'] ?? 0),
             );
         }
+
+        // A batching-aware server answers the start with a ZERO-BYTE ack (ADR-50). A normal PubAck
+        // here means the server stored the start message as a plain publish - it does not understand
+        // Nats-Batch-* headers (pre-2.12), and continuing would store the "batch" message-by-message,
+        // silently breaking the all-or-nothing guarantee (#130). Abort loudly instead. (The start
+        // message itself was already stored by that server; the caller learns atomicity is
+        // unavailable before the rest of the batch is published.)
+        if (isset($data['stream']) || isset($data['seq'])) {
+            throw $this->atomicBatchUnsupported();
+        }
+    }
+
+    /**
+     * Builds the "server too old for atomic batches" failure with the connected server's version.
+     */
+    private function atomicBatchUnsupported(): UnsupportedFeatureException
+    {
+        $serverVersion = $this->client->serverInfo()?->version;
+
+        return new UnsupportedFeatureException(
+            'allow_atomic',
+            '2.12',
+            $serverVersion,
+            sprintf(
+                'Atomic batch publish requires NATS server 2.12+ (connected server%s treated the batch as plain publishes)',
+                $serverVersion !== null && $serverVersion !== '' ? ' ' . $serverVersion : '',
+            ),
+        );
     }
 
     /**
@@ -189,9 +220,11 @@ final class BatchPublisher
 
     /**
      * Parses the atomic-batch commit acknowledgement, mapping a malformed body or an embedded API
-     * error (an aborted batch) to a JetStreamException.
+     * error (an aborted batch) to a JetStreamException. With $requireBatchAck (multi-message
+     * batches), a PubAck lacking the batch id/count means the server committed nothing as a batch
+     * - it stored the messages individually - and must fail as unsupported (#130).
      */
-    private function parseCommitAck(string $payload): PubAck
+    private function parseCommitAck(string $payload, bool $requireBatchAck): PubAck
     {
         try {
             /** @var array<string,mixed> $data */
@@ -208,6 +241,12 @@ final class BatchPublisher
             throw new JetStreamException($description, $code);
         }
 
-        return PubAck::fromArray($data);
+        $ack = PubAck::fromArray($data);
+
+        if ($requireBatchAck && $ack->batchId === null && $ack->batchCount === null) {
+            throw $this->atomicBatchUnsupported();
+        }
+
+        return $ack;
     }
 }
