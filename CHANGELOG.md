@@ -19,6 +19,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` A message handler throwing during the post-recovery delivery drain no longer closes
+  a healthy, fully recovered connection: the exception used to escape `recoverConnection()` into
+  its callers' failure handling, so the heartbeat paths (`pingTimerTick()` maxPingsOut escalation
+  and `consumeHeartbeatResponse()` peer-closed recovery) flipped a SUCCESSFULLY recovered
+  connection to Closed on a live socket - with no Closed event and no runtime-state release -
+  and `publish()`'s write-failure retry surfaced an unrelated handler exception for a frame that
+  was neither written nor buffered. Handler exceptions from that drain are now contained inside
+  `recoverConnection()` and reported through the error listener (nats.go parity: handler errors
+  during post-reconnect delivery are async errors, not connection failures); genuine recovery
+  failures (exhaustion, auth, reconnect disabled) still throw unchanged (#144).
 - `[bugfix]` Ordered consumer: a `TimeoutException` or `ConnectionException` from the best-effort
   `deleteConsumer()` leg of a recreate (sequence-gap or heartbeat tail-gap recovery) no longer
   bypasses the create-retry loop and permanently silences the consumer. Those exceptions extend

@@ -1565,7 +1565,18 @@ final class NatsConnection
         // and hits a write failure starts a fresh recovery instead of deadlocking on the in-progress
         // one, and the per-sid dispatch guard keeps it non-reentrant. (Only reached on success; the
         // catch above rethrows on failure.)
-        $this->drainAllPending();
+        try {
+            $this->drainAllPending();
+        } catch (\Throwable $handlerError) {
+            // Recovery itself already succeeded; only a handler(-triggered) failure can escape this
+            // drain. It must not reach the recovery callers, whose catch blocks treat anything thrown
+            // here as a FAILED recovery - the heartbeat paths would flip a healthy connection to
+            // Closed without a Closed event or state release, and publish()'s retry would surface an
+            // unrelated exception for a frame that was never written (#144). Report it as an async
+            // error instead (nats.go parity: handler errors during post-reconnect delivery are
+            // reported, not fatal).
+            $this->emitError($handlerError);
+        }
     }
 
     /**

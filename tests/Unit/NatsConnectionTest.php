@@ -3405,6 +3405,169 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A handler throwing on a message delivered by the post-recovery drain must not convert a
+     * SUCCESSFUL heartbeat-triggered recovery into a closed connection: the exception used to
+     * escape recoverConnection() into consumeHeartbeatResponse()'s escalation catch, which set
+     * state to Closed on a live, fully recovered socket - with no Closed event and no state
+     * release. The handler error surfaces via the error listener instead (#144).
+     */
+    public function testHeartbeatEofRecoveryStaysOpenWhenPostRecoveryHandlerThrows(): void
+    {
+        $errors = [];
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    '__EOF__',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 1 5\r\nboom!\r\n", // captured during replay; delivered by the post-recovery drain
+                ],
+            ],
+            connectFailures: 0,
+            readFailures: 0,
+        );
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->subscribe('updates', static function (NatsMessage $message): void {
+            throw new \RuntimeException('handler failed on ' . $message->payload);
+        })->await();
+
+        // The heartbeat self-read hits EOF -> recovery succeeds -> the post-recovery drain invokes
+        // the throwing handler. The recovery itself succeeded, so the connection must stay Open.
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+        self::assertContains('handler failed on boom!', $errors);
+
+        // The recovered connection is usable: a publish reaches the new socket.
+        $connection->publish('updates.ack', 'ok')->await();
+        self::assertStringContainsString("PUB updates.ack 2\r\nok\r\n", implode('', $transport->writes));
+    }
+
+    /**
+     * Same containment for the ping watchdog's maxPingsOut escalation: pingTimerTick()'s catch
+     * treated the escaping handler exception as a failed recovery and closed a healthy, fully
+     * recovered connection (#144).
+     */
+    public function testMaxPingsOutRecoveryStaysOpenWhenPostRecoveryHandlerThrows(): void
+    {
+        $errors = [];
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 1 5\r\nboom!\r\n", // captured during replay; delivered by the post-recovery drain
+                ],
+            ],
+            connectFailures: 0,
+            readFailures: 0,
+        );
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                maxPingsOut: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->subscribe('updates', static function (NatsMessage $message): void {
+            throw new \RuntimeException('handler failed on ' . $message->payload);
+        })->await();
+
+        // One tick exceeds maxPingsOut (0) and escalates straight into recovery; the recovery
+        // succeeds and the post-recovery drain invokes the throwing handler.
+        (new \ReflectionMethod($connection, 'pingTimerTick'))->invoke($connection);
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+        self::assertContains('handler failed on boom!', $errors);
+    }
+
+    /**
+     * publish()'s write-failure retry calls recoverConnection(); a handler throwing during the
+     * post-recovery drain used to escape into that retry path, so the caller got an unrelated
+     * handler exception for a frame that was neither written nor buffered. The retried write must
+     * run and succeed; the handler error surfaces via the error listener only (#144).
+     */
+    public function testPublishRetrySucceedsWhenPostRecoveryHandlerThrows(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Epoch 2, consumed by the recovery the failed publish write triggers:
+            'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 5\r\nboom!\r\n", // captured during replay; delivered by the post-recovery drain
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $connection->subscribe('updates', static function (NatsMessage $message) use ($transport): void {
+            // The post-recovery drain runs before publish()'s retry write: heal the transport here
+            // so only the FIRST write of the publish frame fails, then throw.
+            $transport->throwOnWriteContaining = null;
+
+            throw new \RuntimeException('handler failed on ' . $message->payload);
+        })->await();
+
+        $transport->throwOnWriteContaining = 'PUB retry.subject';
+
+        // Write fails -> recoverConnection() -> replay captures the MSG -> the post-recovery drain
+        // invokes the throwing handler -> the retried write must still run and succeed.
+        $connection->publish('retry.subject', 'hello')->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertContains('handler failed on boom!', $errors);
+        self::assertStringContainsString("PUB retry.subject 5\r\nhello\r\n", implode('', $transport->writes));
+    }
+
+    /**
      * Verifies connect retries across rotated servers when earlier attempts fail.
      */
     public function testConnectRotatesServersOnReconnectAttempts(): void
