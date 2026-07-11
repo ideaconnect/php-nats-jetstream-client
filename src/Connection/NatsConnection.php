@@ -46,6 +46,14 @@ final class NatsConnection
     /** Cap on the validated-subject memo (#136); hitting it resets the memo to stay bounded. */
     private const VALIDATED_SUBJECTS_MAX = 512;
 
+    /**
+     * Max bytes per coalesced publish segment in {@see publishHeaderBlock()} (#138). Frames are
+     * concatenated up to this cap and flushed as one transport write, bounding peak buffer memory
+     * (a 1000 x 1MB batch must not concatenate into a ~1GB string). A single frame larger than the
+     * cap is written alone - frames cannot be split.
+     */
+    private const PUBLISH_BLOCK_SEGMENT_BYTES = 512 * 1024;
+
     private ConnectionState $state = ConnectionState::Idle;
     private ?ServerInfo $serverInfo = null;
     private ProtocolParser $parser;
@@ -561,6 +569,102 @@ final class NatsConnection
 
             $this->recordOutbound($payload);
         });
+    }
+
+    /**
+     * Publishes a block of header-carrying messages (no reply subjects) coalesced into bounded
+     * segment writes: every message is validated up front, then consecutive HPUB frames are
+     * concatenated and flushed in segments of at most {@see self::PUBLISH_BLOCK_SEGMENT_BYTES}, so
+     * one transport write carries many frames instead of one awaited write per message (#138).
+     * Each frame is byte-identical to a publishWithHeaders() call for the same message, and frame
+     * order is preserved; segments are consecutive writes with no server round-trip in between.
+     *
+     * @internal Used by BatchPublisher to send atomic-batch intermediates; not part of the
+     *           supported API.
+     *
+     * @param list<array{subject:string,payload:string,headers:array<string,string|list<string>>}> $messages
+     * @return Future<void>
+     */
+    public function publishHeaderBlock(array $messages): Future
+    {
+        return async(function () use ($messages): void {
+            if ($messages === []) {
+                return;
+            }
+
+            // A server that does not advertise the `headers` capability treats HPUB as an unknown
+            // protocol operation and closes the connection; fail client-side instead (nats.go
+            // ErrHeadersNotSupported parity, #132).
+            if ($this->serverInfo?->headersSupported === false) {
+                throw new ConnectionException('Server does not advertise headers support; cannot publish with headers (HPUB)');
+            }
+
+            // Validate EVERY message (subject rules + max_payload) before any bytes hit the wire:
+            // an invalid message must abort the whole block with nothing written, not fail midway
+            // through a partially-sent block. The validated header wire blocks are kept for the
+            // encode pass below - they are small next to the payloads, which stay referenced in
+            // $messages either way (PHP strings are refcounted, not copied).
+            $headerBlocks = [];
+            foreach ($messages as $index => $message) {
+                $this->validateSubjectCached($message['subject']);
+                $headerBlock = NatsHeaders::toWireBlock($message['headers']);
+                $this->enforceMaxPayload(strlen($headerBlock) + strlen($message['payload']));
+                $headerBlocks[$index] = $headerBlock;
+            }
+
+            $segment = '';
+            /** @var list<string> $segmentPayloads */
+            $segmentPayloads = [];
+            foreach ($messages as $index => $message) {
+                $frame = $this->codec->encodeHeaderPublishBlock(
+                    $message['subject'],
+                    $message['payload'],
+                    $headerBlocks[$index],
+                );
+
+                // Flush BEFORE appending would overflow the cap, so a segment never exceeds it
+                // unless a single frame alone does (an unsplittable frame is written by itself).
+                if ($segment !== '' && strlen($segment) + strlen($frame) > self::PUBLISH_BLOCK_SEGMENT_BYTES) {
+                    $this->writePublishSegment($segment, $segmentPayloads);
+                    $segment = '';
+                    $segmentPayloads = [];
+                }
+
+                $segment .= $frame;
+                $segmentPayloads[] = $message['payload'];
+            }
+
+            $this->writePublishSegment($segment, $segmentPayloads);
+        });
+    }
+
+    /**
+     * Writes one coalesced publish segment with the same shape publish() uses for a single frame:
+     * while not Open the WHOLE segment goes through the reconnect buffer (or fails), otherwise one
+     * transport write with a single recover-and-retry on failure. Outbound stats are recorded per
+     * message once the segment is buffered or written, matching per-message publishes.
+     *
+     * @param list<string> $payloads The payloads carried by the segment, in frame order.
+     */
+    private function writePublishSegment(string $segment, array $payloads): void
+    {
+        if ($this->state !== ConnectionState::Open) {
+            // Buffer while a reconnect is in flight (flushed on reconnect); otherwise unusable.
+            if (!$this->bufferFrame($segment)) {
+                throw new ConnectionException('Connection is not open');
+            }
+        } else {
+            try {
+                $this->transport->write($segment)->await();
+            } catch (\Throwable) {
+                $this->recoverConnection();
+                $this->transport->write($segment)->await();
+            }
+        }
+
+        foreach ($payloads as $payload) {
+            $this->recordOutbound($payload);
+        }
     }
 
     /**

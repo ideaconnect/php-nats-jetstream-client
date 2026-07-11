@@ -125,14 +125,23 @@ final class BatchPublisher
                 $this->assertStartAccepted($startReply->payload);
 
                 // Intermediate messages (2..n-1) are fire-and-forget; the server stages them by batch
-                // id. Writes are serialized on the single connection, so they arrive in sequence order.
+                // id, and nothing is awaited from it between them. They are therefore coalesced into
+                // bounded segment writes - one wire operation carrying many frames - instead of one
+                // awaited publish per message (#138). Frames stay byte-identical to per-message
+                // publishes; writes are serialized on the single connection, so they arrive in
+                // sequence order.
+                $intermediates = [];
                 for ($i = 1; $i < $lastIndex; ++$i) {
                     $message = $messages[$i];
-                    $this->client->publishWithHeaders(
-                        $message['subject'],
-                        $message['payload'],
-                        $this->batchHeaders($message['headers'], $i + 1, false),
-                    )->await();
+                    $intermediates[] = [
+                        'subject' => $message['subject'],
+                        'payload' => $message['payload'],
+                        'headers' => $this->batchHeaders($message['headers'], $i + 1, false),
+                    ];
+                }
+
+                if ($intermediates !== []) {
+                    $this->client->publishHeaderBlock($intermediates)->await();
                 }
             }
 
