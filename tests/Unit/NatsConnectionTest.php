@@ -3025,6 +3025,60 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * Verifies publishWithHeaders fails client-side when INFO advertises "headers":false, before
+     * any HPUB reaches the wire (nats.go ErrHeadersNotSupported parity, #132).
+     */
+    public function testPublishWithHeadersThrowsWhenServerLacksHeadersSupport(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":false}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Server does not advertise headers support');
+
+        try {
+            $connection->publishWithHeaders('test.subject', 'data', ['Key' => 'Val'])->await();
+        } finally {
+            self::assertStringNotContainsString('HPUB', implode('', $transport->writes));
+        }
+    }
+
+    /**
+     * Verifies requestWithHeaders shares the HPUB capability guard: no HPUB is written against a
+     * headers-disabled server (#132).
+     */
+    public function testRequestWithHeadersThrowsWhenServerLacksHeadersSupport(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":false}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Server does not advertise headers support');
+
+        try {
+            $connection->requestWithHeaders('svc.echo', 'data', ['Key' => 'Val'])->await();
+        } finally {
+            self::assertStringNotContainsString('HPUB', implode('', $transport->writes));
+        }
+    }
+
+    /**
      * Verifies CONNECT payload includes no_responders flag.
      */
     public function testConnectPayloadIncludesNoResponders(): void

@@ -1071,6 +1071,9 @@ final class JetStreamContext
                 'ack_policy' => 'none',
                 'max_deliver' => 1,
                 'mem_storage' => true,
+                // ADR-17 / nats.go ordered.go pin R1; without it an interest-retention stream's
+                // replica count would be inherited by the ephemeral consumer.
+                'num_replicas' => 1,
             ];
 
             $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
@@ -1594,10 +1597,12 @@ final class JetStreamContext
      * Fetches a batch of messages for a pull consumer.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
-     * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`, and
-     * `no_wait`. When a consumer is pinned, the first delivered message carries a `Nats-Pin-Id` header
-     * (read it with {@see pinIdOf()}); a stale pin id yields a 423 status surfaced as a
-     * JetStreamException with code 423.
+     * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
+     * `no_wait`, and `idle_heartbeat` (nanoseconds, ADR-13; the fetch loop absorbs the resulting
+     * status-100 heartbeat frames). Any other key is rejected with a JetStreamException instead of
+     * being silently dropped (#132). When a consumer is pinned, the first delivered message carries
+     * a `Nats-Pin-Id` header (read it with {@see pinIdOf()}); a stale pin id yields a 423 status
+     * surfaced as a JetStreamException with code 423.
      *
      * The priority-group `$pull` fields require NATS server 2.11+ (the `prioritized` policy 2.12+);
      * a plain `{batch, expires}` fetch works on any JetStream server.
@@ -1970,9 +1975,15 @@ final class JetStreamContext
     }
 
     /**
-     * Builds a pull-consumer CONSUMER.MSG.NEXT request body, merging whitelisted ADR-42 priority and
-     * general pull fields onto the mandatory batch/expires. Lightly validates `group` and `priority`;
-     * the server validates the rest.
+     * Supported optional pull-request fields (ADR-13/ADR-42) accepted by fetchBatch()/fetchNext().
+     */
+    private const PULL_REQUEST_FIELDS = ['group', 'id', 'min_pending', 'min_ack_pending', 'priority', 'max_bytes', 'no_wait', 'idle_heartbeat'];
+
+    /**
+     * Builds a pull-consumer CONSUMER.MSG.NEXT request body, merging supported ADR-13/ADR-42 pull
+     * fields onto the mandatory batch/expires. An unknown `$pull` key is rejected loudly - silently
+     * dropping it would make the caller believe the option took effect (#132). Lightly validates
+     * `group` and `priority`; the server validates the rest.
      *
      * @param array<string,mixed> $pull
      * @return array<string,mixed>
@@ -1983,6 +1994,16 @@ final class JetStreamContext
             'batch' => $batch,
             'expires' => $expiresMs * 1_000_000,
         ];
+
+        foreach (array_keys($pull) as $key) {
+            if (!in_array($key, self::PULL_REQUEST_FIELDS, true)) {
+                throw new JetStreamException(sprintf(
+                    'Unknown pull request field "%s"; supported fields: %s',
+                    $key,
+                    implode(', ', self::PULL_REQUEST_FIELDS),
+                ));
+            }
+        }
 
         if (isset($pull['group'])) {
             $group = $pull['group'];
@@ -1998,7 +2019,7 @@ final class JetStreamContext
             }
         }
 
-        foreach (['group', 'id', 'min_pending', 'min_ack_pending', 'priority', 'max_bytes', 'no_wait'] as $field) {
+        foreach (self::PULL_REQUEST_FIELDS as $field) {
             if (array_key_exists($field, $pull)) {
                 $request[$field] = $pull[$field];
             }

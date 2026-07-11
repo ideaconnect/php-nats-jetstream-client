@@ -502,6 +502,37 @@ final class ServiceTest extends TestCase
         self::assertSame($stats['started'] ?? null, $statsAgain['started'] ?? null);
     }
 
+    /**
+     * Verifies the stats 'started' timestamp is UTC regardless of the process default timezone, so
+     * its hardcoded Z suffix is truthful (ADR-32, #132).
+     */
+    public function testStartedTimestampIsUtcRegardlessOfDefaultTimezone(): void
+    {
+        $previousTimezone = date_default_timezone_get();
+        // A zone with a large offset: a local-time timestamp stamped with Z would be hours off UTC.
+        date_default_timezone_set('Pacific/Kiritimati');
+
+        try {
+            $client = new NatsClient(new NatsOptions(), new FakeTransport());
+            $service = $client->service('echo', '1.0.0');
+
+            $started = $service->statsSnapshot()['started'] ?? null;
+            self::assertIsString($started);
+            self::assertMatchesRegularExpression('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/', $started);
+
+            $parsed = \DateTimeImmutable::createFromFormat(
+                'Y-m-d\TH:i:s.u\Z',
+                $started,
+                new \DateTimeZone('UTC'),
+            );
+            self::assertInstanceOf(\DateTimeImmutable::class, $parsed);
+            // Parsed as UTC, the value must be "now"; a local Kiritimati (+14) time would be ~14h off.
+            self::assertLessThan(60, abs($parsed->getTimestamp() - time()));
+        } finally {
+            date_default_timezone_set($previousTimezone);
+        }
+    }
+
     public function testHandlerCanRespondWithCustomServiceError(): void
     {
         $transport = new FakeTransport([

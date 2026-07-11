@@ -653,6 +653,53 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * Verifies an unknown pull-request field is rejected before dispatch instead of being silently
+     * dropped (#132).
+     */
+    public function testFetchBatchRejectsUnknownPullField(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Unknown pull request field "heartbeat"; supported fields: group, id, min_pending, min_ack_pending, priority, max_bytes, no_wait, idle_heartbeat');
+
+        try {
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500, ['heartbeat' => 1_000_000_000])->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies the ADR-13 idle_heartbeat pull field reaches the wire in the pull request JSON (#132).
+     */
+    public function testFetchBatchSendsIdleHeartbeat(): void
+    {
+        $msg = '{"event":"x"}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500, [
+            'idle_heartbeat' => 1_000_000_000,
+        ])->await();
+
+        self::assertStringContainsString('"idle_heartbeat":1000000000', $transport->writes[3]);
+    }
+
+    /**
      * Verifies unpinConsumer issues the UNPIN request with the group (issue #7).
      */
     public function testUnpinConsumer(): void
@@ -2370,6 +2417,8 @@ final class JetStreamContextTest extends TestCase
         self::assertStringContainsString('"idle_heartbeat":5000000000', $written);
         self::assertStringContainsString('"ack_policy":"none"', $written);
         self::assertStringContainsString('"mem_storage":true', $written);
+        // ADR-17 / nats.go ordered.go parity: ordered consumers pin R1 (#132).
+        self::assertStringContainsString('"num_replicas":1', $written);
     }
 
     // ─── Stream Purge / List / Consumer List / Direct Get ────────────────

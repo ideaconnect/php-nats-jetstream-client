@@ -481,6 +481,12 @@ final class NatsConnection
             if ($replyTo !== null) {
                 $this->validateSubject($replyTo);
             }
+            // A server that does not advertise the `headers` capability treats HPUB as an unknown
+            // protocol operation and closes the connection; fail client-side instead (nats.go
+            // ErrHeadersNotSupported parity, #132).
+            if ($this->serverInfo?->headersSupported === false) {
+                throw new ConnectionException('Server does not advertise headers support; cannot publish with headers (HPUB)');
+            }
             // Build (and CR/LF-validate) the header wire block once, then reuse it for sizing and for
             // each write attempt, instead of re-running toWireBlock() per call.
             $headerBlock = NatsHeaders::toWireBlock($headers);

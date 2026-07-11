@@ -80,8 +80,10 @@ final class Service
         }
 
         $this->id = bin2hex(random_bytes(8));
-        // RFC3339 with microseconds, matching the Go/JS micro clients' sub-second precision.
-        $this->startedAt = (new \DateTimeImmutable())->format('Y-m-d\TH:i:s.u\Z');
+        // RFC3339 with microseconds, matching the Go/JS micro clients' sub-second precision. The
+        // hardcoded Z suffix requires the timestamp itself to be UTC regardless of the process
+        // default timezone (ADR-32, #132).
+        $this->startedAt = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->format('Y-m-d\TH:i:s.u\Z');
     }
 
     /**
