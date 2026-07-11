@@ -3003,13 +3003,21 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
             // In-order msg1 (consumer seq 1).
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap (consumer seq 3) triggers recovery: delete OK (sid 3), recreate FAILS (sid 4, 404).
+            // Gap (consumer seq 3) triggers recovery: delete OK (sid 3), then EVERY create attempt
+            // fails (sids 4-6, one per retry) so the recreate is terminally dead (#114).
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
             sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.e 6 %d\r\n%s\r\n", strlen($createError), $createError),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
         $client->connect()->await();
 
         $received = [];
@@ -3019,13 +3027,69 @@ final class JetStreamContextTest extends TestCase
 
         // Pump all frames. A failed recreate must be CONTAINED - it must not throw out of the shared
         // subscription dispatch loop (which would abort delivery for every other subscription).
-        for ($i = 0; $i < 6; $i++) {
+        for ($i = 0; $i < 9; $i++) {
             $client->processIncoming()->await();
         }
 
-        // The in-order message was delivered; the out-of-order one was discarded; the failed recreate
-        // did not escape.
+        // The in-order message was delivered; the out-of-order one was discarded; the recreate was
+        // retried per attempt and the terminal failure surfaced via the error listener (#114) rather
+        // than escaping the dispatch loop or staying silent.
         self::assertSame(['msg1'], $received);
+        self::assertCount(1, $errors);
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertStringContainsString('after 3 attempts', $errors[0]->getMessage());
+    }
+
+    public function testSubscribeOrderedConsumerRecreateRetriesThroughTransientFailure(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $recreateReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD2',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+        $createError = '{"error":{"code":10008,"description":"transient failure"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Gap: delete OK (sid 3), the first create attempt fails (sid 4), the RETRY succeeds
+            // (sid 5) as ORD2, and delivery resumes from the new consumer instance (#114).
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 9; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // Recovery succeeded on the second attempt: the new instance's first in-order message is
+        // delivered and nothing was reported to the error listener.
+        self::assertSame(['msg1', 'msg4'], $received);
+        self::assertSame([], $errors);
     }
 
     public function testSubscribeOrderedConsumerDeliversFilteredMessagesWithoutSpuriousRecreate(): void

@@ -35,6 +35,12 @@ final class JetStreamContext
     /** Idle window (ns) after which the server reaps an ephemeral push consumer with no interest. */
     private const EPHEMERAL_INACTIVE_THRESHOLD_NS = 300_000_000_000; // 5 minutes
 
+    /** Create attempts when recreating an ordered consumer after a gap, before declaring it dead (#114). */
+    private const ORDERED_RECREATE_ATTEMPTS = 3;
+
+    /** Base backoff between ordered-consumer recreate attempts, in seconds (#114). */
+    private const ORDERED_RECREATE_RETRY_DELAY_S = 0.05;
+
     /** @var array<string,KeyValueBucket> */
     private array $kvBuckets = [];
     /** @var array<string,ObjectStoreBucket> */
@@ -1007,11 +1013,37 @@ final class JetStreamContext
                         // Best-effort cleanup for ephemeral consumers that may already be gone.
                     }
 
-                    $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
-                    $consumerName = $consumer->name;
-                    $expectedConsumerSeq = 1;
-                } catch (\Throwable) {
-                    // Containment: see the docblock above.
+                    // Retry the create: after a successful delete, a failed create leaves NOTHING that
+                    // would ever deliver a message or heartbeat on the inbox again, so a transient
+                    // failure (timeout, leadership change) must not end recovery permanently (#114).
+                    for ($attempt = 1; ; $attempt++) {
+                        try {
+                            $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+                            $consumerName = $consumer->name;
+                            $expectedConsumerSeq = 1;
+
+                            return;
+                        } catch (\Throwable $e) {
+                            if ($attempt >= self::ORDERED_RECREATE_ATTEMPTS) {
+                                throw $e;
+                            }
+
+                            delay(self::ORDERED_RECREATE_RETRY_DELAY_S * $attempt);
+                        }
+                    }
+                } catch (\Throwable $e) {
+                    // Containment: see the docblock above. The app must still learn the ordered
+                    // consumer is now permanently silent, so surface through the error listener (#114).
+                    $this->emitClientError(new JetStreamException(
+                        sprintf(
+                            'Ordered consumer recreate failed for stream "%s" after %d attempts: %s',
+                            $stream,
+                            self::ORDERED_RECREATE_ATTEMPTS,
+                            $e->getMessage(),
+                        ),
+                        (int) $e->getCode(),
+                        $e,
+                    ));
                 }
             };
 
@@ -1751,6 +1783,25 @@ final class JetStreamContext
             // Status 100 control messages are not user payload deliveries.
             return true;
         });
+    }
+
+    /**
+     * Invokes the client's configured error listener (if any), swallowing listener exceptions. Used
+     * to surface contained-but-fatal conditions such as a dead ordered consumer (#114) without
+     * throwing out of the shared subscription dispatch loop.
+     */
+    private function emitClientError(\Throwable $error): void
+    {
+        $listener = $this->client->options()->errorListener;
+        if ($listener === null) {
+            return;
+        }
+
+        try {
+            $listener($error);
+        } catch (\Throwable) {
+            // A throwing listener must never break dispatch.
+        }
     }
 
     /**

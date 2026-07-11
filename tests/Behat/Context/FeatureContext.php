@@ -2545,6 +2545,42 @@ final class FeatureContext implements Context
     }
 
     /**
+     * @When I unsubscribe from my subject with a maximum of :max messages
+     */
+    public function iUnsubscribeFromMySubjectWithAMaximumOfMessages(int $max): void
+    {
+        $sids = $this->subscriptions['primary'] ?? [];
+        if ($sids === []) {
+            throw new RuntimeException('Expected an active primary subscription to arm auto-unsubscribe on.');
+        }
+
+        $this->client('primary')->unsubscribe($sids[array_key_last($sids)], $max)->await();
+    }
+
+    /**
+     * @Then I should receive exactly :count messages
+     */
+    public function iShouldReceiveExactlyMessages(int $count): void
+    {
+        $this->waitFor(function () use ($count): bool {
+            $this->client('primary')->processIncoming()->await();
+
+            return count($this->state->receivedPayloads) >= $count;
+        }, 4.0);
+
+        // Bounded settle window: nothing past the armed maximum may arrive after the count is reached.
+        $deadline = (hrtime(true) / 1e9) + 0.5;
+        while ((hrtime(true) / 1e9) < $deadline) {
+            $this->client('primary')->processIncoming()->await();
+            delay(0.01);
+        }
+
+        if (count($this->state->receivedPayloads) !== $count) {
+            throw new RuntimeException(sprintf('Expected exactly %d delivered messages but received [%s].', $count, implode(', ', $this->state->receivedPayloads)));
+        }
+    }
+
+    /**
      * @When I connect with valid token authentication
      */
     public function iConnectWithValidTokenAuthentication(): void

@@ -39,3 +39,13 @@ Feature: Live client resilience workflows
     And I have a random subject
     When I publish a payload larger than the server max payload
     Then the oversized publish should be rejected by the client
+
+  Scenario: Auto-unsubscribe delivers remaining messages up to the maximum then stops
+    Given I am connected to NATS
+    And I have a random subject
+    When I subscribe to my subject
+    And I unsubscribe from my subject with a maximum of 2 messages
+    And I publish "auto-1" to my subject
+    And I publish "auto-2" to my subject
+    And I publish "auto-3" to my subject
+    Then I should receive exactly 2 messages

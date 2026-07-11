@@ -276,6 +276,387 @@ final class NatsConnectionTest extends TestCase
         self::assertSame("UNSUB 1\r\n", $transport->writes[3]);
     }
 
+    public function testUnsubscribeWithMaxDeliversRemainingMessagesThenRemoves(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\n",
+            "MSG updates 1 2\r\nm2\r\n",
+            "MSG updates 1 2\r\nm3\r\n",
+            "MSG updates 1 2\r\nm4\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $connection->processIncoming()->await();
+        self::assertSame(['m1'], $received);
+
+        // Auto-unsubscribe at 3 TOTAL messages: m1 already counts, so m2 and m3 must still reach the
+        // handler instead of being silently discarded; m4 is past the max (#112).
+        $connection->unsubscribe($sid, 3)->await();
+        self::assertContains("UNSUB 1 3\r\n", $transport->writes);
+
+        for ($i = 0; $i < 3; $i++) {
+            $connection->processIncoming()->await();
+        }
+
+        self::assertSame(['m1', 'm2', 'm3'], $received);
+    }
+
+    public function testUnsubscribeWithMaxAlreadyReachedRemovesImmediately(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\n",
+            "MSG updates 1 2\r\nm2\r\n",
+            "MSG updates 1 2\r\nm3\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $connection->processIncoming()->await();
+        $connection->processIncoming()->await();
+        self::assertSame(['m1', 'm2'], $received);
+
+        // Two messages were already delivered, satisfying max=2: the subscription is removed at once
+        // (the UNSUB still carries the max for the server's own accounting) and later frames for the
+        // sid are discarded.
+        $connection->unsubscribe($sid, 2)->await();
+        self::assertContains("UNSUB 1 2\r\n", $transport->writes);
+
+        $connection->processIncoming()->await();
+        self::assertSame(['m1', 'm2'], $received);
+    }
+
+    public function testReconnectReplaysRemainingAutoUnsubscribeAllowance(): void
+    {
+        $transport = new FlakyTransport(
+            readQueuesByConnection: [
+                [
+                    'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 1 2\r\nm1\r\n",
+                    '__THROW__',
+                ],
+                [
+                    'INFO {"server_id":"S2","server_name":"n2","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                    "PONG\r\n",
+                    "MSG updates 1 2\r\nm2\r\n",
+                    "MSG updates 1 2\r\nm3\r\n",
+                    "MSG updates 1 2\r\nm4\r\n",
+                ],
+            ],
+            connectFailures: 0,
+            readFailures: 0,
+        );
+
+        $options = new NatsOptions(
+            reconnectEnabled: true,
+            maxReconnectAttempts: 3,
+            reconnectDelayMs: 1,
+            reconnectJitterMs: 0,
+        );
+
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $connection->processIncoming()->await();
+        self::assertSame(['m1'], $received);
+
+        $connection->unsubscribe($sid, 3)->await();
+        self::assertContains("UNSUB 1 3\r\n", $transport->writes);
+
+        // The read failure triggers recovery; the replayed SUB resets the server's per-sid count, so
+        // auto-unsubscribe must be re-armed with the REMAINING allowance (3 total - 1 delivered = 2),
+        // mirroring nats.go resendSubscriptions (#112).
+        $connection->processIncoming()->await();
+        self::assertContains("UNSUB 1 2\r\n", $transport->writes);
+
+        for ($i = 0; $i < 3; $i++) {
+            $connection->processIncoming()->await();
+        }
+
+        self::assertSame(['m1', 'm2', 'm3'], $received);
+    }
+
+    public function testSubscribeRollsBackStateWhenSubWriteFails(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nxx\r\n",
+            "MSG other 2 2\r\nyy\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $firstReceived = [];
+        $transport->throwOnWriteContaining = 'SUB updates';
+
+        try {
+            $connection->subscribe('updates', static function (NatsMessage $message) use (&$firstReceived): void {
+                $firstReceived[] = $message->payload;
+            })->await();
+            self::fail('subscribe() must rethrow the transport write failure');
+        } catch (TransportClosedException) {
+            // Expected: the SUB write failed.
+        }
+
+        $transport->throwOnWriteContaining = null;
+
+        $otherReceived = [];
+        $sid = $connection->subscribe('other', static function (NatsMessage $message) use (&$otherReceived): void {
+            $otherReceived[] = $message->payload;
+        })->await();
+
+        // The failed attempt consumed sid 1 but rolled its registry entry back (#116): a frame for
+        // sid 1 is discarded rather than dispatched to the never-established subscription.
+        self::assertSame(2, $sid);
+
+        $connection->processIncoming()->await();
+        $connection->processIncoming()->await();
+
+        self::assertSame([], $firstReceived);
+        self::assertSame(['yy'], $otherReceived);
+    }
+
+    public function testUnsubscribeDropsLocalStateWhenUnsubWriteFails(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $transport->throwOnWriteContaining = 'UNSUB';
+
+        try {
+            $connection->unsubscribe($sid)->await();
+            self::fail('unsubscribe() must rethrow the transport write failure');
+        } catch (TransportClosedException) {
+            // Expected: the UNSUB write failed.
+        }
+
+        // Local state must be gone regardless (#116): the entry would otherwise leak forever and
+        // resubscribeAll() would revive it as a ghost subscription after the next recovery.
+        $connection->processIncoming()->await();
+        self::assertSame([], $received);
+    }
+
+    public function testAutoUnsubscribeCompletesAndCleansUpEvenWhenSlowConsumerDropsMessages(): void
+    {
+        // A burst of 4 frames for one sid arrives in a SINGLE chunk while the pending cap is 2 with the
+        // default DropOldest policy, so 2 are dropped before the handler ever runs. The server sent all
+        // 4 (its UNSUB max), so auto-unsub must still complete and drop the subscription even though the
+        // handler only saw 2 - otherwise the sid leaks forever and a reconnect would re-arm a ghost
+        // (#112, counting at receive not at delivery).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\nMSG updates 1 2\r\nm3\r\nMSG updates 1 2\r\nm4\r\n",
+        ]);
+
+        $options = new NatsOptions(
+            maxPendingMessagesPerSubscription: 2,
+            slowConsumerPolicy: SlowConsumerPolicy::DropOldest,
+        );
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Arm auto-unsub for the full burst of 4 before any message is pumped.
+        $connection->unsubscribe($sid, 4)->await();
+
+        $connection->processIncoming()->await();
+
+        // DropOldest kept the two newest; the handler saw fewer than the max, but the subscription is
+        // fully torn down because all 4 were RECEIVED (received >= max, backlog drained).
+        self::assertSame(['m3', 'm4'], $received);
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayNotHasKey($sid, $meta, 'auto-unsub sid must be cleaned up despite slow-consumer drops');
+    }
+
+    public function testAutoUnsubscribeCapsHandlerDeliveryAtMaxEvenIfServerOverSends(): void
+    {
+        // Defense in depth: even if more frames than the max arrive on the sid (a server race, or a
+        // replayed read), the handler must never be called more than max times (#112).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\nMSG updates 1 2\r\nm3\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $connection->unsubscribe($sid, 2)->await();
+        $connection->processIncoming()->await();
+
+        self::assertSame(['m1', 'm2'], $received);
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayNotHasKey($sid, $meta);
+    }
+
+    public function testAutoUnsubscribeOnNonOpenConnectionDefersArmingInsteadOfDestroyingSubscription(): void
+    {
+        // Regression: the arm form of unsubscribe($sid, $max) must be handled BEFORE the not-open
+        // guard, so arming during a reconnect window defers to recovery (resubscribeAll re-arms) rather
+        // than destroying the subscription and silently dropping the remaining armed deliveries with the
+        // caller believing they will still arrive (#112).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+        $connection->processIncoming()->await();
+        self::assertSame(['m1'], $received);
+
+        // Simulate a reconnect in flight: state is not Open when the app arms auto-unsub.
+        $stateProp = new \ReflectionProperty($connection, 'state');
+        $stateProp->setValue($connection, ConnectionState::Connecting);
+
+        // Must not throw and must not destroy the subscription.
+        $connection->unsubscribe($sid, 3)->await();
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayHasKey($sid, $meta, 'arming while not open must NOT destroy the subscription');
+        $armed = (new \ReflectionProperty($connection, 'autoUnsubMax'))->getValue($connection);
+        self::assertSame(3, $armed[$sid] ?? null, 'the auto-unsub max must be armed for recovery to replay');
+    }
+
+    public function testAutoUnsubscribeArmWriteFailureKeepsSubscriptionArmedForRecovery(): void
+    {
+        // If the arming UNSUB write fails, the error propagates but the arm state is kept so the next
+        // recovery re-arms it - the subscription must not be silently torn down (#112/#116).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
+
+        $transport->throwOnWriteContaining = 'UNSUB';
+
+        try {
+            $connection->unsubscribe($sid, 3)->await();
+            self::fail('the failing UNSUB write must propagate');
+        } catch (TransportClosedException) {
+            // Expected.
+        }
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayHasKey($sid, $meta, 'a failed arm write must not tear down the subscription');
+        $armed = (new \ReflectionProperty($connection, 'autoUnsubMax'))->getValue($connection);
+        self::assertSame(3, $armed[$sid] ?? null);
+    }
+
+    public function testPlainUnsubscribeOnClosedConnectionDropsStateWithoutThrowing(): void
+    {
+        // The #116 not-open drop branch for a KNOWN sid (plain unsubscribe): release state silently.
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
+
+        (new \ReflectionProperty($connection, 'state'))->setValue($connection, ConnectionState::Closed);
+
+        // Must not throw.
+        $connection->unsubscribe($sid)->await();
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayNotHasKey($sid, $meta, 'plain unsubscribe on a closed connection must drop local state');
+    }
+
+    public function testAutoUnsubscribeCleansUpEvenWhenHandlerThrowsOnMaxDelivery(): void
+    {
+        // A handler that throws on its final (max-th) delivery must still leave the subscription torn
+        // down - the terminal cleanup runs in a finally, not after the handler returns (#112).
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG updates 1 2\r\nm1\r\n",
+            "MSG updates 1 2\r\nm2\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $count = 0;
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$count): void {
+            $count++;
+            if ($count === 2) {
+                throw new \RuntimeException('handler failed on the max-th message');
+            }
+        })->await();
+
+        $connection->unsubscribe($sid, 2)->await();
+
+        $connection->processIncoming()->await();
+        try {
+            $connection->processIncoming()->await();
+        } catch (\Throwable) {
+            // The handler exception may surface; what matters is the end state below.
+        }
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayNotHasKey($sid, $meta, 'a throwing max-th handler must not strand the subscription');
+    }
+
     /**
      * Verifies the callback subscribe() API with a queue group emits a `SUB <subject> <queue> <sid>`
      * frame and that a matching MSG is dispatched to the registered handler. This is the exact API the
@@ -2603,13 +2984,15 @@ final class NatsConnectionTest extends TestCase
         $connection->processIncoming()->await();
     }
 
-    public function testUnsubscribeRequiresOpenConnection(): void
+    public function testUnsubscribeOnUnopenedConnectionIsSilentNoOp(): void
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
 
-        $this->expectException(ConnectionException::class);
-        $this->expectExceptionMessage('Connection is not open');
+        // Must not throw: finally-based inbox cleanup runs on broken connections, and an exception
+        // here would both leak the subscription entry and mask the caller's original error (#116).
         $connection->unsubscribe(1)->await();
+
+        self::assertSame(ConnectionState::Idle, $connection->state());
     }
 
     public function testPublishWithHeadersRequiresOpenConnection(): void

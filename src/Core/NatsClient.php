@@ -142,6 +142,11 @@ final class NatsClient
     /**
      * Removes a subscription by SID.
      *
+     * With $maxMessages, arms auto-unsubscribe: delivery continues until that many TOTAL messages
+     * (counting already-delivered ones) have reached the handler, then the subscription is removed
+     * automatically - matching the server-side `UNSUB <sid> <max>` semantics (#112). On a connection
+     * that is not open, local state is released silently instead of throwing (#116).
+     *
      * @return Future<void>
      */
     public function unsubscribe(int $sid, ?int $maxMessages = null): Future
@@ -286,6 +291,14 @@ final class NatsClient
     public function statistics(): ConnectionStats
     {
         return $this->connection->statistics();
+    }
+
+    /**
+     * The runtime options this client was constructed with.
+     */
+    public function options(): NatsOptions
+    {
+        return $this->options;
     }
 
     /**

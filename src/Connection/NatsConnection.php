@@ -54,6 +54,35 @@ final class NatsConnection
     /** @var array<int, SplQueue<NatsMessage>> */
     private array $pendingMessages = [];
     /**
+     * Messages RECEIVED from the server per sid, counted at intake (before any slow-consumer drop),
+     * for auto-unsubscribe accounting. Counting at receive - not at handler delivery - mirrors the
+     * server's own `UNSUB <sid> <max>` counter: a message the slow-consumer policy drops still counts
+     * toward the max, exactly as the server counts a message it sent. Counting at delivery instead
+     * would let a dropped message stall the counter below max forever (the terminal cleanup never
+     * fires, so the subscription leaks), and a reconnect would then re-arm with a positive remaining
+     * and over-deliver live messages past the intended max (#112).
+     *
+     * @var array<int, int>
+     */
+    private array $receivedCounts = [];
+    /**
+     * Messages actually DELIVERED to each subscription's handler, used to cap handler delivery at the
+     * auto-unsubscribe max so the client never over-delivers past it - even if a server (or a replayed
+     * read after reconnect) sends an extra frame. Distinct from {@see $receivedCounts}: under a
+     * slow-consumer drop, delivered can lag received, so cleanup keys on received while the delivery
+     * cap keys on delivered (#112).
+     *
+     * @var array<int, int>
+     */
+    private array $deliveredCounts = [];
+    /**
+     * Per-sid auto-unsubscribe limits armed via unsubscribe($sid, $max): the handler stays registered
+     * until this many TOTAL messages have been received, matching the server-side UNSUB count (#112).
+     *
+     * @var array<int, int>
+     */
+    private array $autoUnsubMax = [];
+    /**
      * SIDs whose queue is currently being delivered. A subscription handler may await on the
      * connection (e.g. an ordered consumer recreating itself), which suspends the dispatch fiber
      * with readInProgress already cleared; a heartbeat tick or nested request() self-pump would then
@@ -301,6 +330,9 @@ final class NatsConnection
             $this->subscriptions = [];
             $this->subscriptionMeta = [];
             $this->pendingMessages = [];
+            $this->receivedCounts = [];
+            $this->deliveredCounts = [];
+            $this->autoUnsubMax = [];
             $this->reconnectBuffer = '';
             $this->parser = new ProtocolParser();
 
@@ -370,6 +402,9 @@ final class NatsConnection
             $this->subscriptions = [];
             $this->subscriptionMeta = [];
             $this->pendingMessages = [];
+            $this->receivedCounts = [];
+            $this->deliveredCounts = [];
+            $this->autoUnsubMax = [];
             $this->drainFlushPending = false;
 
             $this->transport->close()->await();
@@ -507,11 +542,21 @@ final class NatsConnection
                 $this->validateQueueGroup($queue);
             }
             $sid = $this->nextSid++;
+            // Register before the write: once SUB hits the wire another fiber's read may deliver for
+            // this sid immediately, so the handler must already be routable.
             $this->subscriptions[$sid] = $handler;
             $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
             $this->pendingMessages[$sid] = new SplQueue();
 
-            $this->transport->write($this->codec->encodeSubscribe($subject, $sid, $queue))->await();
+            try {
+                $this->transport->write($this->codec->encodeSubscribe($subject, $sid, $queue))->await();
+            } catch (\Throwable $e) {
+                // The SUB never reached the wire; roll back so the registry does not retain an entry
+                // whose sid the caller never learns (and resubscribeAll() cannot revive it) (#116).
+                $this->dropSubscriptionState($sid);
+
+                throw $e;
+            }
 
             return $sid;
         });
@@ -520,17 +565,61 @@ final class NatsConnection
     /**
      * Removes a subscription callback and sends an UNSUB command.
      *
+     * With $maxMessages, arms auto-unsubscribe instead of removing immediately: the server keeps
+     * delivering until $maxMessages TOTAL messages (counting those already delivered) have been sent
+     * on the sid, and the local handler stays registered until that point so the remaining deliveries
+     * reach the application instead of the unknown-sid discard (#112). Mirrors nats.go AutoUnsubscribe.
+     *
+     * On a connection that is not open the server cannot be told, but local state is still released
+     * without throwing: finally-based inbox cleanup runs on broken connections and must neither leak
+     * the subscription entry nor mask the caller's original error (#116).
+     *
      * @return Future<void>
      */
     public function unsubscribe(int $sid, ?int $maxMessages = null): Future
     {
         return async(function () use ($sid, $maxMessages): void {
-            if ($this->state !== ConnectionState::Open) {
-                throw new ConnectionException('Connection is not open');
+            if (!isset($this->subscriptionMeta[$sid])) {
+                return;
             }
 
-            $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
-            $this->dropSubscriptionState($sid);
+            if ($maxMessages !== null) {
+                // Auto-unsubscribe: keep the subscription registered so the remaining deliveries up to
+                // the max still reach the handler - INCLUDING across a reconnect, where resubscribeAll()
+                // replays SUB + re-arms UNSUB with the remaining allowance. This is checked BEFORE the
+                // not-open guard on purpose: arming while a reconnect is in flight must defer the arm to
+                // recovery, never destroy the subscription (which would silently lose the remaining
+                // deliveries with the caller still believing they will arrive) (#112).
+                $this->autoUnsubMax[$sid] = $maxMessages;
+
+                if ($this->state === ConnectionState::Open) {
+                    // On a broken connection the server cannot be told now; recovery re-arms it. A write
+                    // failure propagates but leaves the arm state intact for that recovery.
+                    $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+                }
+
+                // Already satisfied (max <= messages already received) with nothing left to deliver:
+                // complete immediately rather than waiting for a delivery that will never come.
+                $this->completeAutoUnsubIfSatisfied($sid);
+
+                return;
+            }
+
+            if ($this->state !== ConnectionState::Open) {
+                // Plain unsubscribe on a broken connection: release local state without throwing, so
+                // finally-based inbox cleanup neither leaks the entry nor masks the caller's error (#116).
+                $this->dropSubscriptionState($sid);
+
+                return;
+            }
+
+            try {
+                $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+            } finally {
+                // Drop local state even when the UNSUB write fails: the connection is heading into
+                // recovery anyway, and retaining the entry would leak it and re-SUB it later (#116).
+                $this->dropSubscriptionState($sid);
+            }
         });
     }
 
@@ -1324,7 +1413,27 @@ final class NatsConnection
     private function resubscribeAll(): void
     {
         foreach ($this->subscriptionMeta as $sid => $meta) {
+            $max = $this->autoUnsubMax[$sid] ?? null;
+            $remaining = $max === null ? null : $max - ($this->receivedCounts[$sid] ?? 0);
+
+            if ($remaining !== null && $remaining <= 0) {
+                // The auto-unsubscribe max was already reached (all counted at receive, so slow-consumer
+                // drops are included); nothing remains to deliver on this sid, and re-SUBbing would
+                // over-deliver live messages past the intended max. Drop it instead of replaying (#112).
+                $this->dropSubscriptionState($sid);
+
+                continue;
+            }
+
             $this->transport->write($this->codec->encodeSubscribe($meta['subject'], $sid, $meta['queue']))->await();
+
+            if ($remaining !== null) {
+                // A fresh SUB resets the server's per-sid count, so re-arm auto-unsubscribe with the
+                // REMAINING allowance; the cumulative local counter still ends delivery at the
+                // original max (#112). Mirrors nats.go resendSubscriptions.
+                $this->transport->write($this->codec->encodeUnsubscribe($sid, $remaining))->await();
+            }
+
             $this->drainImmediateServerFrames();
         }
     }
@@ -1604,6 +1713,11 @@ final class NatsConnection
      */
     private function enqueueMessage(int $sid, NatsMessage $message): void
     {
+        // Count the message toward auto-unsubscribe accounting at intake - before any slow-consumer
+        // drop below - so a dropped message still advances toward the max exactly as it does on the
+        // server (which counts messages it SENT, not messages the client managed to deliver) (#112).
+        $this->receivedCounts[$sid] = ($this->receivedCounts[$sid] ?? 0) + 1;
+
         if (!isset($this->pendingMessages[$sid])) {
             $this->pendingMessages[$sid] = new SplQueue();
         }
@@ -2022,18 +2136,57 @@ final class NatsConnection
 
                 /** @var NatsMessage $message */
                 $message = $queue->dequeue();
+                $this->deliveredCounts[$sid] = ($this->deliveredCounts[$sid] ?? 0) + 1;
                 $this->subscriptions[$sid]($message);
-            }
 
-            if ($queue->isEmpty()) {
+                $max = $this->autoUnsubMax[$sid] ?? null;
+                if ($max !== null && $this->deliveredCounts[$sid] >= $max) {
+                    // Cap handler delivery at the auto-unsubscribe max: stop and drop now rather than
+                    // deliver a batched-in frame past the max (the server-side UNSUB may not have taken
+                    // effect yet, and a replayed read after reconnect can carry an extra frame) (#112).
+                    $this->dropSubscriptionState($sid);
+
+                    break;
+                }
+            }
+        } finally {
+            unset($this->dispatchingSids[$sid]);
+
+            // Run in finally so a handler that throws mid-drain still triggers the terminal cleanup and
+            // the empty-queue eviction rather than stranding the subscription (#112). completeAutoUnsub
+            // handles the slow-consumer case where delivered stays below max (dropped messages) but the
+            // server-side max was still reached: it drops on received>=max once the backlog is drained.
+            $this->completeAutoUnsubIfSatisfied($sid);
+
+            if (isset($this->pendingMessages[$sid]) && $this->pendingMessages[$sid]->isEmpty()) {
                 // Don't retain a drained (empty) queue: keep drainAllPending()'s per-chunk scan
                 // proportional to the subscriptions that actually have pending messages, not every
                 // subscription that has ever received one.
                 unset($this->pendingMessages[$sid]);
             }
-        } finally {
-            unset($this->dispatchingSids[$sid]);
         }
+    }
+
+    /**
+     * Completes an armed auto-unsubscribe once the server-side max has been received and the local
+     * backlog is fully drained: drops the subscription so no reconnect re-arms it and no further frame
+     * is dispatched. Counting at receive (see {@see $receivedCounts}) means this fires even when the
+     * slow-consumer policy dropped some of the counted messages, so the subscription cannot leak (#112).
+     */
+    private function completeAutoUnsubIfSatisfied(int $sid): void
+    {
+        $max = $this->autoUnsubMax[$sid] ?? null;
+        if ($max === null || ($this->receivedCounts[$sid] ?? 0) < $max) {
+            return;
+        }
+
+        // Wait for the backlog to drain before dropping, so queued-but-undelivered messages that the
+        // server already counted toward the max still reach the handler.
+        if (isset($this->pendingMessages[$sid]) && !$this->pendingMessages[$sid]->isEmpty()) {
+            return;
+        }
+
+        $this->dropSubscriptionState($sid);
     }
 
     private function cleanupRequestSubscription(int $sid): void
@@ -2063,5 +2216,8 @@ final class NatsConnection
         unset($this->subscriptions[$sid]);
         unset($this->subscriptionMeta[$sid]);
         unset($this->pendingMessages[$sid]);
+        unset($this->receivedCounts[$sid]);
+        unset($this->deliveredCounts[$sid]);
+        unset($this->autoUnsubMax[$sid]);
     }
 }

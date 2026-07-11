@@ -33,6 +33,9 @@ final class FakeTransport implements TlsAwareTransportInterface
     /** @var list<string> */
     public array $writes = [];
 
+    /** When set, write() throws a TransportClosedException for bytes containing this substring. */
+    public ?string $throwOnWriteContaining = null;
+
     public bool $closed = false;
 
     public int $upgradeTlsCalls = 0;
@@ -97,6 +100,10 @@ final class FakeTransport implements TlsAwareTransportInterface
     public function write(string $bytes): Future
     {
         return async(function () use ($bytes): void {
+            if ($this->throwOnWriteContaining !== null && str_contains($bytes, $this->throwOnWriteContaining)) {
+                throw new TransportClosedException('Simulated write failure');
+            }
+
             $this->writes[] = $bytes;
         });
     }
