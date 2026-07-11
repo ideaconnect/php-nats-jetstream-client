@@ -63,10 +63,10 @@ final class NatsHeaders
             return [];
         }
 
-        $lines = preg_split('/\r\n/', $rawHeaders);
-        if ($lines === false) {
-            return [];
-        }
+        // explode() on the literal CRLF separator produces the exact same pieces (including empties)
+        // as the previous preg_split('/\r\n/') at a fraction of the cost - this runs on the
+        // per-delivery hot path (#139).
+        $lines = explode("\r\n", $rawHeaders);
 
         $headers = [];
         $firstLine = array_shift($lines);
@@ -115,10 +115,10 @@ final class NatsHeaders
             return [];
         }
 
-        $lines = preg_split('/\r\n/', $rawHeaders);
-        if ($lines === false) {
-            return [];
-        }
+        // explode() on the literal CRLF separator produces the exact same pieces (including empties)
+        // as the previous preg_split('/\r\n/') at a fraction of the cost - this runs on the
+        // per-delivery hot path (#139).
+        $lines = explode("\r\n", $rawHeaders);
 
         $headers = [];
         // First line may be either "NATS/1.0" or "NATS/1.0 <status> <description>".

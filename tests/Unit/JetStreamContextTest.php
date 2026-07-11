@@ -2707,7 +2707,7 @@ final class JetStreamContextTest extends TestCase
         ]);
         $message = new NatsMessage('deliver', 1, null, '', $headers);
 
-        self::assertFalse($method->invoke($js, $message)->await());
+        self::assertFalse($method->invoke($js, $message));
     }
 
     public function testHandlePushControlMessageHeartbeatWithoutReplyReturnsTrue(): void
@@ -2723,7 +2723,7 @@ final class JetStreamContextTest extends TestCase
         ]);
         $message = new NatsMessage('deliver', 1, null, '', $headers);
 
-        self::assertTrue($method->invoke($js, $message)->await());
+        self::assertTrue($method->invoke($js, $message));
     }
 
     public function testHandlePushControlMessageRepliesToJetStreamFlowControlSubject(): void
@@ -2741,7 +2741,7 @@ final class JetStreamContextTest extends TestCase
         $headers = "NATS/1.0 100 Idle Heartbeat\r\nStatus: 100\r\nDescription: Idle Heartbeat\r\n\r\n";
         $message = new NatsMessage('deliver', 1, '$JS.FC.ORDERS.token', '', $headers);
 
-        self::assertTrue($method->invoke($js, $message)->await());
+        self::assertTrue($method->invoke($js, $message));
         self::assertStringContainsString('PUB $JS.FC.ORDERS.token 0' . "\r\n\r\n", implode('', $transport->writes));
     }
 
