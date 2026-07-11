@@ -7,6 +7,7 @@ namespace IDCT\NATS\Tests\Unit;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
@@ -169,6 +170,126 @@ final class BatchPublisherTest extends TestCase
         self::assertStringStartsWith('HPUB orders.created _INBOX.', $batchWrites[2]);
         self::assertStringContainsString('Nats-Batch-Sequence:3', $batchWrites[2]);
         self::assertStringContainsString('Nats-Batch-Commit:1', $batchWrites[2]);
+    }
+
+    /**
+     * The intermediates of a multi-message commit are fire-and-forget (nothing is awaited from the
+     * server between them), so they must be coalesced into ONE transport write instead of one
+     * awaited write per message (#138): a 5-message commit performs exactly 3 batch writes - the
+     * start request, one write carrying the byte-identical HPUB frames for sequences 2-4 in order,
+     * and the commit request.
+     */
+    public function testCommitCoalescesIntermediatesIntoSingleWrite(): void
+    {
+        $commitAck = '{"stream":"ORDERS","seq":5,"batch":"b-coalesce","count":5}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Zero-byte ack to the batch-start request (sid 1).
+            "MSG _INBOX.a 1 0\r\n\r\n",
+            // Commit PubAck to the commit request (sid 2).
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $ack = $client->jetStream()->batch('b-coalesce')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->add('orders.created', 'c')
+            ->add('orders.created', 'd')
+            ->add('orders.created', 'e')
+            ->commit()
+            ->await();
+
+        self::assertSame(5, $ack->batchCount);
+        self::assertSame('b-coalesce', $ack->batchId);
+
+        $batchWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'Nats-Batch-Id:'),
+        ));
+
+        // Exactly 3 transport writes carry batch frames: start, ONE coalesced intermediate
+        // write, commit. Per-intermediate writes would make this 5.
+        self::assertCount(3, $batchWrites);
+
+        // START (seq 1): a request (carries an inbox), no commit marker.
+        self::assertStringStartsWith('HPUB orders.created _INBOX.', $batchWrites[0]);
+        self::assertStringContainsString('Nats-Batch-Sequence:1', $batchWrites[0]);
+
+        // The middle write is the byte-exact concatenation of the intermediate frames
+        // (sequences 2-4, payloads b-d, no reply inbox), in staging order.
+        $expected = '';
+        foreach ([[2, 'b'], [3, 'c'], [4, 'd']] as [$sequence, $payload]) {
+            $headerBlock = sprintf(
+                "NATS/1.0\r\nNats-Batch-Id:b-coalesce\r\nNats-Batch-Sequence:%d\r\n\r\n",
+                $sequence,
+            );
+            $expected .= sprintf(
+                "HPUB orders.created %d %d\r\n%s%s\r\n",
+                strlen($headerBlock),
+                strlen($headerBlock) + strlen($payload),
+                $headerBlock,
+                $payload,
+            );
+        }
+        self::assertSame($expected, $batchWrites[1]);
+
+        // Commit (seq 5): a request carrying the commit marker.
+        self::assertStringStartsWith('HPUB orders.created _INBOX.', $batchWrites[2]);
+        self::assertStringContainsString('Nats-Batch-Sequence:5', $batchWrites[2]);
+        self::assertStringContainsString('Nats-Batch-Commit:1', $batchWrites[2]);
+    }
+
+    /**
+     * Coalescing must not lose per-message max_payload enforcement (#138): an oversized
+     * intermediate (headers + payload above the server's advertised max_payload) throws
+     * ProtocolException BEFORE any intermediate reaches the wire - only the already-sent start
+     * frame is written, and no commit is attempted.
+     */
+    public function testOversizedIntermediateThrowsBeforeAnyIntermediateWrite(): void
+    {
+        $transport = new FakeTransport([
+            // The server advertises max_payload 256; enforceMaxPayload() reads this limit.
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":256,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Zero-byte ack to the batch-start request (sid 1); no further replies - the commit
+            // must never be sent.
+            "MSG _INBOX.a 1 0\r\n\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-toolarge')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            // 300-byte payload + batch headers exceeds max_payload 256.
+            ->add('orders.created', str_repeat('x', 300))
+            ->add('orders.created', 'd');
+
+        try {
+            $batch->commit()->await();
+            self::fail('Expected the oversized intermediate to throw');
+        } catch (ProtocolException $e) {
+            self::assertStringContainsString('exceeds server max_payload', $e->getMessage());
+        }
+
+        // Only the start frame reached the wire: the whole intermediate block is validated
+        // before any of it is written, so even the VALID intermediate (seq 2) was not sent.
+        $batchWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'Nats-Batch-Id:'),
+        ));
+        self::assertCount(1, $batchWrites, 'only the start message may reach the wire');
+        self::assertStringContainsString('Nats-Batch-Sequence:1', $batchWrites[0]);
+
+        $allWrites = implode('', $transport->writes);
+        self::assertStringNotContainsString('Nats-Batch-Sequence:2', $allWrites);
+        self::assertStringNotContainsString('Nats-Batch-Commit', $allWrites);
     }
 
     /**

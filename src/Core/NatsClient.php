@@ -105,6 +105,21 @@ final class NatsClient
     }
 
     /**
+     * Publishes a block of header-carrying messages coalesced into bounded segment writes,
+     * preserving frame order and per-message validation (#138).
+     *
+     * @internal Used by BatchPublisher to send atomic-batch intermediates with one wire write per
+     *           segment instead of one awaited write per message; not part of the supported API.
+     *
+     * @param list<array{subject:string,payload:string,headers:array<string,string|list<string>>}> $messages
+     * @return Future<void>
+     */
+    public function publishHeaderBlock(array $messages): Future
+    {
+        return $this->connection->publishHeaderBlock($messages);
+    }
+
+    /**
      * Registers a subscription handler and returns its SID.
      *
      * @param callable(NatsMessage):void $handler

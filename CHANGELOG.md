@@ -44,6 +44,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   replay is now coalesced into O(1) transport writes - one buffer with every SUB (+UNSUB re-arm)
   frame, byte-identical on the wire and in order - followed by a single bounded drain poll, so
   prompt `-ERR` responses still abort the attempt exactly as before.
+- `[bugfix]` `BatchPublisher::commit()` no longer sends each intermediate batch message as its own
+  awaited write (#138): per ADR-50 only the start and commit legs are request/reply, yet every
+  intermediate paid ~1 syscall + 2 fiber hops, so a max-size 1000-message commit burned ~998
+  unnecessary syscalls of pure overhead in the library's designated atomic bulk API. The
+  intermediates are now coalesced into bounded segments (at most 512 KiB per segment, so a
+  1000 x 1MB batch never concatenates into a ~1GB string) and each segment goes out as ONE
+  transport write - byte-identical HPUB frames, same order, same batch headers. Per-message
+  subject and `max_payload` validation now runs for the WHOLE block before any intermediate hits
+  the wire, and the start/commit request legs (including the #130 pre-2.12 guards) are unchanged.
+  Measured against a live 2.12 server: a 1000-message commit (128-byte payloads) dropped from
+  ~55ms to ~21ms median wall time.
 
 ### Fixed
 
