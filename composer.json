@@ -57,7 +57,10 @@
     ],
     "stan": "phpstan analyse",
     "fix": "php-cs-fixer fix",
-    "infection": "bash scripts/run-mutation.sh"
+    "infection": [
+      "Composer\\Config::disableProcessTimeout",
+      "bash scripts/run-mutation.sh"
+    ]
   },
   "scripts-descriptions": {
     "test:everything": "Full verification of code health: PHPStan level 8, then the compose-backed e2e flow (Docker stack up, unit + integration + Behat, stack down). Skips the JWT fixture validity check; run 'composer fixture:jwt:check' separately for that.",

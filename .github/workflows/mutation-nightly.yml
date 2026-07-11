@@ -1,0 +1,40 @@
+name: Nightly Mutation Tests
+
+# Daily full-tree mutation run (issue-driven: the per-push `mutation` job in ci.yml gates changed
+# code; this scheduled run re-scores the WHOLE unit-covered tree every day so drift - new mutants
+# surviving because unrelated code moved, timeout-budget variance on async mutants, or dependency
+# updates - is caught even on days with no pushes).
+on:
+  schedule:
+    # 03:17 UTC daily - off the top of the hour to avoid the GitHub Actions scheduled-job rush.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  mutation-nightly:
+    # Mutation testing runs only on PHP 8.3+ (Infection 0.33 requires it). Infection is NOT in
+    # require-dev - that would block `composer install` on PHP 8.2, which the library still
+    # supports - so this job installs it on the fly into the ephemeral CI checkout (same as the
+    # per-push mutation job in ci.yml).
+    name: Nightly Mutation (PHP 8.3)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.3"
+          extensions: openssl, sodium, zlib, xdebug
+          coverage: xdebug
+      - uses: ramsey/composer-install@v3
+      - name: Install Infection (PHP 8.3+ only; not in require-dev)
+        run: composer require --dev "infection/infection:^0.33" -W --no-interaction
+      - name: Mutation Tests (strict, >= 90% MSI)
+        run: composer infection
+      - name: Upload mutation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: infection-logs
+          path: build/infection/
+          if-no-files-found: ignore
+          retention-days: 14

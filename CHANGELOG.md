@@ -17,6 +17,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-07-11
+
 ### Added
 
 - `[feature]` `NatsOptions::$pingIntervalSeconds` now accepts `int|float`, so sub-second heartbeat
@@ -227,6 +229,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Testing & CI
 
+- `[docs]` New nightly mutation-testing workflow (`mutation-nightly.yml`, 03:17 UTC daily +
+  manual dispatch): re-scores the whole unit-covered tree against the 90% MSI gate every day and
+  uploads the Infection logs as artifacts, catching mutation-score drift between pushes. The
+  `composer infection` script now disables Composer's 300 s process timeout, which killed any
+  full mutation run mid-flight (the full sweep takes ~30 minutes; current score: 91% covered MSI
+  over 5234 mutants at 100% mutation coverage).
 - `[docs]` Test-suite hygiene roundup from the July review (#142), dev-only: deleted
   `testDirectGetBatchDelaysOnZeroFrames`, whose assertions could not fail for its stated purpose
   (the pacing delay was never observed) while burning ~1 s per run - the sibling
