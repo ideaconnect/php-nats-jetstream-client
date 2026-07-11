@@ -1233,6 +1233,12 @@ $client->subscribe('events.>', static function (NatsMessage $message): void {
 $client->drain()->await();
 ```
 
+Note that `disconnect()` and a plain `unsubscribe($sid)` discard any locally queued,
+undelivered messages (nats.go `Close()`/`Unsubscribe()` parity) - messages already received
+from the server but not yet dispatched to a handler are dropped without warning. Use
+`drain()` (whole connection) or `drainSubscription($sid)` (single subscription) as the
+lossless teardown paths: both deliver the buffered backlog first.
+
 ### Ordered Consumer
 
 > 📄 **Runnable example:** [`examples/ordered-consumer.php`](examples/ordered-consumer.php)

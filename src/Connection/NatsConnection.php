@@ -320,6 +320,10 @@ final class NatsConnection
     /**
      * Closes the transport and marks the runtime as closed.
      *
+     * Locally queued, undelivered messages (already parsed and counted in `inMsgs`, awaiting
+     * dispatch) are discarded without being delivered - nats.go Close() parity (#134). Use
+     * {@see drain()} for the lossless path: it delivers the buffered backlog before closing.
+     *
      * @return Future<void>
      */
     public function disconnect(): Future
@@ -610,6 +614,11 @@ final class NatsConnection
      * On a connection that is not open the server cannot be told, but local state is still released
      * without throwing: finally-based inbox cleanup runs on broken connections and must neither leak
      * the subscription entry nor mask the caller's original error (#116).
+     *
+     * A plain unsubscribe (no $maxMessages) discards the sid's locally queued, undelivered backlog -
+     * messages already parsed and counted in `inMsgs` but not yet dispatched to the handler - matching
+     * nats.go Unsubscribe() (#134). Use {@see drainSubscription()} (or a full {@see drain()}) for the
+     * lossless path that delivers the backlog first.
      *
      * @return Future<void>
      */
@@ -2150,8 +2159,11 @@ final class NatsConnection
 
     /**
      * Invokes the configured asynchronous-error listener, swallowing any exception it raises.
+     *
+     * @internal Public only so client-side buffers (SubscriptionQueue slow-consumer drops, #134)
+     *           can report through the same listener/logger; not part of the supported API.
      */
-    private function emitError(\Throwable $error, string $logLevel = 'error'): void
+    public function emitError(\Throwable $error, string $logLevel = 'error'): void
     {
         // Routine, high-frequency conditions (slow-consumer drops) log at debug so they cannot flood
         // error logs on a per-message hot path; genuine errors stay at error level. The error listener

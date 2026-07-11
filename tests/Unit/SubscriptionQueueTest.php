@@ -457,6 +457,63 @@ final class SubscriptionQueueTest extends TestCase
         self::assertSame('b', $messages[1]->payload);
     }
 
+    /**
+     * A DropOldest overflow must not be silent (#134): droppedCount() increments monotonically and
+     * the client's errorListener receives a slow-consumer error, mirroring the connection layer.
+     */
+    public function testEnqueueDropOldestIncrementsDroppedCountAndNotifiesErrorListener(): void
+    {
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $transport = new FakeTransport($this->infoAndPong());
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+        $queue = new SubscriptionQueue($client, 99, 2, SlowConsumerPolicy::DropOldest);
+
+        $queue->enqueue(new NatsMessage('events', 99, null, 'a'));
+        $queue->enqueue(new NatsMessage('events', 99, null, 'b'));
+        self::assertSame(0, $queue->droppedCount(), 'no drop below the cap');
+
+        $queue->enqueue(new NatsMessage('events', 99, null, 'c')); // over cap (2) -> drops oldest ('a')
+        self::assertSame(1, $queue->droppedCount());
+
+        $queue->enqueue(new NatsMessage('events', 99, null, 'd')); // drops 'b' -> counter is monotonic
+        self::assertSame(2, $queue->droppedCount());
+
+        self::assertCount(2, $errors);
+        self::assertStringContainsString('Slow consumer on sid 99', $errors[0]->getMessage());
+        self::assertStringContainsString('dropped oldest message', $errors[0]->getMessage());
+    }
+
+    /**
+     * A DropNewest overflow must not be silent (#134): the discarded (never-enqueued) message still
+     * increments droppedCount() and reaches the client's errorListener.
+     */
+    public function testEnqueueDropNewestIncrementsDroppedCountAndNotifiesErrorListener(): void
+    {
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $transport = new FakeTransport($this->infoAndPong());
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+        $queue = new SubscriptionQueue($client, 99, 2, SlowConsumerPolicy::DropNewest);
+
+        $queue->enqueue(new NatsMessage('events', 99, null, 'a'));
+        $queue->enqueue(new NatsMessage('events', 99, null, 'b'));
+        self::assertSame(0, $queue->droppedCount(), 'no drop below the cap');
+
+        $queue->enqueue(new NatsMessage('events', 99, null, 'c')); // over cap (2) -> 'c' is discarded
+        self::assertSame(1, $queue->droppedCount());
+
+        self::assertCount(1, $errors);
+        self::assertStringContainsString('Slow consumer on sid 99', $errors[0]->getMessage());
+        self::assertStringContainsString('dropped newest message', $errors[0]->getMessage());
+    }
+
     public function testUnsubscribeSendsUnsubForOwnSid(): void
     {
         $transport = new FakeTransport($this->infoAndPong());

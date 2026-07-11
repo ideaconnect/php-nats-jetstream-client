@@ -57,6 +57,10 @@ final class NatsClient
     /**
      * Closes the active connection and releases underlying transport resources.
      *
+     * Locally queued, undelivered messages are discarded without being delivered - nats.go
+     * Close() parity (#134). Use {@see drain()} for the lossless path: it delivers the buffered
+     * backlog before closing.
+     *
      * @return Future<void>
      */
     public function disconnect(): Future
@@ -163,6 +167,10 @@ final class NatsClient
      * automatically - matching the server-side `UNSUB <sid> <max>` semantics (#112). On a connection
      * that is not open, local state is released silently instead of throwing (#116).
      *
+     * A plain unsubscribe (no $maxMessages) discards the sid's locally queued, undelivered backlog -
+     * nats.go Unsubscribe() parity (#134). Use {@see drainSubscription()} (or a full {@see drain()})
+     * for the lossless path that delivers the backlog first.
+     *
      * @return Future<void>
      */
     public function unsubscribe(int $sid, ?int $maxMessages = null): Future
@@ -190,6 +198,17 @@ final class NatsClient
     public function processIncoming(?Cancellation $cancellation = null): Future
     {
         return $this->connection->processIncoming($cancellation);
+    }
+
+    /**
+     * Routes an asynchronous error through the connection's error listener and logger.
+     *
+     * @internal Used by SubscriptionQueue to surface slow-consumer drops (#134); not part of the
+     *           supported API.
+     */
+    public function emitError(\Throwable $error, string $logLevel = 'error'): void
+    {
+        $this->connection->emitError($error, $logLevel);
     }
 
     /**

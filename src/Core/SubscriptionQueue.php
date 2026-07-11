@@ -32,6 +32,9 @@ final class SubscriptionQueue
     private SplQueue $messages;
     private float $timeout = 0;
 
+    /** Monotonic count of messages discarded by the slow-consumer policy; never resets. */
+    private int $droppedCount = 0;
+
     /**
      * @param NatsClient $client Client used to drive processIncoming polling while waiting for queued deliveries.
      * @param int $sid Subscription ID backing this queue instance.
@@ -58,9 +61,19 @@ final class SubscriptionQueue
         $limit = max(1, $this->maxPending);
 
         if ($this->messages->count() >= $limit) {
+            // A drop must never be silent (#134): this queue is where connection-level drains land
+            // for polling consumers, so overflow here is the real slow-consumer signal. Count it and
+            // route it through the client's error listener exactly like the connection layer does
+            // for its own queue (same message shape, same debug level - drops are a per-message hot
+            // path and must not flood error logs).
             if ($this->slowConsumerPolicy === SlowConsumerPolicy::DropOldest) {
                 $this->messages->dequeue();
+                $this->droppedCount++;
+                $this->client->emitError(new NatsException('Slow consumer on sid ' . $this->sid . ': dropped oldest message'), 'debug');
             } elseif ($this->slowConsumerPolicy === SlowConsumerPolicy::DropNewest) {
+                $this->droppedCount++;
+                $this->client->emitError(new NatsException('Slow consumer on sid ' . $this->sid . ': dropped newest message'), 'debug');
+
                 return;
             } else {
                 throw new NatsException('Subscription queue overflow for sid ' . $this->sid);
@@ -68,6 +81,16 @@ final class SubscriptionQueue
         }
 
         $this->messages->enqueue($message);
+    }
+
+    /**
+     * Monotonic count of messages this queue has discarded under the slow-consumer policy
+     * (DropOldest dequeues and DropNewest rejections). Never resets for the lifetime of the
+     * queue, so applications can detect delivery gaps by observing increases (#134).
+     */
+    public function droppedCount(): int
+    {
+        return $this->droppedCount;
     }
 
     /**

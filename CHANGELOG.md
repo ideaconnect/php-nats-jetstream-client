@@ -19,6 +19,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` `SubscriptionQueue` slow-consumer drops are no longer silent (#134): an overflow under
+  `DropOldest`/`DropNewest` now reports through the client's `errorListener` and logger with the
+  same "Slow consumer on sid ..." debug-level signal the connection layer already emits for its own
+  queue, and a new monotonic `SubscriptionQueue::droppedCount()` lets polling consumers detect
+  delivery gaps. This matters because for `subscribeQueue()` consumers the connection queue drains
+  into this second-level queue on every `processIncoming()` cycle - so this is where real overflow
+  lands, and it previously produced no signal anywhere. The `Error` policy is unchanged (it already
+  throws).
 - `[bugfix]` Resource-release roundup from the July review (#133): `keyValue()`/`objectStore()`
   no longer memoize bucket wrappers - the per-name cache had no eviction (not even
   `deleteBucket()`), so a long-lived client touching many bucket names (e.g. one per tenant)
@@ -145,6 +153,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Documentation
 
+- `[docs]` `disconnect()` and plain `unsubscribe()` docblocks (connection and client facade) plus
+  the README drain section now state that locally queued, undelivered messages are discarded
+  (intentional nats.go `Close()`/`Unsubscribe()` parity) and name `drain()`/`drainSubscription()`
+  as the lossless teardown paths (#134). No behavior change.
 - `[docs]` The README "NATS Server Version Requirements" section now states the real server floor:
   core NATS works against any server, but all JetStream consumer helpers use the 2.9+ named
   `CONSUMER.CREATE` API with no fallback to the legacy `DURABLE.CREATE` form, so consumer
