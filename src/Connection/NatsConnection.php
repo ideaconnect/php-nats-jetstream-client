@@ -766,19 +766,46 @@ final class NatsConnection
                 return 0;
             }
 
-            foreach ($frames as $frame) {
-                $this->handleFrame($frame);
-            }
-
             // Note: the outstanding-ping counter is reset only when an actual PONG is handled (see
             // handleFrame), not on any inbound bytes - otherwise a server that stops answering PINGs
             // but still trickles data would never trip maxPingsOut and the watchdog could not escalate.
-
-            // Drain buffered deliveries after each chunk to preserve wire-order delivery.
-            $this->drainAllPending();
+            try {
+                $this->dispatchFrames($frames);
+            } finally {
+                // Drain buffered deliveries after each chunk to preserve wire-order delivery - even
+                // when a frame failed to dispatch: the messages are already enqueued and their bytes
+                // consumed, so they must not wait behind (or be lost to) the surfacing error.
+                $this->drainAllPending();
+            }
 
             return count($frames);
         });
+    }
+
+    /**
+     * Dispatches parsed frames, containing per-frame failures so one frame cannot abort delivery
+     * of the frames parsed from the same chunk: the parser has already consumed the bytes, so an
+     * undispatched trailing frame is unrecoverable (core NATS does not resend, and a reconnect
+     * replays SUBs, not missed messages) (#128). The first failure is rethrown after every frame
+     * has been dispatched, preserving fatal -ERR / write-failure semantics for the caller.
+     *
+     * @param list<ProtocolFrame> $frames
+     */
+    private function dispatchFrames(array $frames): void
+    {
+        $firstError = null;
+
+        foreach ($frames as $frame) {
+            try {
+                $this->handleFrame($frame);
+            } catch (\Throwable $e) {
+                $firstError ??= $e;
+            }
+        }
+
+        if ($firstError !== null) {
+            throw $firstError;
+        }
     }
 
     /**
@@ -1512,14 +1539,10 @@ final class NatsConnection
                 return;
             }
 
-            $frames = $this->parser->push($chunk);
-            foreach ($frames as $frame) {
-                if ($frame->type === ProtocolFrameType::Ok) {
-                    continue;
-                }
-
-                $this->handleFrame($frame);
-            }
+            // Per-frame containment (#128): a prompt -ERR still aborts this reconnect attempt (the
+            // first failure rethrows after the loop), but sibling MSG frames from the same chunk
+            // are enqueued first instead of being discarded. handleFrame() ignores +OK frames.
+            $this->dispatchFrames($this->parser->push($chunk));
         }
     }
 
@@ -2025,20 +2048,33 @@ final class NatsConnection
             return;
         }
 
+        $dispatchError = null;
         try {
-            foreach ($this->parser->push($chunk) as $frame) {
-                $this->handleFrame($frame);
+            $frames = $this->parser->push($chunk);
+
+            try {
+                $this->dispatchFrames($frames);
+            } catch (\Throwable $e) {
+                // Contained per frame (#128): the sibling MSG frames are already enqueued below.
+                $dispatchError = $e;
             }
 
-            // The PONG handled above (handleFrame) resets the outstanding-ping counter; do not reset
-            // on any other frame, so an unresponsive server still trips maxPingsOut.
+            // The PONG handled above (dispatchFrames) resets the outstanding-ping counter; do not
+            // reset on any other frame, so an unresponsive server still trips maxPingsOut.
 
             // Deliver any message frames captured during the heartbeat read instead of leaving
             // them buffered until the next processIncoming(), mirroring processIncoming().
             $this->drainAllPending();
         } catch (\Throwable) {
-            // A fatal frame surfaced during the heartbeat read; let the next user read / tick
-            // surface and act on it rather than throwing out of the event-loop timer.
+            // A parse failure or a handler error during the drain; leave escalation to the next
+            // user read / tick rather than throwing out of the event-loop timer.
+        }
+
+        if ($dispatchError !== null) {
+            // Previously a fatal frame (e.g. a server -ERR) observed during the heartbeat read was
+            // swallowed whole. Surface it through the error listener (#128); escalation still
+            // belongs to the next user read / tick, not to the event-loop timer.
+            $this->emitError($dispatchError);
         }
     }
 

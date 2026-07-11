@@ -426,6 +426,9 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testSlowConsumerDropOldestPolicy` - With maxPending=1 and DropOldest, only the newest message ("second") is delivered.
 - `testSlowConsumerDropNewestPolicy` - With maxPending=1 and DropNewest, only the earliest message ("first") is delivered.
 - `testSlowConsumerErrorPolicyThrows` - With maxPending=1 and Error policy, an overflow throws ConnectionException ("Subscription queue overflow").
+- `testSlowConsumerErrorOnOneSidDoesNotDiscardSiblingFrames` - An Error-policy overflow on one sid no longer discards same-chunk frames for other sids: siblings are delivered, then the overflow surfaces (#128).
+- `testServerPingWithFailingPongWriteStillDeliversCoChunkedMessages` - A failing PONG reply to a server PING does not discard same-chunk MSG frames; the write failure surfaces after dispatch (#128).
+- `testHeartbeatReadSurfacesFatalErrAndDeliversCoChunkedMessages` - A fatal -ERR consumed by the heartbeat self-read is no longer swallowed: co-chunked messages are delivered and the error surfaces via the errorListener (#128).
 - `testRequestReturnsFirstReplyMessage` - request() returns the first reply payload and emits SUB inbox, PUB with reply subject, then UNSUB.
 - `testRequestReturnsReplyDeliveredOnSameTickAsTimeout` - A reply delivered in the same processIncoming() tick the deadline fires is returned rather than discarded as a timeout (completion-vs-timeout race).
 - `testRequestTimesOutWithoutReply` - request() raises TimeoutException ("Request timed out") when no reply arrives and still emits UNSUB.

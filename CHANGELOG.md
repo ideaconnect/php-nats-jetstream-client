@@ -19,6 +19,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` An exception while handling one inbound frame no longer discards the frames already
+  parsed from the same chunk. The parser has consumed the bytes, so an undispatched trailing frame
+  was silently and permanently lost (core NATS does not resend) - e.g. a slow-consumer overflow on
+  one subscription (Error policy) destroyed messages for healthy sibling subscriptions delivered
+  in the same TCP chunk, and a failing PONG reply destroyed the messages behind the server PING.
+  Dispatch is now contained per frame: every frame is handled, buffered deliveries are drained,
+  and the first failure surfaces afterwards. The heartbeat self-read additionally reports a fatal
+  frame (e.g. a server `-ERR`) through the `errorListener` instead of swallowing it whole (#128).
 - `[bugfix]` Every terminal transition to `Closed` now releases per-connection runtime state
   (subscription registry and handler closures, queued messages, counters, parser bytes, reconnect
   buffer) - previously only user `disconnect()`/`drain()` did. An exhausted reconnect or a
