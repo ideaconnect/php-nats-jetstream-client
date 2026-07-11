@@ -497,6 +497,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testPublishRejectsSubjectWithWhitespace` - publish() with whitespace in the subject throws ProtocolException ("Subject must not contain whitespace").
 - `testPublishRejectsWildcardSubject` - publish() with a "*" wildcard subject throws ProtocolException ("Wildcards are not allowed in publish subjects").
 - `testPublishRejectsEmptyTokenInSubject` - publish() with an empty token ("foo..bar") throws ProtocolException ("Subject must not contain empty tokens").
+- `testPublishSubjectCacheDoesNotBypassValidationForNewInvalidSubject` - After a valid subject is cached in the validated-subject memo (#136), including a repeat publish hitting the memo, a NEW invalid subject ("cache..invalid") still throws ProtocolException - the memo is keyed per subject and never bypasses validation.
 - `testPublishRejectsFullWildcardToken` - publish() with a ">" token throws ProtocolException ("Wildcards are not allowed in publish subjects").
 - `testSubscribeAcceptsWildcardSubject` - subscribe() accepts "*" and ">" wildcard subjects, returning sequential SIDs 1 and 2.
 - `testSubscribeRejectsGreaterThanNotInLastToken` - subscribe() with ">" not in the last token throws ProtocolException ("Wildcard \">\" must be the last token").

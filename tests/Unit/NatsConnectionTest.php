@@ -3456,6 +3456,33 @@ final class NatsConnectionTest extends TestCase
         $connection->publish('foo..bar', 'data')->await();
     }
 
+    /**
+     * Verifies the validated-subject memo (#136) is keyed per subject: caching a valid subject
+     * (including a repeat publish that hits the memo) must not let a NEW invalid subject bypass
+     * validation.
+     */
+    public function testPublishSubjectCacheDoesNotBypassValidationForNewInvalidSubject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // Prime the memo, then publish again through the memo-hit path.
+        $connection->publish('cache.valid', 'data')->await();
+        $connection->publish('cache.valid', 'data')->await();
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('Subject must not contain empty tokens');
+        $connection->publish('cache..invalid', 'data')->await();
+    }
+
     public function testPublishRejectsFullWildcardToken(): void
     {
         $transport = new FakeTransport([

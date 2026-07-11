@@ -26,6 +26,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   when it frees; `requestMany()` waiters additionally wake per delivery so stall detection is
   unchanged. Measured with 200 concurrent requests idling 300ms against a live server: CPU time
   dropped from 425ms (a full core for the whole window) to 92ms (#135).
+- `[bugfix]` The outbound hot path no longer stacks 2-3 `async()` fiber hops per message (#136):
+  transport `write()` runs inline in the caller's fiber and returns an already-resolved future
+  (failures still surface through the future, never as a synchronous throw, so the #124 error
+  contract is unchanged), and the JetStream ack/nak/term/inProgress helper returns the publish
+  future directly instead of wrapping a third fiber around a replyTo null-check. Publish and
+  request-target subjects are also memoized after first validation (bounded at 512 entries, full
+  reset at the cap) so repeat publishes skip the regex + per-token scan; per-request reply inboxes
+  are never cached. Measured against a live server: 50k serial small publishes went from ~4.5s
+  wall / ~4.4s CPU (~11k msg/s) to ~3.9s / ~3.8s (~13k msg/s), and a 5k serial JetStream
+  fetch-and-ack loop from ~1.0s wall / ~0.9s CPU (~4.9k acks/s) to ~0.5s / ~0.5s (~9.2k acks/s).
 
 ### Fixed
 
