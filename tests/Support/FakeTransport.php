@@ -36,6 +36,9 @@ final class FakeTransport implements TlsAwareTransportInterface
     /** When set, write() throws a TransportClosedException for bytes containing this substring. */
     public ?string $throwOnWriteContaining = null;
 
+    /** When > 0, close() suspends this many seconds before completing (see close()). */
+    public float $closeDelay = 0.0;
+
     public bool $closed = false;
 
     public int $upgradeTlsCalls = 0;
@@ -158,6 +161,12 @@ final class FakeTransport implements TlsAwareTransportInterface
     public function close(): Future
     {
         return async(function (): void {
+            if ($this->closeDelay > 0) {
+                // Models a slow socket teardown so tests can interleave fibers inside a terminal
+                // path's close await (the window probed by #146's publish-race regression test).
+                delay($this->closeDelay);
+            }
+
             $this->closed = true;
         });
     }

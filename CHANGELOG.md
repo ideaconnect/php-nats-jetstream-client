@@ -25,7 +25,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `subscriptions`/`subscriptionMeta`/`pendingMessages` (handler closures and payload bytes)
   survived the close, so a later manual `connect()` could deliver frames carrying the dead
   epoch's sids to stale handlers. The `Reconnect is disabled` exception and Closed-event
-  semantics are unchanged (#146).
+  semantics are unchanged. `bufferFrame()` additionally refuses publishes once the state is
+  Closed, so a publish racing a terminal path's transport-close await fails loudly with
+  `Connection is not open` instead of buffering bytes the state release would silently
+  discard (#146).
 
 ## [2.5.1] - 2026-07-11
 
