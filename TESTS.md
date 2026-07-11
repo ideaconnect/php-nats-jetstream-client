@@ -48,6 +48,7 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testCountReturnsNumberOfStagedMessages` - `count()` returns 0 initially and increments to 1 then 2 as messages are added.
 - `testBatchIdReturnsConstructedId` - `batchId()` returns the id passed to the constructor ("my-explicit-id").
 - `testDoubleCommitThrows` - First `commit()` succeeds (batchCount=1); a second `commit()` throws `JetStreamException` ("Batch already committed").
+- `testCommitReleasesStagedPayloads` - `commit()` releases the staged payloads: the internal `messages` array is empty afterwards (reflection) and `count()` returns 0, while the full 3-message wire exchange still happens (#133).
 - `testNonJsonStartReplyTreatedAsAccepted` - A non-empty, non-JSON start reply ("OK") is treated as accepted so publish continues, and the commit ack parses correctly (batchCount=2, batchId="batch-nonjson").
 - `testMalformedCommitAckThrows` - A non-JSON commit ack reply throws `JetStreamException` ("Malformed atomic batch commit ack").
 
@@ -94,8 +95,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testStreamCrud` - createStream/getStream/deleteStream map to CREATE/INFO/DELETE endpoints and return expected name/subjects/success.
 - `testJetStreamApiErrorMapping` - an API error payload on getStream() surfaces as a JetStreamException with the error description.
 - `testJetStreamContextIsCached` - jetStream() returns the same cached JetStreamContext instance on repeated calls.
-- `testObjectStoreContextIsCachedPerBucket` - objectStore() returns the same instance per bucket name and a different one per distinct bucket.
-- `testKeyValueContextIsCachedPerBucket` - keyValue() returns a cached KeyValueBucket per bucket and a different one per distinct bucket.
+- `testObjectStoreConstructsEquivalentBucketPerCall` - objectStore() builds a fresh, equal-by-value ObjectStoreBucket per call (no memoization, nothing retained on the context) with the correct backing stream per bucket name (#133).
+- `testKeyValueConstructsEquivalentBucketPerCall` - keyValue() builds a fresh, equal-by-value KeyValueBucket per call (no memoization, nothing retained on the context) with the correct backing stream per bucket name (#133).
 - `testPullConsumerReturnsIterator` - pullConsumer() returns a PullConsumerIterator instance.
 - `testConsumerCrud` - createConsumer/getConsumer/deleteConsumer map to CONSUMER CREATE/INFO/DELETE and return expected stream/name/success.
 - `testCreateConsumerWithFilterSubjects` - createConsumer() with a filter_subjects array sends filter_subjects and omits the singular filter_subject.
@@ -456,6 +457,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testRandomizeServersDialsFromPool` - With randomizeServers on, the first dial still targets one of the configured pool members (#55).
 - `testRetryOnFailedInitialConnectSucceedsAfterRetry` - retryOnFailedInitialConnect retries the first connect (reconnect disabled) until Open, with >= 2 connect attempts (#56).
 - `testFailedInitialConnectThrowsWithoutRetryOption` - A failed first connect throws ConnectionException when both retryOnFailedInitialConnect and reconnect are off (#56).
+- `testTerminalInitialConnectFailureClosesTransportSocket` - A terminal initial-connect failure (reconnect and initial-retry off) closes the transport socket best-effort instead of leaving the dialed fd open until GC (#133).
+- `testReconnectExhaustionClosesLastAttemptSocket` - Exhausted recovery closes the LAST attempt's socket (attempts + 1 close calls in total): per-attempt closes happen only at each attempt's start, so the terminal exit must add the final close (#133).
 - `testConnectExtractsUrlCredentials` - Credentials in the server URL are stripped from the dialed DSN and applied as user/pass in the CONNECT payload (#37).
 - `testRequestUsesConfiguredInboxPrefix` - request() uses the configured inbox prefix for both the SUB and the PUB reply subject.
 - `testRequestRejectsNonPositiveTimeout` - request() with timeout 0 throws TimeoutException ("Request timeout must be greater than zero").

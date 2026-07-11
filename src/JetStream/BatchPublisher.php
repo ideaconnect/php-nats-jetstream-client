@@ -66,7 +66,8 @@ final class BatchPublisher
     }
 
     /**
-     * Number of messages currently staged.
+     * Number of messages currently staged. commit() releases the staged payloads, so this returns
+     * 0 once the batch is committed (#133).
      */
     public function count(): int
     {
@@ -99,7 +100,15 @@ final class BatchPublisher
 
             $this->committed = true;
 
-            $total = count($this->messages);
+            // Release the staged payloads before sending: once committed they are pure dead weight
+            // (add() rejects a committed batch), yet an app retaining the publisher - e.g. keyed by
+            // batchId() to correlate acks - would otherwise pin up to MAX_MESSAGES full payloads for
+            // the object's lifetime (#133). count() therefore reports 0 after commit(). The local
+            // copy preserves the exact send behavior below.
+            $messages = $this->messages;
+            $this->messages = [];
+
+            $total = count($messages);
             $lastIndex = $total - 1;
 
             // Per ADR-50 the batch START (sequence 1) is a request: the server replies with a zero-byte
@@ -107,7 +116,7 @@ final class BatchPublisher
             // so the client learns immediately instead of blindly publishing the whole batch. For a
             // single-message batch the lone message is both start and commit (handled below).
             if ($total > 1) {
-                $first = $this->messages[0];
+                $first = $messages[0];
                 $startReply = $this->client->requestWithHeaders(
                     $first['subject'],
                     $first['payload'],
@@ -118,7 +127,7 @@ final class BatchPublisher
                 // Intermediate messages (2..n-1) are fire-and-forget; the server stages them by batch
                 // id. Writes are serialized on the single connection, so they arrive in sequence order.
                 for ($i = 1; $i < $lastIndex; ++$i) {
-                    $message = $this->messages[$i];
+                    $message = $messages[$i];
                     $this->client->publishWithHeaders(
                         $message['subject'],
                         $message['payload'],
@@ -129,7 +138,7 @@ final class BatchPublisher
 
             // The final message carries Nats-Batch-Commit and is sent request/reply; the server commits
             // the whole batch and returns a single PubAck (batch id + committed count).
-            $final = $this->messages[$lastIndex];
+            $final = $messages[$lastIndex];
             $reply = $this->client->requestWithHeaders(
                 $final['subject'],
                 $final['payload'],
