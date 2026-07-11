@@ -94,6 +94,11 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testGetLastMessageForSubject` - getLastMessageForSubject() requests STREAM.MSG.GET with last_by_subj and parses the stored subject/payload.
 - `testGetLastMessageForSubjectRejectsWildcard` - getLastMessageForSubject() throws JetStreamException ("non-wildcard") for a wildcard subject.
 - `testCreateOrUpdateStreamFallsBackToUpdate` - createOrUpdateStream() retries with STREAM.UPDATE after a CREATE "already in use" error and returns the updated stream.
+- `testApiErrorEnvelopeExposesErrCode` - a JetStream API error envelope's err_code (10059) is exposed via getErrCode() while getCode() keeps the HTTP-like 404 (#154).
+- `testPublishExpectationMismatchExposesErrCode` - a publish-expectation error ack exposes err_code 10071 via getErrCode(); an envelope without err_code yields null (#154).
+- `testCreateOrUpdateStreamFallsBackToUpdateByErrCode` - createOrUpdateStream() falls back to STREAM.UPDATE on err_code 10058 even when the description shares no wording with "already in use" (#154).
+- `testCreateOrUpdateStreamRethrowsWhenErrCodeIsNotStreamNameInUse` - createOrUpdateStream() trusts a present err_code over a misleading "already in use" description (err_code 10065) and re-throws instead of updating (#154).
+- `testCreateOrUpdateStreamFallsBackToUpdateWithoutErrCode` - createOrUpdateStream() still falls back to STREAM.UPDATE via the "already in use" substring when the envelope carries no err_code (old servers) (#154).
 - `testStreamCrud` - createStream/getStream/deleteStream map to CREATE/INFO/DELETE endpoints and return expected name/subjects/success.
 - `testJetStreamApiErrorMapping` - an API error payload on getStream() surfaces as a JetStreamException with the error description.
 - `testJetStreamContextIsCached` - jetStream() returns the same cached JetStreamContext instance on repeated calls.
@@ -267,6 +272,9 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testPutGetDelete` - put/get/delete round-trip parses values correctly and uses the right subjects (PUB for put, DIRECT.GET for get, HPUB with KV-Operation:DEL for delete).
 - `testCreateKeySucceedsWhenAbsent` - createKey() on an absent key publishes with Nats-Expected-Last-Subject-Sequence:0 and returns the ack (#19).
 - `testCreateKeyThrowsWhenKeyExists` - createKey() throws JetStreamException "Key already exists" when the wrong-last-sequence ack is followed by a get() showing a live value (#19).
+- `testCreateKeyDetectsWrongLastSequenceByErrCode` - createKey() detects the wrong-last-sequence rejection by err_code 10071 even when the description shares no wording with "wrong last sequence" (#154).
+- `testCreateKeyDetectsWrongLastSequenceWithoutErrCode` - createKey() still detects wrong-last-sequence via the description substring when the envelope carries no err_code (old servers) (#154).
+- `testCreateKeyExistsExceptionCarriesBothCodes` - the "Key already exists" collision exception carries the HTTP-like 400 in getCode() and the API err_code 10071 in getErrCode() (#154).
 - `testCreateWithMirrorTranslatesBucketName` - create() with a mirror translates the mirror bucket name to KV_src, emits an empty subjects list, and targets STREAM.CREATE.KV_dst (#62).
 - `testCreateWithSourcesAndExtendedConfig` - create() with sources translates each source name to KV_b1/KV_b2 and passes through compression and placement config (#62).
 - `testGetRevisionReturnsEntryAtSequence` - getRevision() reads a specific sequence via STREAM.MSG.GET (with "seq":2) and returns the entry at revision 2 (#33).
@@ -1020,7 +1028,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testStreamAndConsumerNames` - `streamNames()` (with and without a subject filter) lists the created stream and `consumerNames($stream)` returns exactly `[$consumer]`.
 - `testGetLastMessageForSubjectLive` - `getLastMessageForSubject` returns the most recent message for a subject (`second-a`) with the matching subject across a wildcard stream.
 - `testCreateOrUpdateStreamUpserts` - `createOrUpdateStream` creates the stream first then upserts it, updating the subject set from `['...one']` to `['...one','...two']` without an "already in use" error.
-- `testKeyValueCreateKeyIsExclusive` - KV `createKey` succeeds first (seq>=1) but a second `createKey` on the live key throws `JetStreamException`; the value remains the first write.
+- `testKeyValueCreateKeyIsExclusive` - KV `createKey` succeeds first (seq>=1) but a second `createKey` on the live key throws `JetStreamException` carrying getCode() 400 and getErrCode() 10071 (#154); the value remains the first write.
 - `testKeyValueKeysListsLiveKeys` - `keys()` returns live key names excluding a deleted key (`['alpha','gamma']`) and `listKeys()` returns the same result.
 - `testKeyValueWatchOptionsReplayHistoryAndSignalCaughtUp` - `watch` with `ignoreDeletes` and an `onCaughtUp` callback replays last-per-subject history (delivers live `one='A'`, suppresses the deleted `two`) and fires onCaughtUp after the initial replay.
 - `testObjectStoreUpdateMetaRenames` - `updateMeta` renames an object (`logo.bin`->`brand.bin`) with new metadata without re-uploading; the new name resolves with original bytes and the old name is tombstoned (`deleted` true).

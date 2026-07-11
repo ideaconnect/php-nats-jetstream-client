@@ -48,7 +48,7 @@ final class FeatureSupport
      * feature, returns an {@see UnsupportedFeatureException} to throw; otherwise null (so the caller
      * raises the ordinary error).
      */
-    public static function unsupportedFromApiError(string $description, int $code, ?string $serverVersion): ?UnsupportedFeatureException
+    public static function unsupportedFromApiError(string $description, int $code, ?string $serverVersion, ?int $errCode = null): ?UnsupportedFeatureException
     {
         // A strict-JSON server rejects an unrecognized stream/consumer config field as: unknown field "X"
         if (preg_match('/unknown field ["\']([^"\']+)["\']/i', $description, $matches) !== 1) {
@@ -75,6 +75,7 @@ final class FeatureSupport
                 $description,
             ),
             $code,
+            errCode: $errCode,
         );
     }
 }

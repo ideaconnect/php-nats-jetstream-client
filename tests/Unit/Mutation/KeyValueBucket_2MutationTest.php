@@ -97,8 +97,10 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         } catch (JetStreamException $e) {
             // kills Concat + ConcatOperandRemoval @ 465 - message is exactly "<prefix><key>", not reordered/truncated.
             self::assertSame('Key already exists: theme', $e->getMessage());
-            // kills IncrementInteger + DecrementInteger @ 465 - the err code is exactly 10071, not 10070/10072.
-            self::assertSame(10071, $e->getCode());
+            // kills IncrementInteger + DecrementInteger @ 465 - the codes are exactly 400 (HTTP-like)
+            // and 10071 (API err_code, #154), not off by one.
+            self::assertSame(400, $e->getCode());
+            self::assertSame(10071, $e->getErrCode());
         }
     }
 

@@ -281,14 +281,27 @@ final class JetStreamContext
             try {
                 return $this->createStream($name, $subjects, $options)->await();
             } catch (JetStreamException $e) {
-                // "stream name already in use" (err_code 10058): the stream exists, so update it instead.
-                if (stripos($e->getMessage(), 'already in use') === false) {
+                if (!self::isStreamNameInUseError($e)) {
                     throw $e;
                 }
 
                 return $this->updateStream($name, array_merge($options, ['subjects' => $subjects]))->await();
             }
         });
+    }
+
+    /**
+     * Whether a stream-create rejection means "stream name already in use" (err_code 10058), i.e. the
+     * stream exists. Falls back to description wording only when the envelope carried no err_code
+     * (an old server) - wording changes between server versions (#154).
+     */
+    private static function isStreamNameInUseError(JetStreamException $e): bool
+    {
+        if ($e->getErrCode() !== null) {
+            return $e->getErrCode() === ApiErrCode::STREAM_NAME_IN_USE;
+        }
+
+        return stripos($e->getMessage(), 'already in use') !== false;
     }
 
     /**
@@ -1476,6 +1489,7 @@ final class JetStreamContext
             $this->throwApiError(
                 (string) ($error['description'] ?? 'JetStream publish error'),
                 (int) ($error['code'] ?? 0),
+                ApiErrCode::fromEnvelope($error),
             );
         }
 
@@ -1552,6 +1566,7 @@ final class JetStreamContext
             $this->throwApiError(
                 (string) ($error['description'] ?? 'JetStream counter error'),
                 (int) ($error['code'] ?? 0),
+                ApiErrCode::fromEnvelope($error),
             );
         }
 
@@ -2121,6 +2136,7 @@ final class JetStreamContext
             $this->throwApiError(
                 (string) ($error['description'] ?? 'JetStream API error'),
                 (int) ($error['code'] ?? 0),
+                ApiErrCode::fromEnvelope($error),
             );
         }
 
@@ -2132,10 +2148,10 @@ final class JetStreamContext
      * when the server's response shows the failure is a version-gated feature this server is too old for
      * (e.g. an `unknown field "allow_atomic"` rejection). Reactive only - no per-request version probe.
      */
-    private function throwApiError(string $description, int $code): never
+    private function throwApiError(string $description, int $code, ?int $errCode = null): never
     {
-        throw FeatureSupport::unsupportedFromApiError($description, $code, $this->serverVersion())
-            ?? new JetStreamException($description, $code);
+        throw FeatureSupport::unsupportedFromApiError($description, $code, $this->serverVersion(), $errCode)
+            ?? new JetStreamException($description, $code, null, $errCode);
     }
 
     /**

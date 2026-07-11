@@ -265,10 +265,10 @@ final class KeyValueBucket_3MutationTest extends TestCase
      * so only the `=== 10071` branch can recognise it. Real code proceeds to get()/recreate and
      * succeeds; shifting the constant to 10070/10072 makes createKey re-throw instead.
      */
-    public function testCreateKeyRecognisesWrongLastSequenceByCode10071(): void
+    public function testCreateKeyRecognisesWrongLastSequenceByErrCode10071(): void
     {
-        // kills DecrementInteger @ 778 (10071 -> 10070), IncrementInteger @ 778 (10071 -> 10072)
-        $firstPutErr = '{"error":{"code":10071,"description":"precondition not met"}}'; // no "wrong last sequence" text
+        // kills DecrementInteger + IncrementInteger on the 10071 constant (10070/10072 would rethrow)
+        $firstPutErr = '{"error":{"code":400,"err_code":10071,"description":"precondition not met"}}'; // no "wrong last sequence" text (#154)
         $secondPutAck = '{"stream":"KV_cfg","seq":8,"duplicate":false}';
 
         $transport = new FakeTransport($this->queue(
