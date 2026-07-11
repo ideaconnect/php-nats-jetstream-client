@@ -19,6 +19,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` A `NatsConnection` abandoned without `disconnect()`/`drain()` is now garbage-collectable:
+  the ping timer's repeat closure previously bound `$this` strongly, so the event loop rooted the
+  whole connection graph forever - the open socket, every subscription handler closure, and all
+  buffers leaked per abandoned client, and the zombie timer kept PINGing and even delivering
+  messages to abandoned handlers (stealing queue-group deliveries from live workers). The timer
+  now holds the connection through a `WeakReference` and cancels itself once the application drops
+  its last reference, and a new destructor cancels the heartbeat and closes the socket
+  best-effort (#126).
 - `[bugfix]` The reconnect handshake now starts from a clean protocol parser. Previously the new
   connection's INFO/PONG bytes were fed into the parser state left by the dead connection; after a
   drop mid-message-payload the pending frame swallowed each attempt's INFO as phantom payload
