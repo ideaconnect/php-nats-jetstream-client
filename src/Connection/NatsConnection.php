@@ -1385,6 +1385,18 @@ final class NatsConnection
         }
 
         $this->state = ConnectionState::Closed;
+
+        // Publishes buffered during the outage already reported success to their callers;
+        // abandoning them must be loud, and the buffer must not survive into a later manual
+        // connect() where a future recovery would replay frames from this dead epoch (#123).
+        if ($this->reconnectBuffer !== '') {
+            $abandonedBytes = strlen($this->reconnectBuffer);
+            $this->reconnectBuffer = '';
+            $this->emitError(new NatsException(
+                sprintf('Reconnect exhausted: %d bytes of buffered publishes were discarded', $abandonedBytes),
+            ));
+        }
+
         $this->emitEvent(ConnectionEvent::Closed, $lastError);
         throw new ConnectionException(
             'Reconnect attempts exhausted',
@@ -1402,9 +1414,14 @@ final class NatsConnection
             return;
         }
 
-        $buffered = $this->reconnectBuffer;
+        // Clear only after the write succeeds: publish() already reported success for these
+        // frames when they were buffered, so a flush failure must leave them in place for the
+        // next reconnect attempt to replay - clearing first silently lost every publish
+        // accepted during the reconnect window (#123). A partially transmitted flush can
+        // duplicate frames on the retry; duplication beats loss (nats.go pending-buffer
+        // semantics).
+        $this->transport->write($this->reconnectBuffer)->await();
         $this->reconnectBuffer = '';
-        $this->transport->write($buffered)->await();
     }
 
     /**

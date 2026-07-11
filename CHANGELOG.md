@@ -19,6 +19,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` A reconnect-flush failure no longer silently destroys publishes accepted during the
+  reconnect window: `flushReconnectBuffer()` cleared the buffer before awaiting the write, so a
+  socket failure during the flush left the next (successful) attempt with nothing to replay while
+  every affected `publish()` had already reported success. The buffer is now cleared only after
+  the flush write succeeds (a partially transmitted flush may duplicate frames on the retry -
+  duplication beats loss, matching nats.go pending-buffer semantics), and exhausting reconnect
+  attempts with a non-empty buffer reports the abandoned bytes through the `errorListener` and
+  clears the buffer so a later manual `connect()` cannot replay frames from a dead epoch (#123).
 - `[bugfix]` `unsubscribe($sid, $max)` (auto-unsubscribe) sent `UNSUB <sid> <max>` but dropped the local
   handler immediately, so every message the server legitimately kept delivering up to the max was
   silently discarded. The handler now stays registered until `$max` total messages have been received

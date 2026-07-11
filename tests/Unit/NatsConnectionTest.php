@@ -1281,6 +1281,208 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A flush failure on one reconnect attempt must not lose the buffered publishes: the frames
+     * were already acknowledged to their publishers, so the next attempt has to replay them (#123).
+     */
+    public function testReconnectFlushFailureRetainsBufferedPublishesForNextAttempt(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connects = 0;
+            private bool $flushFailedOnce = false;
+            /** @var list<list<string>> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [
+                    [$info, "PONG\r\n", '__EOF__'], // connection 0: handshake, then EOF -> reconnect
+                    [$info, "PONG\r\n"],            // connection 1: attempt 1 handshake (its flush write fails)
+                    [$info, "PONG\r\n"],            // connection 2: attempt 2 handshake (flush succeeds)
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    // Hold the first reconnect attempt open so a publish lands mid-reconnect.
+                    if ($this->connects === 1) {
+                        $this->release->getFuture()->await();
+                    }
+                    $this->connects++;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    if (!$this->flushFailedOnce && str_contains($bytes, 'PUB a.b')) {
+                        $this->flushFailedOnce = true;
+                        throw new TransportClosedException('socket died during reconnect flush');
+                    }
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $conn = max(0, $this->connects - 1);
+                    $next = array_shift($this->reads[$conn]) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection->connect()->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // let the reconnect begin and suspend on the held connect()
+
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $connection->publish('a.b', 'buffered')->await();
+
+        $release->complete();   // attempt 1 completes its handshake, then its flush write fails
+        $pump->await();
+
+        // Attempt 2 must have replayed the buffered frame even though attempt 1's flush failed.
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertContains("PUB a.b 8\r\nbuffered\r\n", $transport->writes);
+    }
+
+    /**
+     * When reconnect attempts are exhausted, buffered publishes cannot be delivered anymore; the
+     * abandonment must surface through the error listener and the buffer must not leak into a
+     * later manual connect() where a future recovery would replay frames from a dead epoch (#123).
+     */
+    public function testReconnectExhaustionReportsAbandonedBufferedPublishes(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $writes = [];
+            private int $connects = 0;
+            /** @var list<string> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [$info, "PONG\r\n", '__EOF__'];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function (): void {
+                    if ($this->connects === 0) {
+                        $this->connects++;
+
+                        return;
+                    }
+                    if ($this->connects === 1) {
+                        // Hold the first reconnect attempt so a publish can land mid-reconnect.
+                        $this->release->getFuture()->await();
+                    }
+                    $this->connects++;
+                    throw new TransportClosedException('dial failed');
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 2,
+                errorListener: static function (\Throwable $err) use (&$errors): void {
+                    $errors[] = $err;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // let the reconnect begin and suspend on the held connect()
+
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $connection->publish('a.b', 'doomed')->await();
+
+        $release->complete();   // every reconnect attempt now fails -> exhaustion
+
+        try {
+            $pump->await();
+            self::fail('expected ConnectionException after reconnect exhaustion');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect attempts exhausted', $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        $abandonment = array_filter(
+            $errors,
+            static fn(\Throwable $err): bool => str_contains($err->getMessage(), 'buffered publishes were discarded'),
+        );
+        self::assertCount(1, $abandonment, 'abandoning the reconnect buffer must surface via the error listener');
+        self::assertSame(
+            '',
+            (new \ReflectionProperty(NatsConnection::class, 'reconnectBuffer'))->getValue($connection),
+            'the dead-epoch buffer must not survive into a later manual connect()',
+        );
+    }
+
+    /**
      * Verifies HMSG frames preserve raw headers and payload separation.
      */
     public function testProcessIncomingDispatchesHmsgWithRawHeaders(): void
