@@ -107,9 +107,20 @@ final class NatsConnection
     private array $dispatchingSids = [];
     private int $outstandingPings = 0;
     private ?string $pingTimerId = null;
-    private bool $drainFlushPending = false;
-    /** Set while flush() awaits its PONG; cleared by the PONG handler. */
-    private bool $flushPending = false;
+    /**
+     * FIFO pong-correlation queue (#117, nats.go `nc.pongs` parity): every outbound PING except
+     * the connect handshake's enqueues one slot, and the PONG handler completes the OLDEST slot -
+     * TCP delivers PONGs in PING order, so head-of-queue is exactly the PING this PONG answers.
+     * Heartbeat PINGs enqueue a slot nobody awaits purely to hold their queue position; a
+     * timed-out flush leaves its slot queued because its PONG is still owed and must consume that
+     * slot (not a later waiter's) when it arrives. Epoch ends - the reconnect handshake and every
+     * terminal close - error out and clear all slots so none survives into a new TCP connection.
+     * The handshake PING is excluded because awaitInitialPong() consumes its PONG before frames
+     * ever reach handleFrame().
+     *
+     * @var list<DeferredFuture<null>>
+     */
+    private array $pongWaiters = [];
     /**
      * In-progress reconnect, so concurrent callers wait for it instead of starting a second one.
      *
@@ -583,6 +594,9 @@ final class NatsConnection
         $this->autoUnsubMax = [];
         $this->reconnectBuffer = '';
         $this->parser = new ProtocolParser();
+        // Terminal close: no PONG will ever arrive for a queued PING, so parked flush/rtt waiters
+        // must observe the close instead of idling out their deadlines (#117).
+        $this->failPongWaiters(new ConnectionException('Connection closed before the server answered the PING'));
     }
 
     /**
@@ -623,21 +637,33 @@ final class NatsConnection
                 $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
             }
 
-            // Flush in-flight deliveries already emitted by the server before closing.
-            $this->drainFlushPending = true;
-            $this->transport->write($this->codec->encodePing())->await();
+            // Flush in-flight deliveries already emitted by the server before closing. The FIFO
+            // pong slot pairs this PING with ITS pong (#117): a stale PONG answering an earlier
+            // heartbeat PING (whose bounded self-read timed out without consuming it) completes
+            // that older slot instead of ending this flush early - ending early would close the
+            // socket with in-flight MSGs unread, silent loss on the documented lossless path.
+            $flushSlot = $this->enqueuePongSlot();
+            try {
+                $this->transport->write($this->codec->encodePing())->await();
+            } catch (\Throwable $writeError) {
+                // The PING never hit the wire: drop its slot so correlation stays aligned.
+                $this->discardPongSlot($flushSlot);
 
-            // Read until the server's PONG confirms the flush (handleFrame clears drainFlushPending),
-            // bounded by a deadline so a slow/wedged server cannot hang drain() forever. A partial
-            // chunk (0 complete frames yet) must NOT end the flush early - only the PONG or the
-            // deadline does.
+                throw $writeError;
+            }
+
+            // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
+            // the slot), bounded by a deadline so a slow/wedged server cannot hang drain() forever.
+            // A partial chunk (0 complete frames yet) must NOT end the flush early - only the PONG
+            // or the deadline does.
             $flushCancellation = new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000));
             try {
                 while (!$flushCancellation->isRequested()) {
                     $frames = $this->processIncoming($flushCancellation)->await();
 
-                    if (!$this->drainFlushPending) {
-                        // The server's PONG arrived (handleFrame cleared the flag): flush complete.
+                    if ($flushSlot->isComplete()) {
+                        // The PONG answering the drain PING arrived (or a concurrent teardown
+                        // errored the slot - close-and-clean-up below is right either way).
                         break;
                     }
 
@@ -659,9 +685,9 @@ final class NatsConnection
             // Drain any remaining buffered messages to callbacks.
             $this->drainAllPending();
 
-            // Clear subscription state.
+            // Clear subscription state (also errors out any still-parked pong slots, e.g. this
+            // drain's own slot when the flush ended via the deadline).
             $this->releaseRuntimeState();
-            $this->drainFlushPending = false;
 
             $this->transport->close()->await();
             $this->state = ConnectionState::Closed;
@@ -1048,25 +1074,46 @@ final class NatsConnection
                 throw new ConnectionException('Connection is not open');
             }
 
-            $this->flushPending = true;
-            $this->transport->write($this->codec->encodePing())->await();
+            // FIFO pong correlation (#117): completion of THIS slot means "the server processed
+            // everything written before THIS flush's PING". A stale PONG answering an earlier
+            // (heartbeat or timed-out) PING completes that PING's slot, never this one, and a
+            // concurrent flush timing out cannot release this waiter.
+            $slot = $this->enqueuePongSlot();
+            try {
+                $this->transport->write($this->codec->encodePing())->await();
+            } catch (\Throwable $writeError) {
+                // The PING never hit the wire: drop its slot so correlation stays aligned with
+                // wire order (nats.go removePongFromList parity).
+                $this->discardPongSlot($slot);
+
+                throw $writeError;
+            }
 
             $cancellation = new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000));
             try {
-                while ($this->flushPending) {
+                while (!$slot->isComplete()) {
                     $frames = $this->processIncoming($cancellation)->await();
 
                     // A read that produced no complete frame must not busy-spin: yield so the deadline
-                    // can fire (processIncoming() returns 0 synchronously on an empty read).
-                    if ($frames === 0 && $this->flushPending) {
+                    // can fire (processIncoming() returns 0 synchronously on an empty read). A slot
+                    // completed during a 0-frame read exits at the loop head after this one yield.
+                    if ($frames === 0) {
                         delay(0.001, cancellation: $cancellation);
                     }
                 }
             } catch (CancelledException) {
-                throw new TimeoutException('Flush timed out waiting for server PONG');
-            } finally {
-                $this->flushPending = false;
+                // The slot deliberately STAYS queued on timeout: its PONG is still owed and must
+                // consume this slot when it lands - skipping an abandoned head keeps the FIFO
+                // aligned, where removing it mid-queue would desynchronize later waiters. Epoch
+                // teardown clears it if the PONG never comes.
+                if (!$slot->isComplete()) {
+                    throw new TimeoutException('Flush timed out waiting for server PONG');
+                }
             }
+
+            // Completed: the PONG for THIS ping resolves the flush; an epoch end (reconnect or
+            // terminal close) surfaces its ConnectionException to the waiter here.
+            $slot->getFuture()->await();
         });
     }
 
@@ -1077,8 +1124,9 @@ final class NatsConnection
      *                                        so a timed-out caller does not orphan an in-flight read.
      * @return Future<int>
      *
-     * @phpstan-impure Mutates connection state (e.g. clears drainFlushPending / outstandingPings via
-     *                 handled frames), so callers must not assume remembered property values persist.
+     * @phpstan-impure Mutates connection state (e.g. completes queued pong slots / resets
+     *                 outstandingPings via handled frames), so callers must not assume remembered
+     *                 property values persist.
      */
     public function processIncoming(?Cancellation $cancellation = null): Future
     {
@@ -1634,6 +1682,10 @@ final class NatsConnection
         // phantom payload bytes and fail every reconnect attempt against a healthy server (#125).
         // The post-handshake reset below still re-couples the bound to the negotiated max_payload.
         $this->parser = new ProtocolParser();
+        // Pong correlation is per TCP connection, like the parser: a slot parked by a previous
+        // epoch's PING must never be completed by a PONG from this new connection, and its own
+        // PONG died with the old socket - error the waiters (flush/rtt) out instead (#117).
+        $this->failPongWaiters(new ConnectionException('Connection lost before the server answered the PING'));
 
         $server = $this->nextServer();
         $this->connectedServer = $server;
@@ -2266,6 +2318,64 @@ final class NatsConnection
     }
 
     /**
+     * Queues a pong-correlation slot for a PING that is about to be written (see {@see $pongWaiters}).
+     * Enqueue happens synchronously before the write suspends, so queue order matches the order the
+     * PINGs reach the wire even when several fibers send concurrently.
+     *
+     * @return DeferredFuture<null>
+     */
+    private function enqueuePongSlot(): DeferredFuture
+    {
+        /** @var DeferredFuture<null> $slot */
+        $slot = new DeferredFuture();
+        // Slots without a live waiter (heartbeat placeholders, timed-out flushes) are errored at
+        // epoch teardown; suppress unhandled-error reporting - waiters still get the error from
+        // their own await().
+        $slot->getFuture()->ignore();
+        $this->pongWaiters[] = $slot;
+
+        return $slot;
+    }
+
+    /**
+     * Removes a slot whose PING never reached the wire (the write failed). Only that case may
+     * remove mid-queue: no PONG is owed for an unwritten PING, so removal REPAIRS alignment,
+     * whereas removing a timed-out-but-written PING's slot would desynchronize it.
+     *
+     * @param DeferredFuture<null> $slot
+     */
+    private function discardPongSlot(DeferredFuture $slot): void
+    {
+        $remaining = [];
+        foreach ($this->pongWaiters as $queued) {
+            if ($queued !== $slot) {
+                $remaining[] = $queued;
+            }
+        }
+
+        $this->pongWaiters = $remaining;
+    }
+
+    /**
+     * Errors out every parked pong slot and empties the queue. Must run whenever a connection
+     * epoch ends - the reconnect handshake ({@see connectOnce()}) and every terminal close
+     * ({@see releaseRuntimeState()}) - so no slot survives into a new TCP connection: a PONG from
+     * the new socket must never complete a wait pinned to the old one, and the old PING's answer
+     * can no longer arrive (#117, nats.go clearPendingFlushCalls parity).
+     */
+    private function failPongWaiters(\Throwable $error): void
+    {
+        $waiters = $this->pongWaiters;
+        $this->pongWaiters = [];
+
+        foreach ($waiters as $slot) {
+            if (!$slot->isComplete()) {
+                $slot->error($error);
+            }
+        }
+    }
+
+    /**
      * Handles non-message frames immediately and queues message frames for delivery.
      */
     private function handleFrame(ProtocolFrame $frame): void
@@ -2277,9 +2387,16 @@ final class NatsConnection
         }
 
         if ($frame->type === ProtocolFrameType::Pong) {
+            // ANY pong proves the server is alive, so the watchdog resets unconditionally; flush
+            // completion is per-PING (#117): the oldest queued slot is the PING this PONG answers
+            // (TCP preserves order), so a stale heartbeat PONG completes the heartbeat's
+            // placeholder - never a later flush()/drain() waiter's slot.
             $this->outstandingPings = 0;
-            $this->drainFlushPending = false;
-            $this->flushPending = false;
+
+            $slot = array_shift($this->pongWaiters);
+            if ($slot !== null && !$slot->isComplete()) {
+                $slot->complete();
+            }
 
             return;
         }
@@ -2545,9 +2662,18 @@ final class NatsConnection
             return;
         }
 
+        // The heartbeat PING occupies a pong-correlation slot even though nothing awaits it
+        // (#117): its PONG must consume ITS queue position - otherwise a heartbeat PONG left
+        // unconsumed by the bounded self-read below would complete the next flush()/drain()
+        // waiter's slot one PING early.
+        $slot = $this->enqueuePongSlot();
+
         try {
             $this->transport->write($this->codec->encodePing())->await();
         } catch (\Throwable) {
+            // The PING never hit the wire: drop its slot so correlation stays aligned (the
+            // recovery below clears the rest on the epoch change anyway).
+            $this->discardPongSlot($slot);
             $this->cancelPingTimer();
 
             try {

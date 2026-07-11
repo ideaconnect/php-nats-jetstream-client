@@ -19,6 +19,21 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` `flush()`, `drain()`, `drainSubscription()`, and `rtt()` now correlate PONGs to
+  their PINGs through a FIFO slot queue (nats.go `nc.pongs` parity) instead of shared booleans
+  that ANY PONG cleared (#117). Previously a stale PONG - one answering an earlier heartbeat
+  PING whose bounded self-read timed out without consuming it, or a previously timed-out flush's
+  PING - satisfied the wait immediately, so `flush()` returned before the server had processed
+  the writes issued after that older PING, and `drain()`/`drainSubscription()` closed or dropped
+  state with in-flight MSGs still unread: silent loss on the documented lossless path. A
+  concurrent flush timing out also cleared the shared flag, releasing sibling flushes that had
+  seen zero pongs. Now every outbound PING (heartbeats included, as placeholder slots) occupies
+  one queue position, the PONG handler completes the oldest slot (TCP preserves PING/PONG
+  order), a timed-out flush leaves its slot queued so its late PONG cannot release a later
+  waiter, and every epoch end (reconnect handshake, terminal close) errors out all parked slots
+  so a flush caught mid-reconnect fails fast with `ConnectionException` instead of idling out
+  its deadline against the new socket. The `maxPingsOut` liveness watchdog still resets on any
+  PONG.
 - `[bugfix]` A reconnect now stays in `Connecting` until the subscription replay and the
   reconnect-buffer flush have completed, and flips `Open` (arming the ping timer) only then -
   nats.go RECONNECTING parity. Previously `connectOnce()` flipped `Open` before the replay ran,
