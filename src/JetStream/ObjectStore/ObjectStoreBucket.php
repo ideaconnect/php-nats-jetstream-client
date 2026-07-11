@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\ApiErrCode;
 use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Models\StreamInfo;
@@ -1071,6 +1072,8 @@ final class ObjectStoreBucket
             throw new JetStreamException(
                 (string) ($error['description'] ?? 'JetStream publish error'),
                 (int) ($error['code'] ?? 0),
+                null,
+                ApiErrCode::fromEnvelope($error),
             );
         }
     }
@@ -1122,6 +1125,8 @@ final class ObjectStoreBucket
                 throw new JetStreamException(
                     (string) ($error['description'] ?? 'JetStream API error'),
                     (int) ($error['code'] ?? 0),
+                    null,
+                    ApiErrCode::fromEnvelope($error),
                 );
             }
 
@@ -1162,7 +1167,7 @@ final class ObjectStoreBucket
         if ($error !== null) {
             $description = (string) ($error['description'] ?? 'JetStream API error');
             $code = (int) ($error['code'] ?? 0);
-            throw new JetStreamException($description, $code);
+            throw new JetStreamException($description, $code, null, ApiErrCode::fromEnvelope($error));
         }
 
         return $data;

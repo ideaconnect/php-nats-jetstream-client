@@ -60,6 +60,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   depth. Also documents that `BatchPublisher::MAX_MESSAGES = 1000` is ADR-50's server DEFAULT
   batch limit, not a protocol constant - the server's error reply stays authoritative for the
   configured limit.
+- `[bugfix]` JetStream errors: the API error envelope's stable `err_code` (ADR-1) is now parsed at
+  every envelope decode site and exposed via the new `JetStreamException::getErrCode()` accessor
+  (null when the envelope carried none or the error is client-side). Error-kind discrimination now
+  matches `err_code` first - `createOrUpdateStream()` detects "stream name already in use" by 10058
+  and KV `createKey()` detects "wrong last sequence" by 10071 - falling back to description
+  substrings only when `err_code` is absent (old servers), so server rewording no longer breaks the
+  create-or-update and exclusive-create semantics. The previous KV check compared `getCode()` to
+  10071 and could never match a real server rejection (those carry the HTTP-like 400). The synthetic
+  "Key already exists" exception now carries 400 in `getCode()` and 10071 in `getErrCode()` instead
+  of minting an API err_code into the transport-code slot (#154).
 
 ## [2.5.1] - 2026-07-11
 

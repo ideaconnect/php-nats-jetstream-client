@@ -268,6 +268,145 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * Verifies a JetStream API error envelope's err_code is exposed via getErrCode() alongside the
+     * HTTP-like code kept in getCode() (#154).
+     */
+    public function testApiErrorEnvelopeExposesErrCode(): void
+    {
+        $err = '{"error":{"code":404,"err_code":10059,"description":"stream not found"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($err), $err),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->getStream('MISSING')->await();
+            self::fail('Expected a JetStreamException');
+        } catch (JetStreamException $e) {
+            self::assertSame(404, $e->getCode());
+            self::assertSame(10059, $e->getErrCode());
+        }
+    }
+
+    /**
+     * Verifies a publish-expectation error ack exposes err_code 10071 via getErrCode(), and that an
+     * envelope without err_code yields null (old servers) (#154).
+     */
+    public function testPublishExpectationMismatchExposesErrCode(): void
+    {
+        $withErrCode = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 5"}}';
+        $withoutErrCode = '{"error":{"code":400,"description":"wrong last sequence: 5"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($withErrCode), $withErrCode),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($withoutErrCode), $withoutErrCode),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->publish('orders.created', '{"id":1}', expectedLastSequence: 99)->await();
+            self::fail('Expected a JetStreamException');
+        } catch (JetStreamException $e) {
+            self::assertSame(400, $e->getCode());
+            self::assertSame(10071, $e->getErrCode());
+        }
+
+        try {
+            $client->jetStream()->publish('orders.created', '{"id":1}', expectedLastSequence: 99)->await();
+            self::fail('Expected a JetStreamException');
+        } catch (JetStreamException $e) {
+            self::assertSame(400, $e->getCode());
+            self::assertNull($e->getErrCode());
+        }
+    }
+
+    /**
+     * Verifies createOrUpdateStream() discriminates "stream name already in use" by err_code 10058,
+     * not by description wording: a reworded description still falls back to UPDATE (#154).
+     */
+    public function testCreateOrUpdateStreamFallsBackToUpdateByErrCode(): void
+    {
+        $createErr = '{"error":{"code":400,"err_code":10058,"description":"cannot add stream: that name is taken"}}';
+        $updateOk = '{"config":{"name":"ORDERS","subjects":["orders.*"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
+
+        self::assertSame('ORDERS', $info->name);
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[6]);
+    }
+
+    /**
+     * Verifies createOrUpdateStream() trusts a present err_code over a misleading description: an
+     * error whose wording mentions "already in use" but whose err_code is not 10058 is re-thrown
+     * instead of triggering the UPDATE fallback (#154).
+     */
+    public function testCreateOrUpdateStreamRethrowsWhenErrCodeIsNotStreamNameInUse(): void
+    {
+        $createErr = '{"error":{"code":400,"err_code":10065,"description":"subjects [orders.*] already in use by an existing stream"}}';
+        $updateOk = '{"config":{"name":"ORDERS","subjects":["orders.*"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
+            // An UPDATE reply is queued so a wrong fallback would succeed silently instead of hanging.
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('already in use by an existing stream');
+
+        $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
+    }
+
+    /**
+     * Verifies createOrUpdateStream() still falls back to UPDATE via the description substring when
+     * the envelope carries no err_code (old servers) (#154).
+     */
+    public function testCreateOrUpdateStreamFallsBackToUpdateWithoutErrCode(): void
+    {
+        $createErr = '{"error":{"code":400,"description":"stream name already in use"}}';
+        $updateOk = '{"config":{"name":"ORDERS","subjects":["orders.*"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
+
+        self::assertSame('ORDERS', $info->name);
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[6]);
+    }
+
+    /**
      * Verifies create/get/delete stream operations map expected payload fields.
      */
     public function testStreamCrud(): void

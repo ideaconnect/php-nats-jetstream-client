@@ -12,6 +12,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\ApiErrCode;
 use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\MessageTtl;
@@ -335,7 +336,12 @@ final class KeyValueBucket
                 return null;
             }
 
-            throw new JetStreamException((string) ($error['description'] ?? 'JetStream API error'), $code);
+            throw new JetStreamException(
+                (string) ($error['description'] ?? 'JetStream API error'),
+                $code,
+                null,
+                ApiErrCode::fromEnvelope($error),
+            );
         }
 
         /** @var array<string,mixed>|null $message */
@@ -478,7 +484,14 @@ final class KeyValueBucket
             // delete/purge tombstone: recreate the key against that tombstone's revision.
             $entry = $this->get($key)->await();
             if ($entry !== null && $entry->operation !== 'DEL' && $entry->operation !== 'PURGE') {
-                throw new JetStreamException('Key already exists: ' . $key, 10071);
+                // Shaped like the server's own rejection (code 400 / err_code 10071, nats.go
+                // ErrKeyExists) so getCode() keeps a single taxonomy (#154).
+                throw new JetStreamException(
+                    'Key already exists: ' . $key,
+                    400,
+                    null,
+                    ApiErrCode::STREAM_WRONG_LAST_SEQUENCE,
+                );
             }
 
             $revision = $entry !== null ? ($entry->revision ?? 0) : 0;
@@ -712,6 +725,8 @@ final class KeyValueBucket
                 throw new JetStreamException(
                     (string) ($error['description'] ?? 'JetStream API error'),
                     (int) ($error['code'] ?? 0),
+                    null,
+                    ApiErrCode::fromEnvelope($error),
                 );
             }
 
@@ -787,11 +802,17 @@ final class KeyValueBucket
 
     /**
      * Whether a JetStream error is the server's "wrong last sequence" rejection (err_code 10071),
-     * which an exclusive create uses to detect that the key already has a record.
+     * which an exclusive create uses to detect that the key already has a record. Falls back to
+     * description wording only when the envelope carried no err_code (an old server) - the server's
+     * getCode() is the HTTP-like 400, never 10071, and wording changes between versions (#154).
      */
     private function isWrongLastSequenceError(JetStreamException $e): bool
     {
-        return $e->getCode() === 10071 || stripos($e->getMessage(), 'wrong last sequence') !== false;
+        if ($e->getErrCode() !== null) {
+            return $e->getErrCode() === ApiErrCode::STREAM_WRONG_LAST_SEQUENCE;
+        }
+
+        return stripos($e->getMessage(), 'wrong last sequence') !== false;
     }
 
     /**
@@ -810,7 +831,7 @@ final class KeyValueBucket
             if ($error !== null) {
                 $description = (string) ($error['description'] ?? 'JetStream publish error');
                 $code = (int) ($error['code'] ?? 0);
-                throw new JetStreamException($description, $code);
+                throw new JetStreamException($description, $code, null, ApiErrCode::fromEnvelope($error));
             }
 
             return PubAck::fromArray($data);

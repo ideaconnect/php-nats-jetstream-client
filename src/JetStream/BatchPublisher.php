@@ -202,6 +202,8 @@ final class BatchPublisher
             throw new JetStreamException(
                 (string) ($error['description'] ?? 'Atomic batch rejected at start'),
                 (int) ($error['code'] ?? 0),
+                null,
+                ApiErrCode::fromEnvelope($error),
             );
         }
 
@@ -294,7 +296,7 @@ final class BatchPublisher
         if ($error !== null) {
             $description = (string) ($error['description'] ?? 'JetStream atomic batch error');
             $code = (int) ($error['code'] ?? 0);
-            throw new JetStreamException($description, $code);
+            throw new JetStreamException($description, $code, null, ApiErrCode::fromEnvelope($error));
         }
 
         $ack = PubAck::fromArray($data);

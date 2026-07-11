@@ -28,7 +28,8 @@ final class UnsupportedFeatureException extends JetStreamException
         string $message,
         int $code = 0,
         ?\Throwable $previous = null,
+        ?int $errCode = null,
     ) {
-        parent::__construct($message, $code, $previous);
+        parent::__construct($message, $code, $previous, $errCode);
     }
 }

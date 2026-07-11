@@ -765,8 +765,11 @@ final class ClientParityIntegrationTest extends TestCase
         $threw = false;
         try {
             $kv->createKey('token', 'second')->await();
-        } catch (JetStreamException) {
+        } catch (JetStreamException $e) {
             $threw = true;
+            // The collision keeps the server taxonomy: HTTP-like code + API err_code 10071 (#154).
+            self::assertSame(400, $e->getCode());
+            self::assertSame(10071, $e->getErrCode());
         }
         self::assertTrue($threw, 'createKey on an existing live key must throw');
 

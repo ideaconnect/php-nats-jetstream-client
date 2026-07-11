@@ -208,6 +208,82 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
+     * Verifies createKey() detects the wrong-last-sequence rejection by err_code 10071 even when the
+     * server description is reworded (#154).
+     */
+    public function testCreateKeyDetectsWrongLastSequenceByErrCode(): void
+    {
+        // Same rejection as testCreateKeyThrowsWhenKeyExists, but the description shares no wording
+        // with "wrong last sequence" - only err_code 10071 identifies it.
+        $errAck = '{"error":{"code":400,"err_code":10071,"description":"expected stream sequence does not match"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
+            $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Key already exists');
+        $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
+    }
+
+    /**
+     * Verifies createKey() still detects wrong-last-sequence via the description substring when the
+     * envelope carries no err_code (old servers) (#154).
+     */
+    public function testCreateKeyDetectsWrongLastSequenceWithoutErrCode(): void
+    {
+        $errAck = '{"error":{"code":400,"description":"wrong last sequence: 4"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
+            $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Key already exists');
+        $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
+    }
+
+    /**
+     * Verifies the "Key already exists" collision exception keeps the server taxonomy: the HTTP-like
+     * 400 in getCode() and the API err_code 10071 in getErrCode() (#154).
+     */
+    public function testCreateKeyExistsExceptionCarriesBothCodes(): void
+    {
+        $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 4"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
+            $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
+            self::fail('Expected a JetStreamException');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('Key already exists', $e->getMessage());
+            self::assertSame(400, $e->getCode());
+            self::assertSame(10071, $e->getErrCode());
+        }
+    }
+
+    /**
      * Verifies create() with a mirror translates the bucket name to KV_ and emits no subjects (#62).
      */
     public function testCreateWithMirrorTranslatesBucketName(): void
