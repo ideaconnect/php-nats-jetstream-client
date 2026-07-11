@@ -418,6 +418,8 @@ Indicative totals: ~857 unit tests, ~132 integration tests, ~46 Behat scenarios.
 - `testDiscoveredServersFromAsyncInfo` - discoveredServers() is empty initially and reflects connect_urls after an async INFO is processed (#47).
 - `testPublishBuffersDuringReconnectAndFlushesOnReconnect` - A publish issued while state is Connecting (mid-reconnect) is buffered (not thrown) and flushed once reconnect completes, incrementing the reconnects stat (#49).
 - `testReconnectBufferFlushesMultiplePublishesInOrderBeforeLivePublishes` - Multiple publishes buffered during reconnect are flushed as one ordered block that precedes any post-reconnect live publish (hardening 3b).
+- `testReconnectFlushFailureRetainsBufferedPublishesForNextAttempt` - A flush write failure on one reconnect attempt keeps the buffered publishes in place so the next attempt replays them; the frame reaches the wire instead of being silently lost (#123).
+- `testReconnectExhaustionReportsAbandonedBufferedPublishes` - Exhausting reconnect attempts with a non-empty reconnect buffer surfaces the abandonment through the errorListener and clears the buffer so a later manual connect() cannot replay a dead epoch (#123).
 - `testProcessIncomingDispatchesHmsgWithRawHeaders` - An HMSG frame is delivered with rawHeaders and payload kept separate.
 - `testProcessIncomingRespondsToServerPing` - A server PING is answered with a protocol PONG (1 frame processed).
 - `testSlowConsumerDropOldestPolicy` - With maxPending=1 and DropOldest, only the newest message ("second") is delivered.
