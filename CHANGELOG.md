@@ -19,6 +19,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` JetStream stream and consumer (durable) names are now validated client-side before
+  being interpolated into a `$JS.API.*` subject, rejecting empty names and names containing
+  spaces, tabs, CR/LF, `.`, `*`, `>`, `/` or `\` (nats.go `checkStreamName` / `checkConsumerName`
+  parity). Previously a dotted name silently changed which API endpoint the request hit:
+  `createConsumer('S', 'a.b')` was routed by the server as the filtered-create form (consumer
+  "a", filter "b"), `getConsumer()`/`deleteConsumer()` for that name hit no API route at all and
+  surfaced a misleading 503 "subject is not bound to a stream", and `directGetStreamMessage()` on
+  a dotted stream name could be routed as `DIRECT.GET.<stream>.<last_by_subject>` and silently
+  return data from a SIBLING stream (#131).
 - `[bugfix]` Atomic batch publish no longer degrades silently to non-atomic storage on servers
   without batch support (pre-2.12): such a server treats `Nats-Batch-*` headers as opaque and
   acknowledges the batch start/commit as plain publishes, and `commit()` previously reported

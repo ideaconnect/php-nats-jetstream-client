@@ -66,6 +66,9 @@ final class JetStreamContext
      */
     public function pullConsumer(string $stream, string $consumer): PullConsumerIterator
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return new PullConsumerIterator($this, $stream, $consumer);
     }
 
@@ -185,6 +188,25 @@ final class JetStreamContext
     }
 
     /**
+     * Validates a stream or consumer (durable) name before it is interpolated into a `$JS.API.*`
+     * subject. A subject token separator or wildcard in the name silently changes which API endpoint
+     * the request hits: `createConsumer('S', 'a.b')` is routed by the server as the filtered-create
+     * form (consumer "a", filter "b"), a lookup/delete of that name hits no API route at all (a
+     * misleading 503), and a dotted stream name on the Direct Get path can be routed as
+     * `DIRECT.GET.<stream>.<last_by_subject>` and silently return data from a SIBLING stream.
+     * Mirrors nats.go `checkStreamName` / `checkConsumerName` (#131).
+     */
+    private static function assertValidJsName(string $name, string $kind): void
+    {
+        if ($name === '' || preg_match('/[ \t\r\n.*>\/\\\\]/', $name) === 1) {
+            throw new JetStreamException(
+                'Invalid ' . $kind . ' name "' . $name . '": must be non-empty and must not contain spaces, tabs, '
+                . "'.', '*', '>', '/' or '\\'",
+            );
+        }
+    }
+
+    /**
      * Creates or updates a stream using a minimal configuration payload.
      *
      * @param list<string> $subjects
@@ -193,6 +215,8 @@ final class JetStreamContext
      */
     public function createStream(string $name, array $subjects, array $options = []): Future
     {
+        self::assertValidJsName($name, 'stream');
+
         return async(function () use ($name, $subjects, $options): StreamInfo {
             // A stream may legitimately have no subjects of its own when it ingests from a mirror or from
             // one or more sources (a pure aggregate/replica stream); only reject empty subjects otherwise.
@@ -222,6 +246,8 @@ final class JetStreamContext
      */
     public function addStream(StreamConfiguration $config): Future
     {
+        self::assertValidJsName($config->name(), 'stream');
+
         return async(function () use ($config): StreamInfo {
             $response = $this->requestJson(JetStreamApi::STREAM_CREATE_PREFIX . $config->name(), $config->toArray());
 
@@ -237,6 +263,8 @@ final class JetStreamContext
      */
     public function updateStream(string $name, array $config): Future
     {
+        self::assertValidJsName($name, 'stream');
+
         return async(function () use ($name, $config): StreamInfo {
             $payload = array_merge($config, ['name' => $name]);
 
@@ -256,6 +284,8 @@ final class JetStreamContext
      */
     public function createOrUpdateStream(string $name, array $subjects, array $options = []): Future
     {
+        self::assertValidJsName($name, 'stream');
+
         return async(function () use ($name, $subjects, $options): StreamInfo {
             try {
                 return $this->createStream($name, $subjects, $options)->await();
@@ -310,6 +340,8 @@ final class JetStreamContext
      */
     public function getStream(string $name): Future
     {
+        self::assertValidJsName($name, 'stream');
+
         return async(function () use ($name): StreamInfo {
             $response = $this->requestJson(JetStreamApi::STREAM_INFO_PREFIX . $name, []);
 
@@ -324,6 +356,8 @@ final class JetStreamContext
      */
     public function deleteStream(string $name): Future
     {
+        self::assertValidJsName($name, 'stream');
+
         return async(function () use ($name): bool {
             $response = $this->requestJson(JetStreamApi::STREAM_DELETE_PREFIX . $name, []);
 
@@ -339,6 +373,8 @@ final class JetStreamContext
      */
     public function purgeStream(string $name, array $options = []): Future
     {
+        self::assertValidJsName($name, 'stream');
+
         return async(function () use ($name, $options): array {
             $response = $this->requestJson(JetStreamApi::STREAM_PURGE_PREFIX . $name, $options);
 
@@ -384,6 +420,8 @@ final class JetStreamContext
      */
     public function listConsumers(string $stream): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream): array {
             $consumers = [];
             $offset = 0;
@@ -412,6 +450,8 @@ final class JetStreamContext
      */
     public function getStreamMessage(string $stream, int $seq): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $seq): NatsMessage {
             $response = $this->requestJson(
                 JetStreamApi::STREAM_MSG_GET_PREFIX . $stream,
@@ -432,6 +472,8 @@ final class JetStreamContext
      */
     public function getLastMessageForSubject(string $stream, string $subject): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $subject): NatsMessage {
             if ($subject === '' || str_contains($subject, '*') || str_contains($subject, '>')) {
                 throw new JetStreamException('getLastMessageForSubject requires a concrete (non-wildcard) subject');
@@ -496,6 +538,8 @@ final class JetStreamContext
      */
     public function deleteMessage(string $stream, int $seq, bool $secureErase = false): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $seq, $secureErase): bool {
             $body = ['seq' => $seq];
             if (!$secureErase) {
@@ -524,6 +568,8 @@ final class JetStreamContext
      */
     public function directGetStreamMessage(string $stream, int $seq): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return $this->directGet($stream, ['seq' => $seq]);
     }
 
@@ -535,6 +581,8 @@ final class JetStreamContext
      */
     public function directGetLastMessageForSubject(string $stream, string $subject): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return $this->directGet($stream, ['last_by_subj' => $subject]);
     }
 
@@ -609,6 +657,8 @@ final class JetStreamContext
      */
     public function directGetLastForSubjects(string $stream, array $subjects, int $expiresMs = 5000): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $subjects, $expiresMs): array {
             if ($subjects === []) {
                 return [];
@@ -647,6 +697,8 @@ final class JetStreamContext
      */
     public function directGetBatch(string $stream, array $body, int $expiresMs = 5000): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $body, $expiresMs): array {
             if ($expiresMs <= 0) {
                 throw new JetStreamException('Direct Get batch expiresMs must be greater than zero');
@@ -737,6 +789,9 @@ final class JetStreamContext
      */
     public function createConsumer(string $stream, string $consumer, ?string $filterSubject = null, array $options = []): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer, $filterSubject, $options): ConsumerInfo {
             $config = $this->applyDefaultAckPolicy($options);
             $config['durable_name'] = $consumer;
@@ -761,6 +816,11 @@ final class JetStreamContext
      */
     public function addConsumer(string $stream, ConsumerConfiguration $config): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        if ($config->getName() !== null) {
+            self::assertValidJsName($config->getName(), 'consumer');
+        }
+
         return async(function () use ($stream, $config): ConsumerInfo {
             $name = $config->getName();
             $subject = JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . ($name !== null ? '.' . $name : '');
@@ -781,6 +841,9 @@ final class JetStreamContext
      */
     public function addOrUpdateConsumer(string $stream, string $consumer, ?string $filterSubject = null, array $options = []): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return $this->createConsumer($stream, $consumer, $filterSubject, $options);
     }
 
@@ -792,6 +855,8 @@ final class JetStreamContext
      */
     public function consumerNames(string $stream): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream): array {
             $names = [];
             $offset = 0;
@@ -823,6 +888,8 @@ final class JetStreamContext
      */
     public function createEphemeralConsumer(string $stream, ?string $filterSubject = null, array $options = []): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $filterSubject, $options): ConsumerInfo {
             $config = $this->applyDefaultAckPolicy($options);
             $config = $this->applyFilterSubjects($config, $filterSubject);
@@ -850,6 +917,9 @@ final class JetStreamContext
         ?string $filterSubject = null,
         array $options = [],
     ): Future {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer, $deliverSubject, $filterSubject, $options): ConsumerInfo {
             $config = $this->applyDefaultAckPolicy($options);
             $config['durable_name'] = $consumer;
@@ -877,6 +947,8 @@ final class JetStreamContext
         ?string $filterSubject = null,
         array $options = [],
     ): Future {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $deliverSubject, $filterSubject, $options): ConsumerInfo {
             $config = $this->applyDefaultAckPolicy($options);
             $config['deliver_subject'] = $deliverSubject;
@@ -914,6 +986,9 @@ final class JetStreamContext
         ?string $filterSubject = null,
         array $consumerOptions = [],
     ): Future {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer, $handler, $deliverSubject, $filterSubject, $consumerOptions): int {
             $deliver = $deliverSubject ?? Inbox::generate('_INBOX.JS.PUSH');
 
@@ -947,6 +1022,8 @@ final class JetStreamContext
         array $consumerOptions = [],
         ?callable $onConsumerCreated = null,
     ): Future {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $handler, $deliverSubject, $filterSubject, $consumerOptions, $onConsumerCreated): int {
             $deliver = $deliverSubject ?? Inbox::generate('_INBOX.JS.PUSH');
 
@@ -977,6 +1054,8 @@ final class JetStreamContext
         callable $handler,
         ?string $filterSubject = null,
     ): Future {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $handler, $filterSubject): int {
             $deliver = Inbox::generate('_INBOX.JS.ORD');
             // Ordered delivery is tracked by the CONSUMER sequence, which increments by one per
@@ -1101,6 +1180,9 @@ final class JetStreamContext
      */
     public function getConsumer(string $stream, string $consumer): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer): ConsumerInfo {
             $response = $this->requestJson(JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer, []);
 
@@ -1115,6 +1197,9 @@ final class JetStreamContext
      */
     public function deleteConsumer(string $stream, string $consumer): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer): bool {
             $response = $this->requestJson(JetStreamApi::CONSUMER_DELETE_PREFIX . $stream . '.' . $consumer, []);
 
@@ -1130,6 +1215,9 @@ final class JetStreamContext
      */
     public function pauseConsumer(string $stream, string $consumer, string $pauseUntil): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(fn(): array => $this->requestJson(
             JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
             ['pause_until' => $pauseUntil],
@@ -1143,6 +1231,9 @@ final class JetStreamContext
      */
     public function resumeConsumer(string $stream, string $consumer): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(fn(): array => $this->requestJson(
             JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
             [],
@@ -1157,6 +1248,9 @@ final class JetStreamContext
      */
     public function unpinConsumer(string $stream, string $consumer, string $group): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer, $group): bool {
             if ($group === '') {
                 throw new JetStreamException('Priority group must not be empty');
@@ -1426,6 +1520,8 @@ final class JetStreamContext
      */
     public function counterValue(string $stream, string $subject): Future
     {
+        self::assertValidJsName($stream, 'stream');
+
         return async(function () use ($stream, $subject): string {
             try {
                 $message = $this->directGetLastMessageForSubject($stream, $subject)->await();
@@ -1484,6 +1580,9 @@ final class JetStreamContext
      */
     public function fetchNext(string $stream, string $consumer, int $expiresMs = 3000, array $pull = []): Future
     {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer, $expiresMs, $pull): NatsMessage {
             $messages = $this->fetchBatch($stream, $consumer, 1, $expiresMs, $pull)->await();
 
@@ -1519,6 +1618,9 @@ final class JetStreamContext
         array $pull = [],
         ?callable $onTerminalStatus = null,
     ): Future {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
         return async(function () use ($stream, $consumer, $batch, $expiresMs, $pull, $onTerminalStatus): array {
             if ($expiresMs <= 0) {
                 throw new JetStreamException('Pull fetch expiresMs must be greater than zero');

@@ -3929,4 +3929,194 @@ final class JetStreamContextTest extends TestCase
 
         $js->publish('orders.created', '{"id":1}')->await();
     }
+
+    /**
+     * Verifies createStream() rejects a dotted stream name before any $JS.API write reaches the
+     * wire: a '.' in the name would corrupt the API subject and hit the wrong endpoint (#131).
+     */
+    public function testCreateStreamRejectsDottedStreamNameBeforeDispatch(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->createStream('bad.name', ['s.*'])->await();
+        } finally {
+            // Only CONNECT and PING were written - the invalid name never produced a $JS.API PUB.
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies createConsumer() rejects a dotted consumer name before dispatch: the server would
+     * route CONSUMER.CREATE.S.a.b as the filtered-create form (consumer "a", filter "b") (#131).
+     */
+    public function testCreateConsumerRejectsDottedConsumerName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->createConsumer('ORDERS', 'a.b')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies getConsumer() rejects a dotted consumer name before dispatch: CONSUMER.INFO.S.a.b
+     * hits no API route and would surface a misleading 503 "subject is not bound to a stream" (#131).
+     */
+    public function testGetConsumerRejectsDottedConsumerName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->getConsumer('ORDERS', 'a.b')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies deleteConsumer() rejects a dotted consumer name before dispatch (#131).
+     */
+    public function testDeleteConsumerRejectsDottedConsumerName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->deleteConsumer('ORDERS', 'a.b')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies directGetStreamMessage() rejects a dotted stream name before dispatch: the server
+     * could route DIRECT.GET.FOO.BAR as DIRECT.GET.<stream>.<last_by_subject> and silently return
+     * data from a SIBLING stream (#131).
+     */
+    public function testDirectGetStreamMessageRejectsDottedStreamName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "FOO.BAR"');
+
+        try {
+            $client->jetStream()->directGetStreamMessage('FOO.BAR', 1)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies an empty stream name is rejected before dispatch (#131).
+     */
+    public function testCreateStreamRejectsEmptyStreamName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('must be non-empty');
+
+        try {
+            $client->jetStream()->createStream('', ['s.*'])->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies a wildcard '*' stream name is rejected before dispatch (#131).
+     */
+    public function testGetStreamRejectsWildcardStreamName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "*"');
+
+        try {
+            $client->jetStream()->getStream('*')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies a valid name (letters, digits, '-' and '_') passes validation and produces the
+     * expected $JS.API subject on the wire (#131).
+     */
+    public function testCreateStreamAcceptsValidNameWithHyphenAndUnderscore(): void
+    {
+        $streamPayload = '{"config":{"name":"ORDERS-2_prod","subjects":["orders.*"]}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $created = $client->jetStream()->createStream('ORDERS-2_prod', ['orders.*'])->await();
+
+        self::assertSame('ORDERS-2_prod', $created->name);
+        self::assertStringContainsString('$JS.API.STREAM.CREATE.ORDERS-2_prod', $transport->writes[3]);
+    }
 }
