@@ -43,6 +43,36 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `recoverConnection()` and reported through the error listener (nats.go parity: handler errors
   during post-reconnect delivery are async errors, not connection failures); genuine recovery
   failures (exhaustion, auth, reconnect disabled) still throw unchanged (#144).
+- `[bugfix]` `connect()` no longer races an in-flight recovery (nats.go `conn.mu` parity). Calling
+  `connect()` while a recovery was mid-flight (backoff, dial, or handshake) started a second
+  concurrent `connectOnce()` chain against the same transport and parser; the recovery loop's next
+  attempt then closed the healthy socket the user's `connect()` had just established and replayed
+  only the pre-outage subscriptions, silently losing every subscription created on the new epoch
+  (a runtime repro observed 4 dials for one outage). `connect()` now joins the in-flight recovery
+  and shares its outcome, a concurrent `connect()` awaits the first dial instead of dialing in
+  parallel, and `connect()` during `drain()` throws `ConnectionException`
+  (`Cannot connect: drain in progress`) instead of dialing into the teardown. Re-entry semantics:
+  a `connect()` called from a connection/error listener throws `ConnectionException` instead of
+  joining - the listener runs inside the connecting/recovery fiber, so awaiting the join there
+  could never complete (a permanent deadlock, including when the terminal `Closed` event is emitted
+  by a failed initial connect); schedule supervision reconnects with `Revolt\EventLoop::queue()`
+  and do not await the scheduled connect from inside the listener. The in-flight `connect()`
+  deferred is now settled (and cleared) before every synchronous lifecycle emission
+  (`Connected`/`Closed`), so it is never pending while a listener runs - closing the deadlock at its
+  source in addition to the fiber guard. A dial that ends without the connection Open (a recovery or
+  coalesced connect aborted by a concurrent `disconnect()`/`drain()`) throws `ConnectionException`
+  ("aborted before the connection opened") - for the OWNER `connect()` (whose owned recovery was
+  aborted mid-flight) exactly as for joiners, so an aborted owner no longer resolves as success on a
+  Closed connection. The reverse direction is guarded too: `recoverConnection()` ignores recovery
+  requests from stale failure continuations (a write/read that suspended before a terminal close and
+  resumed failing later) while a user `connect()` is dialing - but that guard now also requires the
+  state not be Open, so a genuine live-epoch failure while a `Connected` listener is still parked
+  starts a recovery instead of being swallowed onto a dead socket. The `closing = false` reset also
+  moved onto the fresh-dial path only, so a `connect()` racing a concurrent `disconnect()` can no
+  longer disarm the user's close intent and let the recovery re-open a connection the user just
+  closed - close intent wins and the connection stays Closed. A manual `connect()` after a
+  terminal close (exhaustion, reconnect disabled, auth failure, user close) still starts a clean
+  epoch exactly as before (#145).
 - `[bugfix]` Ordered consumer: a `TimeoutException` or `ConnectionException` from the best-effort
   `deleteConsumer()` leg of a recreate (sequence-gap or heartbeat tail-gap recovery) no longer
   bypasses the create-retry loop and permanently silences the consumer. Those exceptions extend
