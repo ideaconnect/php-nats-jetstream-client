@@ -7,11 +7,111 @@ namespace IDCT\NATS\Tests\Unit;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
 final class BatchPublisherTest extends TestCase
 {
+    /**
+     * A server without atomic-batch support (pre-2.12) answers the batch START with a normal
+     * PubAck instead of ADR-50's zero-byte ack - it stored the message as a plain publish.
+     * Continuing would store the whole "batch" message-by-message, silently breaking the
+     * all-or-nothing guarantee: commit() must abort with UnsupportedFeatureException before
+     * publishing the remaining messages (#130).
+     */
+    public function testCommitAbortsWhenBatchStartIsAcknowledgedAsPlainPublish(): void
+    {
+        $plainPubAck = '{"stream":"ORDERS","seq":41}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.5","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // A pre-2.12 server acks the batch-start request with a NORMAL PubAck.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-old')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->add('orders.created', 'c');
+
+        try {
+            $batch->commit()->await();
+            self::fail('expected UnsupportedFeatureException for a pre-2.12 batch start ack');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('allow_atomic', $e->feature);
+            self::assertSame('2.12', $e->requiredVersion);
+            self::assertSame('2.10.5', $e->serverVersion);
+        }
+
+        // The batch aborted at the start: no intermediate or commit frames were published.
+        $batchWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'Nats-Batch-Id:'),
+        ));
+        self::assertCount(1, $batchWrites, 'only the start message may reach the wire before the abort');
+    }
+
+    /**
+     * Defense in depth for the commit leg: a multi-message commit acknowledged by a PubAck WITHOUT
+     * the batch id/count means the server committed nothing as a batch - it stored messages
+     * individually. commit() must throw UnsupportedFeatureException, not report success (#130).
+     */
+    public function testCommitRejectsMultiMessageAckWithoutBatchFields(): void
+    {
+        $plainCommitAck = '{"stream":"ORDERS","seq":42}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.5","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Zero-byte ack to the batch-start request (sid 1).
+            "MSG _INBOX.a 1 0\r\n\r\n",
+            // Plain PubAck (no batch/count) to the commit request (sid 2).
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($plainCommitAck), $plainCommitAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(UnsupportedFeatureException::class);
+
+        $client->jetStream()->batch('b-nofields')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->commit()
+            ->await();
+    }
+
+    /**
+     * A single-message batch is trivially atomic, so a plain PubAck without batch fields is an
+     * acceptable commit ack (the guard must not reject it) (#130).
+     */
+    public function testSingleMessageBatchAcceptsPlainPubAck(): void
+    {
+        $plainCommitAck = '{"stream":"ORDERS","seq":7}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainCommitAck), $plainCommitAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $ack = $client->jetStream()->batch('b-single')
+            ->add('orders.created', 'only')
+            ->commit()
+            ->await();
+
+        self::assertSame(7, $ack->seq);
+        self::assertNull($ack->batchCount);
+    }
+
     /**
      * Verifies a committed batch: the START (seq 1) is a request, the intermediate is fire-and-forget,
      * the final carries the commit marker as a request, all share one Nats-Batch-Id, and the commit

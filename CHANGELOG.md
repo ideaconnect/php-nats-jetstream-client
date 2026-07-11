@@ -19,6 +19,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Atomic batch publish no longer degrades silently to non-atomic storage on servers
+  without batch support (pre-2.12): such a server treats `Nats-Batch-*` headers as opaque and
+  acknowledges the batch start/commit as plain publishes, and `commit()` previously reported
+  success while the "batch" had been stored message-by-message. The batch start now requires
+  ADR-50's zero-byte ack (a normal PubAck aborts with `UnsupportedFeatureException` carrying the
+  server version, before the remaining messages are published), and a multi-message commit ack
+  must carry the batch id/count. The README "Server Version Requirements" section and the
+  `JetStreamContext::batch()` docblock now describe when `UnsupportedFeatureException` can
+  actually fire per feature class (#130).
 - `[bugfix]` `NatsClient::subscribeQueue()` no longer silently drops messages delivered between
   the SUB hitting the wire and the `SubscriptionQueue` object being constructed: the subscription
   handler is registered before the SUB write (so the sid is immediately routable, and a concurrent
