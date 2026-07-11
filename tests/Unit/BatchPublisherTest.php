@@ -15,20 +15,21 @@ use PHPUnit\Framework\TestCase;
 final class BatchPublisherTest extends TestCase
 {
     /**
-     * A server without atomic-batch support (pre-2.12) answers the batch START with a normal
-     * PubAck instead of ADR-50's zero-byte ack - it stored the message as a plain publish.
-     * Continuing would store the whole "batch" message-by-message, silently breaking the
-     * all-or-nothing guarantee: commit() must abort with UnsupportedFeatureException before
-     * publishing the remaining messages (#130).
+     * A parseable pre-2.12 INFO version means the connected server cannot honor batch semantics:
+     * commit() must fail the version pre-flight BEFORE anything reaches the wire. The reply-shape
+     * detection (#130) fires only AFTER the start message is durably stored, which leaves one
+     * orphan message from an all-or-nothing API (#152). The scripted plain PubAck reply must go
+     * unconsumed: not a single batch frame may be written.
      */
-    public function testCommitAbortsWhenBatchStartIsAcknowledgedAsPlainPublish(): void
+    public function testCommitPreflightRejectsPre212ServerBeforeAnyWrite(): void
     {
         $plainPubAck = '{"stream":"ORDERS","seq":41}';
 
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.5","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.11.4","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // A pre-2.12 server acks the batch-start request with a NORMAL PubAck.
+            // How a pre-2.12 server WOULD ack the start request if it were sent; the pre-flight
+            // must abort before the request goes out, leaving this reply unread.
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
 
@@ -42,11 +43,155 @@ final class BatchPublisherTest extends TestCase
 
         try {
             $batch->commit()->await();
-            self::fail('expected UnsupportedFeatureException for a pre-2.12 batch start ack');
+            self::fail('expected UnsupportedFeatureException from the pre-2.12 version pre-flight');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('allow_atomic', $e->feature);
             self::assertSame('2.12', $e->requiredVersion);
-            self::assertSame('2.10.5', $e->serverVersion);
+            self::assertSame('2.11.4', $e->serverVersion);
+        }
+
+        $batchWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'Nats-Batch-Id:'),
+        ));
+        self::assertCount(0, $batchWrites, 'the pre-flight must reject the batch before any message is published');
+    }
+
+    /**
+     * The pre-flight parses lenient version strings: a two-segment "2.11" is below 2.12 and must
+     * be rejected before any write - including for a single-message batch, whose plain PubAck a
+     * pre-2.12 server would otherwise silently accept as a normal publish (#152).
+     */
+    public function testCommitPreflightRejectsTwoSegmentPre212Version(): void
+    {
+        $plainPubAck = '{"stream":"ORDERS","seq":7}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.11","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // The plain PubAck a pre-2.12 server WOULD return for the lone message; must stay unread.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-two-segment')->add('orders.created', 'only');
+
+        try {
+            $batch->commit()->await();
+            self::fail('expected UnsupportedFeatureException from the two-segment version pre-flight');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('2.11', $e->serverVersion);
+        }
+
+        self::assertStringNotContainsString('Nats-Batch-Id:', implode('', $transport->writes));
+    }
+
+    /**
+     * A 2.12 pre-release ("2.12.0-beta.1") DOES understand batch semantics: the pre-flight must
+     * compare the numeric prefix (nats.go-style), not full semver precedence where a pre-release
+     * orders BELOW its release - commit() proceeds and the batch commits normally (#152).
+     */
+    public function testCommitProceedsOnPrereleaseOf212(): void
+    {
+        $commitAck = '{"stream":"ORDERS","seq":2,"batch":"b-beta","count":2}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0-beta.1","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Zero-byte ack to the batch-start request (sid 1).
+            "MSG _INBOX.a 1 0\r\n\r\n",
+            // Commit PubAck to the commit request (sid 2).
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $ack = $client->jetStream()->batch('b-beta')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->commit()
+            ->await();
+
+        self::assertSame(2, $ack->batchCount);
+        self::assertSame('b-beta', $ack->batchId);
+    }
+
+    /**
+     * An unparseable INFO version (proxy / custom build) must NOT trip the pre-flight: commit()
+     * falls through to the reply-shape detection, which aborts on the plain PubAck to the start
+     * request after exactly one write (#152 keeping #130 as defense in depth).
+     */
+    public function testCommitUnparseableVersionFallsThroughToReplyShapeDetection(): void
+    {
+        $plainPubAck = '{"stream":"ORDERS","seq":41}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"synadia-custom","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // The batch-incapable server acks the batch-start request with a NORMAL PubAck.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-unparseable')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->add('orders.created', 'c');
+
+        try {
+            $batch->commit()->await();
+            self::fail('expected UnsupportedFeatureException for a plain-publish batch start ack');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('allow_atomic', $e->feature);
+            self::assertSame('synadia-custom', $e->serverVersion);
+        }
+
+        $batchWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, 'Nats-Batch-Id:'),
+        ));
+        self::assertCount(1, $batchWrites, 'only the start message may reach the wire before the abort');
+    }
+
+    /**
+     * Reply-shape detection in a mixed-version cluster: the connected server advertises 2.12+ (so
+     * the pre-flight passes) but the JS leader is older and answers the batch START with a normal
+     * PubAck instead of ADR-50's zero-byte ack - it stored the message as a plain publish.
+     * Continuing would store the whole "batch" message-by-message, silently breaking the
+     * all-or-nothing guarantee: commit() must abort with UnsupportedFeatureException before
+     * publishing the remaining messages (#130).
+     */
+    public function testCommitAbortsWhenBatchStartIsAcknowledgedAsPlainPublish(): void
+    {
+        $plainPubAck = '{"stream":"ORDERS","seq":41}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.1","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // The pre-2.12 JS leader acks the batch-start request with a NORMAL PubAck.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-old')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->add('orders.created', 'c');
+
+        try {
+            $batch->commit()->await();
+            self::fail('expected UnsupportedFeatureException for a plain-publish batch start ack');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('allow_atomic', $e->feature);
+            self::assertSame('2.12', $e->requiredVersion);
+            self::assertSame('2.12.1', $e->serverVersion);
         }
 
         // The batch aborted at the start: no intermediate or commit frames were published.

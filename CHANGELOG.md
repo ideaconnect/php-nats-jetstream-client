@@ -17,6 +17,21 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` `BatchPublisher::commit()` now pre-flights the INFO-advertised server version and
+  throws `UnsupportedFeatureException` BEFORE anything reaches the wire when the connected server
+  is parseably older than 2.12 (#152). Previously the pre-2.12 detection (#130) fired only on the
+  reply to the batch START request - by then the old server had already durably stored the start
+  message as a plain publish, leaving one orphan message in the stream on the "nothing" path of an
+  all-or-nothing API (and a silent plain publish for a single-message batch). Version parsing is
+  numeric-prefix (nats.go-style): pre-releases such as `2.12.0-beta.1` count as 2.12 and proceed;
+  unparseable versions (proxies, custom builds) and mixed-version clusters where the JS leader is
+  older than the connected server still fall through to the reply-shape detection as defense in
+  depth. Also documents that `BatchPublisher::MAX_MESSAGES = 1000` is ADR-50's server DEFAULT
+  batch limit, not a protocol constant - the server's error reply stays authoritative for the
+  configured limit.
+
 ## [2.5.1] - 2026-07-11
 
 ### Fixed
