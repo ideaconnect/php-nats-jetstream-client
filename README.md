@@ -117,7 +117,7 @@ Current functionality includes:
 - Stream mirroring and sourcing configuration helpers (`StreamSource`)
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
 
-Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\\NATS\\JetStream\\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+).
+Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+).
 
 ## NATS Server Version Requirements
 
@@ -143,7 +143,7 @@ reactive - there is no per-request version probe - and depends on the feature:
 | --- | --- | --- | --- |
 | Named consumer create (all consumer helpers) | `createConsumer()`, `createEphemeralConsumer()`, ordered/push/pull subscribe helpers | 2.9 | n/a |
 | Multi-subject consumer filters | `createConsumer(..., ['filter_subjects' => [...]])` | 2.10 | `filter_subjects` |
-| Per-message / KV TTL | `publish(..., ttl:)`, `KeyValueBucket::put/delete/purge(..., ttl:)` | 2.11 | `allow_msg_ttl`, `Nats-TTL` |
+| Per-message / KV TTL | `publish(..., ttl:)`, `KeyValueBucket::put(..., ttl:)`, `delete/purge(..., tombstoneTtl:)` | 2.11 | `allow_msg_ttl`, `Nats-TTL` |
 | Subject delete markers | KV/Object Store `watch()`/`get()` (handled automatically) | 2.11 | `subject_delete_marker_ttl`, `Nats-Marker-Reason` |
 | Pull priority groups | `fetchBatch(..., $pull)`, `PullConsumerIterator::setGroup/setPriority/...`, `unpinConsumer()` | 2.11 (`prioritized` 2.12) | `priority_groups`/`priority_policy`, `Nats-Pin-Id` |
 | Batched / multi Direct Get | `directGetBatch()`, `directGetLastForSubjects()` | 2.11 | `allow_direct` |
