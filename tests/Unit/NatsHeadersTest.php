@@ -117,7 +117,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 37: toWireBlock throws when a header value contains a CR character.
+     * Verifies toWireBlock throws when a header value contains a CR character.
      */
     public function testToWireBlockRejectsHeaderValueWithCarriageReturn(): void
     {
@@ -127,7 +127,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 37: toWireBlock throws when a header value contains a LF character.
+     * Verifies toWireBlock throws when a header value contains a LF character.
      */
     public function testToWireBlockRejectsHeaderValueWithLineFeed(): void
     {
@@ -137,7 +137,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 37: toWireBlock throws for multi-value list where one element contains CR/LF.
+     * Verifies toWireBlock throws for multi-value list where one element contains CR/LF.
      */
     public function testToWireBlockRejectsMultiValueListWithCrLfInElement(): void
     {
@@ -147,7 +147,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 63: fromWireBlockMulti returns empty array for null input.
+     * Verifies fromWireBlockMulti returns empty array for null input.
      */
     public function testFromWireBlockMultiReturnsEmptyForNull(): void
     {
@@ -155,7 +155,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 63: fromWireBlockMulti returns empty array for empty string input.
+     * Verifies fromWireBlockMulti returns empty array for empty string input.
      */
     public function testFromWireBlockMultiReturnsEmptyForEmptyString(): void
     {
@@ -163,7 +163,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 88: fromWireBlockMulti skips lines without a colon separator.
+     * Verifies fromWireBlockMulti skips lines without a colon separator.
      */
     public function testFromWireBlockMultiSkipsLinesWithoutColon(): void
     {
@@ -178,7 +178,7 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
-     * Covers line 93: fromWireBlockMulti skips lines whose name is empty after trimming.
+     * Verifies fromWireBlockMulti skips lines whose name is empty after trimming.
      */
     public function testFromWireBlockMultiSkipsLinesWithEmptyName(): void
     {

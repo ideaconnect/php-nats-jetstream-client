@@ -32,7 +32,9 @@ final class NatsOptions
       * @param int $reconnectDelayMs Base reconnect delay in milliseconds before exponential backoff and jitter.
       * @param int $reconnectMaxDelayMs Upper bound in milliseconds for reconnect backoff growth.
       * @param int $reconnectJitterMs Random jitter range in milliseconds added to reconnect delays to avoid thundering herd.
-      * @param int $pingIntervalSeconds Interval in seconds for protocol PING probes while the connection is open.
+      * @param int|float $pingIntervalSeconds Interval in seconds for protocol PING probes while the
+      *                                       connection is open. Fractional values are supported for
+      *                                       sub-second intervals (e.g. `0.05`); `0` disables the heartbeat.
       * @param int $maxPingsOut Maximum outstanding PING frames allowed before treating the server as unresponsive.
       * @param bool $verbose Requests server `+OK` confirmations for protocol commands.
       * @param bool $pedantic Enables server-side strict subject and protocol validation checks.
@@ -99,7 +101,7 @@ final class NatsOptions
         public readonly int $reconnectDelayMs = 100,
         public readonly int $reconnectMaxDelayMs = 10_000,
         public readonly int $reconnectJitterMs = 50,
-        public readonly int $pingIntervalSeconds = 30,
+        public readonly int|float $pingIntervalSeconds = 30,
         public readonly int $maxPingsOut = 2,
         public readonly bool $verbose = false,
         public readonly bool $pedantic = false,

@@ -1263,7 +1263,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies that calling start() on an already-started service is a no-op (idempotency guard, line 194).
+     * Verifies that calling start() on an already-started service is a no-op (the idempotency guard at the top of start()).
      */
     public function testStartIsIdempotentWhenAlreadyStarted(): void
     {
@@ -1286,7 +1286,7 @@ final class ServiceTest extends TestCase
 
     /**
      * Verifies that a ServiceError with no body AND a correlation_id header emits the correlation_id
-     * in the error payload (lines 273-274).
+     * in the error payload.
      */
     public function testServiceErrorWithNullBodyIncludesCorrelationIdFromHeader(): void
     {
@@ -1321,7 +1321,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies that a handler returning null causes no reply to be published (line 310).
+     * Verifies that a handler returning null causes no reply to be published.
      */
     public function testHandlerReturningNullSendsNoReply(): void
     {
@@ -1359,7 +1359,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies that drain() fires the done handler once (line 379 via markDone from drain).
+     * Verifies that drain() fires the done handler once (via markDone() called from drain()).
      */
     public function testDrainFiresDoneHandler(): void
     {
@@ -1386,7 +1386,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies that the done handler exception is swallowed (line 379: handler called inside try/catch).
+     * Verifies that the done handler exception is swallowed (handler called inside try/catch).
      */
     public function testDoneHandlerExceptionIsSwallowed(): void
     {
@@ -1411,7 +1411,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies a discovery message with no replyTo is silently ignored (line 565).
+     * Verifies a discovery message with no replyTo is silently ignored.
      */
     public function testDiscoveryMessageWithoutReplyToIsIgnored(): void
     {
@@ -1441,7 +1441,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies endpoint requests with no replyTo are processed but produce no PUB (line 593).
+     * Verifies endpoint requests with no replyTo are processed but produce no PUB.
      */
     public function testEndpointRequestWithNoReplyToSendsNoResponse(): void
     {
@@ -1475,7 +1475,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies observer that throws does not interrupt request handling (line 672).
+     * Verifies observer that throws does not interrupt request handling.
      */
     public function testObserverExceptionIsSwallowed(): void
     {
@@ -1505,7 +1505,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies buildRunCancellation throws for a non-positive timeout (line 739).
+     * Verifies buildRunCancellation throws for a non-positive timeout.
      */
     public function testRunRejectsNonPositiveTimeout(): void
     {
@@ -1522,7 +1522,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies run() with only a positive timeout (no external cancellation) uses a TimeoutCancellation (line 751).
+     * Verifies run() with only a positive timeout (no external cancellation) uses a TimeoutCancellation.
      */
     public function testRunWithOnlyTimeoutUsesTimeoutCancellation(): void
     {
@@ -1546,7 +1546,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies stats supplier that throws does not break the stats response (line 517 catch).
+     * Verifies stats supplier that throws does not break the stats response (the catch around the stats supplier).
      */
     public function testStatsHandlerExceptionIsSwallowed(): void
     {
@@ -1571,7 +1571,7 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * Verifies the run loop breaks immediately when the cancellation is already requested on entry (line 440).
+     * Verifies the run loop breaks immediately when the cancellation is already requested on entry.
      */
     public function testRunBreaksImmediatelyWhenCancellationAlreadyRequested(): void
     {
@@ -1596,18 +1596,18 @@ final class ServiceTest extends TestCase
 
     /**
      * Verifies start() rollback silently swallows unsubscribe failures when the connection is gone
-     * during the catch block (line 326: inner catch in the rollback foreach).
+     * during the catch block (inner catch in the rollback foreach).
      *
      * Scenario: two endpoints are added; the connection is dropped before start(). The first
      * discovery subscribe succeeds (the fake transport is still open) but everything breaks
      * after that... actually we need a subtler approach: connect, immediately close the transport,
      * then call start() so that even the first subscribe fails - but then the rollback tries
-     * unsub on the already-queued SIDs and THAT also fails (line 326 catch fires).
+     * unsub on the already-queued SIDs and THAT also fails (the rollback foreach's inner catch fires).
      *
      * The simplest reliable trigger: start successfully, close the connection, then force a second
      * start() with a bad endpoint. The partial subscribe at "bad subject" throws, and the rollback
      * over the already-subscribed SIDs (discovery + first endpoint) also throws because the
-     * connection is now closed - exercising the line-326 swallow path.
+     * connection is now closed - exercising the rollback's swallow path.
      */
     public function testStartRollbackSwallowsUnsubscribeFailureOnClosedConnection(): void
     {
@@ -1621,7 +1621,8 @@ final class ServiceTest extends TestCase
             ->addEndpoint('bad', 'bad subject', static fn(NatsMessage $m): string => 'no');
 
         // Make every UNSUB write fail so the rollback of the already-subscribed SIDs throws and must be
-        // swallowed (the line-357 catch). A failing write - not a closed connection - is now what makes
+        // swallowed (the inner catch in start()'s rollback foreach). A failing write - not a closed
+        // connection - is now what makes
         // unsubscribe() throw, since #116 made unsubscribe() a silent no-op on a not-open connection.
         $transport->throwOnWriteContaining = 'UNSUB';
 
@@ -1665,7 +1666,7 @@ final class ServiceTest extends TestCase
 
     /**
      * Verifies drain() silently swallows flush failures when the connection is already gone
-     * (line 408: catch block around flush() inside drain()).
+     * (catch block around flush() inside drain()).
      *
      * This path is reached when $this->started is true and flush() throws (e.g. closed connection).
      */
@@ -1684,7 +1685,7 @@ final class ServiceTest extends TestCase
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
         $service->start()->await();
 
-        // Close connection; now flush() inside drain() will throw (line 408 catch fires).
+        // Close connection; now flush() inside drain() will throw (the catch around flush() fires).
         $client->disconnect()->await();
 
         // drain() must complete without rethrowing the flush exception; state must be cleared.
@@ -1696,7 +1697,7 @@ final class ServiceTest extends TestCase
 
     /**
      * Verifies buildRunCancellation returns a CompositeCancellation when both a timeout and an
-     * external cancellation are supplied (line 751).
+     * external cancellation are supplied.
      */
     public function testRunWithBothTimeoutAndExternalCancellationUsesCompositeCancellation(): void
     {
@@ -1708,7 +1709,7 @@ final class ServiceTest extends TestCase
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
 
         // Provide BOTH a timeout and an external DeferredCancellation - this exercises the
-        // CompositeCancellation branch (line 751). The external cancel fires first.
+        // CompositeCancellation branch. The external cancel fires first.
         $deferred = new \Amp\DeferredCancellation();
         $runner = \Amp\async(static function () use ($service, $deferred): void {
             $service->run(10.0, $deferred->getCancellation())->await();

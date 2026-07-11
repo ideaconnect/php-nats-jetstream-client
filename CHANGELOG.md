@@ -17,6 +17,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Added
+
+- `[feature]` `NatsOptions::$pingIntervalSeconds` now accepts `int|float`, so sub-second heartbeat
+  intervals (e.g. `0.05`) are expressible; integer values keep working unchanged (backward
+  compatible for every existing caller) and `0` still disables the heartbeat. The underlying
+  timer (`EventLoop::repeat()`) and the heartbeat read budget already operate on floats, so no
+  runtime behavior changes for existing configurations. Motivation (#142): the integer floor made
+  1 s the minimum observable interval, forcing every ping-timer unit test to wall-clock-sleep past
+  it (~10 s per unit-suite run); those tests now run 50 ms intervals with the same deterministic
+  assertions.
+
 ### Changed
 
 - `[bugfix]` Concurrent requests no longer poll: a request waiting while another fiber owns the
@@ -216,6 +227,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Testing & CI
 
+- `[docs]` Test-suite hygiene roundup from the July review (#142), dev-only: deleted
+  `testDirectGetBatchDelaysOnZeroFrames`, whose assertions could not fail for its stated purpose
+  (the pacing delay was never observed) while burning ~1 s per run - the sibling
+  `testDirectGetBatchReturnsEmptyArrayOnTimeout` keeps the empty/timeout path covered; test
+  comments no longer pin production line numbers (several were already stale) and reference the
+  method or branch by name instead - deliberate per-mutant line pins in `tests/Unit/Mutation`
+  are exempt; the ping-timer unit tests use fractional 50 ms intervals instead of ~10 s of
+  wall-clock sleeps (see the `pingIntervalSeconds` entry above); the behat exception steps
+  compare via `is_a()` (instanceof semantics) instead of strict class-string equality, so
+  introducing a more precise exception subclass no longer breaks scenarios.
 - `[docs]` The reconnect path is now exercised against a live server (#141): a new
   `SeveringTransport` test decorator over the real `AmpSocketTransport` force-closes the live TCP
   socket mid-session, and two new integration tests (severing mid-idle and mid-traffic) assert the

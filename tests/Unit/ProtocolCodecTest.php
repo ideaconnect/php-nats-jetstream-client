@@ -307,10 +307,10 @@ final class ProtocolCodecTest extends TestCase
     }
 
     /**
-     * Verifies JWT auth with a valid signer but a null nonce throws (line 74).
+     * Verifies JWT auth with a valid signer but a null nonce throws.
      *
      * The existing testEncodeConnectJwtRequiresSignerAndNonce covers the missing-signer
-     * path (line 70). This test covers the complementary branch: signer is present but
+     * path. This test covers the complementary branch: signer is present but
      * the server nonce is null.
      */
     public function testEncodeConnectJwtWithSignerButNullNonceThrows(): void
@@ -328,7 +328,7 @@ final class ProtocolCodecTest extends TestCase
     }
 
     /**
-     * Verifies JWT auth with a valid signer but an empty-string nonce throws (line 74).
+     * Verifies JWT auth with a valid signer but an empty-string nonce throws.
      */
     public function testEncodeConnectJwtWithSignerButEmptyNonceThrows(): void
     {
@@ -346,7 +346,7 @@ final class ProtocolCodecTest extends TestCase
 
     /**
      * Verifies that configuring an NKey that does not match the public key derived from the
-     * NkeySeedSigner seed throws (line 104).
+     * NkeySeedSigner seed throws.
      *
      * The mismatch guard fires regardless of whether JWT is also set; here we use the JWT
      * path so both jwt and nkey are present in the payload and the seed-signer check runs.
@@ -375,7 +375,7 @@ final class ProtocolCodecTest extends TestCase
     }
 
     /**
-     * Verifies that decodeInfoLine throws when the line does not start with 'INFO ' (line 240).
+     * Verifies that decodeInfoLine throws when the line does not start with 'INFO '.
      */
     public function testDecodeInfoLineThrowsOnNonInfoPrefix(): void
     {
@@ -388,9 +388,9 @@ final class ProtocolCodecTest extends TestCase
     }
 
     /**
-     * Verifies that a bare 'INFO' line without a trailing space throws the prefix error (line 240).
+     * Verifies that a bare 'INFO' line without a trailing space throws the prefix error.
      *
-     * NOTE: The "INFO payload cannot be empty" guard at line 246 is structurally unreachable:
+     * NOTE: The "INFO payload cannot be empty" guard is structurally unreachable:
      * trim() strips trailing whitespace, so any trimmed line that passes the str_starts_with(..., 'INFO ')
      * check must contain at least one non-whitespace character after position 5, making substr(..., 5)
      * always non-empty. This test documents the reachable boundary instead.

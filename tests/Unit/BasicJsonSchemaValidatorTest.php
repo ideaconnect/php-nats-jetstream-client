@@ -125,7 +125,7 @@ final class BasicJsonSchemaValidatorTest extends TestCase
     }
 
     /**
-     * Verifies that a property defined in the schema but absent from the object is skipped (line 59).
+     * Verifies that a property defined in the schema but absent from the object is skipped.
      * An optional property that is not present in the payload should not trigger a type error.
      */
     public function testSkipsPropertyNotPresentInObject(): void

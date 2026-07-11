@@ -10,7 +10,7 @@ use PHPUnit\Framework\TestCase;
 final class ObjectStoreConfigTest extends TestCase
 {
     /**
-     * Verifies toStreamConfig() includes 'description' when it is set (line 58).
+     * Verifies toStreamConfig() includes 'description' when it is set.
      */
     public function testToStreamConfigIncludesDescription(): void
     {
@@ -22,7 +22,7 @@ final class ObjectStoreConfigTest extends TestCase
     }
 
     /**
-     * Verifies toStreamConfig() includes 'placement' when it is set (line 61).
+     * Verifies toStreamConfig() includes 'placement' when it is set.
      */
     public function testToStreamConfigIncludesPlacement(): void
     {

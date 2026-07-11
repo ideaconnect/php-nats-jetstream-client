@@ -1890,7 +1890,7 @@ final class NatsConnectionTest extends TestCase
 
         $errors = [];
         $options = new NatsOptions(
-            pingIntervalSeconds: 1,
+            pingIntervalSeconds: 0.05,
             maxPingsOut: 3,
             reconnectEnabled: false,
             errorListener: static function (\Throwable $err) use (&$errors): void {
@@ -1907,7 +1907,7 @@ final class NatsConnectionTest extends TestCase
         })->await();
 
         // Let the ping timer fire; its heartbeat self-read consumes the -ERR + MSG chunk.
-        delay(1.1);
+        delay(0.1);
 
         self::assertSame(['hello'], $received, 'the co-chunked MSG must be delivered despite the fatal -ERR');
         $fatal = array_filter(
@@ -2591,15 +2591,16 @@ final class NatsConnectionTest extends TestCase
                 maxReconnectAttempts: 1,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
-                pingIntervalSeconds: 1,
+                pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
             ),
             $transport,
         );
         $client->connect()->await();
 
-        // Let ping timer fire once; with maxPingsOut=0 this must trigger reconnect.
-        delay(1.1);
+        // Let the ping timer fire once; with maxPingsOut=0 this must trigger reconnect. The window
+        // must end before the restarted timer's next tick, or a second reconnect would fire.
+        delay(0.08);
 
         self::assertCount(2, $transport->connectCalls);
         self::assertNotNull($client->serverInfo());
@@ -3387,9 +3388,9 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        // Use a very short interval (1 second) and let the event loop tick.
+        // Use a very short fractional interval (50 ms) and let the event loop tick.
         $options = new NatsOptions(
-            pingIntervalSeconds: 1,
+            pingIntervalSeconds: 0.05,
             maxPingsOut: 3,
             reconnectEnabled: false,
         );
@@ -3400,7 +3401,7 @@ final class NatsConnectionTest extends TestCase
         $writesBeforePing = count($transport->writes);
 
         // Let the event loop run long enough for the timer to fire.
-        delay(1.1);
+        delay(0.1);
 
         self::assertGreaterThan($writesBeforePing, count($transport->writes));
         self::assertSame("PING\r\n", $transport->writes[$writesBeforePing]);
@@ -3478,7 +3479,7 @@ final class NatsConnectionTest extends TestCase
         ]);
 
         $options = new NatsOptions(
-            pingIntervalSeconds: 1,
+            pingIntervalSeconds: 0.05,
             maxPingsOut: 2,
             reconnectEnabled: false,
         );
@@ -3490,7 +3491,7 @@ final class NatsConnectionTest extends TestCase
         $writesAfterDisconnect = count($transport->writes);
 
         // Let event loop tick past when timer would have fired.
-        delay(1.2);
+        delay(0.12);
 
         // No PING sent after disconnect.
         self::assertCount($writesAfterDisconnect, $transport->writes);
@@ -3509,7 +3510,7 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
-                pingIntervalSeconds: 1,
+                pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
                 reconnectEnabled: false,
             ),
@@ -3517,7 +3518,7 @@ final class NatsConnectionTest extends TestCase
         );
         $connection->connect()->await();
 
-        delay(1.1);
+        delay(0.1);
 
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
@@ -4543,7 +4544,7 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
-                pingIntervalSeconds: 1,
+                pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1,
@@ -4554,7 +4555,9 @@ final class NatsConnectionTest extends TestCase
         );
         $connection->connect()->await();
 
-        delay(1.1);
+        // One tick + reconnect; must end before the restarted timer's next tick (maxPingsOut=0
+        // reconnects on every tick).
+        delay(0.08);
 
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertCount(2, $transport->connectCalls);
@@ -4679,7 +4682,7 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
-                pingIntervalSeconds: 1,
+                pingIntervalSeconds: 0.05,
                 maxPingsOut: 3,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1,
@@ -4690,7 +4693,7 @@ final class NatsConnectionTest extends TestCase
         );
         $connection->connect()->await();
 
-        delay(1.1);
+        delay(0.15);
 
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertCount(2, $transport->connectCalls);
@@ -5003,13 +5006,13 @@ final class NatsConnectionTest extends TestCase
         };
 
         $connection = new NatsConnection(
-            new NatsOptions(pingIntervalSeconds: 1, maxPingsOut: 1, reconnectEnabled: false),
+            new NatsOptions(pingIntervalSeconds: 0.05, maxPingsOut: 1, reconnectEnabled: false),
             $transport,
         );
         $connection->connect()->await();
 
         // Let several heartbeat ticks elapse without any application processIncoming() calls.
-        delay(2.5);
+        delay(0.2);
 
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertGreaterThanOrEqual(2, $transport->pings);
@@ -5459,7 +5462,7 @@ final class NatsConnectionTest extends TestCase
     // ─── New coverage additions ──────────────────────────────────────────
 
     /**
-     * Line 209: rtt() throws when connection is not open.
+     * rtt() throws when connection is not open.
      */
     public function testRttThrowsWhenConnectionNotOpen(): void
     {
@@ -5471,7 +5474,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 325: drain() swallows a fatal frame error mid-flush and still closes.
+     * drain() swallows a fatal frame error mid-flush and still closes.
      */
     public function testDrainSwallowsFatalFrameErrorMidFlush(): void
     {
@@ -5497,7 +5500,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 413, 415: publishWithHeaders() buffers frame when reconnecting and records outbound stats.
+     * publishWithHeaders() buffers frame when reconnecting and records outbound stats.
      */
     public function testPublishWithHeadersBuffersDuringReconnectAndRecordsOutbound(): void
     {
@@ -5584,7 +5587,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 440: bufferFrame() returns false when the buffer would overflow.
+     * bufferFrame() returns false when the buffer would overflow.
      */
     public function testPublishBufferOverflowThrowsDuringReconnect(): void
     {
@@ -5672,7 +5675,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 467: subscribe() throws when connection is not open.
+     * subscribe() throws when connection is not open.
      */
     public function testSubscribeThrowsWhenConnectionNotOpen(): void
     {
@@ -5684,7 +5687,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 514, 516: drainSubscription() on a closed connection drops local state and returns cleanly.
+     * drainSubscription() on a closed connection drops local state and returns cleanly.
      */
     public function testDrainSubscriptionOnClosedConnectionDropsStateAndReturns(): void
     {
@@ -5706,7 +5709,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 520: drainSubscription() returns early when the SID is not registered.
+     * drainSubscription() returns early when the SID is not registered.
      */
     public function testDrainSubscriptionOnUnknownSidReturnsEarly(): void
     {
@@ -5727,7 +5730,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 527: drainSubscription() swallows a flush failure and still drops the subscription.
+     * drainSubscription() swallows a flush failure and still drops the subscription.
      */
     public function testDrainSubscriptionSwallowsFlushFailureAndDropsSub(): void
     {
@@ -5754,7 +5757,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 549: flush() throws when connection is not open.
+     * flush() throws when connection is not open.
      */
     public function testFlushThrowsWhenConnectionNotOpen(): void
     {
@@ -5766,7 +5769,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 566-567: flush() throws TimeoutException when server PONG never arrives.
+     * flush() throws TimeoutException when server PONG never arrives.
      */
     public function testFlushTimesOutWhenNoPongArrives(): void
     {
@@ -5788,7 +5791,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 700: requestInternal() throws when connection is not open (via request()).
+     * requestInternal() throws when connection is not open (via request()).
      */
     public function testRequestThrowsWhenConnectionNotOpen(): void
     {
@@ -5800,7 +5803,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 807: requestMany() throws when maxResponses < 1.
+     * requestMany() throws when maxResponses < 1.
      */
     public function testRequestManyThrowsWhenMaxResponsesLessThanOne(): void
     {
@@ -5818,7 +5821,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 810: requestMany() throws when stallMs <= 0.
+     * requestMany() throws when stallMs <= 0.
      */
     public function testRequestManyThrowsWhenStallMsNotPositive(): void
     {
@@ -5836,7 +5839,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 833-834: requestManyInternal() throws ConnectionException when connection is not open.
+     * requestManyInternal() throws ConnectionException when connection is not open.
      */
     public function testRequestManyThrowsWhenConnectionNotOpen(): void
     {
@@ -5848,7 +5851,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 838: requestManyInternal() throws TimeoutException when totalTimeoutMs <= 0.
+     * requestManyInternal() throws TimeoutException when totalTimeoutMs <= 0.
      * This is reached only via a requestTimeoutMs of 0, but NatsOptions disallows that,
      * so we pass totalTimeoutMs explicitly.
      */
@@ -5864,12 +5867,12 @@ final class NatsConnectionTest extends TestCase
 
         $this->expectException(TimeoutException::class);
         $this->expectExceptionMessage('Request timeout must be greater than zero');
-        // Pass totalTimeoutMs=0 which directly hits line 838.
+        // Pass totalTimeoutMs=0 which directly hits the non-positive-timeout guard.
         $connection->requestMany('svc.scan', 'q', null, null, 0)->await();
     }
 
     /**
-     * Line 864: requestManyInternal() uses HPUB when headers are supplied.
+     * requestManyInternal() uses HPUB when headers are supplied.
      */
     public function testRequestManyWithHeadersUsesHpub(): void
     {
@@ -5890,9 +5893,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 973: rtt() when connection is not open (also covers the not-open check in rtt itself via line 209,
-     * and line 973 is requestInternal's ConnectionException which is actually triggered from request when not open).
-     * Lines 1050: connectOnce() seeds knownConnectUrls from the initial INFO connect_urls.
+     * connectOnce() seeds knownConnectUrls from the initial INFO connect_urls.
      */
     public function testConnectSeedsKnownConnectUrlsFromInitialInfo(): void
     {
@@ -5909,7 +5910,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1083-1085: serverPool() deduplicates and normalizes bare host:port discovered URLs.
+     * serverPool() deduplicates and normalizes bare host:port discovered URLs.
      * Also indirectly verifies the discovered server is dialable after seeding.
      */
     public function testServerPoolNormalizesAndDeduplicatesDiscoveredUrls(): void
@@ -5936,8 +5937,8 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1147: retryInitialConnect() delays between attempts.
-     * Lines 1156-1158, 1160-1161: retryInitialConnect() fails fast on AuthenticationException.
+     * retryInitialConnect() delays between attempts.
+     * retryInitialConnect() fails fast on AuthenticationException.
      */
     public function testRetryInitialConnectFailsFastOnAuthError(): void
     {
@@ -5977,7 +5978,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1166: retryInitialConnect() returns false after exhausting all attempts.
+     * retryInitialConnect() returns false after exhausting all attempts.
      */
     public function testRetryInitialConnectReturnsFalseWhenExhausted(): void
     {
@@ -6006,7 +6007,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1204-1208: performRecovery() fails fast on AuthenticationException during reconnect.
+     * performRecovery() fails fast on AuthenticationException during reconnect.
      */
     public function testReconnectFailsFastOnAuthDuringReconnect(): void
     {
@@ -6056,8 +6057,8 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1274-1275: drainImmediateServerFrames() returns on CancelledException (poll timeout).
-     * Line 1285: drainImmediateServerFrames() skips +OK frames.
+     * drainImmediateServerFrames() returns on CancelledException (poll timeout).
+     * drainImmediateServerFrames() skips +OK frames.
      * This is exercised indirectly during resubscribeAll() on reconnect.
      */
     public function testDrainImmediateServerFramesHandlesOkAndTimeout(): void
@@ -6096,7 +6097,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1382: awaitServerInfo() throws when an -ERR arrives instead of INFO.
+     * awaitServerInfo() throws when an -ERR arrives instead of INFO.
      */
     public function testConnectFailsWhenErrArrivesInsteadOfInfo(): void
     {
@@ -6113,7 +6114,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1415: readHandshakeChunk() returns null when remaining deadline is <= 0.
+     * readHandshakeChunk() returns null when remaining deadline is <= 0.
      */
     public function testConnectHandlesExpiredDeadlineDuringHandshakeRead(): void
     {
@@ -6136,7 +6137,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1609: isRecoverableServerError() returns true for "invalid subject".
+     * isRecoverableServerError() returns true for "invalid subject".
      */
     public function testProcessIncomingTreatsInvalidSubjectErrAsRecoverable(): void
     {
@@ -6167,7 +6168,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1706-1707: consumeHeartbeatResponse() catches recoverConnection() exception and marks closed.
+     * consumeHeartbeatResponse() catches recoverConnection() exception and marks closed.
      */
     public function testConsumeHeartbeatResponseMarksClosedWhenRecoveryFails(): void
     {
@@ -6190,14 +6191,14 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
 
         // consumeHeartbeatResponse() reads EOF -> calls recoverConnection() -> reconnect disabled -> throws.
-        // The catch block on line 1706 must absorb the exception and mark state as Closed.
+        // The catch block must absorb the exception and mark state as Closed.
         (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
 
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /**
-     * Line 1765: emitEvent() swallows exceptions thrown by the connection listener.
+     * emitEvent() swallows exceptions thrown by the connection listener.
      */
     public function testConnectionListenerExceptionIsSwallowed(): void
     {
@@ -6225,7 +6226,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1787: emitError() swallows exceptions thrown by the error listener.
+     * emitError() swallows exceptions thrown by the error listener.
      */
     public function testErrorListenerExceptionIsSwallowed(): void
     {
@@ -6256,7 +6257,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1800: handleServerInfoUpdate() returns early when serverInfo is null.
+     * handleServerInfoUpdate() returns early when serverInfo is null.
      * This is a defensive guard; we verify it does not throw by calling it directly via reflection.
      */
     public function testHandleServerInfoUpdateNoopsWhenServerInfoIsNull(): void
@@ -6279,7 +6280,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1818-1820: handleServerInfoUpdate() emits LameDuck, attempts failover, and emits error when
+     * handleServerInfoUpdate() emits LameDuck, attempts failover, and emits error when
      * failover fails (reconnect enabled but no spare server).
      */
     public function testLameDuckWithFailoverEmitsErrorWhenRecoveryFails(): void
@@ -6329,7 +6330,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1895, 1897: drainPendingForSid() unsets pendingMessages when subscription is gone.
+     * drainPendingForSid() unsets pendingMessages when subscription is gone.
      */
     public function testDrainPendingForSidRemovesPendingWhenSubscriptionIsGone(): void
     {
@@ -6365,7 +6366,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 891-892: requestManyInternal() rethrows CancelledException from external cancellation token.
+     * requestManyInternal() rethrows CancelledException from external cancellation token.
      */
     public function testRequestManyRethrowsExternalCancellation(): void
     {
@@ -6408,9 +6409,9 @@ final class NatsConnectionTest extends TestCase
     // ─── New coverage additions ──────────────────────────────────────────
 
     /**
-     * Lines 918 (continue): requestManyInternal() continues when the internal slice timeout fires
+     * requestManyInternal() continues when the internal slice timeout fires
      * but no external cancellation was requested (covers the `continue` branch in the
-     * CancelledException catch block on line 918).
+     * CancelledException catch block).
      *
      * Strategy: supply a small stallMs and a reply that arrives before the stall expires.
      * After the stall window elapses with no further reply the stall break fires, but along
@@ -6421,7 +6422,7 @@ final class NatsConnectionTest extends TestCase
     {
         // One reply arrives, then nothing.  With stallMs=50 the loop re-evaluates and eventually
         // hits the stall break; the internal slice timeouts (CancelledException) along the way
-        // exercise the `continue` branch on line 918.
+        // exercise the `continue` branch.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -6439,13 +6440,13 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 911-913: requestManyInternal() rethrows CancelledException when the external
+     * requestManyInternal() rethrows CancelledException when the external
      * cancellation fires WHILE processIncoming() is blocking inside the requestMany loop.
      *
      * Strategy: use a blocking transport (blockWhenEmpty=true) so processIncoming() suspends
      * waiting for data. Cancel externally after a short delay; the CancelledException propagates
-     * out of processIncoming(), the catch block on line 911 detects that the external cancellation
-     * is requested and rethrows (line 913).
+     * out of processIncoming(), the catch block detects that the external cancellation
+     * is requested and rethrows.
      */
     public function testRequestManyRethrowsExternalCancellationFromProcessIncoming(): void
     {
@@ -6486,7 +6487,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Lines 1103, 1105: recoverConnection() coalesces concurrent callers: a second caller
+     * recoverConnection() coalesces concurrent callers: a second caller
      * that arrives while a reconnect is already in progress awaits the same future rather than
      * starting a second recovery attempt.
      *
@@ -6602,7 +6603,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1147: retryInitialConnect() ignores transport.close() failures between attempts.
+     * retryInitialConnect() ignores transport.close() failures between attempts.
      *
      * When a close() call throws during the retry loop, the exception is swallowed and the
      * next connect attempt still proceeds normally.
@@ -6691,7 +6692,7 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Line 1189: performRecovery() ignores transport.close() failures during reconnect loop.
+     * performRecovery() ignores transport.close() failures during reconnect loop.
      *
      * A close() that throws between reconnect attempts must be swallowed so subsequent
      * connect attempts still proceed and recovery can succeed.

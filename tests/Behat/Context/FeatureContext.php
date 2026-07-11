@@ -2345,7 +2345,7 @@ final class FeatureContext implements Context
     public function theRequestShouldFailWithANoRespondersError(): void
     {
         $subject = $this->requireValue($this->state->subject, 'subject');
-        if ($this->state->lastExceptionClass !== NatsException::class || !str_contains((string) $this->state->lastExceptionMessage, 'No responders') || !str_contains((string) $this->state->lastExceptionMessage, $subject)) {
+        if (!is_a((string) $this->state->lastExceptionClass, NatsException::class, true) || !str_contains((string) $this->state->lastExceptionMessage, 'No responders') || !str_contains((string) $this->state->lastExceptionMessage, $subject)) {
             throw new RuntimeException('Expected request to fail with a no responders error mentioning the subject.');
         }
     }
@@ -2402,7 +2402,7 @@ final class FeatureContext implements Context
     public function theRequestShouldFailWithATimeoutError(): void
     {
         $subject = $this->requireValue($this->state->requestSubject, 'request subject');
-        if ($this->state->lastExceptionClass !== TimeoutException::class || !str_contains((string) $this->state->lastExceptionMessage, 'Request timed out') || !str_contains((string) $this->state->lastExceptionMessage, $subject)) {
+        if (!is_a((string) $this->state->lastExceptionClass, TimeoutException::class, true) || !str_contains((string) $this->state->lastExceptionMessage, 'Request timed out') || !str_contains((string) $this->state->lastExceptionMessage, $subject)) {
             throw new RuntimeException('Expected request to fail with a timeout error mentioning the subject.');
         }
     }
@@ -2454,7 +2454,7 @@ final class FeatureContext implements Context
             throw new RuntimeException('Expected drain to flush the in-flight message before closing the connection.');
         }
 
-        if ($this->state->lastExceptionClass !== ConnectionException::class || !str_contains((string) $this->state->lastExceptionMessage, 'Connection is not open')) {
+        if (!is_a((string) $this->state->lastExceptionClass, ConnectionException::class, true) || !str_contains((string) $this->state->lastExceptionMessage, 'Connection is not open')) {
             throw new RuntimeException('Expected subsequent publish after drain to fail on a closed connection.');
         }
     }
@@ -2539,7 +2539,7 @@ final class FeatureContext implements Context
      */
     public function theOversizedPublishShouldBeRejectedByTheClient(): void
     {
-        if ($this->state->lastExceptionClass !== ProtocolException::class || !str_contains((string) $this->state->lastExceptionMessage, 'exceeds server max_payload')) {
+        if (!is_a((string) $this->state->lastExceptionClass, ProtocolException::class, true) || !str_contains((string) $this->state->lastExceptionMessage, 'exceeds server max_payload')) {
             throw new RuntimeException('Expected oversized publish to be rejected with a max_payload protocol error.');
         }
     }

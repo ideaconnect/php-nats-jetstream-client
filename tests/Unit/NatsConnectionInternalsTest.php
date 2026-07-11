@@ -479,11 +479,11 @@ final class NatsConnectionInternalsTest extends TestCase
 
     public function testStartPingTimerCancelsWhenConnectionStateIsNotOpen(): void
     {
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 1), new FakeTransport());
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0.05), new FakeTransport());
         $this->setPrivate($connection, 'state', ConnectionState::Closed);
 
         $this->invokePrivate($connection, 'startPingTimer');
-        delay(1.1);
+        delay(0.1);
 
         self::assertNull($this->getPrivate($connection, 'pingTimerId'));
     }
@@ -523,7 +523,7 @@ final class NatsConnectionInternalsTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
-                pingIntervalSeconds: 1,
+                pingIntervalSeconds: 0.05,
                 maxPingsOut: 3,
                 reconnectEnabled: false,
             ),
@@ -532,7 +532,7 @@ final class NatsConnectionInternalsTest extends TestCase
 
         $this->setPrivate($connection, 'state', ConnectionState::Open);
         $this->invokePrivate($connection, 'startPingTimer');
-        delay(1.1);
+        delay(0.1);
 
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertNull($this->getPrivate($connection, 'pingTimerId'));

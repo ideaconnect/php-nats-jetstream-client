@@ -127,7 +127,7 @@ final class NkeySeedSignerTest extends TestCase
 
     /**
      * A base32 string that decodes to only 3 bytes (passes base32Decode but fails the
-     * >= 4 bytes check inside decode(), triggering "Invalid NKey encoding" at line 120).
+     * >= 4 bytes check inside decode(), triggering "Invalid NKey encoding").
      */
     public function testTooShortBase32EncodingThrowsInvalidNKeyEncoding(): void
     {
@@ -145,7 +145,7 @@ final class NkeySeedSignerTest extends TestCase
 
     /**
      * A single base32 character 'B' has 5 bits remaining after decoding no full bytes,
-     * and those trailing bits are non-zero (B = 1), triggering "Invalid trailing bits" at line 185.
+     * and those trailing bits are non-zero (B = 1), triggering "Invalid trailing bits".
      */
     public function testNonZeroTrailingBitsThrowsInvalidTrailingBits(): void
     {
@@ -161,7 +161,7 @@ final class NkeySeedSignerTest extends TestCase
 
     /**
      * A seed string containing '1' (not in the base32 alphabet A-Z2-7) triggers
-     * "Invalid base32 character in NKey encoding" at line 172.
+     * "Invalid base32 character in NKey encoding".
      */
     public function testInvalidBase32CharacterThrowsException(): void
     {
@@ -179,7 +179,7 @@ final class NkeySeedSignerTest extends TestCase
     /**
      * A correctly CRC-checked seed whose base32-decoded payload is only 3 bytes
      * (< 34) passes the inner decode() check but fails the decodeSeed() length guard,
-     * triggering "Invalid NKey seed encoding" at line 79.
+     * triggering "Invalid NKey seed encoding".
      */
     public function testSeedTooShortForDecodeSeedThrowsInvalidNKeySeedEncoding(): void
     {
@@ -197,7 +197,7 @@ final class NkeySeedSignerTest extends TestCase
 
     /**
      * A 36-byte seed whose first byte has b1 = 0 (not PREFIX_SEED = 144) triggers
-     * "Invalid NKey seed prefix" at line 86.
+     * "Invalid NKey seed prefix".
      */
     public function testWrongSeedPrefixB1ThrowsInvalidNKeySeedPrefix(): void
     {
@@ -215,7 +215,7 @@ final class NkeySeedSignerTest extends TestCase
     /**
      * A seed with the correct b1 = PREFIX_SEED (144) but an invalid public prefix
      * byte (b2 = 255, which is not any of the recognised prefix values) triggers
-     * "Invalid NKey seed prefix" at line 86 via isValidPublicPrefix().
+     * "Invalid NKey seed prefix" via isValidPublicPrefix().
      */
     public function testInvalidPublicPrefixInSeedThrowsInvalidNKeySeedPrefix(): void
     {
@@ -232,7 +232,7 @@ final class NkeySeedSignerTest extends TestCase
 
     /**
      * A seed with correct prefixes but a 33-byte inner seed (instead of 32) triggers
-     * "Invalid NKey seed length" at line 91.
+     * "Invalid NKey seed length".
      */
     public function testSeedInnerPayloadWrongLengthThrowsInvalidNKeySeedLength(): void
     {
@@ -252,7 +252,7 @@ final class NkeySeedSignerTest extends TestCase
      * Verify that a synthetically constructed user seed (all-0x01 entropy bytes)
      * is accepted and produces a deterministic public key.
      * This exercises the happy path with a seed different from SAMPLE_SEED,
-     * incidentally covering base32Encode's trailing-bits branch (line 155) for
+     * incidentally covering base32Encode's trailing-bits branch for
      * the 33-byte public-key payload (33 bytes = 264 bits, 264 % 5 = 4 leftover bits).
      */
     public function testSyntheticUserSeedIsAccepted(): void
