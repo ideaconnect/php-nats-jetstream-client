@@ -601,9 +601,16 @@ final class WebSocketTransportTest extends TestCase
             // The closure is still surfaced so the connection layer can reconnect.
         }
 
-        // The client wrote back a (masked) Close frame mirroring the received status code.
+        // The client wrote back a Close frame mirroring the received status code.
         $written = $socket->writtenBytes();
-        $frames = WebSocketFrameCodec::decode($written);
+
+        // RFC 6455 5.3: a client-sent frame MUST be masked (mask bit = high bit of byte 2). Check the
+        // raw wire byte BEFORE decode() (which unmasks) so an unmasked-echo regression is caught.
+        self::assertSame(0x80, ord($written[1]) & 0x80, 'the client Close echo must be masked (RFC 6455 5.3)');
+
+        // decode() consumes its buffer by reference, so run it on a copy after the raw mask check.
+        $buffer = $written;
+        $frames = WebSocketFrameCodec::decode($buffer);
         self::assertNotSame([], $frames, 'no Close echo was written on the server close frame');
         self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
         self::assertSame($status, $frames[0]['payload']);
