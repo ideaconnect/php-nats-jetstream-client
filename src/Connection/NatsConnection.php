@@ -632,6 +632,12 @@ final class NatsConnection
             $this->closing = true;
             $this->cancelPingTimer();
 
+            // One overall drain budget (monotonic), computed once at entry, bounds BOTH the flush-wait
+            // and the backlog-wait phases: total drain time cannot exceed ~requestTimeoutMs. A second
+            // sequential deadline for the backlog wait would roughly double worst-case drain latency;
+            // #149 requires the wait be bounded by the existing (singular) drain deadline.
+            $drainDeadline = $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000);
+
             // Send UNSUB for all active subscriptions so no new messages arrive.
             foreach (array_keys($this->subscriptionMeta) as $sid) {
                 $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
@@ -653,10 +659,10 @@ final class NatsConnection
             }
 
             // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
-            // the slot), bounded by a deadline so a slow/wedged server cannot hang drain() forever.
-            // A partial chunk (0 complete frames yet) must NOT end the flush early - only the PONG
-            // or the deadline does.
-            $flushCancellation = new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000));
+            // the slot), bounded by the REMAINING drain budget (shared with the backlog wait below)
+            // so a slow/wedged server cannot hang drain() forever. A partial chunk (0 complete frames
+            // yet) must NOT end the flush early - only the PONG or the deadline does.
+            $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
             try {
                 while (!$flushCancellation->isRequested()) {
                     $frames = $this->processIncoming($flushCancellation)->await();
@@ -676,14 +682,56 @@ final class NatsConnection
                 }
             } catch (CancelledException) {
                 // Flush deadline reached; close with whatever was delivered.
-            } catch (\Throwable) {
-                // A fatal frame (e.g. a server -ERR) surfaced mid-flush. Stop flushing and fall through
-                // to the cleanup below so drain() still closes the socket and clears state rather than
-                // leaving the connection wedged in Draining with the socket open.
+            } catch (\Throwable $flushError) {
+                // A fatal frame (e.g. a server -ERR) or a handler that threw/published while the
+                // flush-phase read delivered backlog surfaced here. Route it to the error listener
+                // (a swallowed handler failure during the lossless path was invisible before) and
+                // fall through to the cleanup below so drain() still closes rather than leaving the
+                // connection wedged in Draining with the socket open (#150).
+                $this->emitErrorSafely($flushError);
             }
 
-            // Drain any remaining buffered messages to callbacks.
-            $this->drainAllPending();
+            // Deliver the remaining buffered backlog before closing. A handler may await mid-delivery
+            // (suspending on ANOTHER fiber, its sid guarded by dispatchingSids with messages still
+            // queued) or publish an ack/reply (which now reaches the wire during Draining, #150).
+            // Wait - bounded by the single drain deadline computed at entry - for every sid's queue to
+            // empty and every in-flight dispatch to finish before releasing state, so a suspended
+            // dispatch loop cannot resume into a cleared registry and silently drop its remainder on
+            // the lossless path (#149). Each delivery pass is contained so a handler exception is
+            // surfaced rather than stranding the connection in Draining - drain() always reaches
+            // Closed (#150).
+            while (true) {
+                try {
+                    $this->drainAllPending();
+                } catch (\Throwable $handlerError) {
+                    $this->emitErrorSafely($handlerError);
+                }
+
+                if (!$this->hasUndeliveredDrainBacklog()) {
+                    break;
+                }
+
+                if ($this->monotonicSeconds() >= $drainDeadline) {
+                    // Deadline reached with backlog still undelivered (a handler suspended past it):
+                    // releaseRuntimeState() below clears the registry, and the resumed dispatch loop
+                    // then breaks on the missing subscription and discards the remainder. Make that
+                    // discard LOUD, never silent (#149 acceptance: either delivered or an error naming
+                    // the count; mirrors the #123/#134 observable-drop principle).
+                    $undelivered = $this->countUndeliveredDrainBacklog();
+                    if ($undelivered > 0) {
+                        $this->emitErrorSafely(new ConnectionException(
+                            'drain deadline exceeded: ' . $undelivered
+                            . ' buffered message(s) were not delivered before close',
+                        ));
+                    }
+
+                    break;
+                }
+
+                // Yield so a dispatch loop suspended on another fiber can resume and drain its sid's
+                // queue; without this the loop would spin while that fiber is never scheduled.
+                delay(0.001);
+            }
 
             // Clear subscription state (also errors out any still-parked pong slots, e.g. this
             // drain's own slot when the flush ended via the deadline).
@@ -692,6 +740,56 @@ final class NatsConnection
             $this->transport->close()->await();
             $this->state = ConnectionState::Closed;
         });
+    }
+
+    /**
+     * True while drain() still has backlog to deliver: a sid has queued messages, or a dispatch loop
+     * is suspended mid-delivery on another fiber (dispatchingSids non-empty) and may yet enqueue-drain
+     * more for its sid. drain() waits on this - bounded by its deadline - before tearing down (#149).
+     */
+    private function hasUndeliveredDrainBacklog(): bool
+    {
+        if ($this->dispatchingSids !== []) {
+            return true;
+        }
+
+        foreach ($this->pendingMessages as $queue) {
+            if (!$queue->isEmpty()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Sums the messages still buffered across every sid's queue - the backlog drain() would discard
+     * if its deadline is reached before delivery completes. A sid guarded by a suspended dispatch
+     * keeps its not-yet-delivered messages in its queue, so summing all queue sizes counts them too.
+     * Used to name the count in the loud deadline-exceeded error so the drop is never silent (#149).
+     */
+    private function countUndeliveredDrainBacklog(): int
+    {
+        $count = 0;
+        foreach ($this->pendingMessages as $queue) {
+            $count += $queue->count();
+        }
+
+        return $count;
+    }
+
+    /**
+     * Reports an asynchronous error through the listener/logger, swallowing a throw from a
+     * user-supplied logger/listener: emitError() guards the listener but logs before that guard, so a
+     * throwing logger could otherwise re-open the very escape a drain-time containment closes (#150).
+     */
+    private function emitErrorSafely(\Throwable $error): void
+    {
+        try {
+            $this->emitError($error);
+        } catch (\Throwable) {
+            // A throwing user logger/listener must never break drain's teardown.
+        }
     }
 
     /**
@@ -712,24 +810,7 @@ final class NatsConnection
 
             $frame = $this->codec->encodePublish($subject, $payload, $replyTo);
 
-            if ($this->state !== ConnectionState::Open) {
-                // Buffer while a reconnect is in flight (flushed on reconnect); otherwise unusable.
-                if (!$this->bufferFrame($frame)) {
-                    throw new ConnectionException('Connection is not open');
-                }
-
-                $this->recordOutbound($payload);
-
-                return;
-            }
-
-            try {
-                $this->transport->write($frame)->await();
-            } catch (\Throwable) {
-                $this->recoverConnection();
-                $this->transport->write($frame)->await();
-            }
-
+            $this->writePublishFrame($frame);
             $this->recordOutbound($payload);
         });
     }
@@ -767,23 +848,7 @@ final class NatsConnection
 
             $frame = $this->codec->encodeHeaderPublishBlock($subject, $payload, $headerBlock, $replyTo);
 
-            if ($this->state !== ConnectionState::Open) {
-                if (!$this->bufferFrame($frame)) {
-                    throw new ConnectionException('Connection is not open');
-                }
-
-                $this->recordOutbound($payload);
-
-                return;
-            }
-
-            try {
-                $this->transport->write($frame)->await();
-            } catch (\Throwable) {
-                $this->recoverConnection();
-                $this->transport->write($frame)->await();
-            }
-
+            $this->writePublishFrame($frame);
             $this->recordOutbound($payload);
         });
     }
@@ -865,22 +930,45 @@ final class NatsConnection
      */
     private function writePublishSegment(string $segment, array $payloads): void
     {
-        if ($this->state !== ConnectionState::Open) {
-            // Buffer while a reconnect is in flight (flushed on reconnect); otherwise unusable.
-            if (!$this->bufferFrame($segment)) {
-                throw new ConnectionException('Connection is not open');
-            }
-        } else {
-            try {
-                $this->transport->write($segment)->await();
-            } catch (\Throwable) {
-                $this->recoverConnection();
-                $this->transport->write($segment)->await();
-            }
-        }
+        $this->writePublishFrame($segment);
 
         foreach ($payloads as $payload) {
             $this->recordOutbound($payload);
+        }
+    }
+
+    /**
+     * Writes an already-encoded publish frame with the state-appropriate delivery:
+     *   - Open: write to the socket, with a single recover-and-retry on a transient write failure.
+     *   - Draining: write straight to the still-live socket. A draining connection keeps its socket
+     *     open until drain() closes it, and a handler's ack/reply (a JetStream ack, respond(), a
+     *     request reply) MUST reach the wire - nats.go drains by publishing then closing. Buffering
+     *     is wrong (no reconnect will flush it) and refusing would redeliver the just-acked message;
+     *     recovery is not attempted (drain is tearing down). #150
+     *   - otherwise: buffer while a reconnect is in flight (flushed on reconnect), else fail loudly -
+     *     a publish after the connection has Closed still throws (#146).
+     */
+    private function writePublishFrame(string $frame): void
+    {
+        if ($this->state === ConnectionState::Open) {
+            try {
+                $this->transport->write($frame)->await();
+            } catch (\Throwable) {
+                $this->recoverConnection();
+                $this->transport->write($frame)->await();
+            }
+
+            return;
+        }
+
+        if ($this->state === ConnectionState::Draining) {
+            $this->transport->write($frame)->await();
+
+            return;
+        }
+
+        if (!$this->bufferFrame($frame)) {
+            throw new ConnectionException('Connection is not open');
         }
     }
 

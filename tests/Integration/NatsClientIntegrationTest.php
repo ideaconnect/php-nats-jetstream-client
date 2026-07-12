@@ -1559,6 +1559,84 @@ final class NatsClientIntegrationTest extends TestCase
     }
 
     /**
+     * #150 - a push-consumer-style handler that ACKs (publishes to an ack subject, exactly as a
+     * JetStream ack or NatsMessage::respond() does) while the connection is draining. The in-flight
+     * message is delivered during Draining, and the handler's ack must still reach the wire (rather
+     * than throwing ConnectionException because the publish path refused a non-Open connection); the
+     * subscriber then ends Closed. An observer connection confirms the ack left the client.
+     */
+    public function testDrainDeliversHandlerAckToTheWire(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $suffix = bin2hex(random_bytes(4));
+        $work = 'it.drainack.work.' . $suffix;
+        $ackSubject = 'it.drainack.ack.' . $suffix;
+
+        $observer = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $subscriber = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $observer->connect()->await();
+        $subscriber->connect()->await();
+
+        $acks = [];
+        $observer->subscribe($ackSubject, static function (NatsMessage $message) use (&$acks): void {
+            $acks[] = $message->payload;
+        })->await();
+        // Register the observer's SUB server-side before any ack is published.
+        $observer->flush()->await();
+
+        $handled = false;
+        $ackError = null;
+        $subscriber->subscribe($work, static function (NatsMessage $message) use (&$handled, &$ackError, $subscriber, $ackSubject): void {
+            $handled = true;
+            try {
+                $subscriber->publish($ackSubject, 'ACK')->await();
+            } catch (\Throwable $e) {
+                // On the buggy path the publish throws ConnectionException (Draining is not Open).
+                $ackError = $e;
+            }
+        })->await();
+        $subscriber->flush()->await();
+
+        // Publish the in-flight message from the same connection, then drain: it is delivered to the
+        // handler during Draining, and the handler's ack fires mid-drain.
+        $subscriber->publish($work, 'do-it')->await();
+
+        // Pump the observer so it can receive the ack while the subscriber drains.
+        $observerPumpCancel = new DeferredCancellation();
+        $observerPump = async(static function () use ($observer, $observerPumpCancel): void {
+            $cancellation = $observerPumpCancel->getCancellation();
+            try {
+                while (!$cancellation->isRequested()) {
+                    $observer->processIncoming($cancellation)->await();
+                }
+            } catch (CancelledException) {
+                // Stopped once the ack was observed.
+            }
+        });
+
+        try {
+            $subscriber->drain()->await();
+
+            // Wait (bounded, monotonic) for the ack to land on the observer connection.
+            $deadline = $this->monotonic() + 2.0;
+            while ($acks === [] && $this->monotonic() < $deadline) {
+                delay(0.01);
+            }
+        } finally {
+            $observerPumpCancel->cancel();
+            $observerPump->await();
+        }
+
+        self::assertTrue($handled, 'the in-flight message must be delivered to the handler during drain');
+        self::assertNull($ackError, 'the handler ack must not throw while the connection is Draining');
+        self::assertSame(['ACK'], $acks, 'the handler ack must reach the wire before drain closes the socket');
+        self::assertSame(ConnectionState::Closed, $subscriber->state());
+
+        $observer->disconnect()->await();
+    }
+
+    /**
      * Verifies publish rejects payloads that exceed server max_payload.
      */
     public function testOversizedPublishIsRejected(): void

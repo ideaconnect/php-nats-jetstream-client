@@ -19,6 +19,35 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` `drain()` no longer silently discards the backlog of a subscription whose handler is
+  suspended mid-dispatch (#149). When a handler awaited inside the dispatch loop while messages
+  were still queued for its sid, the `dispatchingSids` re-entrancy guard made drain()'s final
+  delivery skip that sid, `releaseRuntimeState()` then cleared the subscription registry, and the
+  resumed dispatch loop broke on the missing subscription - dropping the remainder on the
+  documented lossless path. drain() now waits for every in-flight dispatch to finish and every
+  sid's queue to empty before releasing state (nats.go `Drain()` waits for per-subscription
+  delivery to complete before closing). The wait is bounded by a single overall drain budget
+  computed once at entry - one deadline covers BOTH the flush-wait and the backlog-wait phases, so
+  total drain time cannot exceed ~`requestTimeoutMs` (the earlier fix added a second sequential
+  deadline that roughly doubled worst-case drain latency). When a handler stays suspended PAST that
+  deadline so the remaining buffered messages cannot be delivered, drain() no longer drops them
+  silently: it counts the still-buffered messages and emits an error naming that count ("drain
+  deadline exceeded: N buffered message(s) were not delivered before close") through the error
+  listener before closing, so the loss is always observable (mirrors the #123/#134 observable-drop
+  principle).
+- `[bugfix]` `drain()` no longer breaks when a handler publishes during the drain (#150). A
+  JetStream ack, a `Service` reply, or `NatsMessage::respond()` invoked from a handler while the
+  connection is `Draining` previously threw `ConnectionException` ("Connection is not open"): the
+  publish path only wrote to the socket when `Open` and only buffered while a reconnect was in
+  flight. The unguarded final backlog delivery then propagated that exception out of drain(), so
+  `releaseRuntimeState()`/`transport->close()` never ran - the connection stranded in `Draining`
+  with the socket open and the delivered-but-unacked message was redelivered by the server. Now a
+  publish during `Draining` writes straight to the still-live socket (nats.go drains by publishing
+  then closing), and drain's final delivery is contained per pass so a handler exception is routed
+  to the error listener while drain() always reaches `Closed`. A publish after the connection has
+  `Closed` still throws (#146); pong-slot correlation (#117) and auto-unsubscribe counting (#112)
+  are preserved.
+
 - `[bugfix]` `flush()`, `drain()`, `drainSubscription()`, and `rtt()` now correlate PONGs to
   their PINGs through a FIFO slot queue (nats.go `nc.pongs` parity) instead of shared booleans
   that ANY PONG cleared (#117). Previously a stale PONG - one answering an earlier heartbeat
