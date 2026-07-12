@@ -33,6 +33,29 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   number of passes. Wire ordering is unchanged: the already-buffered frames are written before the
   flip, so per-publisher order and buffered-before-direct (#148) still hold, and #123 retain-on-flush-
   failure / loud-exhaustion semantics are untouched.
+- `[bugfix]` A WebSocket server that delivered final data frames and then gracefully closed in the
+  same read no longer loses those messages (#115). `WebSocketTransport::processFrames()` threw
+  `TransportClosedException` the instant it hit the `OP_CLOSE` frame, discarding the payload of every
+  data frame earlier in the same batch - already consumed out of the read buffer by the by-reference
+  `WebSocketFrameCodec::decode()`, so those NATS messages were gone (silently lost on core NATS;
+  recovered only via redelivery on JetStream). The transport now returns that accumulated data from
+  `readLine()` first and defers the close to the next `readLine()` via a `pendingClose` flag,
+  including on the large-frame spill path (#164) so a spilled frame's bytes are returned too. The RFC
+  6455 Close echo (#161) is still written when the close is first seen. Relatedly, two RFC 6455 5.4
+  protocol violations in the same handler now fail loudly with a `ProtocolException` instead of
+  silently degrading: a new data frame arriving mid-fragmentation (previously overwrote the partial
+  message) and an orphan continuation frame with no fragmented message in progress (previously
+  dropped). Both violations DEFER the same way as the close: any valid data decoded earlier in the
+  same batch is returned from `readLine()` first, and the `ProtocolException` is surfaced on the next
+  `readLine()` call - the connection still fails loudly, just after the already-decoded messages are
+  delivered, with no silent drop.
+- `[bugfix]` The WebSocket permessage-deflate inflate path now caps the decompressed size, closing a
+  decompression-bomb OOM vector (#121). `WebSocketFrameCodec::inflate()` fed the whole compressed
+  payload to a single `inflate_add()` with no output bound, so a tiny hostile frame could inflate to
+  gigabytes and OOM-spike the client - inconsistent with the file's existing max-frame-size / #89
+  threat model. It now inflates the input in bounded slices (DEFLATE's ~1032:1 maximum ratio caps
+  each call's output) and throws a `ProtocolException` the moment the accumulated output exceeds the
+  cap, keeping peak allocation bounded. Legitimate payloads within the cap inflate byte-identically.
 
 ### Documentation
 

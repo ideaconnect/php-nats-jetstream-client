@@ -617,6 +617,169 @@ final class WebSocketTransportTest extends TestCase
     }
 
     /**
+     * A single read carrying [data frame][OP_CLOSE] must NOT lose the data: readLine() returns the
+     * decoded data bytes, the deferred close surfaces on the FOLLOWING readLine(), and the RFC 6455
+     * Close echo (#161) is still written. Regression for #115 (a close frame discarded the data
+     * decoded from the same read chunk, since the by-ref decode had already consumed those bytes).
+     */
+    public function testReadLineReturnsSameChunkDataThenDefersClose(): void
+    {
+        $payload = "MSG orders 1 5\r\nhello\r\n";
+        $data = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, $payload, fin: true);
+        // Server Close mirroring status 1001 ("going away"), in the SAME read as the data frame.
+        $close = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, pack('n', 1001), false);
+        $socket = new ScriptedChunkSocket([$data . $close]);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        // The data decoded from the shared chunk is returned, not discarded by the trailing close.
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+
+        // The Close echo (#161) was still written when the close was seen (mirroring the 1001 status).
+        $written = $socket->writtenBytes();
+        self::assertNotSame('', $written, 'the RFC 6455 Close echo (#161) must still be sent');
+        $buffer = $written;
+        $frames = WebSocketFrameCodec::decode($buffer);
+        self::assertNotSame([], $frames, 'no Close echo was written');
+        self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
+        self::assertSame(pack('n', 1001), $frames[0]['payload']);
+
+        // The close is surfaced on the NEXT readLine (deferred), distinct from a peer EOF.
+        try {
+            $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+            self::fail('expected the deferred close to surface on the following readLine');
+        } catch (TransportClosedException $e) {
+            self::assertStringContainsString('close frame', $e->getMessage());
+        }
+    }
+
+    /**
+     * The deferred-close path integrates with the #164 large-frame spill: a 64-bit-length frame big
+     * enough to spill to chunk-list accumulation, whose final read also carries the server's Close
+     * frame, returns the full spilled payload first and defers the close to the next readLine() -
+     * the spilled bytes must not be lost either. Regression for #115.
+     */
+    public function testReadLineReturnsSpilledFrameThenDefersCloseSharedWithFinalRead(): void
+    {
+        $payload = str_repeat('Z', 70000); // > 65535 -> 64-bit length -> spill path (#164)
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
+        self::assertSame(127, ord($frame[1]) & 0x7F); // 64-bit extended length form
+        $close = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, '', false);
+
+        $transport = $this->transportReadingChunks([
+            substr($frame, 0, 20),        // header + a few payload bytes: sizes the spill
+            substr($frame, 20) . $close,  // rest of the frame AND the trailing Close in one read
+        ]);
+
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(5.0))->await());
+
+        try {
+            $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+            self::fail('expected the deferred close after the spilled frame');
+        } catch (TransportClosedException $e) {
+            self::assertStringContainsString('close frame', $e->getMessage());
+        }
+    }
+
+    /**
+     * A single read carrying [complete data frame][fragment start][new data frame mid-fragmentation]
+     * must NOT lose the complete message: readLine() returns its bytes first, and the RFC 6455 5.4
+     * fragmentation violation surfaces as a ProtocolException on the FOLLOWING readLine() - deferred
+     * exactly like the graceful close. Regression for #115 (the violation threw inline, discarding the
+     * data frame already decoded out of the same read chunk by the by-ref decode).
+     */
+    public function testReadLineReturnsSameChunkDataThenDefersFragmentationViolation(): void
+    {
+        $payload = "MSG orders 1 5\r\nhello\r\n";
+        // A complete data message, then a fragment start, then a new data frame while fragmenting -
+        // all three coalesced into one read (as a graceful-then-buggy server could deliver them).
+        $chunk = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, $payload, fin: true)
+            . $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'PA', fin: false)
+            . $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'RT', fin: false);
+        $socket = new ScriptedChunkSocket([$chunk]);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        // The complete message decoded from the shared chunk is returned, not discarded by the violation.
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+
+        // The violation is surfaced on the NEXT readLine (deferred), and it is the protocol error - not
+        // a peer EOF - so the connection layer fails loudly rather than losing the earlier message.
+        try {
+            $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+            self::fail('expected the deferred fragmentation violation to surface on the following readLine');
+        } catch (ProtocolException $e) {
+            self::assertMatchesRegularExpression('/fragment/i', $e->getMessage());
+        }
+    }
+
+    /**
+     * A single read carrying [complete data frame][orphan continuation frame] must NOT lose the
+     * complete message: readLine() returns its bytes first, and the RFC 6455 5.4 orphan-continuation
+     * violation surfaces as a ProtocolException on the FOLLOWING readLine() - deferred like the close.
+     * Regression for #115 (the violation threw inline, discarding the already-decoded data frame).
+     */
+    public function testReadLineReturnsSameChunkDataThenDefersOrphanContinuation(): void
+    {
+        $payload = "MSG orders 1 2\r\nhi\r\n";
+        // A complete data message, then a continuation frame with no fragmentation in progress, in the
+        // same read.
+        $chunk = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, $payload, fin: true)
+            . $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'XX', fin: true);
+        $socket = new ScriptedChunkSocket([$chunk]);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+
+        try {
+            $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+            self::fail('expected the deferred orphan-continuation violation on the following readLine');
+        } catch (ProtocolException $e) {
+            self::assertMatchesRegularExpression('/continuation/i', $e->getMessage());
+        }
+    }
+
+    /**
+     * RFC 6455 5.4: a new data frame arriving mid-fragmentation is a protocol violation. With no data
+     * decoded earlier in the same batch to return first, it must fail loudly (ProtocolException) right
+     * away instead of silently overwriting the partial message (#115).
+     */
+    public function testDrainFailsWhenDataFrameArrivesMidFragmentation(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions());
+        // Start a fragmented message (FIN=0), then a NEW data frame instead of a continuation.
+        $buffer = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'PI', fin: false)
+            . $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'XX', fin: false);
+        (new \ReflectionProperty(WebSocketTransport::class, 'readBuffer'))->setValue($transport, $buffer);
+        $drain = new \ReflectionMethod(WebSocketTransport::class, 'drainDataFrames');
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/fragment/i');
+        $drain->invoke($transport);
+    }
+
+    /**
+     * RFC 6455 5.4: a continuation frame with no fragmented message in progress is a protocol
+     * violation. With no data decoded earlier in the same batch to return first, it must fail loudly
+     * (ProtocolException) right away instead of being silently dropped (#115).
+     */
+    public function testDrainFailsOnOrphanContinuationFrame(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions());
+        $buffer = $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'XX', fin: true);
+        (new \ReflectionProperty(WebSocketTransport::class, 'readBuffer'))->setValue($transport, $buffer);
+        $drain = new \ReflectionMethod(WebSocketTransport::class, 'drainDataFrames');
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/continuation/i');
+        $drain->invoke($transport);
+    }
+
+    /**
      * Connects a WebSocketTransport to a loopback TCP socket and injects the connected client socket
      * (bypassing the HTTP upgrade handshake) so readLine()/the decode loop can be driven with
      * pre-encoded server frames written from the returned server-side socket.
