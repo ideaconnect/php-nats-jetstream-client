@@ -145,13 +145,15 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     /**
-     * kills Concat + ConcatOperandRemoval @ line 1623 and MethodCallRemoval @ line 1624 (overflow error).
+     * kills Concat + ConcatOperandRemoval on the overflow ConnectionException message.
      *
-     * With the Error policy, overflow builds a ConnectionException, emits it to the error listener, then
-     * throws it. The thrown message must be the exact in-order text including the sid (1623); the listener
-     * must receive exactly that error (1624 removes the emit but still throws).
+     * With the Error policy, overflow builds a ConnectionException and THROWS it (the single surfacing
+     * point). The thrown message must be the exact in-order text including the sid. The connection layer
+     * must NOT also emit the overflow to the error listener: for this single (first) overflow,
+     * dispatchFrames() rethrows it without an emitErrorSafely(), so the listener stays empty - a
+     * re-added connection-level emitError() would report the same exception twice (#159/#158).
      */
-    public function testOverflowErrorPolicyEmitsAndThrowsExactMessage(): void
+    public function testOverflowErrorPolicyThrowsExactMessageWithoutDoubleEmitting(): void
     {
         $errors = [];
         $transport = new FakeTransport([
@@ -181,11 +183,11 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
         }
 
         self::assertInstanceOf(ConnectionException::class, $thrown);
-        // kills Concat/ConcatOperandRemoval @ 1623
+        // kills Concat/ConcatOperandRemoval on the overflow message
         self::assertSame('Subscription queue overflow for sid 1', $thrown->getMessage());
-        // kills MethodCallRemoval @ 1624 (emitError must have fired with the same overflow error)
-        self::assertCount(1, $errors);
-        self::assertSame('Subscription queue overflow for sid 1', $errors[0]);
+        // the first overflow surfaces only by the throw (rethrown by dispatchFrames), so the listener
+        // must NOT see it - a re-added connection-level emitError would double-report it (#159).
+        self::assertCount(0, $errors);
     }
 
     /**

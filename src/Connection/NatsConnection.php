@@ -1645,12 +1645,16 @@ final class NatsConnection
         $replyTick = new DeferredFuture();
         $replyTick->getFuture()->ignore();
 
-        $sid = $this->subscribe($inbox, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick): void {
+        $sid = $this->subscribe($inbox, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, $maxResponses): void {
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
                 $noResponders = true;
-            } else {
+            } elseif ($maxResponses === null || count($messages) < $maxResponses) {
+                // Cap the collection here, not only in the wait loop below: replies coalesced into a
+                // single chunk are ALL dispatched to this collector before the loop regains control,
+                // so an unconditional append could return more than maxResponses. Extra replies past
+                // the cap are dropped here (the loop breaks on count >= maxResponses regardless) (#160).
                 $messages[] = $message;
                 $lastAt = $this->monotonicSeconds();
             }
@@ -2685,12 +2689,20 @@ final class NatsConnection
 
     /**
      * Adds a message to a subscription queue and applies slow-consumer policy when full.
+     *
+     * The queue is bounded by message COUNT only ({@see NatsOptions::$maxPendingMessagesPerSubscription});
+     * there is no byte-based bound, so N large payloads can pin proportional memory per slow
+     * subscription (nats.go's pending limits are both count- and byte-based) (#159).
      */
     private function enqueueMessage(int $sid, NatsMessage $message): void
     {
         // Count the message toward auto-unsubscribe accounting at intake - before any slow-consumer
         // drop below - so a dropped message still advances toward the max exactly as it does on the
-        // server (which counts messages it SENT, not messages the client managed to deliver) (#112).
+        // server (which counts messages it SENT, not messages the client managed to deliver). This
+        // holds for EVERY policy, including Error: the server decremented its auto-unsub max when it
+        // wrote the message, so a client-side slow-consumer drop must not roll this back - doing so
+        // desynchronises the count and completeAutoUnsubIfSatisfied() would never fire, leaking the
+        // subscription (the #112 invariant it relies on) (#112/#159).
         $this->receivedCounts[$sid] = ($this->receivedCounts[$sid] ?? 0) + 1;
 
         if (!isset($this->pendingMessages[$sid])) {
@@ -2711,10 +2723,14 @@ final class NatsConnection
 
                 return;
             } else {
-                $overflow = new ConnectionException('Subscription queue overflow for sid ' . $sid);
-                $this->emitError($overflow);
-
-                throw $overflow;
+                // Error policy: the overflowing message is dropped (core NATS will not resend it) and
+                // the loss is surfaced loudly by THROWING - the single surfacing point. dispatchFrames()
+                // rethrows the first such error to the caller and emitErrorSafely()s any subsequent one
+                // (#158), so an extra emitError() here would report the SAME exception to the listener
+                // twice. The intake count charged above is deliberately NOT rolled back: the server
+                // already counted this message toward the auto-unsub max, so it must count here too or
+                // completeAutoUnsubIfSatisfied() never fires and the subscription leaks (#159/#112).
+                throw new ConnectionException('Subscription queue overflow for sid ' . $sid);
             }
         }
 
@@ -3236,6 +3252,19 @@ final class NatsConnection
         try {
             while (!$queue->isEmpty()) {
                 if (!array_key_exists($sid, $this->subscriptions)) {
+                    break;
+                }
+
+                $max = $this->autoUnsubMax[$sid] ?? null;
+                if ($max !== null && ($this->deliveredCounts[$sid] ?? 0) >= $max) {
+                    // Gate DELIVERY at the cap, not just the aftermath: an auto-unsub armed with
+                    // max <= already-delivered while a backlog was still queued (completeAutoUnsub
+                    // deferred on the non-empty backlog) would otherwise dequeue and deliver exactly
+                    // one message past the max before the post-delivery check below fired. Drop the
+                    // sid here without invoking the handler once more (#156). The post-delivery check
+                    // still handles the #112 flush case where max > delivered on entry.
+                    $this->dropSubscriptionState($sid);
+
                     break;
                 }
 

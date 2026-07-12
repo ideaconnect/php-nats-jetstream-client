@@ -54,6 +54,8 @@ final class NatsOptions
       * @param string|null $nkey Optional public NKey used in JWT or standalone NKey challenge-response auth.
       * @param NonceSignerInterface|null $nonceSigner Signer used to produce Ed25519 signatures for server nonce challenges.
       * @param int $maxPendingMessagesPerSubscription In-memory per-subscription queue cap used by slow-consumer handling.
+      *        This is a message COUNT bound only; there is no byte-based bound, so this many large payloads can pin
+      *        proportional memory per slow subscription (nats.go's pending limits are both count- and byte-based) (#159).
       * @param SlowConsumerPolicy $slowConsumerPolicy Strategy applied when per-subscription pending queue reaches capacity.
       * @param (\Closure(\IDCT\NATS\Connection\Enum\ConnectionEvent,?\Throwable):void)|null $connectionListener
       *        Optional callback invoked on connection lifecycle transitions (connected, disconnected,

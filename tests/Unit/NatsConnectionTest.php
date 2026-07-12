@@ -616,6 +616,63 @@ final class NatsConnectionTest extends TestCase
         self::assertArrayNotHasKey($sid, $meta);
     }
 
+    /**
+     * Auto-unsubscribe armed with max <= already-delivered while a backlog is still queued must gate
+     * DELIVERY at the cap, not just the aftermath. The drain loop previously dequeued and delivered
+     * one more message before its post-delivery cap check fired, over-delivering exactly one message
+     * past the armed max and contradicting the "never over-deliver past max" contract (#112/#156).
+     *
+     * Reproduction (pure wire): sid A (lower sid, drained first) arms unsubscribe(sidB, max=1) from
+     * its handler AFTER sid B's second message is already enqueued but before sid B is drained in the
+     * same drainAllPending() pass, so completeAutoUnsub defers (backlog non-empty) and sid B's fresh
+     * drain then starts with delivered==max and a non-empty queue - the exact over-delivery window.
+     */
+    public function testAutoUnsubscribeArmedAtOrBelowDeliveredDoesNotOverDeliverQueuedBacklog(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Prime sid B with its one allowed delivery (delivered = 1).
+            "MSG b 2 2\r\nb1\r\n",
+            // One chunk: sid A drains first and arms sid B's cap; sid B's second message is already
+            // queued when the arm defers, so sid B's drain starts at delivered == max with a backlog.
+            "MSG a 1 2\r\na1\r\nMSG b 2 2\r\nb2\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $receivedB = [];
+        /** @var int|null $sidB */
+        $sidB = null;
+
+        $connection->subscribe('a', function (NatsMessage $message) use ($connection, &$sidB): void {
+            if ($sidB !== null) {
+                // Arm the cap at max=1 while sid B already delivered 1 and still has a queued backlog.
+                $connection->unsubscribe($sidB, 1)->await();
+            }
+        })->await();
+
+        $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$receivedB): void {
+            $receivedB[] = $message->payload;
+        })->await();
+
+        $connection->processIncoming()->await();
+        self::assertSame(['b1'], $receivedB);
+
+        // The combined chunk: A arms B's cap mid-pass, then B is drained.
+        $connection->processIncoming()->await();
+
+        self::assertSame(
+            ['b1'],
+            $receivedB,
+            'auto-unsub armed at max <= delivered must not over-deliver the queued backlog (#156)',
+        );
+
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayNotHasKey($sidB, $meta, 'the sid must be dropped once the cap gates the queued backlog');
+    }
+
     public function testAutoUnsubscribeOnNonOpenConnectionDefersArmingInsteadOfDestroyingSubscription(): void
     {
         // Regression: the arm form of unsubscribe($sid, $max) must be handled BEFORE the not-open
@@ -2317,6 +2374,121 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * SlowConsumerPolicy::Error drops the overflowing message (core NATS will not resend it) and
+     * surfaces the loss loudly by throwing. The dropped message STILL counts toward the auto-unsub
+     * max at intake, exactly like DropOldest/DropNewest and exactly as the server counts a message
+     * the moment it writes it (#112): rolling that count back would leave receivedCounts short of the
+     * max forever, so completeAutoUnsubIfSatisfied() would never fire and the subscription would leak.
+     * The documented, tested semantics: an Error-policy auto-unsub completes having delivered fewer
+     * than max, the overflow surfaced rather than silent, and the subscription does NOT leak (#159/#112).
+     */
+    public function testSlowConsumerErrorPolicyOverflowCountsTowardAutoUnsubAndDoesNotLeak(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // m1 fills the cap-1 queue and is delivered; m2 overflows under Error (dropped + surfaced)
+            // in the SAME chunk. A conformant server, having written both toward `UNSUB sid 2`, sends
+            // no third message - so the test never asserts an impossible follow-up delivery.
+            "MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\n",
+        ]);
+
+        $options = new NatsOptions(
+            maxPendingMessagesPerSubscription: 1,
+            slowConsumerPolicy: SlowConsumerPolicy::Error,
+        );
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Auto-unsubscribe after 2 messages (the server's UNSUB max). The server counts BOTH m1 and m2
+        // as sent, so it considers the max reached and stops after them.
+        $connection->unsubscribe($sid, 2)->await();
+
+        // The Error-policy overflow surfaces loudly: processIncoming() throws the overflow exception
+        // (its single surfacing point) rather than dropping m2 silently.
+        try {
+            $connection->processIncoming()->await();
+            self::fail('the Error-policy overflow must surface, not drop silently');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('Subscription queue overflow', $e->getMessage());
+        }
+
+        // m2 was lost to the overflow (documented: core NATS will not resend it), so only m1 was
+        // delivered - fewer than the max=2, which the Error policy explicitly allows.
+        self::assertSame(['m1'], $received, 'the overflow-dropped message is lost, so delivery is below max (#159)');
+
+        // Both m1 and m2 counted toward the max at intake, so the auto-unsub COMPLETED and the sid was
+        // dropped: the subscription does not leak. (If the intake count were rolled back for the
+        // rejected m2, receivedCounts would sit at 1 < 2 forever and the sid would remain armed.)
+        $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
+        self::assertArrayNotHasKey(
+            $sid,
+            $meta,
+            'the server-sent-but-dropped message must still complete the auto-unsub so the subscription cannot leak (#159/#112)',
+        );
+    }
+
+    /**
+     * The Error-policy overflow must reach the error listener EXACTLY ONCE, not twice. When several
+     * MSG frames coalesce into one chunk and more than one overflows, dispatchFrames() rethrows the
+     * first overflow to the caller and emitErrorSafely()s each subsequent one (#158). If the
+     * connection layer ALSO emitError()d the overflow before throwing it, that same exception would
+     * reach the listener a second time. The connection layer surfaces the overflow only by throwing,
+     * so the listener sees each surfaced-via-listener overflow once (#159/#158).
+     */
+    public function testSlowConsumerErrorPolicyOverflowSurfacesToListenerOnceNotTwice(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // One chunk, three frames: m1 fills the cap-1 queue, m2 overflows (first error -> rethrown),
+            // m3 overflows again (second error -> reported via the error listener by dispatchFrames).
+            "MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\nMSG updates 1 2\r\nm3\r\n",
+        ]);
+
+        $options = new NatsOptions(
+            maxPendingMessagesPerSubscription: 1,
+            slowConsumerPolicy: SlowConsumerPolicy::Error,
+            errorListener: static function (\Throwable $err) use (&$errors): void {
+                $errors[] = $err->getMessage();
+            },
+        );
+        $connection = new NatsConnection($options, $transport);
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // The first overflow (m2) is rethrown to the caller; m1 still drains.
+        try {
+            $connection->processIncoming()->await();
+            self::fail('the first Error-policy overflow must surface to the caller');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('Subscription queue overflow', $e->getMessage());
+        }
+
+        self::assertSame(['m1'], $received, 'only the one message that fit the cap is delivered');
+
+        // The second overflow (m3) reached the listener via dispatchFrames' emitErrorSafely - exactly
+        // once. Before the fix the connection layer also emitError()d every overflow, so the listener
+        // saw m2 once and m3 twice; now it sees only m3 (the listener-surfaced one), once.
+        self::assertCount(
+            1,
+            $errors,
+            'the Error-policy overflow must reach the listener exactly once, not once per frame plus the #158 re-emit (#159)',
+        );
+        self::assertStringContainsString('Subscription queue overflow', $errors[0]);
+    }
+
+    /**
      * A failing PONG reply to a server PING must not discard the MSG frames parsed from the same
      * chunk: dispatch completes (messages enqueued and drained) before the failure surfaces (#128).
      */
@@ -2481,6 +2653,35 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(['A', 'B', 'C'], $payloads);
         self::assertStringStartsWith('PUB svc.scan _INBOX.', $transport->writes[3]);
         self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+    }
+
+    /**
+     * requestMany() must never return more than maxResponses even when several replies coalesce into
+     * a single TCP chunk. The inbox collector previously appended every reply unconditionally while
+     * the wait loop only capped between reads, so one processIncoming() dispatching 3 replies returned
+     * all 3 for maxResponses=2. The collector now caps at the limit (#160).
+     */
+    public function testRequestManyDoesNotExceedMaxResponsesWhenRepliesArriveInOneChunk(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Three replies in ONE chunk, all dispatched before the wait loop regains control.
+            "MSG _INBOX.any 1 1\r\nA\r\nMSG _INBOX.any 1 1\r\nB\r\nMSG _INBOX.any 1 1\r\nC\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $replies = $connection->requestMany('svc.scan', 'q', null, 2, 1000)->await();
+
+        self::assertCount(
+            2,
+            $replies,
+            'requestMany must cap returned replies at maxResponses even for one-chunk coalesced replies (#160)',
+        );
+        $payloads = array_map(static fn(NatsMessage $m): string => $m->payload, $replies);
+        self::assertSame(['A', 'B'], $payloads);
     }
 
     /**
