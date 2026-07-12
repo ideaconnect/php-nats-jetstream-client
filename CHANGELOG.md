@@ -15,6 +15,39 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` The reconnect-buffer flush no longer defers the `Open` flip indefinitely under sustained
+  publish pressure (#165, a #148 follow-up). Since #148 recovery stays `Connecting` until
+  `flushReconnectBuffer()` fully drains, and the flush loops so publishes buffered mid-flush still go
+  out in order before `Open`. A fiber publishing continuously re-filled the buffer during each flush
+  write's suspension, so the loop kept iterating and the connection could stay `Connecting` for the
+  whole outage window - `subscribe()`/`request()`/`flush()`/`rtt()`/`processIncoming()` all threw
+  "Connection is not open" and `Reconnected` never fired (nats.go converges here by holding the
+  connection mutex during the pending flush; PHP fibers have no equivalent implicit exclusion). The
+  flush is now bounded: after `RECONNECT_FLUSH_MAX_PASSES` drain passes it SEALS the buffer, so late
+  publishers park on a flush-done gate (then write directly once `Open`, or fail loudly once `Closed`)
+  instead of appending, the remaining bytes drain in one final pass, and `Open` flips within a bounded
+  number of passes. Wire ordering is unchanged: the already-buffered frames are written before the
+  flip, so per-publisher order and buffered-before-direct (#148) still hold, and #123 retain-on-flush-
+  failure / loud-exhaustion semantics are untouched.
+
+### Documentation
+
+- `[docs]` `NatsConnection::publish()` now documents its at-least-once, nats.go-parity semantics while
+  reconnecting (#121): a publish issued during a reconnect is buffered and reports success immediately
+  - before the frame reaches any server - and if the reconnect ultimately exhausts every attempt the
+  buffered frames are discarded, with the loss signalled only out-of-band via the connection-level
+  `Closed` event and the "Reconnect exhausted: N bytes ... discarded" async error (#123), never
+  through the returned `Future`. The related write-order note - a publish whose direct write fails is
+  re-sent AFTER the frames concurrent publishers buffered during the same outage - is confirmed as the
+  intended buffered-before-direct ordering (#148/#165), not a defect: the re-send is deliberately not
+  seeded into the flush so recovery success stays independent of the failing frame (#145) and the
+  post-recovery delivery drain runs before the retry (#144); per-publisher order is preserved. No
+  behavior change.
+
 ## [2.5.2] - 2026-07-12
 
 ### Fixed

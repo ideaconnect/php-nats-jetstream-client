@@ -54,6 +54,18 @@ final class NatsConnection
      */
     private const PUBLISH_BLOCK_SEGMENT_BYTES = 512 * 1024;
 
+    /**
+     * Hard cap on {@see flushReconnectBuffer()} drain passes before it SEALS the reconnect buffer
+     * (#165). Each pass writes the whole pending buffer; a fiber publishing during a write's
+     * suspension re-fills the buffer, so an uncapped loop can defer the Open flip indefinitely (the
+     * connection stays Connecting and subscribe/request/flush/rtt/processIncoming all throw). After
+     * this many passes the flush stops admitting new buffered frames - late publishers park on
+     * {@see $reconnectFlushGate} and write directly once Open - so the drain converges within one more
+     * pass. Sized above a normal multi-publisher burst (which drains in one or two passes) so the seal
+     * only ever engages under sustained publish pressure, leaving the common path unchanged.
+     */
+    private const RECONNECT_FLUSH_MAX_PASSES = 8;
+
     private ConnectionState $state = ConnectionState::Idle;
     private ?ServerInfo $serverInfo = null;
     private ProtocolParser $parser;
@@ -219,6 +231,18 @@ final class NatsConnection
     private bool $everConnected = false;
     /** Encoded publishes buffered while reconnecting (flushed on a successful reconnect); see #49. */
     private string $reconnectBuffer = '';
+    /**
+     * Set while {@see flushReconnectBuffer()} has SEALED the reconnect buffer after
+     * {@see self::RECONNECT_FLUSH_MAX_PASSES} drain passes (#165): a publish that would otherwise keep
+     * re-filling the buffer parks on this future in {@see writePublishFrame()} instead, then writes
+     * directly once the connection flips Open (or fails loudly once it flips Closed). Completed and
+     * cleared by {@see recoverConnection()}'s finally after the state is finalized, so a parked
+     * publisher always wakes to a settled state. The buffered frames are fully flushed before the flip,
+     * so the parked (later) writes always land after them - buffered-before-direct ordering (#148).
+     *
+     * @var ?DeferredFuture<void>
+     */
+    private ?DeferredFuture $reconnectFlushGate = null;
     /**
      * Subjects that already passed publish-path validation (#136), so repeat publishes skip the
      * regex + per-token scan. Bounded by {@see self::VALIDATED_SUBJECTS_MAX} with a full reset at
@@ -843,6 +867,16 @@ final class NatsConnection
     /**
      * Publishes payload bytes to the given subject.
      *
+     * At-least-once, nats.go-parity semantics while reconnecting: a publish issued while a reconnect is
+     * in flight is buffered and reports success IMMEDIATELY - the returned Future resolves as soon as
+     * the frame is queued, before it has reached any server. If the reconnect then succeeds the
+     * buffered frames are flushed in publish order; if it exhausts every attempt, those frames are
+     * DISCARDED and this reported success is retroactively void. That loss is signalled only
+     * out-of-band - via the connection-level {@see ConnectionEvent::Closed} event and the
+     * "Reconnect exhausted: N bytes ... discarded" async error (#123) - never through this Future. A
+     * caller needing end-to-end delivery confirmation must use a JetStream publish-with-ack rather than
+     * treating this success as proof the bytes were transmitted.
+     *
      * @return Future<void>
      */
     public function publish(string $subject, string $payload, ?string $replyTo = null): Future
@@ -1002,6 +1036,16 @@ final class NatsConnection
             try {
                 $this->transport->write($frame)->await();
             } catch (\Throwable) {
+                // The direct write failed mid-flight: recover, then re-send on the fresh socket. The
+                // re-send stays AFTER recovery (it is NOT seeded into the flush) on purpose: recovery
+                // success must be independent of this frame - a persistently rejected publish would
+                // otherwise cascade the whole recovery into exhaustion (#145) - and the post-recovery
+                // delivery drain must run before the retry write (#144). This frame therefore lands
+                // after any frames other publishers buffered during the outage: that is the
+                // buffered-before-direct ordering #148/#165 make global, and the at-least-once
+                // consequence documented on publish() (#121). Per-publisher order still holds: this
+                // publish() does not return until the frame is (re-)written, so the same publisher's
+                // next frame follows it on the wire.
                 $this->recoverConnection();
                 $this->transport->write($frame)->await();
             }
@@ -1011,6 +1055,19 @@ final class NatsConnection
 
         if ($this->state === ConnectionState::Draining) {
             $this->transport->write($frame)->await();
+
+            return;
+        }
+
+        // A sealed reconnect flush (#165) parks late publishers here so they stop re-filling the
+        // buffer: once the flush completes the connection is Open (retry writes directly) or Closed
+        // (bufferFrame() refuses -> throw), and either way these frames are ordered AFTER the buffered
+        // frames the flush already emitted. The gate is always completed by recoverConnection()'s
+        // finally with the state finalized, so this await cannot outlive the recovery.
+        $flushGate = $this->reconnectFlushGate;
+        if ($flushGate !== null) {
+            $flushGate->getFuture()->await();
+            $this->writePublishFrame($frame);
 
             return;
         }
@@ -2053,6 +2110,16 @@ final class NatsConnection
         } finally {
             $this->recoveryFiber = null;
             $this->reconnecting = null;
+            // Wake any publishers parked on a sealed flush (#165). The connection state is finalized
+            // by now - Open on success, Closed on every failure/close/auth path - so on wake they route
+            // by it: write directly if Open, or fail loudly via bufferFrame() if Closed. Completing
+            // AFTER $reconnecting is cleared keeps a Closed-path wake from re-buffering onto a dead
+            // epoch (bufferFrame() then sees no active reconnect and refuses, #146).
+            $flushGate = $this->reconnectFlushGate;
+            if ($flushGate !== null) {
+                $this->reconnectFlushGate = null;
+                $flushGate->complete();
+            }
         }
 
         // Deliver any messages buffered during subscription replay now that recovery has finished and
@@ -2297,7 +2364,20 @@ final class NatsConnection
      */
     private function flushReconnectBuffer(): void
     {
+        $passes = 0;
         while ($this->reconnectBuffer !== '') {
+            // Bound the drain (#165): a fiber publishing during each write's suspension re-fills the
+            // buffer, so an uncapped loop can defer the Open flip indefinitely (connection stuck
+            // Connecting). After RECONNECT_FLUSH_MAX_PASSES, SEAL the buffer - writePublishFrame()
+            // then parks late publishers on the gate instead of appending - so with no further
+            // appends the remaining bytes drain in one final pass and recovery reaches Open. The
+            // already-buffered frames are still written before the flip, so buffered-before-direct
+            // ordering (#148) holds. Sealed at most once per recovery; the gate is completed by
+            // recoverConnection()'s finally.
+            if ($passes >= self::RECONNECT_FLUSH_MAX_PASSES && $this->reconnectFlushGate === null) {
+                $this->reconnectFlushGate = new DeferredFuture();
+            }
+
             $pending = $this->reconnectBuffer;
 
             // Remove the transmitted prefix only after the write succeeds: publish() already
@@ -2309,6 +2389,7 @@ final class NatsConnection
             // suspended survive as the remainder and go out on the next iteration.
             $this->transport->write($pending)->await();
             $this->reconnectBuffer = substr($this->reconnectBuffer, strlen($pending));
+            $passes++;
         }
     }
 
