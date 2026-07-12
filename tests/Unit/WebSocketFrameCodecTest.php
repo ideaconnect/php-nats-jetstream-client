@@ -492,4 +492,135 @@ final class WebSocketFrameCodecTest extends TestCase
             restore_error_handler();
         }
     }
+
+    /**
+     * parseFrameHeader() must decode a complete two-byte 7-bit header (the minimum sufficient prefix):
+     * the two-byte availability guard is < 2, so exactly two bytes are enough. A non-final text frame
+     * with FIN=0 pins the fin/rsv1/opcode bit-field extraction - each bit is read from a distinct mask
+     * (0x80/0x40/0x0F), and byte1=0x01 makes those masks disagree so a mutated mask flips a field.
+     */
+    public function testParseFrameHeaderDecodesTwoByteNonFinalTextHeader(): void
+    {
+        // byte1=0x01: FIN=0, RSV1=0, opcode=1 (text). byte2=0x03: unmasked, 7-bit length 3.
+        $header = WebSocketFrameCodec::parseFrameHeader("\x01\x03");
+
+        self::assertNotNull($header, 'two header bytes are sufficient to parse a 7-bit frame');
+        self::assertFalse($header['fin'], 'FIN bit (0x80) is clear on byte1=0x01');
+        self::assertFalse($header['rsv1'], 'RSV1 bit (0x40) is clear on byte1=0x01');
+        self::assertSame(WebSocketFrameCodec::OP_TEXT, $header['opcode'], 'opcode is the low nibble of byte1');
+        self::assertFalse($header['masked']);
+        self::assertSame('', $header['maskKey']);
+        self::assertSame(2, $header['headerBytes']);
+        self::assertSame(3, $header['payloadLength']);
+    }
+
+    /**
+     * frameRequiredBytes() must size a frame from a complete two-byte 7-bit header alone: the guard is
+     * < 2, so exactly two bytes suffice. Pins that boundary against a <= 2 off-by-one that would report
+     * the frame unsized (null) when its whole header is already present.
+     */
+    public function testFrameRequiredBytesSizesTwoByteHeader(): void
+    {
+        // FIN+binary, unmasked, 7-bit length 3: full wire size is 2 header + 3 payload = 5.
+        self::assertSame(5, WebSocketFrameCodec::frameRequiredBytes("\x82\x03"));
+    }
+
+    /**
+     * A zero-length frame (e.g. an empty PING) is valid: frameRequiredBytes() must accept declared
+     * length 0 and return the header size, not treat 0 as out of bounds. Pins the lower length bound
+     * against a <= 0 mutation that would reject an empty frame.
+     */
+    public function testFrameRequiredBytesAcceptsZeroLengthFrame(): void
+    {
+        // 0x89 = FIN+ping, 0x00 = unmasked length 0: whole frame is just its 2 header bytes.
+        self::assertSame(2, WebSocketFrameCodec::frameRequiredBytes("\x89\x00"));
+    }
+
+    /**
+     * A frame declaring exactly MAX_FRAME_PAYLOAD bytes is the largest permitted and must be accepted,
+     * not rejected. frameRequiredBytes() sizes it from its 10-byte 64-bit-length header (no payload
+     * needed). Pins the upper bound against a >= MAX mutation that would reject the boundary length.
+     */
+    public function testFrameRequiredBytesAcceptsExactlyMaxDeclaredLength(): void
+    {
+        $max = 64 * 1024 * 1024; // MAX_FRAME_PAYLOAD
+        // 127 marker + 8-byte big-endian length == MAX; full wire size is 10 header + MAX payload.
+        $header = pack('CC', 0x82, 127) . pack('J', $max);
+
+        self::assertSame(10 + $max, WebSocketFrameCodec::frameRequiredBytes($header));
+    }
+
+    /**
+     * parseFrameHeader() must parse a 16-bit (126-marker) header the moment its 4 length-bearing bytes
+     * arrive: the guard is < 4, so exactly four bytes suffice. Pins that boundary against a <= 4
+     * off-by-one that would report null when the extended length is fully present.
+     */
+    public function testParseFrameHeaderDecodes16BitHeaderAtExactlyFourBytes(): void
+    {
+        // FIN+binary, 126 marker, then the 2-byte length 300 - exactly 4 bytes, no mask/payload yet.
+        $header = WebSocketFrameCodec::parseFrameHeader(pack('CC', 0x82, 126) . pack('n', 300));
+
+        self::assertNotNull($header, 'four bytes are enough to read a 16-bit length');
+        self::assertSame(300, $header['payloadLength']);
+        self::assertSame(4, $header['headerBytes']);
+    }
+
+    /**
+     * parseFrameHeader() must accept a zero-length frame rather than treating declared length 0 as out
+     * of bounds. Pins the lower length bound against a <= 0 mutation.
+     */
+    public function testParseFrameHeaderAcceptsZeroLengthFrame(): void
+    {
+        $header = WebSocketFrameCodec::parseFrameHeader("\x89\x00");
+
+        self::assertNotNull($header);
+        self::assertSame(0, $header['payloadLength']);
+        self::assertSame(2, $header['headerBytes']);
+    }
+
+    /**
+     * parseFrameHeader() must accept a frame declaring exactly MAX_FRAME_PAYLOAD bytes (the largest
+     * permitted), sizing it from its 64-bit-length header alone. Pins the upper bound against a >= MAX
+     * mutation that would reject the boundary length.
+     */
+    public function testParseFrameHeaderAcceptsExactlyMaxDeclaredLength(): void
+    {
+        $max = 64 * 1024 * 1024; // MAX_FRAME_PAYLOAD
+        $header = WebSocketFrameCodec::parseFrameHeader(pack('CC', 0x82, 127) . pack('J', $max));
+
+        self::assertNotNull($header);
+        self::assertSame($max, $header['payloadLength']);
+        self::assertSame(10, $header['headerBytes']);
+    }
+
+    /**
+     * parseFrameHeader() must surface a masked frame's mask key as soon as the header and its 4 mask-key
+     * bytes are present - the guard is available < offset + 4, so a header of exactly offset+4 bytes
+     * (no payload yet) suffices. Pins that boundary against a +5 / <= off-by-one that would report null
+     * when the mask key is already fully buffered.
+     */
+    public function testParseFrameHeaderReadsMaskKeyAtExactHeaderFit(): void
+    {
+        // FIN+binary, mask bit + 7-bit length 5, then the 4 mask-key bytes: 6 bytes == offset(2) + 4.
+        $header = WebSocketFrameCodec::parseFrameHeader(pack('CC', 0x82, 0x80 | 5) . 'ABCD');
+
+        self::assertNotNull($header, 'header plus mask key (6 bytes) is enough to parse');
+        self::assertTrue($header['masked']);
+        self::assertSame('ABCD', $header['maskKey']);
+        self::assertSame(5, $header['payloadLength']);
+        self::assertSame(6, $header['headerBytes']);
+    }
+
+    /**
+     * Sec-WebSocket-Key must carry exactly 16 random bytes per RFC 6455 §4.1: generateClientKey() must
+     * base64-encode 16 bytes. Pins the byte count (the base64 string length is 24 for both 15 and 17
+     * bytes, so the decoded length is what distinguishes them) against +/-1 mutations.
+     */
+    public function testGenerateClientKeyEncodesSixteenRandomBytes(): void
+    {
+        $decoded = base64_decode(WebSocketFrameCodec::generateClientKey(), true);
+
+        self::assertIsString($decoded);
+        self::assertSame(16, strlen($decoded));
+    }
 }
