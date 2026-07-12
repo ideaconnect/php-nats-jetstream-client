@@ -441,6 +441,9 @@ final class NatsConnection_3MutationTest extends TestCase
         $queue->enqueue(new NatsMessage('updates', $sid, null, 'buffered'));
         $pendingProp = new \ReflectionProperty(NatsConnection::class, 'pendingMessages');
         $pendingProp->setValue($connection, [$sid => $queue]);
+        // Mirror enqueueMessage(): the non-empty queue's sid is in the dirty set drainAllPending() scans,
+        // so the ReturnRemoval mutant (which reaches drainAllPending) would deliver it - what this kills.
+        (new \ReflectionProperty(NatsConnection::class, 'pendingDirty'))->setValue($connection, [$sid => true]);
 
         // Close-intent set: recoverConnection must bail at the top and never drain.
         (new \ReflectionProperty(NatsConnection::class, 'closing'))->setValue($connection, true);

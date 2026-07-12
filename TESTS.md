@@ -75,6 +75,12 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testFromFileRejectsNonExistentPath` - Asserts `fromFile()` throws NatsException ('not found or not readable') for a missing path.
 - `testFromFileReadsValidCredsFile` - Asserts `fromFile()` reads a valid creds file written to a temp file, returning the expected jwt and nkeySeed values (cleaning up the temp file afterward).
 
+### tests/Unit/DrainScanPendingDirtyTest.php
+- `testMessageToOneOfManyIdleSubscriptionsIsDelivered` - With 50 idle subscriptions, asserts a single MSG for one mid-list sid is still delivered to exactly that handler - the #162 dirty set routes the lone active sid without depending on scanning every live subscription.
+- `testCrossSidDeliveryOrderMatchesRegistrationOrderNotWireOrder` - Feeds one chunk whose wire order is deliberately non-ascending (c1,a1,b1,c2,a2 across three sids) and asserts delivery is grouped by ascending-sid (registration) order with per-sid FIFO preserved (a1,a2,b1,c1,c2) - pinning that the #162 dirty-set drain keeps the old full-map scan's cross-sid ordering.
+- `testDirtySetTracksOnlyActiveSidAndClearsWhenQueueEmpties` - With three idle subscriptions, enqueuing one message via `enqueueMessage()` puts ONLY that sid in `pendingDirty`; after `drainAllPending()` the message is delivered, the dirty entry is removed so it is not re-scanned (#162), and the emptied `SplQueue` is still retained for every sid (#139 no-realloc).
+- `testHasUndeliveredDrainBacklogTracksDirtySet` - Asserts `hasUndeliveredDrainBacklog()` is false for an idle sid, true once a message is enqueued, and false again after the drain - staying consistent with the dirty set that `drain()`'s round-up loop (#149/#150) depends on.
+
 ### tests/Unit/ExceptionHierarchyTest.php
 - `testNatsExceptionHierarchyImplementsMarker` - Asserts NatsException, ConnectionException, and JetStreamException are all instances of the NatsThrowable marker interface.
 - `testTransportExceptionsImplementMarkerWhileRemainingRuntimeExceptions` - Asserts TransportClosedException and TlsRequiredException implement NatsThrowable and remain RuntimeExceptions, while deliberately NOT being NatsException instances.

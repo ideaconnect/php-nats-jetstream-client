@@ -246,6 +246,10 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         $pending = self::getProp($connection, 'pendingMessages');
         $pending[$sid] = $queue;
         self::setProp($connection, 'pendingMessages', $pending);
+        // Mirror enqueueMessage(): a non-empty queue's sid is in the dirty set drainAllPending() scans.
+        $dirty = self::getProp($connection, 'pendingDirty');
+        $dirty[$sid] = true;
+        self::setProp($connection, 'pendingDirty', $dirty);
 
         $connection->drain()->await();
 

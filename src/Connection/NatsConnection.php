@@ -66,6 +66,21 @@ final class NatsConnection
     /** @var array<int, SplQueue<NatsMessage>> */
     private array $pendingMessages = [];
     /**
+     * Dirty set: the sids whose pending queue currently holds at least one undelivered message. Since
+     * #139 keeps a subscription's SplQueue allocated (EMPTY) for the subscription's whole lifetime to
+     * avoid a per-message alloc/free, iterating {@see $pendingMessages} to drain would scan O(all live
+     * subscriptions) on every inbound chunk - including message-free heartbeat self-reads - re-inverting
+     * the #139 win for many-idle-subscription workloads. drainAllPending() iterates this set instead, so
+     * the per-chunk drain cost is O(sids-with-backlog), independent of the idle-subscription count (#162).
+     *
+     * Invariant: a sid is present here IFF its queue is non-empty. enqueueMessage() adds on enqueue;
+     * drainPendingForSid()/dropSubscriptionState() remove once the queue empties or the sid is dropped.
+     * Only the SCAN set changes - the empty queue objects are still retained (the #139 no-realloc win).
+     *
+     * @var array<int, true>
+     */
+    private array $pendingDirty = [];
+    /**
      * Messages RECEIVED from the server per sid, counted at intake (before any slow-consumer drop),
      * for auto-unsubscribe accounting. Counting at receive - not at handler delivery - mirrors the
      * server's own `UNSUB <sid> <max>` counter: a message the slow-consumer policy drops still counts
@@ -597,6 +612,7 @@ final class NatsConnection
         $this->subscriptions = [];
         $this->subscriptionMeta = [];
         $this->pendingMessages = [];
+        $this->pendingDirty = [];
         $this->receivedCounts = [];
         $this->deliveredCounts = [];
         $this->autoUnsubMax = [];
@@ -786,13 +802,10 @@ final class NatsConnection
             return true;
         }
 
-        foreach ($this->pendingMessages as $queue) {
-            if (!$queue->isEmpty()) {
-                return true;
-            }
-        }
-
-        return false;
+        // The dirty set holds exactly the sids with a non-empty queue (its maintained invariant), so a
+        // non-empty dirty set is precisely "a sid still has buffered messages" - equivalent to the old
+        // full-queue scan but O(1), and consistent with what drainAllPending() iterates (#162).
+        return $this->pendingDirty !== [];
     }
 
     /**
@@ -2760,6 +2773,10 @@ final class NatsConnection
         }
 
         $queue->enqueue($message);
+        // The queue is now non-empty: record the sid in the dirty set so drainAllPending() scans it.
+        // Setting an existing key is idempotent and does NOT change its position, so the set's contents
+        // stay a subset of the sids; drainAllPending() re-imposes ascending (registration) order (#162).
+        $this->pendingDirty[$sid] = true;
     }
 
     /**
@@ -2767,7 +2784,29 @@ final class NatsConnection
      */
     private function drainAllPending(): void
     {
-        foreach (array_keys($this->pendingMessages) as $sid) {
+        if ($this->pendingDirty === []) {
+            // No sid has a buffered message. Return before allocating so a message-free inbound chunk -
+            // every heartbeat self-read, and any chunk that carried only control frames - costs O(1)
+            // instead of the pre-#162 O(all live subscriptions) scan plus a fresh array_keys() copy.
+            return;
+        }
+
+        // Iterate ONLY sids with a non-empty queue (the dirty set), so the per-chunk cost is
+        // O(sids-with-backlog), independent of the idle-subscription count (#162).
+        if (count($this->pendingDirty) === 1) {
+            // The common single-active chunk: one sid has backlog. Deliver it directly - no array_keys()
+            // copy and no sort() (a single sid is already ordered), so this path is cheaper than the old
+            // array_keys(pendingMessages) scan even at one subscription, not just at many idle ones.
+            $this->drainPendingForSid(array_key_first($this->pendingDirty));
+
+            return;
+        }
+
+        // Two or more sids have backlog: sort ascending so cross-sid delivery keeps the registration-order
+        // sequencing of the old array_keys(pendingMessages) scan (subscribe() inserts sids ascending).
+        $sids = array_keys($this->pendingDirty);
+        sort($sids);
+        foreach ($sids as $sid) {
             $this->drainPendingForSid($sid);
         }
     }
@@ -3250,18 +3289,20 @@ final class NatsConnection
         }
 
         if (!isset($this->subscriptions[$sid])) {
-            // The subscription is gone; its backlog is undeliverable. Drop it instead of retaining an
-            // entry that drainAllPending() would re-scan on every chunk.
-            unset($this->pendingMessages[$sid]);
+            // The subscription is gone; its backlog is undeliverable. Drop it (and its dirty-set entry)
+            // instead of retaining state that drainAllPending() would re-scan.
+            unset($this->pendingMessages[$sid], $this->pendingDirty[$sid]);
 
             return;
         }
 
         if ($queue->isEmpty()) {
-            // Nothing buffered. The queue persists empty until the subscription is dropped (#139) -
-            // the previous unset-on-empty meant one SplQueue alloc/free per delivered message in the
-            // promptly-drained common case - so this cheap check is the whole per-chunk scan cost
-            // for an idle subscription.
+            // Nothing buffered. The queue persists empty until the subscription is dropped (#139) - the
+            // previous unset-on-empty meant one SplQueue alloc/free per delivered message in the
+            // promptly-drained common case. Clear any dirty-set entry so the invariant (dirty IFF
+            // non-empty) holds even when a reentrant drain emptied this sid earlier in the same pass.
+            unset($this->pendingDirty[$sid]);
+
             return;
         }
 
@@ -3318,6 +3359,14 @@ final class NatsConnection
             // drained. The drained queue itself is deliberately kept (empty) for reuse - see the
             // early return above (#139); dropSubscriptionState() removes it with the subscription.
             $this->completeAutoUnsubIfSatisfied($sid);
+
+            // Keep the dirty set = sids with a non-empty queue: once this sid's queue has fully drained
+            // (or the subscription was dropped by an auto-unsub cap / completeAutoUnsub above), remove it
+            // so drainAllPending() no longer scans it. A handler that threw mid-drain leaves messages
+            // queued with the subscription still alive - that stays dirty and is re-drained next pass (#162).
+            if (!isset($this->pendingMessages[$sid]) || $this->pendingMessages[$sid]->isEmpty()) {
+                unset($this->pendingDirty[$sid]);
+            }
         }
     }
 
@@ -3370,6 +3419,7 @@ final class NatsConnection
         unset($this->subscriptions[$sid]);
         unset($this->subscriptionMeta[$sid]);
         unset($this->pendingMessages[$sid]);
+        unset($this->pendingDirty[$sid]);
         unset($this->receivedCounts[$sid]);
         unset($this->deliveredCounts[$sid]);
         unset($this->autoUnsubMax[$sid]);
