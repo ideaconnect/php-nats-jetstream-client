@@ -600,6 +600,28 @@ final class NatsConnection
     }
 
     /**
+     * Emits a loud error naming the count of parsed-but-undelivered inbound messages a terminal close is
+     * about to discard, mirroring the outbound reconnect-buffer discard (#123) so an inbound backlog
+     * dropped at close is never silent - the same observable-drop principle as #134. Called BEFORE
+     * releaseRuntimeState() clears the queues. drain() reports its own bounded-deadline discard (#149)
+     * and disconnect() is the documented lossy nats.go Close() path, so neither routes through here (#158).
+     */
+    private function reportDiscardedInboundBacklog(): void
+    {
+        $undelivered = 0;
+        foreach ($this->pendingMessages as $queue) {
+            $undelivered += $queue->count();
+        }
+
+        if ($undelivered > 0) {
+            $this->emitError(new NatsException(sprintf(
+                'Connection closed: %d parsed inbound message(s) were discarded undelivered',
+                $undelivered,
+            )));
+        }
+    }
+
+    /**
      * Best-effort transport close for terminal failure exits, mirroring disconnect(). connectOnce()
      * opens the socket before the handshake can fail, so every path that gives up (terminal connect
      * failure, exhausted or auth-aborted recovery) must close it - otherwise the fd stays pinned by
@@ -781,7 +803,9 @@ final class NatsConnection
     /**
      * Reports an asynchronous error through the listener/logger, swallowing a throw from a
      * user-supplied logger/listener: emitError() guards the listener but logs before that guard, so a
-     * throwing logger could otherwise re-open the very escape a drain-time containment closes (#150).
+     * throwing logger could otherwise re-open the very escape a containment closes (#150). Used wherever
+     * a secondary/handler error must be surfaced WITHOUT masking a primary exception already in flight
+     * (drain teardown, and the per-chunk dispatch/drain containment in processIncoming/dispatchFrames, #158).
      */
     private function emitErrorSafely(\Throwable $error): void
     {
@@ -1305,13 +1329,36 @@ final class NatsConnection
             // Note: the outstanding-ping counter is reset only when an actual PONG is handled (see
             // handleFrame), not on any inbound bytes - otherwise a server that stops answering PINGs
             // but still trickles data would never trip maxPingsOut and the watchdog could not escalate.
+            $dispatchError = null;
             try {
                 $this->dispatchFrames($frames);
-            } finally {
+            } catch (\Throwable $e) {
+                // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
+                // delivery, #128) before this fatal frame error (a server -ERR / PONG-write failure)
+                // escalates to the caller below.
+                $dispatchError = $e;
+            }
+
+            try {
                 // Drain buffered deliveries after each chunk to preserve wire-order delivery - even
                 // when a frame failed to dispatch: the messages are already enqueued and their bytes
                 // consumed, so they must not wait behind (or be lost to) the surfacing error.
                 $this->drainAllPending();
+            } catch (\Throwable $drainError) {
+                if ($dispatchError === null) {
+                    // No primary error in flight: surface the handler failure to the caller unchanged.
+                    throw $drainError;
+                }
+
+                // A fatal dispatch exception is already in flight. A handler throwing during this drain
+                // must NOT replace it - PHP would propagate the later throw and swallow the fatal -ERR,
+                // which then never reaches the caller's escalation path. Route the handler failure to the
+                // error listener and let the primary exception propagate below (#158).
+                $this->emitErrorSafely($drainError);
+            }
+
+            if ($dispatchError !== null) {
+                throw $dispatchError;
             }
 
             return count($frames);
@@ -1335,7 +1382,17 @@ final class NatsConnection
             try {
                 $this->handleFrame($frame);
             } catch (\Throwable $e) {
-                $firstError ??= $e;
+                if ($firstError === null) {
+                    $firstError = $e;
+
+                    continue;
+                }
+
+                // Only the FIRST failure is rethrown (below) for the caller's escalation. A 2nd+ failure
+                // from the same chunk would otherwise vanish - neither thrown nor observable - hiding the
+                // corresponding message loss from the error listener and from tests. Surface it (contained
+                // so a throwing logger cannot mask the first error being rethrown) (#158).
+                $this->emitErrorSafely($e);
             }
         }
 
@@ -1818,16 +1875,34 @@ final class NatsConnection
         $this->transport->write($this->codec->encodeConnect($this->options, $this->serverInfo->nonce, $urlCredentials))->await();
         $this->transport->write($this->codec->encodePing())->await();
 
-        $this->awaitInitialPong();
-        // Reset parser state after handshake to avoid carrying partial bootstrap chunks, and couple the
-        // inbound frame bound to the server's negotiated max_payload so a legitimately large message
-        // (on a server with a raised max_payload) is receivable instead of being rejected as an
-        // oversized frame - which would throw and force a reconnect (#94).
-        $this->parser = new ProtocolParser($this->inboundFrameBound());
+        $trailingFrames = $this->awaitInitialPong();
+        // Couple the inbound frame bound to the server's negotiated max_payload so a legitimately large
+        // message (on a server with a raised max_payload) is receivable instead of being rejected as an
+        // oversized frame - which would throw and force a reconnect (#94). Do it IN PLACE on the existing
+        // parser rather than replacing it: replacing discarded any bytes the handshake segment buffered
+        // behind a partial trailing frame, resuming the stream at an arbitrary offset and raising a
+        // spurious ProtocolException on the next read (#157). The connect-start reset (#125) already
+        // gave this epoch a fresh parser, so no cross-connection framing state can leak here.
+        $this->parser->setMaxFrameSize($this->inboundFrameBound());
         // Seed the discovered-servers set from the initial INFO (without emitting a discovery event -
         // that is reserved for subsequent async INFO changes), so failover can use the cluster peers.
-        if ($this->serverInfo !== null && $this->serverInfo->connectUrls !== []) {
+        // serverInfo is non-null here: awaitServerInfo() set it above and awaitInitialPong() only ever
+        // reassigns it to a non-null ServerInfo.
+        if ($this->serverInfo->connectUrls !== []) {
             $this->knownConnectUrls = $this->serverInfo->connectUrls;
+        }
+
+        // Dispatch frames the server coalesced behind the handshake PONG in the same TCP segment (an
+        // async INFO with connect_urls/lame-duck, an -ERR, or MSGs for a replayed subscription): their
+        // bytes are already consumed, so dropping them would lose them permanently (#157). Routed through
+        // the normal enqueue/dispatch+drain path so an INFO updates the discovered pool and a MSG reaches
+        // its handler; a fatal -ERR here surfaces as a connect failure the caller's policy then handles.
+        if ($trailingFrames !== []) {
+            try {
+                $this->dispatchFrames($trailingFrames);
+            } finally {
+                $this->drainAllPending();
+            }
         }
     }
 
@@ -1913,6 +1988,15 @@ final class NatsConnection
 
         $inProgress = $this->reconnecting;
         if ($inProgress !== null) {
+            // A recover requested re-entrantly from WITHIN the active recovery fiber must not await its
+            // own in-progress future - that would suspend this fiber on a deferred only this fiber can
+            // complete (a deadlock). This reaches here when a lame-duck INFO coalesced behind the
+            // reconnect handshake PONG is dispatched during connectOnce (#157): the recovery is already
+            // underway on this very fiber, so the nested request is a no-op.
+            if ($this->recoveryFiber !== null && $this->recoveryFiber === \Fiber::getCurrent()) {
+                return;
+            }
+
             $inProgress->getFuture()->await();
 
             return;
@@ -2027,6 +2111,8 @@ final class NatsConnection
             // Terminal close: same invariant as the exhaustion/auth paths - release the socket and
             // runtime state so a later manual connect() starts clean (#127/#133, missed here: #146).
             $this->closeTransportBestEffort();
+            // Name any parsed inbound backlog being discarded, mirroring the outbound path (#123/#158).
+            $this->reportDiscardedInboundBacklog();
             $this->releaseRuntimeState();
             $this->emitEvent(ConnectionEvent::Closed);
             throw new ConnectionException('Reconnect is disabled');
@@ -2103,6 +2189,8 @@ final class NatsConnection
                 // rather than hammering the server until attempts are exhausted (#46).
                 $this->state = ConnectionState::Closed;
                 $this->closeTransportBestEffort();
+                // Name any parsed inbound backlog being discarded, mirroring the outbound path (#123/#158).
+                $this->reportDiscardedInboundBacklog();
                 $this->releaseRuntimeState();
                 $this->emitError($e);
                 $this->emitEvent(ConnectionEvent::Closed, $e);
@@ -2135,6 +2223,11 @@ final class NatsConnection
         // The last attempt's socket may still be open (each attempt closes only at its START, and
         // connectOnce() dials before the handshake can fail) - release it now (#133).
         $this->closeTransportBestEffort();
+
+        // Parsed-but-undelivered inbound messages are about to be cleared with the runtime state. Name
+        // the count in a loud error first (mirror of the outbound discard above, #123) so an inbound
+        // backlog dropped at terminal close is never silent, the same as #134's observable drops (#158).
+        $this->reportDiscardedInboundBacklog();
 
         // The connection is terminally closed: subscriptions do not survive it. Releasing here
         // keeps handler closures/payloads from outliving the connection and stops a later manual
@@ -2296,9 +2389,15 @@ final class NatsConnection
     }
 
     /**
-     * Waits for initial PONG while handling expected intermediary control lines.
+     * Waits for initial PONG while handling expected intermediary control lines. Returns any frames the
+     * server coalesced BEHIND the PONG in the same TCP segment (an async INFO, a lame-duck notice, an
+     * -ERR, or MSGs for a replayed subscription): they parsed in the same batch and their bytes are
+     * already consumed, so returning them lets connectOnce() dispatch them instead of dropping them
+     * when this loop returns at the PONG (#157).
+     *
+     * @return list<ProtocolFrame>
      */
-    private function awaitInitialPong(): void
+    private function awaitInitialPong(): array
     {
         $deadline = $this->handshakeDeadline();
         $remainingPolls = $this->handshakePollBudget();
@@ -2311,7 +2410,7 @@ final class NatsConnection
 
             $frames = $this->parser->push($chunk);
 
-            foreach ($frames as $frame) {
+            foreach ($frames as $index => $frame) {
                 if ($frame->type === ProtocolFrameType::Ok) {
                     continue;
                 }
@@ -2328,7 +2427,10 @@ final class NatsConnection
                 }
 
                 if ($frame->type === ProtocolFrameType::Pong) {
-                    return;
+                    // Hand back the frames parsed after the PONG in this batch so they are not lost;
+                    // connectOnce() dispatches them once the parser bound is coupled to max_payload.
+                    // array_slice with default keys re-indexes, so the result is already a list.
+                    return array_slice($frames, $index + 1);
                 }
 
                 if ($frame->type === ProtocolFrameType::Err) {

@@ -83,6 +83,18 @@ final class ProtocolParser
     }
 
     /**
+     * Re-couples the inbound frame bound to the server's negotiated `max_payload` WITHOUT discarding
+     * buffered bytes or a pending header. The connection raises the bound once past the handshake; doing
+     * it in place (instead of replacing the parser) preserves any residual buffer left when the handshake
+     * segment ended mid-frame, so the stream is not resumed at an arbitrary offset (#157). Only bounds
+     * frames parsed AFTER this call - a header already validated under the previous bound is unaffected.
+     */
+    public function setMaxFrameSize(int $maxFrameSize): void
+    {
+        $this->maxFrameSize = $maxFrameSize;
+    }
+
+    /**
      * Appends a raw socket chunk and emits all complete frames currently available.
      *
      * @return list<ProtocolFrame>

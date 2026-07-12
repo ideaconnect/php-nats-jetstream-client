@@ -19,6 +19,38 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Frames the server coalesces BEHIND the handshake PONG in one TCP segment are no longer
+  dropped, and a frame left partly buffered at the handshake boundary no longer corrupts the stream
+  (#157). `awaitInitialPong()` returned the moment it saw the PONG, discarding every frame the parser
+  had already extracted after it in the same batch - an async INFO with `connect_urls`, a lame-duck
+  notice, an -ERR - so discovered cluster peers vanished with no trace. Separately, `connectOnce()`
+  then replaced the parser wholesale to couple the frame bound to the negotiated `max_payload`; if
+  the handshake segment ended mid-frame, those buffered bytes were thrown away, the next read resumed
+  at an arbitrary offset, parsed a bogus control line, and raised a spurious `ProtocolException` that
+  forced an unnecessary reconnect. `awaitInitialPong()` now hands the frames parsed behind the PONG
+  back to `connectOnce()`, which dispatches them through the normal enqueue/deliver path (an INFO
+  updates the discovered-server pool; a MSG reaches its handler); and the post-handshake bound change
+  is applied in place on the same parser (`ProtocolParser::setMaxFrameSize()`) instead of replacing
+  it, so a partial trailing frame completes cleanly on the next read. The connect-start parser reset
+  (#125) is preserved, so no framing state leaks across a reconnect. A lame-duck INFO coalesced behind
+  a RECONNECT PONG, now dispatched during `connectOnce()`, would ask to reconnect while a recovery was
+  already running on the same fiber; that re-entrant request is guarded to a no-op so the in-flight
+  recovery still completes instead of deadlocking on its own future.
+- `[bugfix]` Frame-dispatch errors and a discarded inbound backlog can no longer vanish silently
+  (#158), closing three gaps in tension with the "a drop must never be silent" principle (#134).
+  First, the per-chunk `finally { drainAllPending(); }` in `processIncoming()` could REPLACE the
+  in-flight dispatch exception: when a fatal frame (a server -ERR, a PONG-write failure) had thrown
+  and a handler then threw while the enqueued backlog drained, PHP propagated the finally's exception
+  and swallowed the fatal one, so the connection continued as if the server never errored. The drain
+  is now contained so a handler failure during it is routed to the error listener and the primary
+  dispatch exception still reaches the caller's escalation path. Second, `dispatchFrames()` kept only
+  the FIRST failure (rethrown after the loop) and dropped the second and later frame failures from the
+  same chunk without a trace; each suppressed failure is now emitted through the error listener (the
+  first is still rethrown). Third, a terminal close reached from reconnect exhaustion, an auth abort,
+  or reconnect being disabled cleared the parsed-but-undelivered INBOUND backlog silently, asymmetric
+  with the loud OUTBOUND reconnect-buffer discard (#123); such a close now emits an error naming the
+  count of inbound messages being discarded before releasing state (`drain()`'s own bounded-deadline
+  discard (#149) and `disconnect()`'s documented nats.go `Close()` parity path are unchanged).
 - `[bugfix]` `drain()` no longer silently discards the backlog of a subscription whose handler is
   suspended mid-dispatch (#149). When a handler awaited inside the dispatch loop while messages
   were still queued for its sid, the `dispatchingSids` re-entrancy guard made drain()'s final

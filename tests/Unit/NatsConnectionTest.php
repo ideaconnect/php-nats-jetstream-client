@@ -9068,4 +9068,272 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertCount(2, $transport->connectCalls);
     }
+
+    /**
+     * A server that coalesces the handshake PONG with an async INFO in one TCP segment must not lose
+     * the INFO: awaitInitialPong() returned at the PONG and dropped every frame the parser had already
+     * extracted behind it in the same batch, so discovered cluster peers (connect_urls) advertised in
+     * that trailing INFO vanished with no trace (#157). The handshake INFO here carries no connect_urls
+     * (so the seed at connect leaves the pool empty) - only the frame coalesced behind the PONG does.
+     */
+    public function testTrailingFrameCoalescedBehindHandshakePongIsProcessed(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            // One segment: the handshake PONG plus an async INFO advertising a cluster peer.
+            'PONG' . "\r\n" . 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
+        ]);
+
+        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection->connect()->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(
+            ['10.0.0.2:4222'],
+            $connection->discoveredServers(),
+            'an INFO coalesced behind the handshake PONG must still update the discovered-server pool',
+        );
+    }
+
+    /**
+     * A handshake segment that ends with the FIRST bytes of a frame parsed behind the PONG (here a
+     * partial async INFO) must not corrupt the stream: replacing the parser wholesale after the
+     * handshake threw those buffered bytes away, so the next read resumed at an arbitrary byte offset,
+     * parsed a bogus control line, and raised a spurious ProtocolException forcing an extra reconnect.
+     * Carrying the parser's buffer across the post-handshake bound transition lets the next read
+     * complete the frame cleanly (#157).
+     */
+    public function testPartialFrameBufferedBehindHandshakePongSurvivesParserTransition(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            // The handshake PONG coalesced with the opening bytes of an async INFO, split mid-frame.
+            'PONG' . "\r\n" . 'INFO {"connect_ur',
+            // The remainder of that INFO arrives on the next read.
+            'ls":["10.0.0.9:4222"]}' . "\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                errorListener: static function (\Throwable $error) use (&$errors): void {
+                    $errors[] = $error;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        self::assertSame([], $connection->discoveredServers());
+
+        $thrown = null;
+        try {
+            $connection->processIncoming()->await();
+        } catch (\Throwable $e) {
+            $thrown = $e;
+        }
+
+        self::assertNull(
+            $thrown,
+            'a frame partly buffered behind the handshake PONG must complete on the next read, not corrupt the stream',
+        );
+        self::assertSame(['10.0.0.9:4222'], $connection->discoveredServers());
+        self::assertSame([], $errors, 'no spurious protocol error should surface after the handshake');
+    }
+
+    /**
+     * A lame-duck INFO coalesced behind the RECONNECT handshake PONG is dispatched during connectOnce
+     * (#157). Its lame-duck failover asks recoverConnection() to reconnect while a recovery is already
+     * running on this very fiber; awaiting the in-progress future would deadlock. The re-entrant request
+     * must be a no-op so the current recovery still completes cleanly (#157).
+     */
+    public function testLameDuckCoalescedBehindReconnectPongDoesNotDeadlockRecovery(): void
+    {
+        $handshakeInfo = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $transport = new FakeTransport([
+            $handshakeInfo,
+            "PONG\r\n",
+            FakeTransport::EOF, // drop the first connection -> recovery
+            $handshakeInfo,     // reconnect handshake INFO
+            // Reconnect PONG coalesced with a lame-duck INFO advertising a peer (triggers failover).
+            'PONG' . "\r\n" . 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.9:4222"]}' . "\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                servers: ['nats://127.0.0.1:4222', 'nats://127.0.0.1:4223'],
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // The read that hits EOF drives the recovery whose handshake carries the coalesced lame-duck INFO.
+        $connection->processIncoming()->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(['10.0.0.9:4222'], $connection->discoveredServers());
+    }
+
+    /**
+     * A fatal server -ERR co-chunked with a MSG whose handler throws during the per-chunk drain must
+     * still surface: the finally-drain could REPLACE the in-flight dispatch exception with the
+     * handler's throw, swallowing the fatal error so the connection continued as if the server never
+     * errored. The -ERR must reach the caller and the handler failure must still be observable (#158).
+     */
+    public function testFatalErrorCoalescedWithThrowingHandlerStillSurfaces(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // One segment: a MSG for sid 1, then a fatal (non-recoverable) -ERR.
+            "MSG foo 1 3\r\nabc\r\n-ERR 'Authorization Violation'\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                errorListener: static function (\Throwable $error) use (&$errors): void {
+                    $errors[] = $error;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $sid = $connection->subscribe('foo', static function (): void {
+            throw new \RuntimeException('handler boom');
+        })->await();
+        self::assertSame(1, $sid);
+
+        $caught = null;
+        try {
+            $connection->processIncoming()->await();
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+
+        self::assertInstanceOf(
+            ConnectionException::class,
+            $caught,
+            'the fatal -ERR must surface, not be masked by the drain-time handler throw',
+        );
+        self::assertStringContainsString('Authorization Violation', $caught->getMessage());
+
+        $handlerErrors = array_filter(
+            $errors,
+            static fn(\Throwable $error): bool => str_contains($error->getMessage(), 'handler boom'),
+        );
+        self::assertCount(1, $handlerErrors, 'the masked drain-time handler failure must still be emitted');
+    }
+
+    /**
+     * Two frames in one chunk that both fail dispatch must both be observable: dispatchFrames() kept
+     * only the first error (rethrown) and dropped the second silently, so a second message loss was
+     * invisible to the error listener. The first is still thrown; the second is now emitted (#158).
+     */
+    public function testMultipleFrameDispatchFailuresAreAllObservable(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // One segment: two fatal -ERR frames.
+            "-ERR 'Boom One'\r\n-ERR 'Boom Two'\r\n",
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                errorListener: static function (\Throwable $error) use (&$errors): void {
+                    $errors[] = $error;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $caught = null;
+        try {
+            $connection->processIncoming()->await();
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+
+        self::assertInstanceOf(ConnectionException::class, $caught);
+        self::assertStringContainsString('Boom One', $caught->getMessage());
+
+        $secondFailure = array_filter(
+            $errors,
+            static fn(\Throwable $error): bool => str_contains($error->getMessage(), 'Boom Two'),
+        );
+        self::assertCount(1, $secondFailure, 'the 2nd frame failure must be emitted through the error listener');
+    }
+
+    /**
+     * A terminal close (reconnect exhausted here) discarding parsed-but-undelivered inbound messages
+     * must be loud about it, mirroring the outbound reconnect-buffer discard (#123): releaseRuntimeState()
+     * cleared the inbound backlog with no signal, asymmetric with the outbound path and the
+     * observable-drop principle (#134). The close must now emit an error naming the discarded count (#158).
+     */
+    public function testTerminalCloseReportsDiscardedInboundBacklog(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            FakeTransport::EOF, // the read fails -> recovery -> exhaustion (no reconnect handshake available)
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                connectTimeoutMs: 50,
+                errorListener: static function (\Throwable $error) use (&$errors): void {
+                    $errors[] = $error;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $sid = $connection->subscribe('foo', static fn(): null => null)->await();
+
+        // Inject three parsed-but-undelivered messages into the subscription's inbound backlog, modeling
+        // frames enqueued but not yet dispatched when the connection is torn down.
+        $pending = (new \ReflectionProperty(NatsConnection::class, 'pendingMessages'))->getValue($connection);
+        $pending[$sid]->enqueue(new NatsMessage('foo', $sid, null, 'm1'));
+        $pending[$sid]->enqueue(new NatsMessage('foo', $sid, null, 'm2'));
+        $pending[$sid]->enqueue(new NatsMessage('foo', $sid, null, 'm3'));
+
+        $caught = null;
+        try {
+            $connection->processIncoming()->await();
+        } catch (\Throwable $e) {
+            $caught = $e;
+        }
+
+        self::assertInstanceOf(ConnectionException::class, $caught);
+        self::assertSame('Reconnect attempts exhausted', $caught->getMessage());
+        self::assertSame(ConnectionState::Closed, $connection->state());
+
+        $discardMessages = array_map(
+            static fn(\Throwable $error): string => $error->getMessage(),
+            array_filter(
+                $errors,
+                static fn(\Throwable $error): bool => str_contains($error->getMessage(), 'inbound message(s) were discarded'),
+            ),
+        );
+        self::assertCount(1, $discardMessages, 'discarding parsed inbound backlog at terminal close must surface via the error listener');
+        self::assertStringContainsString('3', implode('', $discardMessages), 'the discarded inbound count must be named');
+    }
 }

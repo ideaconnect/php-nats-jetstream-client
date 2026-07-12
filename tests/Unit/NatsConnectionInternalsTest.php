@@ -240,7 +240,8 @@ final class NatsConnectionInternalsTest extends TestCase
 
         $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport($queue));
 
-        self::assertNull($this->invokePrivate($connection, 'awaitInitialPong'));
+        // awaitInitialPong() returns the frames coalesced behind the PONG (#157); none here.
+        self::assertSame([], $this->invokePrivate($connection, 'awaitInitialPong'));
     }
 
     public function testAwaitServerInfoRespondsToPingBeforeInfo(): void
