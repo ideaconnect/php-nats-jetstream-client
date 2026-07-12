@@ -614,7 +614,10 @@ final class NatsConnection
         }
 
         if ($undelivered > 0) {
-            $this->emitError(new NatsException(sprintf(
+            // emitErrorSafely, not emitError: this runs on terminal-close paths immediately before
+            // releaseRuntimeState()/emitEvent(Closed), and emitError() logs BEFORE its listener-throw
+            // guard - a throwing user logger here would otherwise skip the cleanup that follows (#158).
+            $this->emitErrorSafely(new NatsException(sprintf(
                 'Connection closed: %d parsed inbound message(s) were discarded undelivered',
                 $undelivered,
             )));
