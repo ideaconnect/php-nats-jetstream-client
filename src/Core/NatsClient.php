@@ -175,6 +175,18 @@ final class NatsClient
     }
 
     /**
+     * Reports whether a subscription with the given sid is still registered (dropped by
+     * unsubscribe/drain or a terminal close). Lets the JetStream idle-heartbeat watchdog self-cancel
+     * when the subscription it guards is torn down (#113).
+     *
+     * @internal Not part of the supported public API.
+     */
+    public function isSubscriptionActive(int $sid): bool
+    {
+        return $this->connection->isSubscriptionActive($sid);
+    }
+
+    /**
      * Removes a subscription by SID.
      *
      * With $maxMessages, arms auto-unsubscribe: delivery continues until that many TOTAL messages

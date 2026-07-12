@@ -22,9 +22,42 @@ use IDCT\NATS\JetStream\Models\StreamInfo;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
+use Revolt\EventLoop\CallbackType;
+
+use function Amp\delay;
 
 final class JetStreamContextTest extends TestCase
 {
+    /**
+     * A subscription's idle-heartbeat watchdog (#113) is a live EventLoop timer that outlives a test
+     * whose client is never disconnect()ed. Cancel every callback left registered so the shared loop
+     * (Revolt keeps one per process) starts each test clean and a leaked watchdog cannot fire against
+     * a lingering client from an earlier test.
+     */
+    protected function tearDown(): void
+    {
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
+    }
+
+    /**
+     * Counts EventLoop repeat timers currently registered (the watchdog is one). Used by the
+     * teardown-leak regression to probe watchdog arm/cancel without reaching into private state.
+     */
+    private static function countRepeatTimers(): int
+    {
+        $count = 0;
+        foreach (EventLoop::getIdentifiers() as $id) {
+            if (EventLoop::getType($id) === CallbackType::Repeat) {
+                $count++;
+            }
+        }
+
+        return $count;
+    }
+
     private function jsOkResponse(string $json): string
     {
         return sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($json), $json);
@@ -4102,6 +4135,206 @@ final class JetStreamContextTest extends TestCase
 
         // msg1 is delivered; bad3 (out-of-order) is discarded; delete failure is absorbed.
         self::assertSame(['msg1'], $received);
+
+        $client->disconnect()->await();
+    }
+
+    // ─── Idle-heartbeat watchdog (#113) ──────────────────────────────────
+
+    /**
+     * Verifies the idle-heartbeat watchdog (#113): an ordered consumer that requested heartbeats but
+     * whose transport goes totally silent (no data, no status-100 heartbeat, no flow-control) for more
+     * than two heartbeat intervals is recreated - the missed-heartbeat monitor nats.go runs. It detects
+     * a consumer the server reaped (inactive_threshold lapse, mem_storage R1 restart, interest gap) that
+     * the sequence-gap logic can never observe because that only fires when a frame arrives. A second
+     * CONSUMER.CREATE reaching the wire proves the watchdog re-established the consumer.
+     */
+    public function testSubscribeOrderedConsumerRecreatesOnMissedHeartbeats(): void
+    {
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        // blockWhenEmpty models a live-but-idle socket: reads suspend rather than return EOF, so the
+        // only thing that can end the silence is the watchdog firing a recreate. The recreate's DELETE
+        // (request inbox sid 3) and CREATE (request inbox sid 4) replies are held back until those
+        // requests are actually written; only the recreate CREATE carries by_start_sequence.
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+        ], blockWhenEmpty: true);
+        $transport->enqueueOnWriteContaining = [
+            '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply)],
+            'by_start_sequence' => [sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
+        ];
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 30 ms heartbeat -> the watchdog fires after ~60 ms of silence.
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.CREATE.EVENTS') < 2 && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+
+        $client->disconnect()->await();
+
+        $written = implode('', $transport->writes);
+        // Exactly one watchdog-driven recreate: one DELETE of the silent consumer and a second CREATE.
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the reaped consumer must be deleted once');
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'the watchdog must recreate the silent consumer exactly once');
+        // Nothing was delivered before the silence, so recovery restarts from the first stream sequence.
+        self::assertStringContainsString('"opt_start_seq":1', $written);
+        self::assertSame([], $errors, 'a successful watchdog recreate must not surface an error');
+    }
+
+    /**
+     * Verifies the watchdog does NOT fire while heartbeats keep arriving (#113): an ordered consumer
+     * that receives an idle heartbeat every interval - a legitimately long-but-alive quiet period - is
+     * never recreated. Every inbound frame (here, status-100 heartbeats) rearms the watchdog, so a
+     * consumer that is quiet but alive is left untouched.
+     */
+    public function testSubscribeOrderedConsumerHeartbeatsPreventFalsePositiveRecreate(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        // A plain idle heartbeat with no Nats-Last-Consumer: proves liveness without reporting a tail gap.
+        $hb = NatsHeaders::toWireBlock(['Status' => '100', 'Description' => 'Idle Heartbeat']);
+        $hbFrame = sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 100 ms heartbeat -> 200 ms watchdog threshold.
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 100_000_000)->await();
+
+        // Feed a heartbeat roughly every 10 ms for ~500 ms (past two thresholds). Each frame rearms the
+        // watchdog with a ~20x margin on the feed gap, so a slow CI must not produce a false recreate.
+        $deadlineNs = hrtime(true) + 500_000_000;
+        while (hrtime(true) < $deadlineNs) {
+            $transport->pushReadChunk($hbFrame);
+            $client->processIncoming()->await();
+            delay(0.01);
+        }
+
+        $client->disconnect()->await();
+
+        $written = implode('', $transport->writes);
+        self::assertSame(0, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'), 'live heartbeats must not trigger a recreate');
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'only the initial consumer create must reach the wire');
+        self::assertSame([], $errors, 'a heartbeating consumer must not surface a stall error');
+    }
+
+    /**
+     * Verifies the watchdog surfaces a descriptive error for a caller-owned push consumer (#113): a
+     * durable push consumer created with idle_heartbeat whose transport goes silent for more than two
+     * intervals notifies the error listener (nats.go ErrConsumerNotActive). The library cannot recreate
+     * a caller-owned consumer, so it surfaces the stall through the error listener instead - exactly
+     * once per silence episode, no recreate on the wire.
+     */
+    public function testSubscribePushConsumerSurfacesErrorOnMissedHeartbeats(): void
+    {
+        $createReply = '{"stream_name":"EVENTS","name":"PROC","config":{"deliver_subject":"deliver.push"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ], blockWhenEmpty: true);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 30 ms heartbeat -> the watchdog surfaces a stall after ~60 ms of silence.
+        $client->jetStream()->subscribePushConsumer(
+            'EVENTS',
+            'PROC',
+            static function (NatsMessage $message): void {},
+            'deliver.push',
+            null,
+            ['idle_heartbeat' => 30_000_000],
+        )->await();
+
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while ($errors === [] && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+
+        $client->disconnect()->await();
+
+        self::assertCount(1, $errors, 'a silent caller-owned push consumer must surface exactly one stall error');
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertStringContainsString('not active', $errors[0]->getMessage());
+        self::assertStringContainsString('PROC', $errors[0]->getMessage());
+        // A caller-owned consumer is never deleted/recreated by the library.
+        self::assertSame(0, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE'), 'the library must not recreate a caller-owned push consumer');
+    }
+
+    /**
+     * Verifies the watchdog timer is cancelled when the subscription is torn down (#113): it must not
+     * outlive the subscription it guards (mirrors the #126 ping-timer teardown, so no timer leaks and
+     * roots an abandoned connection). Probed through the event loop's registered-timer set.
+     */
+    public function testSubscribeOrderedConsumerWatchdogTimerIsCancelledOnUnsubscribe(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+        ], blockWhenEmpty: true);
+
+        // pingIntervalSeconds: 0 disables the connection ping timer, so the only repeat timer the
+        // subscription can add is the watchdog.
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $before = self::countRepeatTimers();
+        $sid = $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+        self::assertSame($before + 1, self::countRepeatTimers(), 'subscribing an ordered consumer must arm exactly one heartbeat watchdog timer');
+
+        $client->unsubscribe($sid)->await();
+
+        // The next watchdog tick observes the dropped subscription and self-cancels; wait for it.
+        $deadlineNs = hrtime(true) + 1_000_000_000;
+        while (self::countRepeatTimers() > $before && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+        self::assertSame($before, self::countRepeatTimers(), 'the watchdog timer must be cancelled after unsubscribe (no leaked timer)');
+
+        $client->disconnect()->await();
     }
 
     /**

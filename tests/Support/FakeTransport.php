@@ -76,6 +76,15 @@ final class FakeTransport implements TlsAwareTransportInterface
     ) {}
 
     /**
+     * Appends a chunk to the read queue at runtime, so a test can feed frames spaced over time (e.g. a
+     * periodic idle heartbeat) instead of pre-seeding them all at once.
+     */
+    public function pushReadChunk(string $chunk): void
+    {
+        $this->readQueue[] = $chunk;
+    }
+
+    /**
      * Records connect calls for assertions.
      */
     public function connect(string $dsn, int $timeoutMs): Future
