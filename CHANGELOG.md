@@ -58,6 +58,23 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   scan. The `dispatchingSids` re-entrancy guard (#112/#156), auto-unsubscribe completion (#112), and
   `drain()`'s bounded backlog round-up (#149/#150) are unaffected - `hasUndeliveredDrainBacklog()` now
   keys on the same dirty set, staying consistent with what the drain iterates.
+- `[bugfix]` Restore inbound hot-path throughput lost in #140 and drop the extra per-chunk read
+  fiber (#163). First, `ProtocolParser::splitControlLine()` tokenized MSG/HMSG control lines with an
+  `explode(' ')` + per-token canonical scan fast path that measured slower per line than the
+  `preg_split('/\s+/')` it replaced on a PCRE-JIT build (roughly 5-7% on typical single-space lines
+  and larger on non-canonical lines; JIT is on by default since PHP 7.3 and this package requires
+  8.2+): the canonical scan cost more than the JIT-compiled regex on typical single-space lines, and
+  any non-canonical line then ran `preg_split()` anyway. The split reverts
+  to `preg_split('/\s+/')`, which is byte-identical to the fast path for every input (the fast path
+  already fell back to this exact call off the canonical path), so the whitespace tolerance is
+  unchanged - multi-space, tab, and other whitespace runs still separate fields, pinned by the
+  differential fuzz and the tokenization tests - and only the speed changes. Second,
+  `AmpSocketTransport::readLine()` wrapped the socket read in its own `async()`, so each inbound
+  chunk spawned a SECOND fiber on top of `processIncoming()`'s read fiber; the read now runs inline
+  in the caller's fiber and returns an already-resolved future (mirroring the write path #136),
+  removing one fiber and future allocation per chunk. Read cancellation (a bounded read's timeout
+  still surfaces as `CancelledException`), EOF-to-`TransportClosedException`, and the empty-string
+  no-socket poll all still surface through the returned future exactly as before.
 - `[bugfix]` Frames the server coalesces BEHIND the handshake PONG in one TCP segment are no longer
   dropped, and a frame left partly buffered at the handshake boundary no longer corrupts the stream
   (#157). `awaitInitialPong()` returned the moment it saw the PONG, discarding every frame the parser

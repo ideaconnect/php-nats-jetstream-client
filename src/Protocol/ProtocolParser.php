@@ -282,39 +282,23 @@ final class ProtocolParser
     }
 
     /**
-     * Tokenizes a MSG/HMSG control line on whitespace.
+     * Tokenizes a MSG/HMSG control line on runs of whitespace (space, tab, and the other ASCII
+     * whitespace bytes), so any whitespace run - not just a single space - separates arguments,
+     * matching the NATS wire spec's leniency (see the note in push()). Consecutive whitespace
+     * collapses to one separator.
      *
-     * Fast path: real servers separate arguments with single spaces (see the leniency note in
-     * push()), so a plain explode() covers virtually every frame without the per-message regex
-     * cost (#140). The whitespace-tolerant preg_split fallback must engage whenever explode()
-     * could disagree with it: an empty token (doubled/trailing spaces), a token count outside
-     * the frame's valid range, or a token containing non-space whitespace (tab/LF/VT/FF/CR)
-     * that the regex would treat as a separator - e.g. a tab can hide an extra field inside a
-     * space-separated token and silently change which fields the tokens map to.
+     * preg_split('/\s+/') is used rather than a hand-rolled tokenizer: PCRE's JIT (on by default
+     * since PHP 7.3; this package requires 8.2+) makes it the fastest strategy on the measured
+     * hot path, and it is the reference definition of the whitespace semantics the callers and the
+     * differential fuzz pin. This restores the pre-#140 split after that release's explode() +
+     * canonical-scan fast path measured ~9% slower per message on a PCRE-JIT build (#163); the two
+     * are byte-identical (the fast path already fell back to this exact preg_split off the canonical
+     * path), so the revert changes speed only, not behaviour.
      *
-     * @param int $minParts Minimum valid token count for the frame type (caller re-validates).
-     * @param int $maxParts Maximum valid token count for the frame type (caller re-validates).
      * @return list<string>
      */
-    private function splitControlLine(string $line, int $minParts, int $maxParts): array
+    private function splitControlLine(string $line): array
     {
-        $parts = explode(' ', $line);
-        $count = count($parts);
-
-        if ($count >= $minParts && $count <= $maxParts) {
-            $canonical = true;
-            foreach ($parts as $part) {
-                if ($part === '' || strpbrk($part, "\t\n\v\f\r") !== false) {
-                    $canonical = false;
-                    break;
-                }
-            }
-
-            if ($canonical) {
-                return $parts;
-            }
-        }
-
         $parts = preg_split('/\s+/', $line);
 
         // preg_split() only returns false on a compile/backtrack error, which the constant
@@ -328,7 +312,7 @@ final class ProtocolParser
      */
     private function parseMsgHeader(string $line, int $payloadOffset): array
     {
-        $parts = $this->splitControlLine($line, 4, 5);
+        $parts = $this->splitControlLine($line);
         if (count($parts) < 4 || count($parts) > 5) {
             throw new ProtocolException('Invalid MSG frame line: ' . $line);
         }
@@ -355,7 +339,7 @@ final class ProtocolParser
      */
     private function parseHMsgHeader(string $line, int $payloadOffset): array
     {
-        $parts = $this->splitControlLine($line, 5, 6);
+        $parts = $this->splitControlLine($line);
         if (count($parts) < 5 || count($parts) > 6) {
             throw new ProtocolException('Invalid HMSG frame line: ' . $line);
         }

@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\CancelledException;
 use Amp\Socket\ConnectContext;
+use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Transport\AmpSocketTransport;
 use IDCT\NATS\Transport\TlsRequiredException;
@@ -205,6 +207,51 @@ final class AmpSocketTransportTest extends TestCase
 
         self::assertStringContainsString('hello', $collected);
         self::assertTrue($threw, 'readLine() must throw TransportClosedException on peer EOF');
+    }
+
+    /**
+     * A bounded read whose cancellation fires (no bytes arrive within the window) must surface the
+     * timeout as a CancelledException through the returned future - NOT as EOF/TransportClosedException
+     * and NOT as an empty string. The connection layer relies on this to tell a bounded read
+     * (handshake slice, heartbeat wait) apart from a genuine peer close. Guards the #163 inline
+     * readLine() (no async() wrapper): the passed Cancellation must still reach the underlying read
+     * and its exception must still flow back through await() unchanged.
+     */
+    public function testReadLineSurfacesReadTimeoutAsCancelledExceptionNotEof(): void
+    {
+        $server = listen('tcp://127.0.0.1:0');
+        $address = (string) $server->getAddress();
+
+        // Accept and hold the peer open WITHOUT sending any bytes: the only way readLine() can return
+        // is via the cancellation - the socket is live (not '') and the peer never closes (not EOF).
+        $accepted = async(static function () use ($server): void {
+            $client = $server->accept();
+            if ($client !== null) {
+                delay(0.5);
+                $client->close();
+            }
+        });
+
+        $transport = new AmpSocketTransport(new NatsOptions());
+        $transport->connect('tcp://' . $address, 1000)->await();
+
+        $cancelled = false;
+        try {
+            $transport->readLine(new TimeoutCancellation(0.05))->await();
+            self::fail('readLine() must not return normally when its read is cancelled by timeout');
+        } catch (CancelledException) {
+            $cancelled = true;
+        } finally {
+            $transport->close()->await();
+            try {
+                $accepted->await();
+            } catch (\Throwable) {
+                // The held-open peer may be torn down mid-delay; irrelevant to the assertion.
+            }
+            $server->close();
+        }
+
+        self::assertTrue($cancelled, 'readLine() must surface a read timeout as CancelledException');
     }
 
     /**
