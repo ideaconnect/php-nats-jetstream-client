@@ -15,6 +15,8 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
+use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
+use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamSource;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
 use IDCT\NATS\JetStream\JetStreamContext;
@@ -5546,5 +5548,407 @@ final class JetStreamContextTest extends TestCase
         $this->expectException(JetStreamException::class);
         // expiresMs=100 -> internal deadline ~1.1s; the incomplete batch surfaces as an error.
         $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 100)->await();
+    }
+
+    /**
+     * A connected client over a FakeTransport seeded only with INFO + PONG, so the two handshake
+     * writes (CONNECT, PING) are the sole entries in $transport->writes until a request dispatches
+     * one more frame. The name-validation regressions below assert count stays at 2, proving an
+     * invalid stream/consumer name is rejected before any $JS.API PUB reaches the wire.
+     *
+     * @return array{NatsClient, FakeTransport}
+     */
+    private function connectedForNameGuard(): array
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        return [$client, $transport];
+    }
+
+    /**
+     * Verifies updateStream() rejects a dotted stream name before dispatch: the '.' would corrupt
+     * the $JS.API.STREAM.UPDATE subject and hit the wrong endpoint (#131).
+     */
+    public function testUpdateStreamRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->updateStream('bad.name', ['max_msgs' => 1])->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies addStream() rejects a StreamConfiguration whose name is dotted before dispatch (#131).
+     */
+    public function testAddStreamRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->addStream(StreamConfiguration::create('bad.name')->subjects('s.*'))->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies deleteStream() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testDeleteStreamRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->deleteStream('bad.name')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies purgeStream() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testPurgeStreamRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->purgeStream('bad.name')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies listConsumers() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testListConsumersRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->listConsumers('bad.name')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies consumerNames() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testConsumerNamesRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->consumerNames('bad.name')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies getStreamMessage() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testGetStreamMessageRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->getStreamMessage('bad.name', 1)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies getLastMessageForSubject() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testGetLastMessageForSubjectRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->getLastMessageForSubject('bad.name', 'orders.created')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies deleteMessage() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testDeleteMessageRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->deleteMessage('bad.name', 1)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies directGetLastMessageForSubject() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testDirectGetLastMessageForSubjectRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->directGetLastMessageForSubject('bad.name', 'orders.created')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies directGetBatch() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testDirectGetBatchRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->directGetBatch('bad.name', ['batch' => 1])->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies createConsumer() rejects a dotted STREAM name before dispatch (the consumer-name
+     * guard is covered separately); a '.' in the stream corrupts the CONSUMER.CREATE subject (#131).
+     */
+    public function testCreateConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->createConsumer('bad.name', 'durable')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies createEphemeralConsumer() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testCreateEphemeralConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->createEphemeralConsumer('bad.name')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies getConsumer() rejects a dotted STREAM name before dispatch (its consumer-name guard
+     * is covered by testGetConsumerRejectsDottedConsumerName); CONSUMER.INFO.bad.name misroutes (#131).
+     */
+    public function testGetConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->getConsumer('bad.name', 'durable')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies pullConsumer() rejects a dotted STREAM name synchronously, before building the
+     * iterator - a '.' in the stream would misroute the consumer's pull requests (#131).
+     */
+    public function testPullConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->pullConsumer('bad.name', 'durable');
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies pullConsumer() rejects a dotted CONSUMER name synchronously (valid stream), guarding
+     * the second name check independently of the stream guard (#131).
+     */
+    public function testPullConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->pullConsumer('ORDERS', 'a.b');
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies addConsumer() rejects a dotted CONSUMER name (from the config) before dispatch, with
+     * a valid stream so the stream guard passes and the consumer guard is exercised in isolation (#131).
+     */
+    public function testAddConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->addConsumer('ORDERS', ConsumerConfiguration::create()->durable('a.b'))->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies createPushConsumer() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+     */
+    public function testCreatePushConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->createPushConsumer('ORDERS', 'a.b', 'deliver.here')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies pauseConsumer() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+     */
+    public function testPauseConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->pauseConsumer('ORDERS', 'a.b', '2030-01-01T00:00:00Z')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies resumeConsumer() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+     */
+    public function testResumeConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->resumeConsumer('ORDERS', 'a.b')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies unpinConsumer() rejects a dotted CONSUMER name before dispatch (valid stream); the
+     * consumer guard fires ahead of the empty-group check (#131).
+     */
+    public function testUnpinConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->unpinConsumer('ORDERS', 'a.b', 'group1')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies fetchBatch() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+     */
+    public function testFetchBatchRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "a.b"');
+
+        try {
+            $client->jetStream()->fetchBatch('ORDERS', 'a.b', 1)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
     }
 }
