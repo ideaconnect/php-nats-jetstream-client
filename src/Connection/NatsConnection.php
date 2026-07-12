@@ -632,6 +632,12 @@ final class NatsConnection
             $this->closing = true;
             $this->cancelPingTimer();
 
+            // One overall drain budget (monotonic), computed once at entry, bounds BOTH the flush-wait
+            // and the backlog-wait phases: total drain time cannot exceed ~requestTimeoutMs. A second
+            // sequential deadline for the backlog wait would roughly double worst-case drain latency;
+            // #149 requires the wait be bounded by the existing (singular) drain deadline.
+            $drainDeadline = $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000);
+
             // Send UNSUB for all active subscriptions so no new messages arrive.
             foreach (array_keys($this->subscriptionMeta) as $sid) {
                 $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
@@ -653,10 +659,10 @@ final class NatsConnection
             }
 
             // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
-            // the slot), bounded by a deadline so a slow/wedged server cannot hang drain() forever.
-            // A partial chunk (0 complete frames yet) must NOT end the flush early - only the PONG
-            // or the deadline does.
-            $flushCancellation = new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000));
+            // the slot), bounded by the REMAINING drain budget (shared with the backlog wait below)
+            // so a slow/wedged server cannot hang drain() forever. A partial chunk (0 complete frames
+            // yet) must NOT end the flush early - only the PONG or the deadline does.
+            $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
             try {
                 while (!$flushCancellation->isRequested()) {
                     $frames = $this->processIncoming($flushCancellation)->await();
@@ -688,12 +694,12 @@ final class NatsConnection
             // Deliver the remaining buffered backlog before closing. A handler may await mid-delivery
             // (suspending on ANOTHER fiber, its sid guarded by dispatchingSids with messages still
             // queued) or publish an ack/reply (which now reaches the wire during Draining, #150).
-            // Wait - bounded by the drain deadline - for every sid's queue to empty and every
-            // in-flight dispatch to finish before releasing state, so a suspended dispatch loop
-            // cannot resume into a cleared registry and silently drop its remainder on the lossless
-            // path (#149). Each delivery pass is contained so a handler exception is surfaced rather
-            // than stranding the connection in Draining - drain() always reaches Closed (#150).
-            $backlogDeadline = $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000);
+            // Wait - bounded by the single drain deadline computed at entry - for every sid's queue to
+            // empty and every in-flight dispatch to finish before releasing state, so a suspended
+            // dispatch loop cannot resume into a cleared registry and silently drop its remainder on
+            // the lossless path (#149). Each delivery pass is contained so a handler exception is
+            // surfaced rather than stranding the connection in Draining - drain() always reaches
+            // Closed (#150).
             while (true) {
                 try {
                     $this->drainAllPending();
@@ -701,7 +707,24 @@ final class NatsConnection
                     $this->emitErrorSafely($handlerError);
                 }
 
-                if (!$this->hasUndeliveredDrainBacklog() || $this->monotonicSeconds() >= $backlogDeadline) {
+                if (!$this->hasUndeliveredDrainBacklog()) {
+                    break;
+                }
+
+                if ($this->monotonicSeconds() >= $drainDeadline) {
+                    // Deadline reached with backlog still undelivered (a handler suspended past it):
+                    // releaseRuntimeState() below clears the registry, and the resumed dispatch loop
+                    // then breaks on the missing subscription and discards the remainder. Make that
+                    // discard LOUD, never silent (#149 acceptance: either delivered or an error naming
+                    // the count; mirrors the #123/#134 observable-drop principle).
+                    $undelivered = $this->countUndeliveredDrainBacklog();
+                    if ($undelivered > 0) {
+                        $this->emitErrorSafely(new ConnectionException(
+                            'drain deadline exceeded: ' . $undelivered
+                            . ' buffered message(s) were not delivered before close',
+                        ));
+                    }
+
                     break;
                 }
 
@@ -737,6 +760,22 @@ final class NatsConnection
         }
 
         return false;
+    }
+
+    /**
+     * Sums the messages still buffered across every sid's queue - the backlog drain() would discard
+     * if its deadline is reached before delivery completes. A sid guarded by a suspended dispatch
+     * keeps its not-yet-delivered messages in its queue, so summing all queue sizes counts them too.
+     * Used to name the count in the loud deadline-exceeded error so the drop is never silent (#149).
+     */
+    private function countUndeliveredDrainBacklog(): int
+    {
+        $count = 0;
+        foreach ($this->pendingMessages as $queue) {
+            $count += $queue->count();
+        }
+
+        return $count;
     }
 
     /**

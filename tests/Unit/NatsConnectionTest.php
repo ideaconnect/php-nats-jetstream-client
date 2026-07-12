@@ -5047,13 +5047,16 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * #150(a) - a handler that PUBLISHES (a JetStream ack, respond(), a reply) during drain's final
-     * backlog delivery. Two messages for two sids arrive in one chunk; the sid-1 handler suspends
-     * on another fiber, holding drainAllPending()'s foreach open before it reaches sid 2, so sid 2's
-     * message is delivered by drain()'s own final pass while state === Draining. On the buggy path
-     * that publish throws ConnectionException (buffering refused, connection not Open), the unguarded
-     * final delivery aborts drain() before cleanup - stuck Draining, socket open, the ack never on
-     * the wire. The fix writes the ack straight to the still-live socket and drain() reaches Closed.
+     * #150(a) - a handler that PUBLISHES (a JetStream ack, respond(), a reply) during drain. Two
+     * messages for two sids arrive in one chunk; a background fiber delivers sid 1 and suspends
+     * inside its handler, holding that sid's dispatch guard. drain() then runs: its FLUSH-PHASE read
+     * (processIncoming's post-chunk finally-drain - NOT the dedicated backlog loop) skips the guarded
+     * sid 1 and delivers sid 2 while state === Draining, so the publishing handler fires there. On the
+     * buggy path that publish throws ConnectionException (buffering refused, connection not Open) and
+     * the unguarded delivery aborts drain() before cleanup - stuck Draining, socket open, the ack
+     * never on the wire. The fix writes the ack straight to the still-live socket and drain() reaches
+     * Closed. (The dedicated backlog loop's own per-pass containment is covered separately by
+     * testDrainDedicatedLoopSendsAckAndContainsThrowAfterGuardHolderAborts.)
      */
     public function testDrainDeliversPublishingHandlerBacklogAndReachesClosed(): void
     {
@@ -5100,10 +5103,14 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * #150(b) - a handler that THROWS during drain's final backlog delivery must not wedge the
-     * connection in Draining. The throw is contained, surfaced to the error listener, and drain()
-     * still tears the connection down to Closed. Same two-sid setup: sid 1 suspends on another fiber
-     * so sid 2 is delivered by drain()'s own final pass.
+     * #150(b) - a handler that THROWS during drain must not wedge the connection in Draining. Same
+     * two-sid setup: a background fiber delivers sid 1 and suspends inside its handler, holding that
+     * sid's dispatch guard, so drain()'s FLUSH-PHASE read (processIncoming's post-chunk finally-drain
+     * - NOT the dedicated backlog loop) delivers sid 2 while Draining and the throwing handler fires
+     * there. The throw is contained by the flush-phase catch, surfaced to the error listener, and
+     * drain() still tears the connection down to Closed. (The dedicated backlog loop's own per-pass
+     * containment is covered separately by
+     * testDrainDedicatedLoopSendsAckAndContainsThrowAfterGuardHolderAborts.)
      */
     public function testDrainContainsThrowingHandlerAndReachesClosed(): void
     {
@@ -5150,6 +5157,177 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(ConnectionState::Closed, $connection->state());
         $messages = array_map(static fn(\Throwable $e): string => $e->getMessage(), $errors);
         self::assertContains('handler boom during drain', $messages, 'the handler exception must reach the error listener');
+    }
+
+    /**
+     * #149 (acceptance criterion 2 - "either they are delivered or an error is emitted naming the
+     * count") - when a handler stays suspended PAST the drain deadline, drain() cannot deliver the
+     * messages still queued behind it: it breaks the backlog wait, releaseRuntimeState() clears the
+     * registry, and the resumed dispatch loop then breaks on the missing subscription and drops the
+     * remainder. That discard must be LOUD, never silent. drain() counts the still-buffered messages
+     * and emits an error naming the count before releasing state (mirrors #123/#134 observable-drop).
+     */
+    public function testDrainEmitsLoudErrorNamingUndeliveredCountWhenDeadlineExceeded(): void
+    {
+        $gate = new DeferredFuture();
+        $errors = [];
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // One chunk carrying TWO messages for the same sid: the handler suspends on the first
+            // (holding the per-sid dispatch guard) with the second still queued behind it.
+            "MSG events 1 1\r\nA\r\nMSG events 1 1\r\nB\r\n",
+            "PONG\r\n", // answers drain()'s flush PING so the budget is spent on the backlog wait
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                // Short overall drain budget so the deadline is reached quickly while the handler
+                // is still suspended.
+                requestTimeoutMs: 120,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('events', static function (NatsMessage $message) use (&$received, $gate): void {
+            $received[] = $message->payload;
+            if ($message->payload === 'A') {
+                // Stay suspended past the drain deadline - 'B' can never be delivered.
+                $gate->getFuture()->await();
+            }
+        })->await();
+
+        // A background fiber delivers 'A' and suspends inside the handler, holding the per-sid guard
+        // while 'B' waits queued behind it.
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.02);
+        self::assertSame(['A'], $received, 'the handler must be suspended after the first message');
+
+        // drain() runs while the handler is suspended and never resumes before the deadline. Bound
+        // the await so a regression (a drain that never terminates) fails rather than hangs.
+        $connection->drain()->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+
+        $messages = array_map(static fn(\Throwable $e): string => $e->getMessage(), $errors);
+        $loud = array_filter(
+            $messages,
+            static fn(string $m): bool => str_contains($m, 'drain deadline exceeded')
+                && str_contains($m, '1 buffered message'),
+        );
+        self::assertNotEmpty(
+            $loud,
+            'the deadline-exceeded discard must emit a loud error naming the undelivered count',
+        );
+
+        // Release the still-suspended handler so its fiber unwinds; 'B' is dropped (the registry was
+        // cleared), which is exactly the discard the loud error above accounted for.
+        $gate->complete();
+        $pump->await();
+        self::assertSame(
+            ['A'],
+            $received,
+            'the message queued behind the deadline-exceeded dispatch is not delivered',
+        );
+    }
+
+    /**
+     * #150 - genuinely exercises drain()'s DEDICATED backlog loop and its per-pass containment (the
+     * try/catch around drainAllPending in that loop), distinct from the flush-phase read's finally-
+     * drain that the other #150 tests exercise. A first handler (A) suspends mid-dispatch on a
+     * background fiber, holding the per-sid guard with an ack-publishing handler (B) and a throwing
+     * handler (C) queued behind it; drain()'s flush-phase drain skips the guarded sid. When A resumes
+     * it fails, abandoning its dispatch loop with B and C still queued - so drain()'s own dedicated
+     * loop is what delivers them: B's ack must reach the wire while state is Draining, C's throw must
+     * be contained by the per-pass catch, and drain() must still reach Closed. Removing that per-pass
+     * try/catch lets C's throw escape drain(), stranding it in Draining - this test then fails.
+     */
+    public function testDrainDedicatedLoopSendsAckAndContainsThrowAfterGuardHolderAborts(): void
+    {
+        $gate = new DeferredFuture();
+        $errors = [];
+        $ackSubject = 'ack.subject';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Three messages for one sid in a single chunk: A suspends (holding the guard), B and C
+            // stay queued behind it.
+            "MSG work 1 1\r\nA\r\nMSG work 1 1\r\nB\r\nMSG work 1 1\r\nC\r\n",
+            "PONG\r\n", // answers drain()'s flush PING
+        ]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                requestTimeoutMs: 2000,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('work', static function (NatsMessage $message) use (&$received, $gate, $connection, $ackSubject): void {
+            $received[] = $message->payload;
+            if ($message->payload === 'A') {
+                $gate->getFuture()->await();
+                // On resume the guard holder fails, abandoning its dispatch loop with B and C still
+                // queued - drain()'s dedicated loop must pick them up.
+                throw new \RuntimeException('guard holder aborts after resume');
+            }
+            if ($message->payload === 'B') {
+                // Delivered by drain()'s dedicated loop while Draining: the ack must reach the wire.
+                $connection->publish($ackSubject, 'ACK')->await();
+
+                return;
+            }
+            // 'C' - delivered by drain()'s dedicated loop; its throw must be contained per pass.
+            throw new \RuntimeException('handler boom in dedicated drain loop');
+        })->await();
+
+        // A background fiber delivers 'A' and suspends inside the handler, holding the per-sid guard
+        // with 'B' and 'C' queued behind it.
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.02);
+        self::assertSame(['A'], $received, 'the handler must be suspended after the first message');
+
+        // drain() flushes (skipping the guarded sid), then spins in its dedicated backlog loop.
+        $drain = async(static fn(): null => $connection->drain()->await());
+        delay(0.02);
+
+        // Resume the guard holder: A throws, releasing the guard with B and C still queued. drain()'s
+        // dedicated loop then delivers B (ack) and C (throw).
+        $gate->complete();
+
+        // Bound so removing the per-pass containment (the mutant) fails rather than hangs.
+        $drain->await(new TimeoutCancellation(5.0));
+
+        try {
+            $pump->await();
+            self::fail('the guard holder was expected to abort');
+        } catch (\RuntimeException $e) {
+            self::assertStringContainsString('guard holder aborts after resume', $e->getMessage());
+        }
+
+        self::assertSame(['A', 'B', 'C'], $received, 'B and C must be delivered by the dedicated loop');
+        self::assertStringContainsString('ACK', implode('', $transport->writes), 'the ack must reach the wire');
+        $messages = array_map(static fn(\Throwable $e): string => $e->getMessage(), $errors);
+        self::assertContains(
+            'handler boom in dedicated drain loop',
+            $messages,
+            'the dedicated-loop handler throw must be contained and surfaced to the error listener',
+        );
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     public function testRequestTimeoutPreservesOriginalExceptionDuringCleanup(): void

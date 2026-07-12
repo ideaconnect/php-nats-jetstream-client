@@ -7,6 +7,7 @@ namespace IDCT\NATS\Tests\Integration;
 use Amp\CancelledException;
 use Amp\Future;
 use Amp\TimeoutCancellation;
+use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -872,6 +873,88 @@ final class JetStreamIntegrationTest extends TestCase
         $js->deleteConsumer($stream, $consumer)->await();
         $js->deleteStream($stream)->await();
         $client->disconnect()->await();
+    }
+
+    /**
+     * #150 - a REAL JetStream push consumer whose handler calls the JetStream ack path (`ack()`,
+     * which publishes `+ACK` to the message reply subject) while the connection is Draining. The
+     * server pushes a message that stays buffered on the subscriber's socket (no pump before drain),
+     * so drain()'s own flush-phase read delivers it during Draining; the handler's ack must reach the
+     * wire even though the connection is no longer Open, the subscriber must end Closed, and the ack
+     * must be recorded server-side (num_ack_pending and num_pending both drain to 0), confirming the
+     * delivered message was durably acknowledged rather than left for redelivery.
+     */
+    public function testDrainDeliversJetStreamPushConsumerAckToTheServer(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.drainack';
+        $consumer = 'C_' . strtoupper(bin2hex(random_bytes(2)));
+
+        // Admin connection creates the stream/consumer and later verifies the ack server-side.
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $adminJs = $admin->jetStream();
+        $adminJs->createStream($stream, [$subject])->await();
+
+        // Subscriber runs the push consumer; disable heartbeats so no background self-read consumes
+        // the pushed message before drain()'s flush-phase read does.
+        $subscriber = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()], pingIntervalSeconds: 0));
+        $subscriber->connect()->await();
+        $js = $subscriber->jetStream();
+
+        $handled = false;
+        $ackError = null;
+        $ackState = null;
+        $js->subscribePushConsumer(
+            $stream,
+            $consumer,
+            static function (NatsMessage $message) use (&$handled, &$ackError, &$ackState, $js, $subscriber): void {
+                $handled = true;
+                $ackState = $subscriber->state();
+                try {
+                    // The real JetStream ack path; it must reach the wire while state is Draining.
+                    $js->ack($message)->await();
+                } catch (\Throwable $e) {
+                    $ackError = $e;
+                }
+            },
+            null,
+            $subject,
+        )->await();
+        // Register the consumer interest server-side before publishing.
+        $subscriber->flush()->await();
+
+        // Publish one message, then do NOT pump: the server's push MSG stays buffered on the socket
+        // until drain()'s flush-phase read consumes and delivers it during Draining.
+        $adminJs->publish($subject, '{"event":"drain-ack"}')->await();
+        delay(0.3);
+
+        $subscriber->drain()->await();
+
+        self::assertTrue($handled, 'the push message must be delivered to the handler during drain');
+        self::assertSame(ConnectionState::Draining, $ackState, 'the ack must run while the connection is Draining');
+        self::assertNull($ackError, 'the JetStream ack must not throw while the connection is Draining');
+        self::assertSame(ConnectionState::Closed, $subscriber->state());
+
+        // Server-side: the delivered message must be acknowledged (nothing left to ack, nothing left
+        // pending), proving the ack sent during drain was durably recorded rather than lost.
+        $deadline = $this->monotonic() + 5.0;
+        $info = $adminJs->getConsumer($stream, $consumer)->await();
+        while (
+            ((int) ($info->raw['num_ack_pending'] ?? -1) !== 0 || (int) ($info->raw['num_pending'] ?? -1) !== 0)
+            && $this->monotonic() < $deadline
+        ) {
+            delay(0.1);
+            $info = $adminJs->getConsumer($stream, $consumer)->await();
+        }
+        self::assertSame(0, (int) ($info->raw['num_ack_pending'] ?? -1), 'the ack sent during drain must be recorded server-side');
+        self::assertSame(0, (int) ($info->raw['num_pending'] ?? -1), 'the delivered message must not be left pending for redelivery');
+
+        $adminJs->deleteConsumer($stream, $consumer)->await();
+        $adminJs->deleteStream($stream)->await();
+        $admin->disconnect()->await();
     }
 
     /**

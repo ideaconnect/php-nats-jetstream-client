@@ -24,9 +24,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   were still queued for its sid, the `dispatchingSids` re-entrancy guard made drain()'s final
   delivery skip that sid, `releaseRuntimeState()` then cleared the subscription registry, and the
   resumed dispatch loop broke on the missing subscription - dropping the remainder on the
-  documented lossless path. drain() now waits (bounded by the drain deadline) for every in-flight
-  dispatch to finish and every sid's queue to empty before releasing state (nats.go `Drain()`
-  waits for per-subscription delivery to complete before closing).
+  documented lossless path. drain() now waits for every in-flight dispatch to finish and every
+  sid's queue to empty before releasing state (nats.go `Drain()` waits for per-subscription
+  delivery to complete before closing). The wait is bounded by a single overall drain budget
+  computed once at entry - one deadline covers BOTH the flush-wait and the backlog-wait phases, so
+  total drain time cannot exceed ~`requestTimeoutMs` (the earlier fix added a second sequential
+  deadline that roughly doubled worst-case drain latency). When a handler stays suspended PAST that
+  deadline so the remaining buffered messages cannot be delivered, drain() no longer drops them
+  silently: it counts the still-buffered messages and emits an error naming that count ("drain
+  deadline exceeded: N buffered message(s) were not delivered before close") through the error
+  listener before closing, so the loss is always observable (mirrors the #123/#134 observable-drop
+  principle).
 - `[bugfix]` `drain()` no longer breaks when a handler publishes during the drain (#150). A
   JetStream ack, a `Service` reply, or `NatsMessage::respond()` invoked from a handler while the
   connection is `Draining` previously threw `ConnectionException` ("Connection is not open"): the
