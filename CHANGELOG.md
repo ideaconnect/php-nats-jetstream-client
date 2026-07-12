@@ -19,6 +19,21 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` The per-inbound-chunk pending-message drain no longer scans every live subscription
+  (#162), a performance regression introduced by #139. To avoid a per-message `SplQueue` alloc/free,
+  #139 began keeping each subscription's queue allocated but EMPTY for the subscription's lifetime;
+  `drainAllPending()` then iterated `array_keys($this->pendingMessages)` after every inbound chunk, so
+  the drain scan became O(all live subscriptions) plus a fresh `array_keys()` copy of every sid - paid
+  on every chunk INCLUDING each message-free heartbeat self-read (measured ~213 us/chunk at 10,000
+  idle subscriptions, ~0 in v2.4.0). The drain now iterates a dirty set of only the sids whose queue
+  actually holds a message: a sid is recorded when a message is enqueued to it and removed once its
+  queue drains empty, so the per-chunk cost is O(sids-with-backlog) and a message-free chunk returns
+  in O(1) with no allocation. #139's no-per-message-realloc win is preserved (the empty queue objects
+  are still retained; only the scan set changed), and delivery is byte-for-byte unchanged: per-sid
+  FIFO holds, and cross-sid delivery keeps the ascending-sid (registration) order of the old full-map
+  scan. The `dispatchingSids` re-entrancy guard (#112/#156), auto-unsubscribe completion (#112), and
+  `drain()`'s bounded backlog round-up (#149/#150) are unaffected - `hasUndeliveredDrainBacklog()` now
+  keys on the same dirty set, staying consistent with what the drain iterates.
 - `[bugfix]` Frames the server coalesces BEHIND the handshake PONG in one TCP segment are no longer
   dropped, and a frame left partly buffered at the handshake boundary no longer corrupts the stream
   (#157). `awaitInitialPong()` returned the moment it saw the PONG, discarding every frame the parser

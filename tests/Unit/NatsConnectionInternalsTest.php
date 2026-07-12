@@ -379,6 +379,8 @@ final class NatsConnectionInternalsTest extends TestCase
             },
         ]);
         $this->setPrivate($connection, 'pendingMessages', [1 => $queue]);
+        // Mirror enqueueMessage(): a non-empty queue's sid is in the dirty set drainAllPending() scans.
+        $this->setPrivate($connection, 'pendingDirty', [1 => true]);
 
         $this->invokePrivate($connection, 'drainAllPending');
 
