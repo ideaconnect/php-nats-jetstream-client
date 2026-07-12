@@ -1109,6 +1109,322 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * #110 regression: directGetLastForSubjects() must split an exact-subject list larger than the
+     * server's per-request result cap into several batched requests, rather than sending one oversized
+     * multi_last a NATS 2.11+ server rejects with "Too Many Results". With 1001 subjects it issues TWO
+     * Direct Get requests (1000 + 1) and concatenates the replies in chunk order.
+     *
+     * Falsifies the pre-fix code, which sent all subjects in a single request (`batch: 1001`): that
+     * produced exactly one DIRECT.GET PUB, so the two-request assertions below fail.
+     */
+    public function testDirectGetLastForSubjectsChunksAboveResultCap(): void
+    {
+        // 1001 exact subjects: one past the 1000-subject chunk cap, forcing a 1000 + 1 split.
+        $subjects = [];
+        for ($i = 0; $i <= 1000; $i++) {
+            $subjects[] = 'orders.k' . $i;
+        }
+
+        // The server answers each chunk on its own inbox sid (monotonic: chunk 1 -> sid 1, chunk 2 ->
+        // sid 2). Each reply is a single data message terminated by Nats-Num-Pending: 0.
+        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.k0\r\nNats-Sequence: 1\r\nNats-Num-Pending: 0\r\n\r\n";
+        $b1 = 'v0';
+        $h2 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.k1000\r\nNats-Sequence: 2\r\nNats-Num-Pending: 0\r\n\r\n";
+        $b2 = 'v1000';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($h1), strlen($h1) + strlen($b1), $h1, $b1),
+            sprintf("HMSG _INBOX.JS.DGET.y 2 %d %d\r\n%s%s\r\n", strlen($h2), strlen($h2) + strlen($b2), $h2, $b2),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
+
+        // Merged in chunk order: chunk 1's message first, chunk 2's second.
+        self::assertCount(2, $messages);
+        self::assertSame('orders.k0', $messages[0]->subject);
+        self::assertSame('v0', $messages[0]->payload);
+        self::assertSame('orders.k1000', $messages[1]->subject);
+        self::assertSame('v1000', $messages[1]->payload);
+
+        // Exactly two batched Direct Get requests were sent (not one oversized request).
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        self::assertCount(2, $directGets);
+
+        // First chunk carries 1000 subjects (batch 1000) up to orders.k999; the 1001st subject is held
+        // back for the second chunk (batch 1) - the split boundary is the 1000-subject cap.
+        self::assertStringContainsString('"batch":1000', $directGets[0]);
+        self::assertStringContainsString('"orders.k0"', $directGets[0]);
+        self::assertStringContainsString('"orders.k999"', $directGets[0]);
+        self::assertStringNotContainsString('"orders.k1000"', $directGets[0]);
+
+        self::assertStringContainsString('"batch":1', $directGets[1]);
+        self::assertStringContainsString('"orders.k1000"', $directGets[1]);
+    }
+
+    /**
+     * #110 regression: directGetLastForSubjects() must also keep each batched request within the
+     * server's negotiated max_payload, so a bucket whose subject list would not fit one PUB is
+     * enumerated across several requests. With a deliberately small max_payload the five-subject list
+     * splits, every request stays within max_payload, and the union of requested subjects is exactly
+     * the input (no subject lost or duplicated).
+     *
+     * Falsifies the pre-fix code, which packed all subjects into a single request regardless of
+     * max_payload (one DIRECT.GET PUB): the > 1 request and per-request size assertions below fail.
+     */
+    public function testDirectGetLastForSubjectsChunksToRespectMaxPayload(): void
+    {
+        $maxPayload = 200;
+        // Subjects long enough that only a couple fit one request under the small max_payload.
+        $letters = 'abcde';
+        $subjects = [];
+        for ($i = 0; $i < 5; $i++) {
+            $subjects[] = 'orders.' . $letters[$i] . str_repeat('x', 40);
+        }
+
+        // Each chunk replies with a single empty end-of-batch marker (204) on its own sid; the split is
+        // what is under test, not the payloads. sids are monotonic across the sequential chunks.
+        $reads = [
+            sprintf('INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":%d,"headers":true}' . "\r\n", $maxPayload),
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        for ($sid = 1; $sid <= 5; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+        self::assertSame($maxPayload, $client->maxPayload());
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+
+        // The small max_payload forces more than one request, and no request's JSON payload (the part
+        // max_payload bounds - not the PUB command/subject prefix) exceeds it. A single unchunked
+        // request of all five subjects would exceed max_payload and be rejected by publish().
+        self::assertGreaterThan(1, count($directGets));
+        foreach ($directGets as $frame) {
+            // PUB <subject> <reply> <len>\r\n<payload>\r\n - the payload follows the first CRLF.
+            $payload = rtrim(explode("\r\n", $frame, 2)[1] ?? '', "\r\n");
+            self::assertLessThanOrEqual($maxPayload, strlen($payload), 'a batched Direct Get payload exceeded max_payload');
+        }
+
+        // Every input subject appears in exactly one request - nothing lost or duplicated by the split.
+        $seen = [];
+        foreach ($subjects as $subject) {
+            $hits = 0;
+            foreach ($directGets as $frame) {
+                if (str_contains($frame, '"' . $subject . '"')) {
+                    $hits++;
+                }
+            }
+
+            self::assertSame(1, $hits, sprintf('subject %s appeared in %d chunks', $subject, $hits));
+            $seen[] = $subject;
+        }
+
+        self::assertCount(5, $seen);
+    }
+
+    /**
+     * #110 regression: the per-chunk max_payload budget must count each subject's cost with the SAME
+     * encoding the request is serialized with. json_encode escapes '/' to '\/' (and KV keys legally
+     * contain '/'), so a slash-bearing subject encodes wider than strlen + 2 quotes. Estimating cost as
+     * strlen + 3 under-counts every slash, packing too many subjects into a chunk whose real payload
+     * then exceeds max_payload and is rejected by publish() - exactly the failure chunking prevents.
+     *
+     * Falsifies the strlen-based estimate: with these slash-heavy subjects and this small max_payload,
+     * the under-count builds an oversized first chunk and publish() throws a ProtocolException before
+     * any reply is read. The escaping-aware estimate keeps every chunk's real payload within budget.
+     */
+    public function testDirectGetLastForSubjectsChunkPayloadAccountsForJsonSlashEscaping(): void
+    {
+        $maxPayload = 400;
+        // Slash-heavy subjects: strlen 27, but json_encode widens each of the 12 slashes by one byte.
+        $subjects = [];
+        for ($i = 0; $i < 20; $i++) {
+            $subjects[] = 's' . $i . '.' . str_repeat('a/', 12) . 'z';
+        }
+
+        $reads = [
+            sprintf('INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":%d,"headers":true}' . "\r\n", $maxPayload),
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        // Over-seed EOB markers (one per possible chunk sid); unused frames are harmless.
+        for ($sid = 1; $sid <= 20; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        // With the escaping-aware budget this completes; with strlen + 3 the oversized chunk's PUB throws.
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+
+        self::assertGreaterThan(1, count($directGets));
+        foreach ($directGets as $frame) {
+            $payload = rtrim(explode("\r\n", $frame, 2)[1] ?? '', "\r\n");
+            self::assertLessThanOrEqual(
+                $maxPayload,
+                strlen($payload),
+                'a batched Direct Get payload exceeded max_payload despite slash escaping',
+            );
+        }
+    }
+
+    /**
+     * #110 regression: when the server does not advertise max_payload, maxPayload() returns 0 and the
+     * chunker must fall back to the NATS default 1 MiB budget, NOT collapse onto 0. A modest ten-subject
+     * list then fits ONE batched request.
+     *
+     * Falsifies the guard mutations on the fallback ternary (`$maxPayload > 0` -> `>= 0`, and the `&&`
+     * -> `||`): either would select max_payload==0 as the budget (floored to a 1-byte budget), forcing
+     * one request PER subject - ten DIRECT.GET PUBs instead of one.
+     */
+    public function testDirectGetLastForSubjectsUsesDefaultBudgetWhenServerAdvertisesNoMaxPayload(): void
+    {
+        $subjects = [];
+        for ($i = 0; $i < 10; $i++) {
+            $subjects[] = 'orders.k' . $i;
+        }
+
+        // INFO WITHOUT a max_payload field: ServerInfo::maxPayload defaults to 0 (maxPayload() -> 0).
+        $reads = [
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        // Over-seed one EOB per possible chunk sid: with the mutants each subject becomes its own chunk (10).
+        for ($sid = 1; $sid <= 10; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+        self::assertSame(0, $client->maxPayload());
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        // Exactly ONE request: all ten subjects fit the 1 MiB fallback budget.
+        self::assertCount(1, $directGets);
+        self::assertStringContainsString('"batch":10', $directGets[0]);
+    }
+
+    /**
+     * #110 regression: the per-chunk max_payload packing is byte-exact. Three 6-char slash-free subjects
+     * each encode as `"o.aaaa"` (8 bytes) + 1 separator = 9 bytes. With max_payload 82 the budget is
+     * 82 - 64 (envelope) = 18 = EXACTLY two subjects (2 * 9); the third overflows into a second chunk,
+     * so the split is [2, 1].
+     *
+     * Falsifies two boundary mutations that would over-eagerly flush to [1, 1, 1] (three requests):
+     * the fill comparison `> $payloadBudget` -> `>= $payloadBudget` (flushes AT the exact fit), and the
+     * per-subject cost `+ 1` -> `+ 2` (inflates each subject so only one fits).
+     */
+    public function testDirectGetLastForSubjectsChunkBoundaryPacksToExactPayloadBudget(): void
+    {
+        $subjects = ['o.aaaa', 'o.bbbb', 'o.cccc'];
+
+        $reads = [
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":82,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        for ($sid = 1; $sid <= 3; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        self::assertCount(2, $directGets);
+        self::assertStringContainsString('"multi_last":["o.aaaa","o.bbbb"]', $directGets[0]);
+        self::assertStringContainsString('"batch":2', $directGets[0]);
+        self::assertStringContainsString('"multi_last":["o.cccc"]', $directGets[1]);
+        self::assertStringContainsString('"batch":1', $directGets[1]);
+    }
+
+    /**
+     * #110 regression: one byte tighter, the packing must count every subject byte. With max_payload 81
+     * the budget is 81 - 64 = 17 < 18, so even two 9-byte subjects no longer share a chunk - each subject
+     * gets its own request, split [1, 1, 1].
+     *
+     * Falsifies the byte-accounting mutations that would let subjects share a chunk ([2, 1] or [1, 2]):
+     * the initial `$currentBytes = 0` -> -1 (a phantom free byte in the first chunk), the flush-reset
+     * `$currentBytes = 0` -> -1 (a phantom free byte in every later chunk), and the per-subject cost
+     * `+ 1` -> `+ 0` / `- 1` (undercounting each subject).
+     */
+    public function testDirectGetLastForSubjectsChunkBoundaryCountsEverySubjectByte(): void
+    {
+        $subjects = ['o.aaaa', 'o.bbbb', 'o.cccc'];
+
+        $reads = [
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":81,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        for ($sid = 1; $sid <= 3; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        self::assertCount(3, $directGets);
+        self::assertStringContainsString('"multi_last":["o.aaaa"]', $directGets[0]);
+        self::assertStringContainsString('"multi_last":["o.bbbb"]', $directGets[1]);
+        self::assertStringContainsString('"multi_last":["o.cccc"]', $directGets[2]);
+        foreach ($directGets as $frame) {
+            self::assertStringContainsString('"batch":1', $frame);
+        }
+    }
+
+    /**
      * Verifies a batched Direct Get error status surfaces as a JetStreamException (issue #13).
      */
     public function testDirectGetBatchSurfacesError(): void
@@ -1128,6 +1444,39 @@ final class JetStreamContextTest extends TestCase
         $this->expectExceptionCode(408);
 
         $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10])->await();
+    }
+
+    /**
+     * Verifies supportsBatchedDirectGet() gates the batched multi_last Direct Get on NATS 2.11+, the
+     * version gate KV getAll() / Object Store list() use to choose the batched path vs the per-subject
+     * fan-out fallback (#110). An unknown/unparseable version is treated as unsupported so the
+     * conservative fan-out (which works on any server) is used.
+     */
+    public function testSupportsBatchedDirectGetGatesOnServerVersion(): void
+    {
+        $cases = [
+            '2.10.9' => false,            // pre-2.11: unsupported
+            '2.11.0' => true,             // boundary: supported
+            'v2.11.0' => true,            // leading 'v' consumed by v? - the MAJOR is match[1]==2, not
+                                          // match[0]=="v2.11" ((int) of which is 0 -> would misread as < 2.11)
+            '2.12.9' => true,
+            '3.0.0' => true,
+            '2.11.0-beta.1' => true,      // pre-release tag ignored, numeric prefix >= 2.11
+            'dev-custom' => false,        // unparseable -> conservative fan-out fallback
+            'x9.9' => false,              // leading non-digit: the ^ anchor forbids matching 9.9 mid-string,
+                                          // so an unparseable prefix stays unsupported (fan-out fallback)
+        ];
+
+        foreach ($cases as $version => $expected) {
+            $info = sprintf(
+                'INFO {"server_id":"S1","server_name":"n1","version":"%s","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                $version,
+            );
+            $client = new NatsClient(new NatsOptions(), new FakeTransport([$info, "PONG\r\n"]));
+            $client->connect()->await();
+
+            self::assertSame($expected, $client->jetStream()->supportsBatchedDirectGet(), 'version ' . $version);
+        }
     }
 
     /**

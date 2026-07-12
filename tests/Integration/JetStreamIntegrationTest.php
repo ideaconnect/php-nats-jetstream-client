@@ -1495,6 +1495,88 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
+     * Behavior-preservation guard for #110: keys()/listKeys() must return exactly the non-deleted key
+     * names - the same set as array_keys(getAll()) - with a DEL tombstone AND a PURGE tombstone present,
+     * and getAll() must return the correct values. This is protocol-agnostic (it asserts the observable
+     * result, not the wire mechanism), so it passes on both the old per-key Direct Get path and the new
+     * headers-only enumeration + batched getAll path.
+     */
+    public function testJetStreamKeyValueKeysExcludeTombstonesAndMatchGetAll(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $bucket = 'enum' . strtolower(bin2hex(random_bytes(2)));
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue($bucket);
+        $kv->create()->await();
+
+        // Larger-than-trivial values so a values-downloading keys() would move real bytes.
+        $value = str_repeat('v', 4096);
+        foreach (['alpha', 'beta', 'gamma', 'delta', 'epsilon'] as $key) {
+            $kv->put($key, $value)->await();
+        }
+        $kv->delete('beta')->await();   // DEL tombstone
+        $kv->purge('gamma')->await();   // PURGE tombstone
+
+        $expected = ['alpha', 'delta', 'epsilon'];
+
+        $keys = $kv->keys()->await();
+        sort($keys);
+        self::assertSame($expected, $keys, 'keys() must exclude DEL and PURGE tombstones');
+
+        $listKeys = $kv->listKeys()->await();
+        sort($listKeys);
+        self::assertSame($expected, $listKeys, 'listKeys() alias must match keys()');
+
+        $all = $kv->getAll()->await();
+        $allKeys = array_keys($all);
+        sort($allKeys);
+        self::assertSame($expected, $allKeys, 'keys() must equal array_keys(getAll())');
+        self::assertSame($value, $all['alpha'] ?? null, 'getAll() must return the stored value');
+        self::assertArrayNotHasKey('beta', $all);
+        self::assertArrayNotHasKey('gamma', $all);
+
+        $kv->deleteBucket()->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Behavior-preservation guard for #110: Object Store list() must return the identical objects and
+     * honour the deleted filter with a deleted object present - excluded by default, included with
+     * includeDeleted: true. Protocol-agnostic, so it passes on both the per-subject fan-out and the
+     * batched multi_last Direct Get path.
+     */
+    public function testJetStreamObjectStoreListPreservedAcrossDeletedFilter(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $bucket = 'oslist' . strtolower(bin2hex(random_bytes(2)));
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $store = $client->jetStream()->objectStore($bucket);
+        $store->create()->await();
+
+        foreach (['one.bin', 'two.bin', 'three.bin'] as $name) {
+            $store->put($name, str_repeat('o', 4096))->await();
+        }
+        $store->delete('two.bin')->await();
+
+        $active = array_map(static fn($o): string => $o->name, $store->list()->await());
+        sort($active);
+        self::assertSame(['one.bin', 'three.bin'], $active, 'list() must exclude the deleted object');
+
+        $all = array_map(static fn($o): string => $o->name, $store->list(includeDeleted: true)->await());
+        sort($all);
+        self::assertSame(['one.bin', 'three.bin', 'two.bin'], $all, 'list(includeDeleted) must include the deleted object');
+
+        $store->deleteBucket()->await();
+        $client->disconnect()->await();
+    }
+
+    /**
      * Verifies Object Store bucket lifecycle with put/get/info/delete operations.
      */
     public function testJetStreamObjectStoreLifecycle(): void

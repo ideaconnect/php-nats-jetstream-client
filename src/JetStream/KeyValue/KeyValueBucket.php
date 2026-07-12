@@ -523,14 +523,114 @@ final class KeyValueBucket
     }
 
     /**
+     * Default no-progress bound (seconds) for the keys() headers-only enumeration replay, mirroring
+     * history()'s stall guard: a replay that makes NO progress for the whole interval surfaces as an
+     * incomplete-result error rather than a silently truncated key list (#110/#121).
+     */
+    private const KEYS_TIMEOUT_S = 5.0;
+
+    /**
      * Returns the names of all keys currently present in the bucket (deleted/purged keys excluded),
      * mirroring nats.go / nats.java `KeyValue.Keys()`. Use {@see getAll()} when the values are needed.
      *
+     * Enumerates names WITHOUT downloading any value bytes: a `last_per_subject` + `headers_only`
+     * ephemeral push consumer replays the latest record of every key carrying only its headers
+     * (`KV-Operation`/`Nats-Sequence`), so tombstones are filtered by the `KV-Operation` header alone
+     * and no value body crosses the wire (nats.go's `Keys()` uses the same headers-only watcher). The
+     * previous `array_keys(getAll())` transferred every value just to discard it (#110). The returned
+     * set of names is identical to `array_keys(getAll())`; the order (stream-sequence order of the
+     * latest record per key) is unspecified, as it was before.
+     *
+     * @param float|null $progressTimeoutSeconds No-progress bound in seconds (null uses the default).
      * @return Future<list<string>>
      */
-    public function keys(): Future
+    public function keys(?float $progressTimeoutSeconds = null): Future
     {
-        return async(fn(): array => array_keys($this->getAll()->await()));
+        $progressTimeoutSeconds ??= self::KEYS_TIMEOUT_S;
+
+        return async(function () use ($progressTimeoutSeconds): array {
+            $deliver = Inbox::generate('_INBOX.KV.KEYS');
+            $consumer = $this->jetStream->createEphemeralPushConsumer(
+                $this->streamName(),
+                $deliver,
+                $this->subjectPrefix() . '>',
+                // last_per_subject replays the latest record per key; headers_only strips the value
+                // body so only the KV-Operation/Nats-Sequence headers return (the metaOnly watch path).
+                ['deliver_policy' => 'last_per_subject', 'ack_policy' => 'none', 'headers_only' => true],
+            )->await();
+
+            $pending = (int) ($consumer->raw['num_pending'] ?? 0);
+            if ($pending === 0) {
+                return [];
+            }
+
+            /** @var list<string> $keys */
+            $keys = [];
+            $caughtUp = false;
+            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use (&$keys, &$caughtUp): void {
+                // Null-tolerant metadata parse: a non-conformant / control delivery without a parseable
+                // $JS.ACK reply subject must NOT throw out of the shared dispatch loop and tear down every
+                // subscription on the connection (the #90 class, as in history()). Skip such a frame.
+                $meta = JsMessageMetadata::fromMessage($message);
+                if ($meta === null) {
+                    return;
+                }
+
+                $key = $this->keyFromSubject($message->subject);
+                if ($key !== null && $key !== '') {
+                    $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+                    $operation = $this->operationFromHeaders($headers);
+                    // Exclude DEL/PURGE tombstones (and server delete-markers) - the same records
+                    // getAll() omits - using only the headers; the value body is never fetched.
+                    if ($operation !== 'DEL' && $operation !== 'PURGE') {
+                        $keys[] = $key;
+                    }
+                }
+
+                if ($meta->numPending === 0) {
+                    $caughtUp = true;
+                }
+            })->await();
+
+            // Progress-based bound identical to history(): reset the stall clock on each replayed record,
+            // so a healthy-but-slow large bucket that keeps making progress is never failed - only a
+            // server that makes NO progress for the whole interval throws (#121).
+            $progressIntervalNs = (int) ($progressTimeoutSeconds * 1_000_000_000);
+            $lastActivityNs = hrtime(true);
+            $seen = count($keys);
+            try {
+                while (!$caughtUp) {
+                    $nowNs = hrtime(true);
+                    if ($nowNs - $lastActivityNs >= $progressIntervalNs) {
+                        throw new JetStreamException(sprintf(
+                            'Key enumeration stalled: no progress for %.3f s (collected %d key(s), '
+                                . 'replay not caught up)',
+                            $progressTimeoutSeconds,
+                            count($keys),
+                        ));
+                    }
+
+                    $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
+                    try {
+                        $frames = $this->client->processIncoming($waitCancellation)->await();
+                        if ($frames === 0) {
+                            delay(0.001, cancellation: $waitCancellation);
+                        }
+                    } catch (CancelledException) {
+                        // This wait segment ended; loop around to re-evaluate the stall deadline.
+                    }
+
+                    if (count($keys) > $seen) {
+                        $seen = count($keys);
+                        $lastActivityNs = hrtime(true);
+                    }
+                }
+            } finally {
+                $this->client->unsubscribe($sid)->await();
+            }
+
+            return $keys;
+        });
     }
 
     /**
@@ -662,6 +762,14 @@ final class KeyValueBucket
                 return [];
             }
 
+            // Fast path (#110): one batched multi_last Direct Get (ADR-31) returns the latest record of
+            // every key in a single request/reply, instead of one Direct Get round-trip per key. Gated
+            // on server support (batched Direct Get needs NATS 2.11+); older servers take the per-subject
+            // fan-out below. The returned data, tombstone filtering, and 404/missing handling are identical.
+            if ($this->jetStream->supportsBatchedDirectGet()) {
+                return $this->getAllBatched(array_keys($subjects));
+            }
+
             // Look up the latest record per key CONCURRENTLY via the Direct Get API (last_by_subj).
             // Direct Get is served by any replica (not just the leader) and the round-trips overlap,
             // turning O(keys) serial reads into roughly one round-trip of wall-clock.
@@ -707,6 +815,53 @@ final class KeyValueBucket
 
             return $latest;
         });
+    }
+
+    /**
+     * getAll() fast path: fetch the latest record of every key with ONE batched multi_last Direct Get
+     * (ADR-31) instead of a per-subject fan-out. Produces the identical `key => value` map: the same
+     * candidate subjects are considered (non-key subjects skipped), DEL/PURGE tombstones are filtered
+     * by the KV-Operation header, and subjects with no stored record are simply absent from the batch
+     * reply (mirroring the fan-out's 404-skip). Only reached when {@see JetStreamContext::supportsBatchedDirectGet()}.
+     *
+     * @param list<int|string> $subjectNames STREAM.INFO subject-map keys (`$KV.<bucket>.<key>`).
+     * @return array<string,string>
+     */
+    private function getAllBatched(array $subjectNames): array
+    {
+        $subjects = [];
+        foreach ($subjectNames as $subjectName) {
+            $key = $this->keyFromSubject((string) $subjectName);
+            if ($key === null || $key === '') {
+                continue;
+            }
+
+            $subjects[] = $this->subjectForKey($key);
+        }
+
+        if ($subjects === []) {
+            return [];
+        }
+
+        $messages = $this->jetStream->directGetLastForSubjects($this->streamName(), $subjects)->await();
+
+        $latest = [];
+        foreach ($messages as $message) {
+            $key = $this->keyFromSubject($message->subject);
+            if ($key === null || $key === '') {
+                continue;
+            }
+
+            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+            $operation = $this->operationFromHeaders($headers);
+            if ($operation === 'DEL' || $operation === 'PURGE') {
+                continue;
+            }
+
+            $latest[$key] = $message->payload;
+        }
+
+        return $latest;
     }
 
     /**

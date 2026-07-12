@@ -15,6 +15,29 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Changed
+
+- `[feature]` KV `keys()`/`listKeys()` no longer download every value just to list names (#110). They now
+  enumerate via a `last_per_subject` + `headers_only` ephemeral consumer (the metaOnly watch path nats.go's
+  `Keys()` uses), so only the `KV-Operation`/`Nats-Sequence` headers return and DEL/PURGE tombstones are
+  filtered by header alone - no value body crosses the wire. Previously `keys()` was `array_keys(getAll())`,
+  which issued one full-value Direct Get per key. The returned set of names is unchanged (deleted keys
+  excluded); the order (stream-sequence order of each key's latest record) remains unspecified, as before.
+  Measured against a 100-key bucket with 4 KiB values: value bytes read dropped from ~423 KiB to ~13 KiB
+  (headers only) and the 100 per-key Direct Get requests became a single consumer.
+- `[feature]` KV `getAll()` and Object Store `list()` fetch every key/object with ONE batched multi_last
+  Direct Get (ADR-31) instead of one Direct Get request per subject, on servers that support it (#110).
+  The batched path is version-gated via the new `JetStreamContext::supportsBatchedDirectGet()` (NATS 2.11+);
+  older or unparseable-version servers fall back to the unchanged per-subject Direct Get fan-out. The
+  subject list is split into chunks bounded by the server's 1024-result cap and by the negotiated
+  `max_payload`, so buckets with more than ~1024 keys are enumerated across several batched requests
+  instead of a single oversized one the server would reject. Returned data, tombstone/deleted filtering,
+  and 404/missing handling are identical on both paths. Measured against a 100-key bucket, `getAll()`
+  issued 1 Direct Get request instead of 100 (the value bytes it must transfer are unchanged, since it
+  returns the values).
+
 ## [2.5.4] - 2026-07-13
 
 ### Fixed

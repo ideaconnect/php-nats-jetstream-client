@@ -858,8 +858,10 @@ final class ObjectStoreBucketTest extends TestCase
 
         $emptyPage = '{"state":{"subjects":{}}}';
 
+        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             // list(): paginated enumeration - page 1 (sid 1) returns the subjects, the empty page 2
             // (sid 2) terminates the loop - then a concurrent Direct Get per meta subject (logo ->
@@ -900,8 +902,10 @@ final class ObjectStoreBucketTest extends TestCase
         $emptyPage = '{"state":{"subjects":{}}}';
         $extra = ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')];
 
+        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($page1), $page1),           // page 1 (sid 1): a.txt
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($page2), $page2),           // page 2 (sid 2): b.txt
@@ -926,6 +930,67 @@ final class ObjectStoreBucketTest extends TestCase
         self::assertStringContainsString('"offset":0', $writes);
         self::assertStringContainsString('"offset":1', $writes);
         self::assertStringContainsString('"offset":2', $writes);
+    }
+
+    /**
+     * Verifies list() on a 2.11+ server issues exactly ONE batched multi_last Direct Get for all
+     * objects (instead of one Direct Get per object), returns the identical objects, and honours the
+     * deleted filter (#110). The single-request assertion FAILS on the pre-#110 per-subject fan-out,
+     * which writes one Direct Get PUB per object.
+     */
+    public function testListUsesSingleBatchedDirectGetOnModernServer(): void
+    {
+        $logoEnc = $this->encodeName('logo.txt');
+        $docEnc = $this->encodeName('doc.txt');
+        $streamInfo = (string) json_encode([
+            'config' => ['name' => 'OBJ_assets'],
+            'state' => ['subjects' => ['$O.assets.M.' . $logoEnc => 1, '$O.assets.M.' . $docEnc => 1]],
+        ], JSON_THROW_ON_ERROR);
+        $emptyPage = '{"state":{"subjects":{}}}';
+
+        $logoMeta = (string) json_encode([
+            'name' => 'logo.txt', 'bucket' => 'assets', 'mtime' => '2030-01-01T00:00:00Z', 'deleted' => false,
+            'nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello'),
+        ], JSON_THROW_ON_ERROR);
+        $docMeta = (string) json_encode([
+            'name' => 'doc.txt', 'bucket' => 'assets', 'mtime' => '2030-01-01T00:00:00Z', 'deleted' => false,
+            'nuid' => 'n2', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('abc'),
+        ], JSON_THROW_ON_ERROR);
+        // One batched reply stream on a single inbox (sid 3); the last frame carries Nats-Num-Pending: 0.
+        // TWO active objects so the batch result is not silently truncated to a single entry.
+        $logoHdrs = "NATS/1.0\r\nNats-Stream: OBJ_assets\r\nNats-Subject: \$O.assets.M." . $logoEnc . "\r\nNats-Sequence: 3\r\n\r\n";
+        $docHdrs = "NATS/1.0\r\nNats-Stream: OBJ_assets\r\nNats-Subject: \$O.assets.M." . $docEnc . "\r\nNats-Sequence: 4\r\nNats-Num-Pending: 0\r\n\r\n";
+        $lh = strlen($logoHdrs);
+        $dh = strlen($docHdrs);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),   // metaSubjects() page 1 (sid 1)
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),      // terminator page (sid 2)
+            sprintf("HMSG \$O.assets.M.%s 3 %d %d\r\n%s%s\r\n", $logoEnc, $lh, $lh + strlen($logoMeta), $logoHdrs, $logoMeta), // batched: logo (active)
+            sprintf("HMSG \$O.assets.M.%s 3 %d %d\r\n%s%s\r\n", $docEnc, $dh, $dh + strlen($docMeta), $docHdrs, $docMeta),     // batched: doc (active, terminator)
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $objects = $client->jetStream()->objectStore('assets')->list()->await();
+
+        // Identical returned data: BOTH active objects are listed, in batch-reply order.
+        self::assertCount(2, $objects);
+        self::assertSame('logo.txt', $objects[0]->name);
+        self::assertSame(3, $objects[0]->revision);
+        self::assertSame('doc.txt', $objects[1]->name);
+        self::assertSame(4, $objects[1]->revision);
+
+        // The win: exactly ONE Direct Get request for all objects (the batched multi_last).
+        $directGetPubs = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_starts_with($w, 'PUB $JS.API.DIRECT.GET.OBJ_assets'),
+        ));
+        self::assertCount(1, $directGetPubs);
+        self::assertStringContainsString('"multi_last":["$O.assets.M.' . $logoEnc . '","$O.assets.M.' . $docEnc . '"]', $directGetPubs[0]);
     }
 
     public function testInfoIncludesRevisionFromSequenceHeader(): void
@@ -1307,8 +1372,10 @@ final class ObjectStoreBucketTest extends TestCase
             'state' => ['subjects' => ['$O.assets.M.' . $this->encodeName('doc.txt') => 1]],
         ], JSON_THROW_ON_ERROR);
 
+        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),  // metaSubjects() page 1 (sid 1)
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page (sid 2)
@@ -1379,8 +1446,10 @@ final class ObjectStoreBucketTest extends TestCase
                 '$O.assets.M.' . $this->encodeName('logo.txt') => 1,
             ]],
         ], JSON_THROW_ON_ERROR);
+        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo), // metaSubjects() page 1 (sid 1)
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page (sid 2)
@@ -2052,8 +2121,10 @@ final class ObjectStoreBucketTest extends TestCase
         $badBody = 'NOT_VALID_JSON';
         $badReply = sprintf("HMSG _INBOX.x 3 %d %d\r\n%s%s\r\n", $bh, $bh + strlen($badBody), $badHdrs, $badBody);
 
+        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo), // page 1 (sid 1)
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),   // page 2 terminator (sid 2)
