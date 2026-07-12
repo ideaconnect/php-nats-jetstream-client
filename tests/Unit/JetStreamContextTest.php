@@ -2993,20 +2993,30 @@ final class JetStreamContextTest extends TestCase
         self::assertNull($method->invoke($js, $nonInt));
     }
 
-    public function testHandlePushControlMessageReturnsFalseForNonControlStatus(): void
+    /**
+     * A data message carrying user headers but NO status line (Status 0) is real payload and must be
+     * delivered (returns false). A non-100 status frame (e.g. 404/409/503) is a JetStream control/error
+     * frame, never user data, and must be intercepted so it is not forwarded to the handler (#121).
+     */
+    public function testHandlePushControlMessageInterceptsNon100StatusButNotDataMessages(): void
     {
         $client = new NatsClient(new NatsOptions(), new FakeTransport());
         $js = $client->jetStream();
 
         $method = new \ReflectionMethod($js, 'handlePushControlMessage');
 
-        $headers = NatsHeaders::toWireBlock([
+        // A headered data message with no Status line -> delivered as data.
+        $dataHeaders = NatsHeaders::toWireBlock(['My-Header' => 'value']);
+        $dataMessage = new NatsMessage('deliver', 1, null, 'body', $dataHeaders);
+        self::assertFalse($method->invoke($js, $dataMessage));
+
+        // A non-100 status frame -> intercepted (withheld from the handler).
+        $statusHeaders = NatsHeaders::toWireBlock([
             'Status' => '404',
             'Description' => 'No Messages',
         ]);
-        $message = new NatsMessage('deliver', 1, null, '', $headers);
-
-        self::assertFalse($method->invoke($js, $message));
+        $statusMessage = new NatsMessage('deliver', 1, null, '', $statusHeaders);
+        self::assertTrue($method->invoke($js, $statusMessage));
     }
 
     public function testHandlePushControlMessageHeartbeatWithoutReplyReturnsTrue(): void
@@ -3219,8 +3229,9 @@ final class JetStreamContextTest extends TestCase
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             // Gap recovery deletes the old consumer (request sid 3) ...
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            // ... and recreates it from the expected sequence (request sid 4).
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            // ... subscribes the ROTATED deliver inbox (sid 4) and recreates it from the expected
+            // sequence (create request sid 5, shifted by the inserted new-inbox subscribe) (#122).
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -3323,8 +3334,10 @@ final class JetStreamContextTest extends TestCase
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
             // Idle heartbeat: last delivered consumer seq 3 > processed (1) -> tail gap -> recreate.
             sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
+            // Delete old (sid 3); the create reply is sid 5 - the rotated new-inbox subscribe takes
+            // sid 4 ahead of the create request (#122).
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -3365,13 +3378,14 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
             // In-order msg1 (consumer seq 1).
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap (consumer seq 3) triggers recovery: delete OK (sid 3), then EVERY create attempt
-            // fails (sids 4-6, one per retry) so the recreate is terminally dead (#114).
+            // Gap (consumer seq 3) triggers recovery: delete OK (sid 3), the rotated new-inbox
+            // subscribe takes sid 4, then EVERY create attempt fails (sids 5-7, one per retry) so the
+            // recreate is terminally dead (#114/#122).
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.e 6 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.d 6 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.e 7 %d\r\n%s\r\n", strlen($createError), $createError),
         ]);
 
         $errors = [];
@@ -3422,13 +3436,14 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap: delete OK (sid 3), the first create attempt fails (sid 4), the RETRY succeeds
-            // (sid 5) as ORD2, and delivery resumes from the new consumer instance (#114).
+            // Gap: delete OK (sid 3), the rotated new-inbox subscribe takes sid 4, the first create
+            // attempt fails (sid 5), the RETRY succeeds (sid 6) as ORD2, and delivery resumes on the
+            // ROTATED deliver inbox (sid 4) from the new consumer instance (#114/#122).
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.d 6 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
+            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
         ]);
 
         $errors = [];
@@ -3487,9 +3502,11 @@ final class JetStreamContextTest extends TestCase
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
         ]);
         $transport->enqueueOnWriteContaining = [
+            // The create request is sid 5 (the rotated new-inbox subscribe took sid 4 after the timed-
+            // out delete's sid 3), and delivery resumes on the rotated inbox sid 4 (#122).
             '"opt_start_seq":2' => [
-                sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
-                "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+                sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
+                "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
             ],
         ];
 
@@ -3550,9 +3567,10 @@ final class JetStreamContextTest extends TestCase
             // ConnectionException out of deleteConsumer() without closing the connection.
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             "-ERR 'Stale Connection'\r\n",
-            // The create-retry loop still runs and succeeds (sid 4) as ORD2; delivery resumes.
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+            // The rotated new-inbox subscribe took sid 4; the create-retry loop still runs and succeeds
+            // (sid 5) as ORD2; delivery resumes on the rotated inbox (sid 4) (#122).
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
+            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
         ]);
 
         $errors = [];
@@ -4058,12 +4076,14 @@ final class JetStreamContextTest extends TestCase
             // In-order delivery (consumer seq 1 / stream seq 1) so the tail-gap heartbeat below has
             // a processed baseline to compare against.
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Tail-gap heartbeat -> recreate: delete ORD1 (sid 3), create ORD2 (sid 4).
+            // Tail-gap heartbeat -> recreate: delete ORD1 (sid 3), rotate the deliver inbox (new
+            // subscribe sid 4), create ORD2 (sid 5). The second epoch delivers on the rotated inbox
+            // sid 4 (#122).
             sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
             // Unparseable ack subject on the SECOND epoch -> the latch re-armed, second error.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.1.1.0.0.X 4\r\nbad2\r\n",
+            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.1.1.0.0.X 4\r\nbad2\r\n",
         ]);
 
         $errors = [];
@@ -4118,8 +4138,9 @@ final class JetStreamContextTest extends TestCase
             "MSG _INBOX.JS.ORD.test 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             // deleteConsumer returns an error - JetStreamException caught.
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteError), $deleteError),
-            // createEphemeralPushConsumer still proceeds and succeeds (sid 4).
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
+            // createEphemeralPushConsumer still proceeds and succeeds (sid 5 - the rotated new-inbox
+            // subscribe took sid 4 ahead of the create request) (#122).
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -4170,7 +4191,8 @@ final class JetStreamContextTest extends TestCase
         ], blockWhenEmpty: true);
         $transport->enqueueOnWriteContaining = [
             '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply)],
-            'by_start_sequence' => [sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
+            // The create request is sid 5: the rotated deliver-inbox subscribe takes sid 4 first (#122).
+            'by_start_sequence' => [sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
         ];
 
         $errors = [];
@@ -4431,7 +4453,8 @@ final class JetStreamContextTest extends TestCase
         // intentionally never answered - its presence on the wire is all this test needs.
         $transport->enqueueOnWriteContaining = [
             '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply)],
-            'by_start_sequence' => [sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
+            // The create request is sid 5: the rotated deliver-inbox subscribe takes sid 4 first (#122).
+            'by_start_sequence' => [sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
         ];
 
         $errors = [];
@@ -4850,12 +4873,14 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies directGetBatch() catches CancelledException when the wait-cancellation
-     * fires while processIncoming is blocked on an idle socket (blockWhenEmpty path).
+     * Verifies directGetBatch() surfaces the CancelledException (as a JetStreamException) when the
+     * wait-cancellation fires while processIncoming is blocked on an idle socket (blockWhenEmpty
+     * path) before the batch completes.
      *
-     * The method should return an empty array rather than propagating the cancellation.
+     * The method must NOT silently return a (here empty) prefix as if the batch were complete: the
+     * deadline firing before any end-of-batch marker is an incomplete-result error (#121).
      */
-    public function testDirectGetBatchReturnsEmptyArrayOnTimeout(): void
+    public function testDirectGetBatchThrowsWhenDeadlineFiresBeforeCompletion(): void
     {
         $transport = new FakeTransport(
             readQueue: [
@@ -4869,11 +4894,10 @@ final class JetStreamContextTest extends TestCase
         $client->connect()->await();
 
         // expiresMs=1 makes the TimeoutCancellation fire after ~1001 ms; the blocking transport
-        // keeps processIncoming suspended so the cancellation is the only way out - the
-        // catch (CancelledException) in directGetBatch().
-        $messages = $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 1)->await();
-
-        self::assertSame([], $messages);
+        // keeps processIncoming suspended so the cancellation is the only way out. The batch never
+        // completed, so it surfaces as a JetStreamException rather than a silent empty result.
+        $this->expectException(JetStreamException::class);
+        $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 1)->await();
     }
 
     /**
@@ -5130,5 +5154,397 @@ final class JetStreamContextTest extends TestCase
 
         self::assertSame('ORDERS-2_prod', $created->name);
         self::assertStringContainsString('$JS.API.STREAM.CREATE.ORDERS-2_prod', $transport->writes[3]);
+    }
+
+    /**
+     * #122(1): a recreate whose FIRST CONSUMER.CREATE reply is lost (here a -ERR raised as a
+     * ConnectionException, NOT a definitive JetStream API rejection) can leave the just-created
+     * ephemeral alive server-side while the retry adopts a DIFFERENT consumer. The library now
+     * chooses each recreate consumer name CLIENT-SIDE, so it can best-effort-delete that orphan by
+     * name even though it never saw its create reply. Asserts a DELETE for the first (orphaned)
+     * attempt name reaches the wire and the adopted name is NOT deleted.
+     */
+    public function testSubscribeOrderedConsumerReapsOrphanFromLostCreateReply(): void
+    {
+        $createReply = static fn (string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Initial ephemeral create (sid 1) -> current consumer ORD1.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+            // In-order msg1 (consumer seq 1, stream seq 1) -> expected next 2, lastStreamSeq 1.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Gap (consumer seq 3) triggers recovery.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+            // Recreate: delete the current ORD1 (sid 3) ...
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            // ... create attempt 1 (sid 4) -> a -ERR raised as ConnectionException: its reply is
+            // "lost" but the consumer may already exist server-side (the orphan).
+            "-ERR 'Stale Connection'\r\n",
+            // ... create attempt 2 (sid 5) succeeds as ORD2 and is adopted.
+            sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            // ... best-effort reap of the orphaned attempt-1 name (sid 6).
+            sprintf("MSG _INBOX.e 6 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // Only the in-order message was delivered; the gap message was discarded; recovery succeeded
+        // on the retry so nothing was reported as terminally dead.
+        self::assertSame(['msg1'], $received);
+        self::assertSame([], $errors);
+
+        $written = implode('', $transport->writes);
+        // Both recreate attempts carry a client-chosen name in the create config, so a lost-reply
+        // orphan is deletable by name.
+        preg_match_all('/"name":"(ord-[0-9a-f]+)"/', $written, $all);
+        $attempted = $all[1];
+        self::assertCount(2, $attempted, 'exactly two recreate create attempts, each with a client-chosen name');
+        [$orphanName, $adoptedName] = $attempted;
+        // The orphan (first attempt, reply lost) is best-effort-deleted by its client-chosen name ...
+        self::assertStringContainsString('$JS.API.CONSUMER.DELETE.EVENTS.' . $orphanName, $written);
+        // ... while the adopted (successful) consumer is NOT reaped.
+        self::assertStringNotContainsString('$JS.API.CONSUMER.DELETE.EVENTS.' . $adoptedName, $written);
+    }
+
+    /**
+     * #122(2), falsifiable core: after a recreate ROTATES the deliver inbox, an orphan's PLAIN idle
+     * heartbeat arriving on the OLD (now unsubscribed) inbox must NOT drive a further recreate. The
+     * client dropped its interest on that inbox, so neither the orphan's data nor its plain heartbeats
+     * reach the tail-gap check. Before rotation, that plain heartbeat (attributable to no consumer by
+     * subject) drove a spurious recreate storm - the exact defect #122 targets.
+     */
+    public function testSubscribeOrderedConsumerIgnoresOrphanHeartbeatOnRotatedOldInbox(): void
+    {
+        $createReply = static fn (string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+        // A PLAIN idle heartbeat (no FC reply subject, no Nats-Consumer-Stalled) reporting the server
+        // delivered up to consumer seq 9 - far ahead of anything the current consumer processed.
+        $orphanHb = NatsHeaders::toWireBlock([
+            'Status' => '100',
+            'Description' => 'Idle Heartbeat',
+            'Nats-Last-Consumer' => '9',
+        ]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+            // In-order msg1 (consumer seq 1, stream seq 1) on the ORIGINAL inbox (sid 2).
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Data gap (consumer seq 3) -> the ONE legitimate recreate: delete ORD1 (sid 3), rotate the
+            // deliver inbox (subscribe sid 4), create ORD2 (sid 5); the original inbox (sid 2) is
+            // unsubscribed.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            // The orphan's PLAIN idle heartbeat arrives on the OLD, now-unsubscribed inbox (sid 2). It
+            // must be dropped - no tail-gap check, no second recreate.
+            sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($orphanHb), strlen($orphanHb), $orphanHb),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(requestTimeoutMs: 50, errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        self::assertSame(['msg1'], $received);
+        self::assertSame([], $errors);
+
+        $written = implode('', $transport->writes);
+        // Exactly ONE recreate (the data gap): the orphan plain heartbeat on the old inbox added no
+        // second DELETE and no third CREATE - the storm #122 removes.
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'), 'the orphan heartbeat on the old inbox must not delete any consumer');
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'the orphan heartbeat on the old inbox must not recreate the consumer');
+    }
+
+    /**
+     * #122(2): a recreate ROTATES the deliver inbox - it subscribes a FRESH inbox (a new sid), points
+     * the new CONSUMER.CREATE at that fresh deliver subject, and UNSUBSCRIBES the previous inbox. This
+     * is what makes an orphan on the old inbox unreachable (and lets its inactive_threshold reap it).
+     */
+    public function testSubscribeOrderedConsumerRotatesDeliverInboxAndUnsubscribesOld(): void
+    {
+        $createReply = static fn (string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Data gap -> recreate: delete ORD1 (sid 3), subscribe the rotated inbox (sid 4), create
+            // ORD2 (sid 5). The original inbox (sid 2) is then unsubscribed.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, 'events.>')->await();
+
+        for ($i = 0; $i < 6; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        $written = implode('', $transport->writes);
+        // The original deliver subscription (sid 2) is unsubscribed on rotation.
+        self::assertStringContainsString("UNSUB 2\r\n", $written);
+        // Two DISTINCT deliver inboxes were subscribed (the initial + the rotated one).
+        preg_match_all('/SUB (_INBOX\.JS\.ORD\.\S+) \d+\r\n/', $written, $subs);
+        self::assertCount(2, $subs[1], 'a recreate must subscribe a fresh deliver inbox');
+        self::assertNotSame($subs[1][0], $subs[1][1], 'the rotated deliver inbox must differ from the original');
+        // The recreate CONSUMER.CREATE points at the ROTATED deliver subject, not the original.
+        preg_match_all('/"deliver_subject":"(_INBOX\.JS\.ORD\.[^"]+)"/', $written, $delivers);
+        self::assertCount(2, $delivers[1], 'both creates carry a rotated deliver_subject');
+        self::assertNotSame($delivers[1][0], $delivers[1][1], 'the recreate must point CONSUMER.CREATE at the rotated deliver subject');
+    }
+
+    /**
+     * #122(3): on a TERMINAL recreate failure (all attempts exhausted) the ordered subscription is
+     * torn down (the deliver sid is unsubscribed) so "dead" is actually dead - the deliver inbox
+     * stops receiving traffic - rather than lingering to receive filtered orphan/stale frames.
+     */
+    public function testSubscribeOrderedConsumerTearsDownSubscriptionOnTerminalRecreateFailure(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+        $createError = '{"error":{"code":404,"description":"stream not found"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+            // Gap triggers recovery: delete OK (sid 3), the rotated deliver-inbox subscribe takes sid 4,
+            // every create attempt fails (sids 5-7) -> the recreate is terminally dead (#122).
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.d 6 %d\r\n%s\r\n", strlen($createError), $createError),
+            sprintf("MSG _INBOX.e 7 %d\r\n%s\r\n", strlen($createError), $createError),
+            // A late frame on the (now torn-down) ORIGINAL deliver inbox (sid 2): it must NOT be
+            // delivered - the terminal teardown unsubscribed both the rotated and the original inbox.
+            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.2.2.2.0.0 4\r\ntail\r\n",
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error;
+        });
+
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 10; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // The terminal failure was surfaced, and the deliver subscription (sid 2) was unsubscribed.
+        self::assertCount(1, $errors);
+        self::assertStringContainsString('after 3 attempts', $errors[0]->getMessage());
+        self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
+        // The late frame arriving after teardown is not delivered to the handler.
+        self::assertSame(['msg1'], $received);
+    }
+
+    /**
+     * #121: a non-100 status control frame (409/408/503) on a push deliver subject is a JetStream
+     * control/error frame, never user data. It must be intercepted and NOT forwarded to the user
+     * handler as if it were a message payload.
+     */
+    public function testSubscribeEphemeralPushConsumerDropsNon100StatusFrames(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"EPH","config":{"deliver_subject":"deliver.eph","ack_policy":"none"}}';
+        $status = static fn (string $code, string $desc): string => NatsHeaders::toWireBlock([
+            'Status' => $code,
+            'Description' => $desc,
+        ]);
+
+        $frames = [
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ];
+        foreach ([['409', 'Consumer Deleted'], ['503', 'No Responders'], ['408', 'Request Timeout']] as [$code, $desc]) {
+            $block = $status($code, $desc);
+            $frames[] = sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($block), strlen($block), $block);
+        }
+
+        $transport = new FakeTransport($frames);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeEphemeralPushConsumer(
+            'ORDERS',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+            'deliver.eph',
+        )->await();
+
+        for ($i = 0; $i < 5; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // None of the status control frames were delivered to the user handler as data.
+        self::assertSame([], $received);
+    }
+
+    /**
+     * #121: a CALLER-OWNED push consumer (subscribeEphemeralPushConsumer / subscribePushConsumer) that
+     * receives a TERMINAL (4xx/5xx) status frame surfaces it through the error listener as a
+     * descriptive JetStreamException instead of silently dropping it - the library cannot recreate a
+     * consumer whose lifecycle it does not own, so the drop is made observable. A status-100 heartbeat
+     * stays intercepted-and-silent (not surfaced).
+     */
+    public function testCallerOwnedPushConsumerSurfacesTerminalStatusViaErrorListener(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"EPH","config":{"deliver_subject":"deliver.eph","ack_policy":"none"}}';
+        $hb = NatsHeaders::toWireBlock(['Status' => '100', 'Description' => 'Idle Heartbeat']);
+        $terminal = NatsHeaders::toWireBlock(['Status' => '409', 'Description' => 'Consumer Deleted']);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            // A status-100 idle heartbeat: intercepted and NOT surfaced.
+            sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb),
+            // A terminal 409 Consumer Deleted: intercepted AND surfaced via the error listener.
+            sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($terminal), strlen($terminal), $terminal),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeEphemeralPushConsumer(
+            'ORDERS',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+            'deliver.eph',
+        )->await();
+
+        for ($i = 0; $i < 5; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // Neither control frame reached the handler as data.
+        self::assertSame([], $received);
+        // Exactly the terminal 409 was surfaced; the status-100 heartbeat was not.
+        self::assertCount(1, $errors);
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertSame(409, $errors[0]->getCode());
+        self::assertStringContainsString('terminal status 409', $errors[0]->getMessage());
+        self::assertStringContainsString('Consumer Deleted', $errors[0]->getMessage());
+    }
+
+    /**
+     * #121: a JetStream publish ack that carries neither an `error` nor a `stream` is invalid
+     * (nats.go rejects an empty-stream ack). It must throw rather than be accepted as a bogus
+     * PubAck('', 0) success.
+     */
+    public function testPublishRejectsAckWithoutStream(): void
+    {
+        // A JSON ack with no `error` and no `stream`.
+        $ackPayload = '{"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('stream');
+
+        $client->jetStream()->publish('orders.created', '{"id":1}')->await();
+    }
+
+    /**
+     * #121: directGetBatch() must NOT silently return a truncated prefix when the deadline fires
+     * before the batch completes (no 204 EOB and no Nats-Num-Pending: 0). It has an explicit
+     * completion signal, so a timeout before completion is an error.
+     */
+    public function testDirectGetBatchThrowsOnTimeoutBeforeCompletion(): void
+    {
+        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\n\r\n";
+        $b1 = 'aaa';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // One data message, then NO end-of-batch marker (204 / Num-Pending:0) - the batch never
+            // completes and the wait deadline fires.
+            sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($h1), strlen($h1) + strlen($b1), $h1, $b1),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        // expiresMs=100 -> internal deadline ~1.1s; the incomplete batch surfaces as an error.
+        $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 100)->await();
     }
 }

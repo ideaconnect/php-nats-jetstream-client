@@ -343,7 +343,7 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
             // lastStreamSeq is still 0, so opt_start_seq must be 0 + 1 = 1.
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.5.9.5.0.0 4\r\nbad5\r\n",
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
 
         $client = $this->connected($transport);
@@ -387,9 +387,10 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
             // Gap (consumer seq 3) -> recreate to ORD2; expected resets to 1.
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
-            // Recreated consumer ORD2 delivers consumer seq 1 -> must be accepted against expected 1.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD2.1.2.1.0.0 5\r\nafter\r\n",
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            // Recreated consumer ORD2 delivers consumer seq 1 on the ROTATED inbox (sid 4) -> must be
+            // accepted against expected 1.
+            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.2.1.0.0 5\r\nafter\r\n",
         ]);
 
         $client = $this->connected($transport);
@@ -436,7 +437,7 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
             "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
             sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb),
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
+            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
 
         $client = $this->connected($transport);

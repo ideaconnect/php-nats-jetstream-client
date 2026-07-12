@@ -2089,4 +2089,78 @@ final class KeyValueBucketTest extends TestCase
 
         self::assertTrue($caughtUp, 'onCaughtUp must fire on an empty bucket without any delivery');
     }
+
+    /**
+     * #121: history() must NOT silently return a truncated prefix when its bounded wait elapses
+     * before the replay is caught up (num_pending never reaches 0). A slow/stalled server that
+     * yields only part of the history must surface as an error rather than a partial list that
+     * looks complete. The bound is parameterised so the timeout path is exercised deterministically.
+     */
+    public function testHistoryThrowsWhenDeadlineFiresBeforeCaughtUp(): void
+    {
+        // num_pending=2 but only ONE revision is ever delivered (num_pending stays 1): the replay
+        // never catches up and the bounded wait elapses.
+        $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":2,"config":{"deliver_subject":"dlv","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            // One revision (num_pending token = 1, NOT 0) then silence.
+            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.5.1.0.1 2\r\nv1\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        // A short bound so the incomplete-history timeout is exercised quickly.
+        $client->jetStream()->keyValue('cfg')->history('theme', 0.2)->await();
+    }
+
+    /**
+     * #121: the history() bound is PROGRESS-based, not a whole-replay deadline. A healthy-but-slow
+     * replay whose revisions keep arriving (each gap shorter than the bound) must complete WITHOUT
+     * throwing even when the TOTAL replay time exceeds the bound - only a genuinely stalled server (no
+     * progress for the whole interval) throws. Revisions are fed spaced apart at runtime: each resets
+     * the stall clock, and the total elapsed (~0.6 s) exceeds the 0.5 s bound, so a whole-replay
+     * deadline would have thrown here.
+     */
+    public function testHistoryDoesNotThrowWhileReplayKeepsMakingProgress(): void
+    {
+        $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":6,"config":{"deliver_subject":"dlv","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        // Start the replay with a 0.5 s PROGRESS bound but do not await yet.
+        $future = $client->jetStream()->keyValue('cfg')->history('theme', 0.5);
+
+        // Feed six revisions 0.1 s apart (each gap < 0.5 s bound); num_pending decrements to 0 on the
+        // last so the replay catches up. Total elapsed ~0.6 s > 0.5 s bound.
+        for ($i = 1; $i <= 6; $i++) {
+            delay(0.1);
+            $numPending = 6 - $i;
+            $transport->pushReadChunk(sprintf(
+                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.%d.%d.%d.0.%d 2\r\nv%d\r\n",
+                $i,
+                4 + $i,
+                $i,
+                $numPending,
+                $i,
+            ));
+        }
+
+        $entries = $future->await();
+
+        // The replay completed with all six revisions, in order, without a stall error.
+        self::assertCount(6, $entries);
+        self::assertSame(['v1', 'v2', 'v3', 'v4', 'v5', 'v6'], array_map(static fn (KeyValueEntry $e): ?string => $e->value, $entries));
+    }
 }

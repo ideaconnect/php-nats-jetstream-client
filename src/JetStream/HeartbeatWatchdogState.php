@@ -40,6 +40,14 @@ final class HeartbeatWatchdogState
      */
     public bool $recreateInFlight = false;
 
+    /**
+     * The deliver-inbox subscription id an ordered consumer guards, set once the subscription is
+     * established. On a TERMINAL recreate failure the recreate closure unsubscribes it so the dead
+     * consumer's inbox stops receiving traffic (including filtered orphan/stale frames) (#122). Null
+     * until armed and for caller-owned push consumers (which never recreate).
+     */
+    public ?int $deliverSid = null;
+
     public function __construct(public int $lastActivityNs)
     {
         $this->onMiss = static function (): void {};
