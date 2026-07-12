@@ -176,6 +176,26 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   not trigger a recreate: the replacement consumer would produce the same unparseable form, and
   the tolerant parser makes the branch nearly unreachable. Absent or plain (non-ack) reply
   subjects keep the silent best-effort path (#155).
+- `[bugfix]` WebSocket inbound performance for large frames (#164): a single WebSocket frame larger
+  than 65 535 bytes (which must carry a 64-bit length) used to grow `$readBuffer` with a
+  payload-sized `.=` copy per 8 KiB socket read - superlinear, the #140 issue the TCP path already
+  fixed. Such a frame is now sized from its header (`WebSocketFrameCodec::frameRequiredBytes()`) and
+  its remaining reads accumulate in a chunk list joined exactly once by a new spanning-consume path,
+  so each payload byte is copied a bounded number of times regardless of how many reads it spans;
+  fragmented-message continuation payloads likewise collect in a list joined once at the final
+  fragment. Frames that fit a 7-bit or 16-bit length (<= 65 535 bytes, including every fragmented
+  message's per-frame payloads) are inherently bounded and keep the pre-#164 `.=` + batch-decode
+  path byte-for-byte - they are never even sized - so the small-frame and fragmented paths are
+  unchanged. Measured through `readLine()` fed exact 8 KiB reads by an in-memory socket (medians of
+  21 interleaved before/after process rounds, min-of-5 each, one pinned core, WSL2/PHP 8.5): a single
+  10 MB frame drops ~22 ms to ~7 ms (~3x); a 10 MB message fragmented into 8 KiB continuation frames
+  (~20 ms) and a flood of 100k 200-byte frames (~190 ms) stay at parity (within run-to-run noise).
+  Outbound masking is unchanged - measured allocator-bound, with no stable win on PHP 8.5 (dropping
+  the `substr` trim was within noise at 1 MB and slower at 8 KiB; PHP-level 8-byte-word masking was
+  ~15x slower than the native whole-string XOR). Wire behavior is unchanged, pinned by the existing
+  decode, reassembly and fragment-bound tests plus new multi-chunk, partial-next-frame,
+  ping-between-fragments and read-boundary torture pins (a 64-bit-length frame and a large masked
+  frame in one-byte reads, and continuation-frame headers split across reads).
 
 ## [2.5.1] - 2026-07-11
 

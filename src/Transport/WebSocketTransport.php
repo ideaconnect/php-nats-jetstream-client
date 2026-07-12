@@ -32,6 +32,18 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     /** Hard cap on a reassembled fragmented message, bounding memory against a hostile/buggy server (#89). */
     private const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
+    /**
+     * Outstanding-tail size above which a head frame that declares a 64-bit length switches from
+     * cheap `.=` buffer appends to O(1) chunk-list accumulation joined once (#164). Only frames
+     * carrying the 64-bit length marker are ever considered: a frame that fits a 7-bit or 16-bit
+     * length is at most 65 535 bytes, so its `.=` accumulation is inherently bounded and stays on
+     * the pre-#164 batch-decode path byte-for-byte - the small-frame and fragmented-message paths
+     * are therefore untouched and never even size the pending frame. A frame larger than this,
+     * whose repeated `.=` growth is superlinear, spills so each payload byte is copied a bounded
+     * number of times. Below the threshold the two paths differ only in cost, never in bytes.
+     */
+    private const LARGE_FRAME_SPILL_BYTES = 32 * 1024;
+
     private ?Socket $socket = null;
     private int $lastConnectTimeoutMs = 5_000;
     private bool $tlsEstablished = false;
@@ -39,8 +51,41 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     /** Raw (post-handshake) bytes received but not yet decoded into complete frames. */
     private string $readBuffer = '';
 
-    /** Reassembly buffer for a fragmented data message and whether one is in progress. */
+    /**
+     * Full wire size of the large head frame currently spilling to chunk-list accumulation, or null
+     * when no frame is spilling (the common case). Set only once an incomplete head frame is sized
+     * and its outstanding tail exceeds {@see LARGE_FRAME_SPILL_BYTES}; while set, further reads queue
+     * in $readChunks (O(1) each) and the frame is consumed by {@see consumeSpanningFrame()} with a
+     * single payload join, so each payload byte is copied a bounded number of times no matter how
+     * many reads deliver it (#164, mirrors the #140 TCP fix). Bounded by the codec's per-frame cap.
+     */
+    private ?int $readFrameRequired = null;
+
+    /**
+     * Socket chunks received while a large head frame is spilling, in arrival order; joined once by
+     * {@see consumeSpanningFrame()}. Empty whenever $readFrameRequired is null.
+     *
+     * @var list<string>
+     */
+    private array $readChunks = [];
+
+    /** Total byte length of $readChunks, tracked so frame completion is detected without joining. */
+    private int $readChunksLength = 0;
+
+    /** First fragment of an in-progress fragmented data message and whether one is in progress. */
     private string $fragmentBuffer = '';
+
+    /**
+     * Continuation-frame payloads of the in-progress fragmented message, joined once on its final
+     * frame instead of a message-sized `.=` copy per continuation frame (#164).
+     *
+     * @var list<string>
+     */
+    private array $fragmentChunks = [];
+
+    /** Total byte length of $fragmentChunks, tracked so the #89 bound is enforced without joining. */
+    private int $fragmentChunksLength = 0;
+
     private bool $fragmenting = false;
     /** Whether the in-progress fragmented message was flagged compressed (RSV1 on its first frame). */
     private bool $fragmentCompressed = false;
@@ -67,7 +112,12 @@ final class WebSocketTransport implements TlsAwareTransportInterface
             $this->lastConnectTimeoutMs = max(1, $timeoutMs);
             $this->tlsEstablished = false;
             $this->readBuffer = '';
+            $this->readFrameRequired = null;
+            $this->readChunks = [];
+            $this->readChunksLength = 0;
             $this->fragmentBuffer = '';
+            $this->fragmentChunks = [];
+            $this->fragmentChunksLength = 0;
             $this->fragmenting = false;
             $this->compressionActive = false;
 
@@ -175,9 +225,88 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                     throw new TransportClosedException('WebSocket closed by peer (EOF)');
                 }
 
-                $this->readBuffer .= $chunk;
+                if ($chunk === '') {
+                    continue;
+                }
+
+                if ($this->readFrameRequired !== null) {
+                    // A large head frame is spilling: queue reads in O(1) instead of re-copying the
+                    // growing prefix per read; consumeSpanningFrame() joins its payload once (#164).
+                    $this->readChunks[] = $chunk;
+                    $this->readChunksLength += strlen($chunk);
+                } else {
+                    // No frame spilling: the buffer holds at most one sub-threshold frame's bytes, so
+                    // this `.=` is bounded - byte-for-byte the pre-#164 append path.
+                    $this->readBuffer = $this->readBuffer === '' ? $chunk : $this->readBuffer . $chunk;
+                }
             }
         });
+    }
+
+    /**
+     * Consumes the pending head frame - its header at the start of $readBuffer, its payload spanning
+     * $readBuffer and $readChunks - joining the payload exactly once. The unconsumed tail of the
+     * chunk the frame ends inside becomes the new $readBuffer. The caller must have verified the
+     * frame is fully buffered.
+     *
+     * @return array{opcode: int, payload: string, fin: bool, rsv1: bool}
+     */
+    private function consumeSpanningFrame(): array
+    {
+        // Pathologically small reads can leave part of the header itself in the chunks; topping the
+        // buffer up costs at most one extra chunk copy per frame, keeping the per-byte bound.
+        while (($header = WebSocketFrameCodec::parseFrameHeader($this->readBuffer)) === null) {
+            $chunk = array_shift($this->readChunks);
+            if ($chunk === null) {
+                throw new ProtocolException('WebSocket frame header incomplete despite sized frame');
+            }
+            $this->readChunksLength -= strlen($chunk);
+            $this->readBuffer .= $chunk;
+        }
+
+        // The header top-up above may have overshot the frame end, so bound the payload slice and
+        // start $rest from any surplus already in the buffer.
+        $pieces = [substr($this->readBuffer, $header['headerBytes'], $header['payloadLength'])];
+        $need = $header['payloadLength'] - strlen($pieces[0]);
+        $rest = substr($this->readBuffer, $header['headerBytes'] + strlen($pieces[0]));
+        $index = 0;
+
+        while ($need > 0) {
+            $chunk = $this->readChunks[$index];
+            $length = strlen($chunk);
+            $index++;
+
+            if ($need >= $length) {
+                $pieces[] = $chunk;
+                $need -= $length;
+                continue;
+            }
+
+            $pieces[] = substr($chunk, 0, $need);
+            $rest = substr($chunk, $need);
+            $need = 0;
+        }
+
+        // Reads drain immediately, so at most the final chunk overshoots the frame; fold any
+        // remainder back into the working buffer to restore the append-mode invariant.
+        if ($index < count($this->readChunks)) {
+            $rest = implode('', [$rest, ...array_slice($this->readChunks, $index)]);
+        }
+        $this->readBuffer = $rest;
+        $this->readChunks = [];
+        $this->readChunksLength = 0;
+
+        $payload = implode('', $pieces);
+        if ($header['masked'] && $payload !== '') {
+            $payload = WebSocketFrameCodec::unmask($payload, $header['maskKey']);
+        }
+
+        return [
+            'opcode' => $header['opcode'],
+            'payload' => $payload,
+            'fin' => $header['fin'],
+            'rsv1' => $header['rsv1'],
+        ];
     }
 
     /**
@@ -205,10 +334,57 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     /**
      * Decodes whatever complete frames are buffered, handling control frames inline and returning the
      * concatenated payload of any completed data messages ('' when none are ready yet).
+     *
+     * Frames whose bytes fit the buffer take the tight batch {@see WebSocketFrameCodec::decode()}
+     * path unchanged from before #164. Only a frame whose outstanding tail exceeds
+     * {@see LARGE_FRAME_SPILL_BYTES} spills: its remaining reads queue in $readChunks (O(1) each) and
+     * it is consumed with a single payload join, bounding the per-byte copy count no matter how many
+     * reads it spans (#164).
      */
     private function drainDataFrames(): string
     {
+        $out = '';
+
+        // A large frame was spilling to $readChunks: once fully buffered, consume it with one join,
+        // then fall through to decode whatever trailing bytes arrived with its final read.
+        if ($this->readFrameRequired !== null) {
+            if (strlen($this->readBuffer) + $this->readChunksLength < $this->readFrameRequired) {
+                return '';
+            }
+
+            $this->readFrameRequired = null;
+            $out .= $this->processFrames([$this->consumeSpanningFrame()]);
+        }
+
         $frames = WebSocketFrameCodec::decode($this->readBuffer);
+        if ($frames !== []) {
+            $out .= $this->processFrames($frames);
+        }
+
+        // decode() consumed every complete frame, so the buffer now holds at most one incomplete head
+        // frame - and already threw on a hostile declared length (its own MAX_FRAME_PAYLOAD guard
+        // fires the moment the length bytes are in). Only a frame that declares a 64-bit length can
+        // exceed 65 535 bytes; size just those and, when the outstanding tail is large, switch that
+        // frame to O(1) chunk accumulation. Frames with a 7-bit/16-bit length are never sized here,
+        // so the small-frame and fragmented paths keep the pre-#164 `.=` + batch-decode cost exactly.
+        if (strlen($this->readBuffer) >= 2 && (ord($this->readBuffer[1]) & 0x7F) === 127) {
+            $required = WebSocketFrameCodec::frameRequiredBytes($this->readBuffer);
+            if ($required !== null && $required - strlen($this->readBuffer) > self::LARGE_FRAME_SPILL_BYTES) {
+                $this->readFrameRequired = $required;
+            }
+        }
+
+        return $out;
+    }
+
+    /**
+     * Applies decoded frames: answers pings, reacts to close, reassembles fragmented messages, and
+     * returns the concatenated payload of any completed data messages.
+     *
+     * @param list<array{opcode: int, payload: string, fin: bool, rsv1: bool}> $frames
+     */
+    private function processFrames(array $frames): string
+    {
         $out = '';
 
         foreach ($frames as $frame) {
@@ -231,6 +407,8 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                         $out .= $frame['rsv1'] ? WebSocketFrameCodec::inflate($frame['payload']) : $frame['payload'];
                     } else {
                         $this->fragmentBuffer = $frame['payload'];
+                        $this->fragmentChunks = [];
+                        $this->fragmentChunksLength = 0;
                         $this->fragmenting = true;
                         // permessage-deflate marks RSV1 only on the first frame of the message.
                         $this->fragmentCompressed = $frame['rsv1'];
@@ -240,13 +418,18 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
                 case WebSocketFrameCodec::OP_CONTINUATION:
                     if ($this->fragmenting) {
-                        $this->fragmentBuffer .= $frame['payload'];
+                        $this->fragmentChunks[] = $frame['payload'];
+                        $this->fragmentChunksLength += strlen($frame['payload']);
                         $this->enforceFragmentBound();
                         if ($frame['fin']) {
+                            // Single join of all fragments (#164) - one copy of every byte.
+                            $message = implode('', [$this->fragmentBuffer, ...$this->fragmentChunks]);
                             $out .= $this->fragmentCompressed
-                                ? WebSocketFrameCodec::inflate($this->fragmentBuffer)
-                                : $this->fragmentBuffer;
+                                ? WebSocketFrameCodec::inflate($message)
+                                : $message;
                             $this->fragmentBuffer = '';
+                            $this->fragmentChunks = [];
+                            $this->fragmentChunksLength = 0;
                             $this->fragmenting = false;
                             $this->fragmentCompressed = false;
                         }
@@ -264,12 +447,14 @@ final class WebSocketTransport implements TlsAwareTransportInterface
      */
     private function enforceFragmentBound(): void
     {
-        if (strlen($this->fragmentBuffer) <= $this->maxMessageBytes) {
+        if (strlen($this->fragmentBuffer) + $this->fragmentChunksLength <= $this->maxMessageBytes) {
             return;
         }
 
         $limit = $this->maxMessageBytes;
         $this->fragmentBuffer = '';
+        $this->fragmentChunks = [];
+        $this->fragmentChunksLength = 0;
         $this->fragmenting = false;
         $this->fragmentCompressed = false;
 
