@@ -285,6 +285,41 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   decode, reassembly and fragment-bound tests plus new multi-chunk, partial-next-frame,
   ping-between-fragments and read-boundary torture pins (a 64-bit-length frame and a large masked
   frame in one-byte reads, and continuation-frame headers split across reads).
+- `[bugfix]` Auto-unsubscribe armed with `max <= already-delivered` while a backlog was still
+  queued no longer over-delivers exactly one message past the cap (#156). `drainPendingForSid()`
+  enforced the delivery cap only AFTER delivering each message, so when `unsubscribe(sid, max)` was
+  armed with `max` at or below the current delivered count while messages were still queued,
+  `completeAutoUnsubIfSatisfied()` deferred (backlog not yet drained) and the next drain dequeued and
+  delivered one more message before the post-delivery check fired - contradicting the #112 contract
+  that the handler is never invoked more than `max` times. The drain loop now checks the cap at the
+  TOP of the loop, before dequeuing/delivering, and drops the sid without invoking the handler once
+  more when `delivered >= max` (nats.go `AutoUnsubscribe` gates delivery, not the aftermath). The
+  existing post-delivery check is preserved for the #112 backlog-flush case where `max > delivered`
+  on entry.
+- `[bugfix]` `SlowConsumerPolicy::Error`'s overflow drop is now always observable, and its
+  auto-unsubscribe accounting is documented and self-consistent (#159). The overflowing message is
+  still lost - core NATS does not resend it - but the loss was surfaced inconsistently: the
+  polling-queue (`SubscriptionQueue`) variant threw WITHOUT counting the drop through
+  `droppedCount()`/the error listener, so it did not match the observable-drop contract the
+  DropOldest/DropNewest paths honour (#134). The polling-queue Error variant now counts the drop via
+  `droppedCount()` and reports it through the error listener before it throws. Accounting is
+  deliberately unchanged: the dropped message still counts toward the auto-unsub max at intake
+  (`receivedCounts`), exactly like DropOldest/DropNewest and exactly as the server counts a message
+  the moment it writes it (#112). A client-side drop must NOT roll that count back - doing so would
+  leave `receivedCounts` short of the max forever, so `completeAutoUnsubIfSatisfied()` would never
+  fire and the subscription would leak (the #112 invariant). The documented, tested semantics: an
+  Error-policy auto-unsub can therefore complete having delivered fewer than `max` messages, with each
+  overflow surfaced loudly rather than lost silently. On the push (handler) path the overflow is
+  surfaced exactly once - the thrown `ConnectionException` is rethrown to the caller (or, for a second
+  frame in the same chunk, reported through the error listener) by `dispatchFrames()` (#158); the
+  connection layer no longer also emits that same exception, which would have reported it twice. The
+  per-subscription pending bound is message-COUNT based only; there is no byte-based bound (nats.go's
+  pending limits are both count- and byte-based).
+- `[bugfix]` `requestMany()` no longer returns more than `maxResponses` when replies coalesce into a
+  single TCP chunk (#160). The inbox collector appended every reply unconditionally while the wait
+  loop enforced the cap only between reads, so one `processIncoming()` dispatching several replies
+  could return more than requested. The collector now caps at `maxResponses`, dropping replies past
+  the limit; stall/total-deadline semantics for under-cap collections are unchanged.
 
 ## [2.5.1] - 2026-07-11
 

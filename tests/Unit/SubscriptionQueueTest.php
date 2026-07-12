@@ -526,22 +526,37 @@ final class SubscriptionQueueTest extends TestCase
     }
 
     /**
-     * SlowConsumerPolicy::Error throws NatsException when the queue is full.
+     * SlowConsumerPolicy::Error throws NatsException when the queue is full, and the drop is
+     * observable: droppedCount() increments and the client's errorListener is notified before the
+     * throw, mirroring the DropOldest/DropNewest paths so the loss is never silent (#134/#159).
      */
     public function testEnqueueThrowsOnOverflowWhenPolicyIsError(): void
     {
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
         $transport = new FakeTransport($this->infoAndPong());
-        $client = $this->makeConnectedClient($transport);
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
         $queue = new SubscriptionQueue($client, 99, 2, SlowConsumerPolicy::Error);
 
         $queue->enqueue(new NatsMessage('events', 99, null, 'a'));
         $queue->enqueue(new NatsMessage('events', 99, null, 'b'));
-
-        $this->expectException(\IDCT\NATS\Exception\NatsException::class);
-        $this->expectExceptionMessage('Subscription queue overflow for sid 99');
+        self::assertSame(0, $queue->droppedCount(), 'no drop below the cap');
 
         // Third enqueue exceeds the cap of 2 and must throw with the Error policy.
-        $queue->enqueue(new NatsMessage('events', 99, null, 'c'));
+        try {
+            $queue->enqueue(new NatsMessage('events', 99, null, 'c'));
+            self::fail('the Error-policy overflow must throw');
+        } catch (\IDCT\NATS\Exception\NatsException $e) {
+            self::assertStringContainsString('Subscription queue overflow for sid 99', $e->getMessage());
+        }
+
+        // The drop is observable even though it threw: counted and surfaced through the error listener.
+        self::assertSame(1, $queue->droppedCount());
+        self::assertCount(1, $errors);
+        self::assertStringContainsString('Subscription queue overflow for sid 99', $errors[0]->getMessage());
     }
 
     /**

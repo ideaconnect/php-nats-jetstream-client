@@ -76,7 +76,15 @@ final class SubscriptionQueue
 
                 return;
             } else {
-                throw new NatsException('Subscription queue overflow for sid ' . $this->sid);
+                // Error policy: the overflowing message is dropped and the loss is surfaced loudly.
+                // The drop must still be observable and counted, exactly like DropOldest/DropNewest,
+                // so droppedCount()/the error listener never miss it (#134/#159); the throw then
+                // propagates the failure to the caller.
+                $this->droppedCount++;
+                $overflow = new NatsException('Subscription queue overflow for sid ' . $this->sid);
+                $this->client->emitError($overflow, 'debug');
+
+                throw $overflow;
             }
         }
 
@@ -85,8 +93,9 @@ final class SubscriptionQueue
 
     /**
      * Monotonic count of messages this queue has discarded under the slow-consumer policy
-     * (DropOldest dequeues and DropNewest rejections). Never resets for the lifetime of the
-     * queue, so applications can detect delivery gaps by observing increases (#134).
+     * (DropOldest dequeues, DropNewest rejections, and Error-policy overflows before the throw).
+     * Never resets for the lifetime of the queue, so applications can detect delivery gaps by
+     * observing increases (#134/#159).
      */
     public function droppedCount(): int
     {
