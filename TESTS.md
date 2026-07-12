@@ -288,6 +288,28 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testCreateStreamRejectsEmptyStreamName` - createStream() rejects an empty stream name ("must be non-empty") before dispatch (#131).
 - `testGetStreamRejectsWildcardStreamName` - getStream() rejects a wildcard '*' stream name before dispatch (#131).
 - `testCreateStreamAcceptsValidNameWithHyphenAndUnderscore` - createStream() accepts a valid name containing '-' and '_' (ORDERS-2_prod) and produces the expected STREAM.CREATE subject on the wire (#131).
+- `testUpdateStreamRejectsDottedStreamName` - updateStream() rejects a dotted stream name before dispatch (only CONNECT+PING written), pinning the name guard on the STREAM.UPDATE path (#131).
+- `testAddStreamRejectsDottedStreamName` - addStream() rejects a StreamConfiguration whose name is dotted before dispatch, pinning the builder-path name guard (#131).
+- `testDeleteStreamRejectsDottedStreamName` - deleteStream() rejects a dotted stream name before dispatch (#131).
+- `testPurgeStreamRejectsDottedStreamName` - purgeStream() rejects a dotted stream name before dispatch (#131).
+- `testListConsumersRejectsDottedStreamName` - listConsumers() rejects a dotted stream name before dispatch (#131).
+- `testConsumerNamesRejectsDottedStreamName` - consumerNames() rejects a dotted stream name before dispatch (#131).
+- `testGetStreamMessageRejectsDottedStreamName` - getStreamMessage() rejects a dotted stream name before dispatch (#131).
+- `testGetLastMessageForSubjectRejectsDottedStreamName` - getLastMessageForSubject() rejects a dotted stream name before dispatch (#131).
+- `testDeleteMessageRejectsDottedStreamName` - deleteMessage() rejects a dotted stream name before dispatch (#131).
+- `testDirectGetLastMessageForSubjectRejectsDottedStreamName` - directGetLastMessageForSubject() rejects a dotted stream name before dispatch (#131).
+- `testDirectGetBatchRejectsDottedStreamName` - directGetBatch() rejects a dotted stream name before dispatch (#131).
+- `testCreateConsumerRejectsDottedStreamName` - createConsumer() rejects a dotted STREAM name before dispatch, pinning the stream guard independently of the consumer-name guard (#131).
+- `testCreateEphemeralConsumerRejectsDottedStreamName` - createEphemeralConsumer() rejects a dotted stream name before dispatch (#131).
+- `testGetConsumerRejectsDottedStreamName` - getConsumer() rejects a dotted STREAM name before dispatch, pinning the stream guard independently of the consumer-name guard (#131).
+- `testPullConsumerRejectsDottedStreamName` - pullConsumer() rejects a dotted STREAM name synchronously before building the iterator (#131).
+- `testPullConsumerRejectsDottedConsumerName` - pullConsumer() rejects a dotted CONSUMER name synchronously (valid stream), pinning the second name guard in isolation (#131).
+- `testAddConsumerRejectsDottedConsumerName` - addConsumer() rejects a dotted CONSUMER name from the config before dispatch (valid stream), pinning the consumer guard in isolation (#131).
+- `testCreatePushConsumerRejectsDottedConsumerName` - createPushConsumer() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+- `testPauseConsumerRejectsDottedConsumerName` - pauseConsumer() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+- `testResumeConsumerRejectsDottedConsumerName` - resumeConsumer() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
+- `testUnpinConsumerRejectsDottedConsumerName` - unpinConsumer() rejects a dotted CONSUMER name before dispatch (valid stream), ahead of the empty-group check (#131).
+- `testFetchBatchRejectsDottedConsumerName` - fetchBatch() rejects a dotted CONSUMER name before dispatch (valid stream) (#131).
 
 ### tests/Unit/JsMessageMetadataTest.php
 - `testFromMessageReturnsNullWhenReplyToIsNull` - `fromMessage()` returns null when the message has no reply subject.
