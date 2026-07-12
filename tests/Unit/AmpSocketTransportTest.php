@@ -235,12 +235,17 @@ final class AmpSocketTransportTest extends TestCase
         $transport = new AmpSocketTransport(new NatsOptions());
         $transport->connect('tcp://' . $address, 1000)->await();
 
-        $cancelled = false;
         try {
             $transport->readLine(new TimeoutCancellation(0.05))->await();
             self::fail('readLine() must not return normally when its read is cancelled by timeout');
-        } catch (CancelledException) {
-            $cancelled = true;
+        } catch (\Throwable $e) {
+            // A read timeout MUST surface as CancelledException, never as EOF
+            // (TransportClosedException) - the connection layer distinguishes the two.
+            self::assertInstanceOf(
+                CancelledException::class,
+                $e,
+                'readLine() must surface a read timeout as CancelledException, not EOF',
+            );
         } finally {
             $transport->close()->await();
             try {
@@ -250,8 +255,6 @@ final class AmpSocketTransportTest extends TestCase
             }
             $server->close();
         }
-
-        self::assertTrue($cancelled, 'readLine() must surface a read timeout as CancelledException');
     }
 
     /**
