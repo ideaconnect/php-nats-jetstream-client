@@ -29,6 +29,21 @@ final class WebSocketFrameCodec
     /** Hard cap on a single frame's declared payload length, to bound memory on a hostile/garbled stream. */
     private const MAX_FRAME_PAYLOAD = 64 * 1024 * 1024;
 
+    /**
+     * Hard cap on the DECOMPRESSED size of a permessage-deflate frame, bounding a decompression bomb:
+     * a tiny compressed frame can inflate to gigabytes, so {@see inflate()} aborts past this (#121).
+     * Four times {@see MAX_FRAME_PAYLOAD} leaves generous headroom for a legitimately compressible
+     * message while keeping a hostile server's peak allocation bounded, consistent with the #89 caps.
+     */
+    private const MAX_DECOMPRESSED_PAYLOAD = 4 * self::MAX_FRAME_PAYLOAD;
+
+    /**
+     * Compressed-input slice size fed per {@see inflate_add()} call. DEFLATE's ~1032:1 maximum ratio
+     * bounds each call's output to this times ~1032, so the decompressed-size cap is enforced with a
+     * bounded peak allocation instead of expanding the whole input in one call (#121).
+     */
+    private const INFLATE_INPUT_CHUNK_BYTES = 8192;
+
     /** Longest possible frame header: 2 base bytes + 8 extended-length bytes + 4 mask-key bytes. */
     public const HEADER_MAX_BYTES = 14;
 
@@ -300,24 +315,50 @@ final class WebSocketFrameCodec
 
     /**
      * Decompresses a permessage-deflate payload (the inverse of {@see deflate()}): re-append the empty
-     * block tail, then raw INFLATE.
+     * block tail, then raw INFLATE, capping the decompressed size.
+     *
+     * A single {@see inflate_add()} call would expand the whole input at once, so a tiny hostile frame
+     * could inflate to gigabytes and OOM the client (#121). The input is instead fed in bounded
+     * slices - DEFLATE's ~1032:1 maximum ratio caps each call's output - and inflation aborts the
+     * moment the accumulated output exceeds $maxBytes, keeping peak allocation bounded.
+     *
+     * @param int|null $maxBytes Maximum decompressed size; defaults to {@see MAX_DECOMPRESSED_PAYLOAD}.
      */
-    public static function inflate(string $payload): string
+    public static function inflate(string $payload, ?int $maxBytes = null): string
     {
+        $maxBytes ??= self::MAX_DECOMPRESSED_PAYLOAD;
+
         $ctx = inflate_init(ZLIB_ENCODING_RAW);
         if ($ctx === false) {
             throw new ProtocolException('Failed to initialize INFLATE context');
         }
 
-        // Suppress the native E_WARNING ("inflate_add(): data error") on a corrupt peer-controlled frame:
-        // the false-check below already raises a typed ProtocolException. Without @, an app that promotes
-        // warnings to exceptions would get an ErrorException from inside the codec instead (#100).
-        $result = @inflate_add($ctx, $payload . "\x00\x00\xff\xff");
-        if ($result === false) {
-            throw new ProtocolException('Failed to inflate compressed WebSocket frame');
+        $data = $payload . "\x00\x00\xff\xff";
+        $length = strlen($data);
+        $out = '';
+
+        for ($offset = 0; $offset < $length; $offset += self::INFLATE_INPUT_CHUNK_BYTES) {
+            $slice = substr($data, $offset, self::INFLATE_INPUT_CHUNK_BYTES);
+            $final = $offset + self::INFLATE_INPUT_CHUNK_BYTES >= $length;
+
+            // Suppress the native E_WARNING ("inflate_add(): data error") on a corrupt peer-controlled
+            // frame: the false-check below already raises a typed ProtocolException. Without @, an app
+            // that promotes warnings to exceptions would get an ErrorException from inside the codec
+            // instead (#100).
+            $piece = @inflate_add($ctx, $slice, $final ? ZLIB_SYNC_FLUSH : ZLIB_NO_FLUSH);
+            if ($piece === false) {
+                throw new ProtocolException('Failed to inflate compressed WebSocket frame');
+            }
+
+            $out .= $piece;
+            if (strlen($out) > $maxBytes) {
+                throw new ProtocolException(
+                    sprintf('WebSocket decompressed frame exceeded the maximum of %d bytes', $maxBytes),
+                );
+            }
         }
 
-        return $result;
+        return $out;
     }
 
     /**

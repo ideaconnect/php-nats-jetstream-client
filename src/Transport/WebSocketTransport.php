@@ -90,6 +90,17 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     /** Whether the in-progress fragmented message was flagged compressed (RSV1 on its first frame). */
     private bool $fragmentCompressed = false;
 
+    /**
+     * Holds a deferred terminal condition - a graceful Close, or an RFC 6455 5.4 fragmentation
+     * violation (a data frame mid-fragmentation, or an orphan continuation) - that shared a read with
+     * data frames whose already-decoded bytes were returned first. The stored exception is surfaced on
+     * the next {@see readLine()} once the buffered data is drained, so neither a graceful server close
+     * nor a fragmentation violation can discard same-read data (#115). The first terminal condition in
+     * a read wins (later frames after it are dropped). Null when no condition is pending. For a Close,
+     * the RFC 6455 echo (#161) is sent when the Close is first seen, not when it is finally surfaced.
+     */
+    private ?\Throwable $pendingTerminal = null;
+
     /** Whether permessage-deflate was negotiated with the server (#61). */
     private bool $compressionActive = false;
 
@@ -119,6 +130,7 @@ final class WebSocketTransport implements TlsAwareTransportInterface
             $this->fragmentChunks = [];
             $this->fragmentChunksLength = 0;
             $this->fragmenting = false;
+            $this->pendingTerminal = null;
             $this->compressionActive = false;
 
             $parts = parse_url($dsn);
@@ -343,6 +355,17 @@ final class WebSocketTransport implements TlsAwareTransportInterface
      */
     private function drainDataFrames(): string
     {
+        // A terminal condition (Close or fragmentation violation) shared a read with data we already
+        // returned; surface it now that the buffered data is drained (#115). A Close's RFC 6455 echo
+        // (#161) was already written when it was first seen, so the connection layer just needs this
+        // exception to reconnect (or to fail loudly on a protocol violation).
+        if ($this->pendingTerminal !== null) {
+            $terminal = $this->pendingTerminal;
+            $this->pendingTerminal = null;
+
+            throw $terminal;
+        }
+
         $out = '';
 
         // A large frame was spilling to $readChunks: once fully buffered, consume it with one join,
@@ -356,9 +379,29 @@ final class WebSocketTransport implements TlsAwareTransportInterface
             $out .= $this->processFrames([$this->consumeSpanningFrame()]);
         }
 
-        $frames = WebSocketFrameCodec::decode($this->readBuffer);
-        if ($frames !== []) {
-            $out .= $this->processFrames($frames);
+        // Skip the batch decode if the spilled frame's trailing bytes already carried a terminal
+        // condition (Close or fragmentation violation).
+        if ($this->pendingTerminal === null) {
+            $frames = WebSocketFrameCodec::decode($this->readBuffer);
+            if ($frames !== []) {
+                $out .= $this->processFrames($frames);
+            }
+        }
+
+        // processFrames() flags a terminal condition (Close, or an RFC 6455 5.4 fragmentation
+        // violation) instead of throwing when data preceded it in the same batch. If that data was
+        // returned this call, hand it back now and defer the condition to the next call (#115); with no
+        // accompanying data, surface it immediately - so the connection still fails loudly, just after
+        // the already-decoded messages are delivered.
+        if ($this->pendingTerminal !== null) {
+            if ($out === '') {
+                $terminal = $this->pendingTerminal;
+                $this->pendingTerminal = null;
+
+                throw $terminal;
+            }
+
+            return $out;
         }
 
         // decode() consumed every complete frame, so the buffer now holds at most one incomplete head
@@ -382,6 +425,9 @@ final class WebSocketTransport implements TlsAwareTransportInterface
      * returns the concatenated payload of any completed data messages.
      *
      * @param list<array{opcode: int, payload: string, fin: bool, rsv1: bool}> $frames
+     *
+     * @phpstan-impure Mutates fragment-reassembly state and sets $pendingTerminal on a Close frame or
+     *                 an RFC 6455 5.4 fragmentation violation.
      */
     private function processFrames(array $frames): string
     {
@@ -400,9 +446,7 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 case WebSocketFrameCodec::OP_CLOSE:
                     // RFC 6455 5.5.1: an endpoint receiving a Close MUST send a Close in response.
                     // Echo one mirroring the received status code (the first two payload bytes; empty
-                    // when the peer sent no status), best-effort - the socket may already be gone.
-                    // The TransportClosedException below is unchanged, so the connection layer still
-                    // reconnects on it (#161).
+                    // when the peer sent no status), best-effort - the socket may already be gone (#161).
                     $echo = strlen($frame['payload']) >= 2 ? substr($frame['payload'], 0, 2) : '';
 
                     try {
@@ -411,10 +455,33 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                         // The peer may have already dropped the socket; surfacing the close is what matters.
                     }
 
-                    throw new TransportClosedException('WebSocket close frame received');
+                    // Flag the close and stop instead of throwing here: any data frames earlier in this
+                    // batch have already been decoded out of the read buffer, so throwing would silently
+                    // discard them (#115). drainDataFrames() returns that data now and surfaces the close
+                    // on the next readLine(); nothing meaningful follows a Close, so later frames drop.
+                    // First terminal condition in the read wins (??=).
+                    $this->pendingTerminal ??= new TransportClosedException('WebSocket close frame received');
+
+                    return $out;
 
                 case WebSocketFrameCodec::OP_BINARY:
                 case WebSocketFrameCodec::OP_TEXT:
+                    if ($this->fragmenting) {
+                        // RFC 6455 5.4: a new data frame while a fragmented message is in progress is a
+                        // protocol violation. Fail loudly instead of silently overwriting the partial
+                        // message (#115) - but defer exactly like the Close: data frames earlier in this
+                        // batch were already decoded out of the read buffer, so throwing here would
+                        // discard them. Flag the violation and stop; drainDataFrames() returns that data
+                        // now and surfaces this exception on the next readLine() (immediately when there
+                        // is no accompanying data). First terminal condition in the read wins (??=).
+                        $this->resetFragmentState();
+                        $this->pendingTerminal ??= new ProtocolException(
+                            'WebSocket data frame received while a fragmented message is in progress',
+                        );
+
+                        return $out;
+                    }
+
                     if ($frame['fin']) {
                         // A compressed (RSV1) message is inflated once fully received.
                         $out .= $frame['rsv1'] ? WebSocketFrameCodec::inflate($frame['payload']) : $frame['payload'];
@@ -430,22 +497,30 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                     break;
 
                 case WebSocketFrameCodec::OP_CONTINUATION:
-                    if ($this->fragmenting) {
-                        $this->fragmentChunks[] = $frame['payload'];
-                        $this->fragmentChunksLength += strlen($frame['payload']);
-                        $this->enforceFragmentBound();
-                        if ($frame['fin']) {
-                            // Single join of all fragments (#164) - one copy of every byte.
-                            $message = implode('', [$this->fragmentBuffer, ...$this->fragmentChunks]);
-                            $out .= $this->fragmentCompressed
-                                ? WebSocketFrameCodec::inflate($message)
-                                : $message;
-                            $this->fragmentBuffer = '';
-                            $this->fragmentChunks = [];
-                            $this->fragmentChunksLength = 0;
-                            $this->fragmenting = false;
-                            $this->fragmentCompressed = false;
-                        }
+                    if (!$this->fragmenting) {
+                        // RFC 6455 5.4: a continuation frame with no fragmented message in progress is a
+                        // protocol violation. Fail loudly instead of silently dropping the orphan (#115),
+                        // but defer exactly like the Close so data frames earlier in this batch (already
+                        // decoded out of the read buffer) are returned first rather than discarded.
+                        // drainDataFrames() surfaces this on the next readLine() (immediately when there
+                        // is no accompanying data). First terminal condition in the read wins (??=).
+                        $this->pendingTerminal ??= new ProtocolException(
+                            'WebSocket continuation frame with no fragmented message in progress',
+                        );
+
+                        return $out;
+                    }
+
+                    $this->fragmentChunks[] = $frame['payload'];
+                    $this->fragmentChunksLength += strlen($frame['payload']);
+                    $this->enforceFragmentBound();
+                    if ($frame['fin']) {
+                        // Single join of all fragments (#164) - one copy of every byte.
+                        $message = implode('', [$this->fragmentBuffer, ...$this->fragmentChunks]);
+                        $out .= $this->fragmentCompressed
+                            ? WebSocketFrameCodec::inflate($message)
+                            : $message;
+                        $this->resetFragmentState();
                     }
                     break;
             }
@@ -465,15 +540,24 @@ final class WebSocketTransport implements TlsAwareTransportInterface
         }
 
         $limit = $this->maxMessageBytes;
+        $this->resetFragmentState();
+
+        throw new ProtocolException(
+            sprintf('WebSocket fragmented message exceeded the maximum of %d bytes', $limit),
+        );
+    }
+
+    /**
+     * Clears all in-progress fragment-reassembly state, returning the transport to the not-fragmenting
+     * baseline (on completion, on a bound overflow, or on a protocol violation).
+     */
+    private function resetFragmentState(): void
+    {
         $this->fragmentBuffer = '';
         $this->fragmentChunks = [];
         $this->fragmentChunksLength = 0;
         $this->fragmenting = false;
         $this->fragmentCompressed = false;
-
-        throw new ProtocolException(
-            sprintf('WebSocket fragmented message exceeded the maximum of %d bytes', $limit),
-        );
     }
 
     /**

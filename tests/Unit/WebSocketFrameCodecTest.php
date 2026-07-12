@@ -124,6 +124,65 @@ final class WebSocketFrameCodecTest extends TestCase
     }
 
     /**
+     * permessage-deflate inflate() must cap the decompressed size: a small frame that inflates far
+     * beyond the cap (a decompression bomb) throws a ProtocolException instead of allocating
+     * unboundedly. Regression for #121 (inflate_add() had no decompressed-size cap - a hostile
+     * server could OOM-spike the client, inconsistent with the file's #89 threat model).
+     */
+    public function testInflateEnforcesDecompressedSizeCap(): void
+    {
+        // ~1 MiB of a single repeated byte compresses to ~1 KiB - well under the 4096-byte cap, so
+        // only the decompressed size (not the compressed input) can trip the guard.
+        $bomb = WebSocketFrameCodec::deflate(str_repeat('A', 1024 * 1024));
+        self::assertLessThan(4096, strlen($bomb));
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/maximum/i');
+        // A cap far below the ~1 MiB decompressed size must abort rather than allocate it all.
+        WebSocketFrameCodec::inflate($bomb, 4096);
+    }
+
+    /**
+     * A payload under the cap still inflates byte-identically even when its COMPRESSED form spans many
+     * bounded inflate slices - the multi-slice reassembly must not corrupt or truncate legitimate
+     * output (#121). The input must be incompressible: a repetitive payload deflates to well under
+     * INFLATE_INPUT_CHUNK_BYTES (8192) and the loop runs a single iteration, so it would never
+     * exercise the multi-slice path. 64 KiB of random bytes deflates to slightly MORE than 64 KiB, so
+     * inflate() feeds it in ~9 slices, genuinely iterating the bounded loop and reassembling across it.
+     */
+    public function testInflateReturnsFullPayloadWithinCap(): void
+    {
+        $original = random_bytes(64 * 1024); // incompressible: deflates to > 64 KiB, no shrink
+        $compressed = WebSocketFrameCodec::deflate($original);
+
+        // Prove the input genuinely spans several INFLATE_INPUT_CHUNK_BYTES (8192-byte) slices, so the
+        // bounded loop iterates many times rather than collapsing to one pass.
+        self::assertGreaterThanOrEqual(strlen($original), strlen($compressed), 'random data must not shrink');
+        self::assertGreaterThan(8192 * 4, strlen($compressed), 'compressed input must span several inflate slices');
+
+        // A cap exactly at the payload size must accept the full reassembled output byte-for-byte.
+        self::assertSame($original, WebSocketFrameCodec::inflate($compressed, strlen($original)));
+    }
+
+    /**
+     * The decompressed-size cap is enforced WHILE the bounded loop iterates, not just on a single-pass
+     * frame: an incompressible payload whose compressed form spans many INFLATE_INPUT_CHUNK_BYTES
+     * slices, inflated under a cap far below its decompressed size, must abort with a ProtocolException
+     * partway through the loop rather than reassembling the whole output first (#121).
+     */
+    public function testInflateAbortsMidLoopWhenMultiSliceOutputExceedsCap(): void
+    {
+        $original = random_bytes(96 * 1024); // ~13 compressed slices, decompresses to 96 KiB
+        $compressed = WebSocketFrameCodec::deflate($original);
+        self::assertGreaterThan(8192 * 4, strlen($compressed), 'compressed input must span several inflate slices');
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/maximum/i');
+        // 16 KiB cap << 96 KiB output: the accumulated output crosses the cap mid-loop and aborts.
+        WebSocketFrameCodec::inflate($compressed, 16 * 1024);
+    }
+
+    /**
      * Verifies a compressed frame carries RSV1 and decodes back to the original payload (#61).
      */
     public function testCompressedFrameRoundTrip(): void
