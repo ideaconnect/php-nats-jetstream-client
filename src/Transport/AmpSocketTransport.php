@@ -146,21 +146,37 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
      * when the peer closes a live socket (EOF), so the connection layer can reconnect from the read
      * path. A read timeout surfaces as an Amp CancelledException from the underlying read, never as
      * EOF, so a bounded read is not mistaken for a peer close.
+     *
+     * Runs inline in the caller's fiber and returns an already-resolved future (#163, mirroring the
+     * write() path #136): every caller awaits the result immediately, so wrapping the read in async()
+     * only added a second fiber (plus a Future allocation) per inbound chunk on top of the caller's
+     * own read fiber. Amp's read() suspends this fiber until bytes, EOF, or cancellation - the
+     * immediate-await contract makes that safe, exactly as it is for write()'s backpressure suspend.
+     * All outcomes still surface through the returned future - never a synchronous throw - so the
+     * cancellation/EOF/empty semantics callers depend on are byte-for-byte unchanged: a passed
+     * Cancellation still reaches the underlying read (its CancelledException flows back through the
+     * future), EOF still becomes TransportClosedException, and a missing socket still yields ''.
      */
     public function readLine(?Cancellation $cancellation = null): Future
     {
-        return async(function () use ($cancellation): string {
-            if ($this->socket === null) {
-                return '';
-            }
+        $socket = $this->socket;
+        if ($socket === null) {
+            return Future::complete('');
+        }
 
-            $chunk = $this->socket->read($cancellation);
-            if ($chunk === null) {
-                throw new TransportClosedException('Socket closed by peer (EOF)');
-            }
+        try {
+            $chunk = $socket->read($cancellation);
+        } catch (\Throwable $e) {
+            // Surface read failures (including a read timeout's CancelledException) through the
+            // future so callers observe them via await(), never as a synchronous throw.
+            return Future::error($e);
+        }
 
-            return $chunk;
-        });
+        if ($chunk === null) {
+            return Future::error(new TransportClosedException('Socket closed by peer (EOF)'));
+        }
+
+        return Future::complete($chunk);
     }
 
     /**

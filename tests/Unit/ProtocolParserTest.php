@@ -77,10 +77,11 @@ final class ProtocolParserTest extends TestCase
     }
 
     /**
-     * The fast-path tokenization (#140) must defer to the whitespace-tolerant split whenever a
-     * control line is not canonically single-space separated: doubled spaces produce empty
-     * explode() tokens, and a tab hidden inside a space-separated token changes the real token
-     * count (turning a 4-token-looking MSG line into the 5-token reply-to form).
+     * The whitespace-tolerant control-line split must tokenize on any whitespace run, not just a
+     * single space: doubled spaces collapse to one separator, and a tab hidden inside what looks
+     * like a space-separated token changes the real token count (turning a 4-token-looking MSG
+     * line into the 5-token reply-to form). Pinned across the #140 explode fast path and its #163
+     * revert to preg_split (both byte-identical here).
      */
     public function testParsesControlLinesWithMultiSpaceAndEmbeddedTabSeparators(): void
     {
@@ -117,6 +118,65 @@ final class ProtocolParserTest extends TestCase
         self::assertSame('orders', $hmsg[0]->subject);
         self::assertSame(4, $hmsg[0]->sid);
         self::assertSame($headers . 'hey', $hmsg[0]->payload);
+    }
+
+    /**
+     * Guards the control-line tokenizer's whitespace-collapse semantics against a naive
+     * single-space split: MSG/HMSG argument separators may be ANY run of ASCII whitespace
+     * (space, tab, vertical tab \v, form feed \f, or a mixed run), and consecutive whitespace
+     * collapses to one separator - so a non-space whitespace byte inside a space-separated line
+     * still delimits the real fields. A plain explode(' ') would miscount these lines (raising a
+     * spurious ProtocolException or misframing the reply-to); the tokenizer must match
+     * preg_split('/\s+/'). Pins the #163 revert of splitControlLine to preg_split as behaviour
+     * identical to the #140 explode fast path it replaced.
+     */
+    public function testControlLineTokenizationTreatsAnyWhitespaceRunAsSeparator(): void
+    {
+        $parser = new ProtocolParser();
+
+        // Vertical tab between subject and sid: a 4-field MSG that explode(' ') sees as 3 tokens.
+        $vt = $parser->push("MSG foo\x0b1 2\r\nhi\r\n");
+        self::assertCount(1, $vt);
+        self::assertSame(ProtocolFrameType::Msg, $vt[0]->type);
+        self::assertSame('foo', $vt[0]->subject);
+        self::assertSame(1, $vt[0]->sid);
+        self::assertNull($vt[0]->replyTo);
+        self::assertSame('hi', $vt[0]->payload);
+
+        // Form feed between subject and sid in an HMSG (no reply-to form).
+        $headers = "NATS/1.0\r\n\r\n"; // 12 bytes
+        $total = strlen($headers) + 2;
+        $ff = $parser->push(sprintf("HMSG orders\x0c4 %d %d\r\n%shi\r\n", strlen($headers), $total, $headers));
+        self::assertCount(1, $ff);
+        self::assertSame(ProtocolFrameType::HMsg, $ff[0]->type);
+        self::assertSame('orders', $ff[0]->subject);
+        self::assertSame(4, $ff[0]->sid);
+        self::assertNull($ff[0]->replyTo);
+        self::assertSame(strlen($headers), $ff[0]->headerBytes);
+        self::assertSame($total, $ff[0]->totalBytes);
+        self::assertSame($headers . 'hi', $ff[0]->payload);
+
+        // A mixed whitespace run (space + tab + space) collapses to a single separator.
+        $mixed = $parser->push("MSG  \t updates 7 5\r\nhello\r\n");
+        self::assertCount(1, $mixed);
+        self::assertSame('updates', $mixed[0]->subject);
+        self::assertSame(7, $mixed[0]->sid);
+        self::assertSame('hello', $mixed[0]->payload);
+
+        // Tabs as the sole separators for every field of an HMSG reply-to line.
+        $tabbed = $parser->push(sprintf(
+            "HMSG\tbar\t9\t_INBOX.z\t%d\t%d\r\n%shey\r\n",
+            strlen($headers),
+            strlen($headers) + 3,
+            $headers,
+        ));
+        self::assertCount(1, $tabbed);
+        self::assertSame('bar', $tabbed[0]->subject);
+        self::assertSame(9, $tabbed[0]->sid);
+        self::assertSame('_INBOX.z', $tabbed[0]->replyTo);
+        self::assertSame(strlen($headers), $tabbed[0]->headerBytes);
+        self::assertSame(strlen($headers) + 3, $tabbed[0]->totalBytes);
+        self::assertSame($headers . 'hey', $tabbed[0]->payload);
     }
 
     /**

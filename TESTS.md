@@ -21,6 +21,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testConnectThrowsOnInvalidDsn` - Asserts connect() propagates a Throwable for an invalid DSN.
 - `testNormalizeSocketUriRewritesTlsScheme` - Asserts normalizeSocketUri() rewrites tls:// to tcp:// and leaves tcp:// unchanged, while accepting nats:// directly as tcp://.
 - `testReadLineThrowsTransportClosedOnPeerEof` - With a server that writes "hello\r\n" then closes, asserts readLine() returns the data and the subsequent read throws TransportClosedException on EOF (not collapsing to '').
+- `testReadLineSurfacesReadTimeoutAsCancelledExceptionNotEof` - With a peer held open but silent, asserts a bounded readLine() whose TimeoutCancellation fires surfaces CancelledException through the returned future - not EOF/TransportClosedException and not '' - guarding the #163 inline readLine() (no async() wrapper) so the passed Cancellation still reaches the underlying read and a bounded read stays distinguishable from a peer close.
 - `testUpgradeTlsThrowsWhenConnectedWithoutTlsContext` - With a held-open plaintext connection, asserts upgradeTls() fails fast with TlsRequiredException ("TLS upgrade requested but no TLS context") rather than leaving the socket plaintext.
 
 ### tests/Unit/BasicJsonSchemaValidatorTest.php
@@ -847,7 +848,8 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 ### tests/Unit/ProtocolParserTest.php
 - `testRejectsOverflowingSizeField` - asserts a 20-digit MSG size field (exceeding PHP_INT_MAX) is rejected with ProtocolException instead of saturating.
 - `testParsesControlFrames` - asserts a stream of PING/PONG/+OK/-ERR parses into four frames with correct types and the -ERR error string `'boom'`.
-- `testParsesControlLinesWithMultiSpaceAndEmbeddedTabSeparators` - asserts the #140 explode() fast path defers to the whitespace-tolerant split: multi-space-separated MSG/HMSG lines tokenize, and a tab hidden inside a space-separated token (making a 4-token-looking MSG line really the 5-token reply-to form) still yields the reply-to.
+- `testParsesControlLinesWithMultiSpaceAndEmbeddedTabSeparators` - asserts the whitespace-tolerant control-line split (pinned across the #140 explode fast path and its #163 preg_split revert): multi-space-separated MSG/HMSG lines tokenize, and a tab hidden inside a space-separated token (making a 4-token-looking MSG line really the 5-token reply-to form) still yields the reply-to.
+- `testControlLineTokenizationTreatsAnyWhitespaceRunAsSeparator` - asserts the control-line tokenizer treats ANY whitespace run as a separator (guarding the #163 revert of splitControlLine to preg_split): a vertical tab or form feed embedded in an otherwise space-separated MSG/HMSG line still delimits the real fields, a mixed space+tab run collapses to one separator, and tab-only HMSG reply-to lines parse - cases a naive explode(' ') would miscount.
 - `testParsesFragmentedMsgFrame` - asserts an MSG split across two pushes yields no frame on the first and a complete frame (subject, sid 17, payload `hello`) on the second.
 - `testParsesHmsgFrame` - asserts an HMSG (no replyTo) parses with subject, sid, headerBytes 12, totalBytes 17, and the combined header+payload bytes.
 - `testParsesHmsgFrameWithReplyTo` - asserts an HMSG with a reply subject parses replyTo `inbox.reply` along with subject, sid, byte counts, and payload.
