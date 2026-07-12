@@ -23,6 +23,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testReadLineThrowsTransportClosedOnPeerEof` - With a server that writes "hello\r\n" then closes, asserts readLine() returns the data and the subsequent read throws TransportClosedException on EOF (not collapsing to '').
 - `testReadLineSurfacesReadTimeoutAsCancelledExceptionNotEof` - With a peer held open but silent, asserts a bounded readLine() whose TimeoutCancellation fires surfaces CancelledException through the returned future - not EOF/TransportClosedException and not '' - guarding the #163 inline readLine() (no async() wrapper) so the passed Cancellation still reaches the underlying read and a bounded read stays distinguishable from a peer close.
 - `testUpgradeTlsThrowsWhenConnectedWithoutTlsContext` - With a held-open plaintext connection, asserts upgradeTls() fails fast with TlsRequiredException ("TLS upgrade requested but no TLS context") rather than leaving the socket plaintext.
+- `testReadChunkSizeControlsMaxBytesPerRead` - Over a real loopback socket, writes a 256 KiB payload and asserts the configured `readChunkSizeBytes` bounds each read: a 128 KiB chunk size lets a single readLine() return more than 8 KiB (and uses fewer total reads), while an 8 KiB chunk size caps every read at 8 KiB; both deliver the full payload (#119). Falsifiable: without the setChunkSize() call the transport stays at Amp's 8 KiB default and the >8 KiB assertion fails.
 
 ### tests/Unit/BasicJsonSchemaValidatorTest.php
 - `testRejectsInvalidJsonPayload` - Asserts validating a message with a malformed JSON body (`{invalid`) against an object schema returns the error `payload is not valid JSON`.
@@ -769,8 +770,9 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testRejectsNonPositiveRequestTimeout` - Asserts the constructor throws InvalidArgumentException ('requestTimeoutMs') for `requestTimeoutMs: 0`.
 - `testRejectsZeroMaxPendingMessages` - Asserts the constructor throws InvalidArgumentException ('maxPendingMessagesPerSubscription') for value 0.
 - `testRejectsNegativeReconnectValue` - Asserts the constructor throws InvalidArgumentException ('reconnectDelayMs') for `reconnectDelayMs: -1`.
+- `testRejectsNonPositiveReadChunkSize` - Asserts the constructor throws InvalidArgumentException ('readChunkSizeBytes') for `readChunkSizeBytes: 0` (#119).
 - `testAllowsDisabledHeartbeatAndEmptyServers` - Asserts that `pingIntervalSeconds: 0`, `maxPingsOut: 0`, and an empty servers list are all accepted (heartbeat-disabled is legitimate), preserving the zero values.
-- `testDefaultsMatchDocumentedValues` - Asserts the full set of constructor defaults (servers, name, inboxPrefix, all timeouts, reconnect params, ping/TLS/auth fields, slowConsumerPolicy=DropOldest, reconnectBufferSize=8388608, WebSocket/logger defaults, etc.) match the README configuration table, field by field.
+- `testDefaultsMatchDocumentedValues` - Asserts the full set of constructor defaults (servers, name, inboxPrefix, all timeouts, reconnect params, ping/TLS/auth fields, slowConsumerPolicy=DropOldest, reconnectBufferSize=8388608, WebSocket/logger defaults, readChunkSizeBytes=131072, etc.) match the README configuration table, field by field.
 
 ### tests/Unit/NkeySeedSignerTest.php
 - `testPublicKeyMatchesKnownUserSeed` - Asserts `publicKey()` for a known sample user seed equals the expected public key; skips without the sodium extension.
@@ -987,6 +989,12 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testReusedIteratorAfterDrainStartsFresh` - an iterator that called `drain()` in run 1 (`['run1']`) is not pre-drained on a second `handle()`; the second run polls again and delivers `['run2']`, proving resetLifecycle clears the drain flag.
 - `testOnErrorNotFiredOnRoutine408` - a routine 408 Request Timeout status does not fire the onError callback.
 - `testHandleRePinsOnStalePin` - a 423 Nats-Pin-Id Mismatch drops the pin id and re-pulls without it (#7); the new pin id from the next delivery is captured and resent on the following pull; asserts total 2, payloads `['order-9','order-10']`, and that pull 1 carries `"group":"g1"` with no `"id"`, pull 2 has no `"id"`, and pull 3 carries `"id":"pin-new"`.
+
+### tests/Unit/ReadPathProgressTest.php
+- `testReadIncomingReportsConsumedBytesOnPartialFrameAndIdleOnEmptyRead` - Feeds a 50-byte MSG frame one byte at a time and asserts `readIncoming()` reports `consumedBytes=true` on every byte-consuming read even while the frame is incomplete (frames=0), exactly one read completes the frame (frames=1), a subsequent empty read reports `consumedBytes=false`, and the reassembled payload is byte-identical (#119). Falsifiable: a naive `consumedBytes = frames>0` would report false on the partial reads.
+- `testProcessIncomingStillReturnsFrameCountForMultiChunkMessage` - Splits a 1600-byte message into 7-byte chunks and asserts the public `processIncoming()` still sums to exactly one frame across the partial reads and delivers the payload identically, pinning that the #119 refactor left the frame-count contract unchanged.
+- `testChunkedMessageIsCollectedWithoutIdleSleepPerChunk` - Drives `SubscriptionQueue::fetchAll(1)` over a 317-chunk (one byte each) message with a 60 ms timeout window and asserts the message is collected inside the window with the correct payload (#119). Falsifiable: on the pre-fix path each of the ~316 partial reads sleeps 1 ms (~316 ms), overrunning the window so fetchAll returns [] - verified by temporarily restoring the unconditional sleep.
+- `testIdleWaitRespectsDeadlineAndDoesNotBusySpin` - With a live-but-silent socket (blockWhenEmpty), asserts `next()` with a 50 ms timeout returns null at ~the deadline (>= 45 ms, does not bail early), terminates (does not hang), and bounds its read with a cancellation - the genuinely-idle path still yields and honors its deadline (#119).
 
 ### tests/Unit/RepublishAndTransformTest.php
 - `testRepublishMinimal` - Asserts Republish::create(src, dest)->toArray() yields exactly ['src','dest'] with no headers_only key.

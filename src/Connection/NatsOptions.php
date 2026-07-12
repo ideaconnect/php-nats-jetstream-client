@@ -91,6 +91,11 @@ final class NatsOptions
       * @param LoggerInterface|null $logger Optional PSR-3 logger; lifecycle events (connect/disconnect/
       *        reconnect/close, discovery, lame-duck), reconnect attempts, and async errors are logged to
       *        it. Defaults to a NullLogger (no output).
+      * @param int $readChunkSizeBytes Max bytes a single transport socket read may return, applied via
+      *        the Amp socket's chunk size (default 128 KiB, up from Amp's 8 KiB). A larger cap divides
+      *        the per-chunk syscall + fiber-spawn + parser-push overhead for large payloads (e.g. an
+      *        ObjectStore download) without forcing larger reads: the socket still returns only what is
+      *        available, so small messages are unaffected (#119). Must be at least 1.
      */
     public function __construct(
         public readonly array $servers = [self::DEFAULT_SERVER],
@@ -135,6 +140,7 @@ final class NatsOptions
         public readonly array $webSocketHeaders = [],
         public readonly bool $webSocketCompression = false,
         public readonly ?LoggerInterface $logger = null,
+        public readonly int $readChunkSizeBytes = 131_072,
     ) {
         // Fail fast on values that have no valid meaning, rather than misbehaving later. Note that
         // pingIntervalSeconds <= 0 (disables the heartbeat) and an empty servers list (falls back to
@@ -149,6 +155,10 @@ final class NatsOptions
 
         if ($maxPendingMessagesPerSubscription < 1) {
             throw new \InvalidArgumentException('maxPendingMessagesPerSubscription must be at least 1');
+        }
+
+        if ($readChunkSizeBytes < 1) {
+            throw new \InvalidArgumentException('readChunkSizeBytes must be at least 1');
         }
 
         foreach ([

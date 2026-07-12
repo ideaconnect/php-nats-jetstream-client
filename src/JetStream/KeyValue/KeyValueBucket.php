@@ -612,8 +612,11 @@ final class KeyValueBucket
 
                     $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
                     try {
-                        $frames = $this->client->processIncoming($waitCancellation)->await();
-                        if ($frames === 0) {
+                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        if (!$read->consumedBytes) {
+                            // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
+                            // completed no key-record frame yet (a chunked replay) loops immediately,
+                            // draining the already-buffered rest with no idle sleep (#119).
                             delay(0.001, cancellation: $waitCancellation);
                         }
                     } catch (CancelledException) {
@@ -723,8 +726,11 @@ final class KeyValueBucket
 
                     $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
                     try {
-                        $frames = $this->client->processIncoming($waitCancellation)->await();
-                        if ($frames === 0) {
+                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        if (!$read->consumedBytes) {
+                            // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
+                            // completed no revision frame yet (a chunked history payload) loops
+                            // immediately, draining the already-buffered rest with no idle sleep (#119).
                             delay(0.001, cancellation: $waitCancellation);
                         }
                     } catch (CancelledException) {

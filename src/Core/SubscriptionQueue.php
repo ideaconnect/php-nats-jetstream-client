@@ -199,13 +199,18 @@ final class SubscriptionQueue
 
         try {
             do {
-                $this->client->processIncoming($cancellation)->await();
+                $read = $this->client->readIncoming($cancellation)->await();
 
                 if ($this->messages->count() > 0) {
                     break;
                 }
 
-                delay(0.001, cancellation: $cancellation);
+                if (!$read->consumedBytes) {
+                    // Genuinely idle read: yield so the deadline can fire without a busy-spin. A read
+                    // that consumed bytes but did not complete a message yet (a large payload arriving
+                    // in chunks) loops immediately - no 1 ms sleep is paid per partial chunk (#119).
+                    delay(0.001, cancellation: $cancellation);
+                }
             } while ($this->monotonicSeconds() < $deadline);
         } catch (CancelledException) {
             // Timeout elapsed without a message.
@@ -245,7 +250,8 @@ final class SubscriptionQueue
 
         try {
             while ($limit === null || count($collected) < $limit) {
-                $frames = $this->client->processIncoming($cancellation)->await();
+                $read = $this->client->readIncoming($cancellation)->await();
+                $frames = $read->frames;
 
                 while (!$this->messages->isEmpty() && ($limit === null || count($collected) < $limit)) {
                     $collected[] = $this->messages->dequeue();
@@ -257,10 +263,14 @@ final class SubscriptionQueue
                         break;
                     }
 
-                    // With a timeout, keep waiting for the full window instead of bailing on a
-                    // transient empty read (e.g. the heartbeat self-read briefly owning the socket).
-                    // The cancellation ends the wait by throwing CancelledException.
-                    delay(0.001, cancellation: $cancellation);
+                    if (!$read->consumedBytes) {
+                        // With a timeout, keep waiting for the full window instead of bailing on a
+                        // transient idle read (e.g. the heartbeat self-read briefly owning the socket).
+                        // The cancellation ends the wait by throwing CancelledException. A read that
+                        // consumed bytes but completed no frame yet (a large payload arriving in chunks)
+                        // loops immediately - no 1 ms sleep is paid per partial chunk (#119).
+                        delay(0.001, cancellation: $cancellation);
+                    }
                 }
             }
         } catch (CancelledException) {

@@ -738,7 +738,7 @@ final class NatsConnection
             $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
             try {
                 while (!$flushCancellation->isRequested()) {
-                    $frames = $this->processIncoming($flushCancellation)->await();
+                    $read = $this->readIncoming($flushCancellation)->await();
 
                     if ($flushSlot->isComplete()) {
                         // The PONG answering the drain PING arrived (or a concurrent teardown
@@ -746,10 +746,13 @@ final class NatsConnection
                         break;
                     }
 
-                    if ($frames === 0) {
-                        // No complete frame this read. Yield so the event loop advances and the
-                        // deadline can fire - processIncoming() returns 0 synchronously on an empty
-                        // read, so without this the loop would busy-spin and starve the timer forever.
+                    if (!$read->consumedBytes) {
+                        // Genuinely idle read (empty socket, or another fiber owns the read). Yield so
+                        // the event loop advances and the deadline can fire - without this the loop
+                        // would busy-spin and starve the timer forever. A read that consumed bytes but
+                        // did not complete this drain PONG frame (a large payload arriving in chunks)
+                        // loops immediately: the rest is already buffered, so no idle sleep is paid per
+                        // partial chunk (#119).
                         delay(0.001, cancellation: $flushCancellation);
                     }
                 }
@@ -1304,12 +1307,14 @@ final class NatsConnection
             $cancellation = new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000));
             try {
                 while (!$slot->isComplete()) {
-                    $frames = $this->processIncoming($cancellation)->await();
+                    $read = $this->readIncoming($cancellation)->await();
 
-                    // A read that produced no complete frame must not busy-spin: yield so the deadline
-                    // can fire (processIncoming() returns 0 synchronously on an empty read). A slot
-                    // completed during a 0-frame read exits at the loop head after this one yield.
-                    if ($frames === 0) {
+                    // Only a genuinely idle read yields: without it the loop would busy-spin and
+                    // starve the deadline. A read that consumed bytes but produced no complete frame
+                    // yet (this flush's PONG arriving behind a large payload split across chunks) loops
+                    // immediately - the rest is already buffered, so no 1 ms sleep per chunk (#119). A
+                    // slot completed during any read exits at the loop head regardless.
+                    if (!$read->consumedBytes) {
                         delay(0.001, cancellation: $cancellation);
                     }
                 }
@@ -1330,19 +1335,26 @@ final class NatsConnection
     }
 
     /**
-     * Reads one transport chunk, parses frames, and dispatches message callbacks.
+     * Reads one transport chunk, parses frames, and dispatches message callbacks, reporting BOTH the
+     * number of complete frames dispatched and whether the read consumed bytes off the wire (#119).
+     *
+     * A wait loop uses {@see IncomingChunkResult::$consumedBytes} to tell partial-frame progress (a
+     * large payload arriving in socket-sized chunks: bytes consumed, frame not yet complete) apart
+     * from a genuinely idle read (empty socket / another fiber owns the read): it loops immediately in
+     * the former case and yields 1 ms only in the latter. {@see processIncoming()} exposes the same
+     * cycle as a frame count only, preserving its existing contract.
      *
      * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read,
      *                                        so a timed-out caller does not orphan an in-flight read.
-     * @return Future<int>
+     * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state (e.g. completes queued pong slots / resets
      *                 outstandingPings via handled frames), so callers must not assume remembered
      *                 property values persist.
      */
-    public function processIncoming(?Cancellation $cancellation = null): Future
+    public function readIncoming(?Cancellation $cancellation = null): Future
     {
-        return async(function () use ($cancellation): int {
+        return async(function () use ($cancellation): IncomingChunkResult {
             if ($this->state !== ConnectionState::Open && $this->state !== ConnectionState::Draining) {
                 throw new ConnectionException('Connection is not open');
             }
@@ -1350,7 +1362,7 @@ final class NatsConnection
             if ($this->readInProgress) {
                 // A concurrent read (e.g. the heartbeat timer) owns the socket; avoid a second
                 // overlapping read which the transport would reject with a pending-read error.
-                return 0;
+                return new IncomingChunkResult(0, false);
             }
 
             $this->readInProgress = true;
@@ -1368,14 +1380,14 @@ final class NatsConnection
                     $this->recoverConnection();
                 }
 
-                return 0;
+                return new IncomingChunkResult(0, false);
             } finally {
                 $this->readInProgress = false;
                 $this->signalReadSlotFree();
             }
 
             if ($chunk === '') {
-                return 0;
+                return new IncomingChunkResult(0, false);
             }
 
             try {
@@ -1412,7 +1424,9 @@ final class NatsConnection
                     $this->recoverConnection();
                 }
 
-                return count($recovered);
+                // A non-empty chunk was read and pushed, so bytes were consumed even though the
+                // parse failed partway - the caller made wire progress and should not idle-sleep.
+                return new IncomingChunkResult(count($recovered), true);
             }
 
             // Note: the outstanding-ping counter is reset only when an actual PONG is handled (see
@@ -1450,8 +1464,28 @@ final class NatsConnection
                 throw $dispatchError;
             }
 
-            return count($frames);
+            // Bytes were consumed off the wire this read (the chunk was non-empty); $frames may still
+            // be 0 when a large frame spans several chunks and this one did not complete it (#119).
+            return new IncomingChunkResult(count($frames), true);
         });
+    }
+
+    /**
+     * Reads one transport chunk, parses frames, and dispatches message callbacks, returning the
+     * number of complete frames dispatched. Frame-count-only view of {@see readIncoming()} (whose
+     * result also reports whether bytes were consumed); its contract is unchanged (#119).
+     *
+     * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read,
+     *                                        so a timed-out caller does not orphan an in-flight read.
+     * @return Future<int>
+     *
+     * @phpstan-impure Mutates connection state (e.g. completes queued pong slots / resets
+     *                 outstandingPings via handled frames), so callers must not assume remembered
+     *                 property values persist.
+     */
+    public function processIncoming(?Cancellation $cancellation = null): Future
+    {
+        return $this->readIncoming($cancellation)->map(static fn(IncomingChunkResult $result): int => $result->frames);
     }
 
     /**
@@ -1628,7 +1662,7 @@ final class NatsConnection
                 }
 
                 try {
-                    $frames = $this->processIncoming($waitCancellation)->await();
+                    $read = $this->readIncoming($waitCancellation)->await();
                 } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
                         throw $e;
@@ -1640,8 +1674,10 @@ final class NatsConnection
                     continue;
                 }
 
-                if ($frames === 0) {
-                    // No data available from transport; yield to avoid a tight spin.
+                if (!$read->consumedBytes) {
+                    // No data available from transport (genuinely idle read); yield to avoid a tight
+                    // spin. A read that consumed bytes but did not complete the reply frame yet loops
+                    // immediately - the rest is already buffered, so no 1 ms sleep per chunk (#119).
                     delay(0.001);
                 }
             }
@@ -1813,7 +1849,7 @@ final class NatsConnection
                 }
 
                 try {
-                    $frames = $this->processIncoming($sliceCancellation)->await();
+                    $read = $this->readIncoming($sliceCancellation)->await();
                 } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
                         throw $e;
@@ -1824,7 +1860,10 @@ final class NatsConnection
                     continue;
                 }
 
-                if ($frames === 0) {
+                if (!$read->consumedBytes) {
+                    // Genuinely idle read: yield to avoid a tight spin. A read that consumed bytes but
+                    // completed no reply frame yet loops immediately - the rest of a chunked reply is
+                    // already buffered, so no 1 ms sleep is paid per partial chunk (#119).
                     delay(0.001);
                 }
             }

@@ -52,6 +52,13 @@ final class NatsOptionsTest extends TestCase
         new NatsOptions(reconnectDelayMs: -1);
     }
 
+    public function testRejectsNonPositiveReadChunkSize(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('readChunkSizeBytes');
+        new NatsOptions(readChunkSizeBytes: 0);
+    }
+
     public function testAllowsDisabledHeartbeatAndEmptyServers(): void
     {
         // pingIntervalSeconds <= 0 disables the heartbeat, maxPingsOut 0 is aggressive-but-valid, and
@@ -113,5 +120,6 @@ final class NatsOptionsTest extends TestCase
         self::assertSame([], $options->webSocketHeaders);
         self::assertFalse($options->webSocketCompression);
         self::assertNull($options->logger);
+        self::assertSame(131072, $options->readChunkSizeBytes);
     }
 }

@@ -9,6 +9,7 @@ use Amp\Future;
 use Amp\Socket\Certificate;
 use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
+use Amp\Socket\ResourceSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
@@ -60,11 +61,31 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
             $this->tlsContextConfigured = $context->getTlsContext() !== null;
 
             $this->socket = connect($this->normalizeSocketUri($dsn), $context);
+            $this->applyReadChunkSize();
 
             if ($this->tlsContextConfigured && $this->options->tlsHandshakeFirst) {
                 $this->establishTls();
             }
         });
+    }
+
+    /**
+     * Raises the socket read chunk size to the configured value (default 128 KiB, up from Amp's 8 KiB
+     * default) so a large inbound payload arrives in far fewer chunks, dividing the per-chunk syscall +
+     * fiber-spawn + parser-push overhead 8-32x (#119). A no-op for a Socket implementation that is not
+     * a ResourceSocket, since setChunkSize is not on the Socket interface. This raises only the MAXIMUM
+     * a read may return; the socket still returns just what is available, so small messages are
+     * unaffected.
+     */
+    private function applyReadChunkSize(): void
+    {
+        $chunkSize = $this->options->readChunkSizeBytes;
+        // setChunkSize only exists on ResourceSocket (not the Socket interface), hence the type check.
+        // The `> 0` also narrows int to int<1, max> for setChunkSize()'s signature; NatsOptions already
+        // rejects a non-positive readChunkSizeBytes, so the branch is never false in practice.
+        if ($this->socket instanceof ResourceSocket && $chunkSize > 0) {
+            $this->socket->setChunkSize($chunkSize);
+        }
     }
 
     /**
