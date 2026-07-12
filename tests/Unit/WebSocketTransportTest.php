@@ -692,17 +692,19 @@ final class WebSocketTransportTest extends TestCase
     public function testReadLineReturnsSameChunkDataThenDefersFragmentationViolation(): void
     {
         $payload = "MSG orders 1 5\r\nhello\r\n";
-        // A complete data message, then a fragment start, then a new data frame while fragmenting -
-        // all three coalesced into one read (as a graceful-then-buggy server could deliver them).
+        // A complete data message, then a fragment start, then a COMPLETE data frame while fragmenting
+        // (fin: true, so removing the deferring `return $out` would wrongly deliver its payload here -
+        // this pins the return, not just the branch). All coalesced into one read.
         $chunk = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, $payload, fin: true)
             . $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'PA', fin: false)
-            . $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'RT', fin: false);
+            . $this->serverFrame(WebSocketFrameCodec::OP_BINARY, "MSG orders 1 4\r\nleak\r\n", fin: true);
         $socket = new ScriptedChunkSocket([$chunk]);
 
         $transport = new WebSocketTransport(new NatsOptions());
         (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
 
-        // The complete message decoded from the shared chunk is returned, not discarded by the violation.
+        // Only the complete message before the fragmentation is returned; the mid-fragmentation frame's
+        // payload must NOT be appended (the violation defers before it is delivered).
         self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
 
         // The violation is surfaced on the NEXT readLine (deferred), and it is the protocol error - not
