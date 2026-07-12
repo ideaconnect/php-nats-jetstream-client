@@ -1139,7 +1139,20 @@ final class JetStreamContext
             // and no recreate storm. A failed recreate (stream pruned/deleted, leadership change,
             // transient timeout) is CONTAINED here so it cannot throw out of the shared subscription
             // dispatch loop and abort delivery for every other subscription on the connection.
-            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, $stream, $deliver, $filterSubject): void {
+            // The watchdog (armed below) and the dispatch handler both trigger $recreate; $state carries
+            // the in-flight guard that serializes them, so it is built before $recreate for the closure
+            // to capture. See HeartbeatWatchdogState::$recreateInFlight for the race this closes (#113).
+            $state = new HeartbeatWatchdogState(hrtime(true));
+
+            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, $stream, $deliver, $filterSubject, $state): void {
+                if ($state->recreateInFlight) {
+                    // A recreate is already running (on the dispatch fiber or the watchdog fiber); it
+                    // resumes from the current lastStreamSeq+1, covering this trigger too. A second
+                    // concurrent CONSUMER.CREATE would orphan an ephemeral consumer, so no-op (#113).
+                    return;
+                }
+                $state->recreateInFlight = true;
+
                 $consumerOptions['deliver_policy'] = 'by_start_sequence';
                 $consumerOptions['opt_start_seq'] = $lastStreamSeq + 1;
 
@@ -1162,6 +1175,13 @@ final class JetStreamContext
                             $consumerName = $consumer->name;
                             $expectedConsumerSeq = 1;
                             $ackParseErrorEmitted = false;
+                            // Re-arm the watchdog for the NEW consumer: the watchdog sets the miss latch
+                            // before invoking onMiss and only an inbound frame's touch() clears it, so a
+                            // replacement reaped again before its first heartbeat would leave the latch
+                            // stuck and the watchdog wedged. Clear it and rebase the silence clock from
+                            // now, when the new consumer is live; the in-flight guard prevents a storm (#113).
+                            $state->notified = false;
+                            $state->lastActivityNs = hrtime(true);
 
                             return;
                         } catch (\Throwable $e) {
@@ -1185,6 +1205,10 @@ final class JetStreamContext
                         (int) $e->getCode(),
                         $e,
                     ));
+                } finally {
+                    // Always release the guard - on the success return, the retry-exhausted throw, or a
+                    // teardown cancellation - so a legitimately-needed later recreate is never blocked (#113).
+                    $state->recreateInFlight = false;
                 }
             };
 
@@ -1192,7 +1216,6 @@ final class JetStreamContext
             // two intervals pass with no frame - the missed-heartbeat monitor nats.go's ordered.go runs
             // to detect a server-side consumer that was reaped/restarted/lost interest, which the gap
             // logic above can never see because it only runs when a frame arrives (#113).
-            $state = new HeartbeatWatchdogState(hrtime(true));
             $state->onMiss = $recreate;
 
             $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$ackParseErrorEmitted, $stream, $recreate, $state): void {

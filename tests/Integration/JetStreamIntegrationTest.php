@@ -12,6 +12,8 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
+use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\JetStream\ObjectStore\ObjectData;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\Tests\Support\DroppingTransport;
@@ -1233,6 +1235,61 @@ final class JetStreamIntegrationTest extends TestCase
 
         $client->unsubscribe($sid)->await();
         $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies the idle-heartbeat watchdog (#113) surfaces a "not active" error when a KV watch's
+     * server-side consumer disappears. The default KV watch previously requested no idle heartbeat, so
+     * total silence was indistinguishable from an idle stream and a reaped watch consumer hung forever;
+     * the watch now requests a heartbeat, arming the push watchdog. Deleting the watch consumer
+     * out-of-band stands in for an inactive_threshold reap - the deliver inbox is left with no producer
+     * and no heartbeat - and the watchdog must notice the silence and notify the error listener.
+     */
+    public function testJetStreamKeyValueWatchWatchdogSurfacesErrorOnReapedConsumer(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $bucket = 'wd' . strtolower(bin2hex(random_bytes(3)));
+        $errors = [];
+        $client = new NatsClient(new NatsOptions(
+            servers: [$this->integrationServerUrl()],
+            errorListener: static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e;
+            },
+        ));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $kv = $js->keyValue($bucket);
+        $kv->create()->await();
+
+        // 150 ms heartbeat -> the watchdog surfaces a stall after ~300 ms of silence.
+        $sid = $kv->watch(
+            static function (KeyValueEntry $entry): void {},
+            '>',
+            new KeyWatchOptions(idleHeartbeat: 150_000_000),
+        )->await();
+
+        // Reap the watch consumer server-side (before its first heartbeat), standing in for a reap: the
+        // deliver inbox now has no producer and no heartbeat.
+        $names = $js->consumerNames($kv->streamName())->await();
+        self::assertCount(1, $names, 'the watch consumer must be the only consumer on the KV stream');
+        $js->deleteConsumer($kv->streamName(), $names[0])->await();
+
+        // The watchdog fires on its own EventLoop timer (no processIncoming pump needed); drive the loop
+        // until it surfaces the stall or a monotonic deadline elapses.
+        $deadlineNs = hrtime(true) + 10_000_000_000;
+        while ($errors === [] && hrtime(true) < $deadlineNs) {
+            delay(0.05);
+        }
+
+        self::assertNotSame([], $errors, 'a reaped KV watch consumer must surface a stall error via the watchdog');
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertStringContainsString('not active', $errors[0]->getMessage());
+
+        $client->unsubscribe($sid)->await();
+        $kv->deleteBucket()->await();
         $client->disconnect()->await();
     }
 

@@ -34,6 +34,11 @@ final class KeyWatchOptions
      *                                          pending (empty / no-match bucket), in which case it fires
      *                                          immediately without any delivery (#99). Mirrors the
      *                                          reference "end of initial data" signal.
+     * @param int|null      $idleHeartbeat      Idle-heartbeat interval in nanoseconds the watch consumer
+     *                                          requests, driving the missed-heartbeat watchdog so a silent
+     *                                          or reaped watch surfaces an error instead of hanging forever
+     *                                          (#113). Null uses {@see KeyValueBucket::WATCH_IDLE_HEARTBEAT_NS}.
+     *                                          Must be a positive integer.
      */
     public function __construct(
         public readonly bool $includeHistory = false,
@@ -42,7 +47,12 @@ final class KeyWatchOptions
         public readonly bool $metaOnly = false,
         public readonly ?int $resumeFromRevision = null,
         public readonly ?\Closure $onCaughtUp = null,
-    ) {}
+        public readonly ?int $idleHeartbeat = null,
+    ) {
+        if ($idleHeartbeat !== null && $idleHeartbeat <= 0) {
+            throw new \InvalidArgumentException('idleHeartbeat must be a positive integer (nanoseconds)');
+        }
+    }
 
     /**
      * Resolves the consumer config fragment (deliver policy + headers-only) implied by these options.
@@ -66,6 +76,10 @@ final class KeyWatchOptions
 
         if ($this->metaOnly) {
             $config['headers_only'] = true;
+        }
+
+        if ($this->idleHeartbeat !== null) {
+            $config['idle_heartbeat'] = $this->idleHeartbeat;
         }
 
         return $config;

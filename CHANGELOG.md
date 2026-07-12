@@ -36,7 +36,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   recreate/error storm; a failed recreate falls back to the existing bounded-retry + error-listener
   path), and holds the connection weakly and self-cancels the moment its subscription is torn down,
   so it never leaks a timer or roots an abandoned connection (mirroring the #126 ping timer).
-  `subscribeOrderedConsumer()` gains an optional `idleHeartbeatNs` argument to tune the interval.
+  `subscribeOrderedConsumer()` gains an optional `idleHeartbeatNs` argument to tune the interval, and
+  KV watchers now request a default idle heartbeat too (tunable via the new
+  `KeyWatchOptions::$idleHeartbeat`), so a silent or reaped watch surfaces a "not active" error instead
+  of hanging forever - previously the default KV watch requested no idle heartbeat, so total silence
+  was indistinguishable from an idle stream and no watchdog armed. The ordered-consumer recreate is
+  serialized by an in-flight guard so the dispatch-handler (sequence-gap / tail-gap) and watchdog-timer
+  paths cannot both drive a recreate at once and orphan a transient ephemeral consumer, and a
+  successful recreate clears the miss latch and rebases the silence clock so the watchdog re-arms for
+  the new consumer - a replacement reaped again before its first heartbeat is recovered rather than
+  leaving the watchdog wedged. The watchdog also rebases (and neither fires nor cancels) while the
+  connection is mid-reconnect, so it survives a transient reconnect.
 - `[bugfix]` `flush()`, `drain()`, `drainSubscription()`, and `rtt()` now correlate PONGs to
   their PINGs through a FIFO slot queue (nats.go `nc.pongs` parity) instead of shared booleans
   that ANY PONG cleared (#117). Previously a stale PONG - one answering an earlier heartbeat

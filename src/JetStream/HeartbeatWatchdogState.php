@@ -28,6 +28,18 @@ final class HeartbeatWatchdogState
     /** True once the current silence episode has been surfaced; cleared by the next inbound frame. */
     public bool $notified = false;
 
+    /**
+     * True while a recreate is in flight, serializing the two fibers that can trigger one for an ordered
+     * consumer - the message-dispatch handler (sequence-gap / tail-gap) and the watchdog timer (onMiss).
+     * The dispatch handler is serialized against itself by NatsConnection's per-sid dispatch guard, but
+     * the watchdog runs in its own timer fiber the per-sid guard does not cover, so without this flag a
+     * frame arriving after the watchdog computed opt_start_seq (from a now-stale lastStreamSeq) but
+     * before its first await could drive a second concurrent CONSUMER.CREATE and orphan an ephemeral
+     * consumer. Only the ordered recreate closure reads/writes it (the caller-owned push path never
+     * recreates); it must be cleared in a finally so a legitimately-needed later recreate is not blocked.
+     */
+    public bool $recreateInFlight = false;
+
     public function __construct(public int $lastActivityNs)
     {
         $this->onMiss = static function (): void {};

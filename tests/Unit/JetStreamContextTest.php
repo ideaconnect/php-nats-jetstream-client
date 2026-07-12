@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Unit;
 
 use DateTimeImmutable;
 use DateTimeZone;
+use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -4333,6 +4334,187 @@ final class JetStreamContextTest extends TestCase
             delay(0.01);
         }
         self::assertSame($before, self::countRepeatTimers(), 'the watchdog timer must be cancelled after unsubscribe (no leaked timer)');
+
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies the ordered-consumer recreate is serialized across the two fibers that can trigger it -
+     * the message-dispatch handler (sequence-gap / tail-gap) and the watchdog timer (onMiss) - so a
+     * concurrent trigger cannot drive a SECOND CONSUMER.CREATE and orphan an ephemeral consumer (#113).
+     *
+     * The dispatch handler is serialized against itself by NatsConnection's per-sid dispatch guard, but
+     * the watchdog runs in its own timer fiber that the per-sid guard does not cover. Here the watchdog
+     * fires the first recreate on a silent transport; the instant that recreate writes its DELETE.ORD1
+     * (and parks on a never-answered delete reply) a gap-bearing delivery for the still-current ORD1 is
+     * fed, which the dispatch handler turns into a second recreate. With an in-flight-recreate guard the
+     * second trigger is a no-op, so ORD1 is deleted exactly once; without it ORD1 is deleted twice and a
+     * second consumer is created and orphaned. Falsifiable: this fails (two DELETE.ORD1) against a build
+     * with no in-flight guard.
+     */
+    public function testSubscribeOrderedConsumerWatchdogAndGapRecreateDoNotRunConcurrently(): void
+    {
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        // A gap delivery for consumer ORD1: consumer seq 5 != expected 1 -> the dispatch handler calls
+        // recreate(). Tokens: num_delivered=5, stream_seq=5, consumer_seq=5.
+        $gapFrame = "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.5.5.5.0.0 4\r\ngap5\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+        ], blockWhenEmpty: true);
+        // Feed the gap frame only once the watchdog recreate has written its DELETE.ORD1 - i.e. while
+        // that recreate is suspended on its delete await (no delete reply is enqueued, so it stays
+        // parked). That is exactly the window in which a concurrent second recreate must be suppressed.
+        $transport->enqueueOnWriteContaining = [
+            '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [$gapFrame],
+        ];
+
+        $errors = [];
+        // Short request timeout so the parked delete/create fall through quickly for clean teardown.
+        $options = new NatsOptions(requestTimeoutMs: 200, pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 30 ms heartbeat -> the watchdog fires the first recreate after ~60 ms of silence.
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+
+        // Allow ample time for a bug's SECOND DELETE.ORD1 to appear before asserting it did not.
+        $deadlineNs = hrtime(true) + 1_500_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORD1') < 2 && hrtime(true) < $deadlineNs) {
+            delay(0.02);
+        }
+
+        $written = implode('', $transport->writes);
+        $client->disconnect()->await();
+
+        self::assertSame(
+            1,
+            substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'),
+            'a recreate already in flight must suppress the concurrent trigger (exactly one DELETE.ORD1, no orphaned consumer)',
+        );
+    }
+
+    /**
+     * Verifies a successful ordered recreate re-arms the watchdog for the NEW consumer (#113). The
+     * watchdog sets its miss latch before invoking onMiss and only an inbound frame's touch() clears it,
+     * so a recreate that succeeds but is then re-reaped before its first heartbeat would leave the latch
+     * stuck and the watchdog wedged forever. Here the first (watchdog) recreate is answered so it
+     * succeeds (ORD1 -> ORD2); ORD2 then also stays silent. A watchdog that clears the latch on a
+     * successful recreate fires again and deletes ORD2 too; a wedged one never touches ORD2. Falsifiable:
+     * this fails (no DELETE.ORD2) against a build that does not clear the latch on a successful recreate.
+     */
+    public function testSubscribeOrderedConsumerWatchdogRefiresAfterSuccessfulRecreate(): void
+    {
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
+        ], blockWhenEmpty: true);
+        // Answer the first (watchdog) recreate's DELETE.ORD1 (request sid 3) and its by_start_sequence
+        // CREATE (request sid 4) so it SUCCEEDS, leaving ORD2 live. The second recreate's DELETE.ORD2 is
+        // intentionally never answered - its presence on the wire is all this test needs.
+        $transport->enqueueOnWriteContaining = [
+            '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply)],
+            'by_start_sequence' => [sprintf("MSG _INBOX.c 4 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
+        ];
+
+        $errors = [];
+        $options = new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 30 ms heartbeat -> ~60 ms silence threshold.
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+
+        // Wait for the SECOND recreate (of the still-silent ORD2), which only happens if the successful
+        // first recreate re-armed the watchdog.
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORD2') < 1 && hrtime(true) < $deadlineNs) {
+            delay(0.02);
+        }
+
+        $written = implode('', $transport->writes);
+        $client->disconnect()->await();
+
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the first watchdog recreate must delete ORD1 exactly once');
+        self::assertGreaterThanOrEqual(
+            1,
+            substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD2'),
+            'a successful recreate must re-arm the watchdog so a re-reaped consumer (ORD2) is recreated again',
+        );
+    }
+
+    /**
+     * Verifies the watchdog rebases its clock and neither fires nor cancels while the connection is
+     * mid-reconnect (state Connecting), so it survives a transient reconnect (#113). No frame can arrive
+     * during a reconnect and the consumer is not the culprit, so recreating or cancelling would be
+     * wrong. Pins the ordering of armHeartbeatWatchdog's Closed / isSubscriptionActive / not-Open checks
+     * against a future reorder. The connection is forced into Connecting via reflection (a real
+     * reconnect cannot be driven deterministically in a unit test); the subscription stays registered,
+     * so isSubscriptionActive remains true.
+     */
+    public function testSubscribeOrderedConsumerWatchdogSurvivesTransientReconnect(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+        ], blockWhenEmpty: true);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $before = self::countRepeatTimers();
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+        self::assertSame($before + 1, self::countRepeatTimers(), 'subscribing an ordered consumer must arm exactly one watchdog timer');
+
+        // Force the connection into a mid-reconnect state; the subscription stays registered.
+        $connection = (new \ReflectionProperty(NatsClient::class, 'connection'))->getValue($client);
+        self::assertIsObject($connection);
+        $stateProp = new \ReflectionProperty($connection::class, 'state');
+        $stateProp->setValue($connection, ConnectionState::Connecting);
+
+        // Let several 30 ms intervals elapse well past the 2-interval (60 ms) miss threshold.
+        $deadlineNs = hrtime(true) + 300_000_000;
+        while (hrtime(true) < $deadlineNs) {
+            delay(0.02);
+        }
+
+        $written = implode('', $transport->writes);
+        // Restore Open BEFORE asserting so a failed assertion cannot leave the connection un-teardownable.
+        $stateProp->setValue($connection, ConnectionState::Open);
+
+        self::assertSame(0, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'), 'the watchdog must not recreate during a reconnect');
+        self::assertSame([], $errors, 'the watchdog must not surface a stall during a reconnect');
+        self::assertSame($before + 1, self::countRepeatTimers(), 'the watchdog timer must survive a transient reconnect (rebase, not cancel)');
 
         $client->disconnect()->await();
     }
