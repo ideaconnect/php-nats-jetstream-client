@@ -1332,6 +1332,13 @@ final class JetStreamContext
                         }
                     }
                     $state->deliverSid = null;
+
+                    // Terminal teardown: the consumer is dead for good, so cancel the watchdog timer now
+                    // rather than leaving it to self-cancel once it notices the sid is gone (#122).
+                    if ($state->watchdogTimerId !== null) {
+                        EventLoop::cancel($state->watchdogTimerId);
+                        $state->watchdogTimerId = null;
+                    }
                 } finally {
                     // Always release the guard - on the success return, the retry-exhausted throw, or a
                     // teardown cancellation - so a legitimately-needed later recreate is never blocked (#113).
@@ -2339,7 +2346,14 @@ final class JetStreamContext
         $weakClient = \WeakReference::create($this->client);
         $weakState = \WeakReference::create($state);
 
-        EventLoop::repeat($intervalSeconds, static function (string $timerId) use ($weakClient, $weakState, $sid, $missThresholdNs): void {
+        // A rotation (#122) arms a new timer for the new deliver sid; cancel the prior one explicitly
+        // rather than waiting for its self-cancel tick, so a timer for a stale sid cannot linger if the
+        // old inbox's best-effort UNSUB failed while the connection stayed Open.
+        if ($state->watchdogTimerId !== null) {
+            EventLoop::cancel($state->watchdogTimerId);
+        }
+
+        $state->watchdogTimerId = EventLoop::repeat($intervalSeconds, static function (string $timerId) use ($weakClient, $weakState, $sid, $missThresholdNs): void {
             $client = $weakClient->get();
             $state = $weakState->get();
             if ($client === null || $state === null) {
@@ -2354,6 +2368,9 @@ final class JetStreamContext
             if ($connectionState === ConnectionState::Closed || !$client->isSubscriptionActive($sid)) {
                 // Torn down (disconnect/drain, or unsubscribe): the subscription is gone for good.
                 EventLoop::cancel($timerId);
+                if ($state->watchdogTimerId === $timerId) {
+                    $state->watchdogTimerId = null;
+                }
 
                 return;
             }

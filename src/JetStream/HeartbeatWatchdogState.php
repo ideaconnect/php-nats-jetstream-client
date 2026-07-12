@@ -48,6 +48,14 @@ final class HeartbeatWatchdogState
      */
     public ?int $deliverSid = null;
 
+    /**
+     * The EventLoop id of the currently-armed watchdog timer, so a deliver-inbox rotation (#122) or a
+     * teardown can cancel it explicitly instead of relying on its next self-cancel tick - which would
+     * otherwise keep ticking if the old inbox's best-effort UNSUB failed while the connection stayed
+     * Open. Null when no timer is armed.
+     */
+    public ?string $watchdogTimerId = null;
+
     public function __construct(public int $lastActivityNs)
     {
         $this->onMiss = static function (): void {};
