@@ -9877,4 +9877,279 @@ final class NatsConnectionTest extends TestCase
         self::assertCount(1, $discardMessages, 'discarding parsed inbound backlog at terminal close must surface via the error listener');
         self::assertStringContainsString('3', implode('', $discardMessages), 'the discarded inbound count must be named');
     }
+
+    private const HANDSHAKE_INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
+    /**
+     * publishHeaderBlock() validates every message's subject up front: an invalid subject must abort the
+     * whole block with a ProtocolException before any bytes are written (line 981 validation call).
+     */
+    public function testPublishHeaderBlockValidatesEverySubject(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $this->expectException(ProtocolException::class);
+
+        $connection->publishHeaderBlock([
+            ['subject' => 'bad subject', 'payload' => 'x', 'headers' => ['h' => 'v']],
+        ])->await();
+    }
+
+    /**
+     * publishHeaderBlock() flushes a coalesced segment BEFORE appending a frame would overflow the
+     * PUBLISH_BLOCK_SEGMENT_BYTES cap, so a block larger than the cap becomes several segment writes
+     * rather than one giant write (line 999 flush-before-overflow condition).
+     */
+    public function testPublishHeaderBlockSplitsSegmentsAtCap(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        // Each payload is > half the 512 KiB segment cap, so any two frames together exceed it: the
+        // three-message block must be emitted as three separate segment writes.
+        $payload = str_repeat('x', 300 * 1024);
+        $connection->publishHeaderBlock([
+            ['subject' => 'a.b', 'payload' => $payload, 'headers' => ['h' => 'v']],
+            ['subject' => 'a.b', 'payload' => $payload, 'headers' => ['h' => 'v']],
+            ['subject' => 'a.b', 'payload' => $payload, 'headers' => ['h' => 'v']],
+        ])->await();
+
+        $hpubWrites = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'HPUB'));
+        self::assertCount(3, $hpubWrites, 'an over-cap block must split into one segment write per frame');
+    }
+
+    /**
+     * publishHeaderBlock() records outbound traffic once per message in the block (writePublishSegment's
+     * per-payload recordOutbound loop, lines 1025-1026): statistics must advance by the message count and
+     * total payload bytes.
+     */
+    public function testPublishHeaderBlockRecordsOutboundPerMessage(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $before = $connection->statistics();
+        $connection->publishHeaderBlock([
+            ['subject' => 'a.b', 'payload' => 'hello', 'headers' => ['h' => 'v']],
+            ['subject' => 'a.b', 'payload' => 'world!', 'headers' => ['h' => 'v']],
+        ])->await();
+        $after = $connection->statistics();
+
+        self::assertSame($before->outMsgs + 2, $after->outMsgs, 'both block messages must be counted outbound');
+        self::assertSame($before->outBytes + 11, $after->outBytes, 'payload bytes of both messages must be counted');
+    }
+
+    /**
+     * unsubscribe() on a sid that was never registered must be a no-op: the early return skips the UNSUB
+     * write, so an unknown sid never emits a spurious UNSUB to the server (line 1196 guard).
+     */
+    public function testUnsubscribeUnknownSidWritesNoUnsub(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+
+        $connection->unsubscribe(999)->await();
+
+        self::assertStringNotContainsString('UNSUB 999', implode('', $transport->writes));
+    }
+
+    /**
+     * An authorization failure during connect must release the transport socket (closeTransportBestEffort)
+     * before the AuthenticationException propagates, so the fd is not pinned until GC (line 539, #133).
+     */
+    public function testConnectAuthFailureClosesTransport(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "-ERR Authorization Violation\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+
+        try {
+            $connection->connect()->await();
+            self::fail('expected AuthenticationException');
+        } catch (\IDCT\NATS\Exception\AuthenticationException) {
+            // expected
+        }
+
+        self::assertTrue($transport->closed, 'auth failure must close the transport socket (#133)');
+    }
+
+    /**
+     * The terminal-close inbound-discard report SUMS every subscription's queued backlog, not just the
+     * last one: two subscriptions holding 2 and 3 undelivered messages must be named as 5 discarded
+     * (line 661 accumulation).
+     */
+    public function testTerminalCloseSumsDiscardedInboundBacklogAcrossSubscriptions(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n", FakeTransport::EOF]);
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                connectTimeoutMs: 50,
+                errorListener: static function (\Throwable $error) use (&$errors): void {
+                    $errors[] = $error;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $sid1 = $connection->subscribe('foo', static fn(): null => null)->await();
+        $sid2 = $connection->subscribe('bar', static fn(): null => null)->await();
+
+        /** @var array<int, \SplQueue<NatsMessage>> $pending */
+        $pending = (new \ReflectionProperty(NatsConnection::class, 'pendingMessages'))->getValue($connection);
+        $pending[$sid1]->enqueue(new NatsMessage('foo', $sid1, null, 'm1'));
+        $pending[$sid1]->enqueue(new NatsMessage('foo', $sid1, null, 'm2'));
+        $pending[$sid2]->enqueue(new NatsMessage('bar', $sid2, null, 'm3'));
+        $pending[$sid2]->enqueue(new NatsMessage('bar', $sid2, null, 'm4'));
+        $pending[$sid2]->enqueue(new NatsMessage('bar', $sid2, null, 'm5'));
+
+        try {
+            $connection->processIncoming()->await();
+        } catch (\Throwable) {
+            // terminal 'Reconnect attempts exhausted' is expected
+        }
+
+        $discardMessages = array_filter(
+            $errors,
+            static fn(\Throwable $error): bool => str_contains($error->getMessage(), 'inbound message(s) were discarded'),
+        );
+        self::assertCount(1, $discardMessages);
+        self::assertStringContainsString(
+            '5 parsed inbound message',
+            implode('', array_map(static fn(\Throwable $e): string => $e->getMessage(), $discardMessages)),
+            'the discarded inbound count must be the SUM across all subscription queues',
+        );
+    }
+
+    /**
+     * hasUndeliveredDrainBacklog() must report backlog while a dispatch loop is suspended mid-delivery
+     * (dispatchingSids non-empty) even when no sid queue is dirty: drain() relies on this to wait for the
+     * suspended loop rather than tearing down early (line 826 early return true).
+     */
+    public function testHasUndeliveredDrainBacklogTrueWhileDispatchInFlight(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        (new \ReflectionProperty(NatsConnection::class, 'dispatchingSids'))->setValue($connection, [7 => true]);
+        (new \ReflectionProperty(NatsConnection::class, 'pendingDirty'))->setValue($connection, []);
+
+        $method = new \ReflectionMethod(NatsConnection::class, 'hasUndeliveredDrainBacklog');
+        self::assertTrue($method->invoke($connection), 'an in-flight dispatch must count as undelivered backlog');
+    }
+
+    /**
+     * countUndeliveredDrainBacklog() sums the messages buffered across EVERY sid queue - the loud
+     * deadline-exceeded discard count depends on this total, not on any single queue (line 845 accumulation).
+     */
+    public function testCountUndeliveredDrainBacklogSumsAllQueues(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        /** @var \SplQueue<NatsMessage> $q1 */
+        $q1 = new \SplQueue();
+        $q1->enqueue(new NatsMessage('foo', 1, null, 'a'));
+        $q1->enqueue(new NatsMessage('foo', 1, null, 'b'));
+
+        /** @var \SplQueue<NatsMessage> $q2 */
+        $q2 = new \SplQueue();
+        $q2->enqueue(new NatsMessage('bar', 2, null, 'c'));
+        $q2->enqueue(new NatsMessage('bar', 2, null, 'd'));
+        $q2->enqueue(new NatsMessage('bar', 2, null, 'e'));
+
+        (new \ReflectionProperty(NatsConnection::class, 'pendingMessages'))->setValue($connection, [1 => $q1, 2 => $q2]);
+
+        $method = new \ReflectionMethod(NatsConnection::class, 'countUndeliveredDrainBacklog');
+        self::assertSame(5, $method->invoke($connection), 'the backlog count must sum both queues (2 + 3)');
+    }
+
+    /**
+     * On reconnect, resubscribeAll() re-arms an auto-unsubscribe with the REMAINING allowance
+     * (max minus already-received), so a fresh SUB does not over-deliver past the original max. With no
+     * messages counted yet the remaining allowance equals the full max (line 2420 received-count subtraction).
+     */
+    public function testResubscribeAllReArmsAutoUnsubWithRemainingAllowance(): void
+    {
+        $transport = new FakeTransport();
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+
+        (new \ReflectionProperty(NatsConnection::class, 'state'))->setValue($connection, ConnectionState::Connecting);
+        (new \ReflectionProperty(NatsConnection::class, 'subscriptionMeta'))
+            ->setValue($connection, [5 => ['subject' => 'foo', 'queue' => null]]);
+        (new \ReflectionProperty(NatsConnection::class, 'autoUnsubMax'))->setValue($connection, [5 => 3]);
+        // receivedCounts left empty: nothing received yet, so the remaining allowance is the full max (3).
+
+        $method = new \ReflectionMethod(NatsConnection::class, 'resubscribeAll');
+        async(static fn(): mixed => $method->invoke($connection))->await();
+
+        $written = implode('', $transport->writes);
+        self::assertStringContainsString("SUB foo 5\r\n", $written, 'the subscription must be replayed');
+        self::assertStringContainsString("UNSUB 5 3\r\n", $written, 'auto-unsub must be re-armed with the remaining allowance (3)');
+    }
+
+    /**
+     * On reconnect, resubscribeAll() DROPS an auto-unsubscribe whose max has already been reached
+     * (remaining <= 0) instead of replaying it - re-SUBbing would over-deliver live messages past the
+     * intended max, so no SUB is written for that sid (line 2422 remaining-exhausted guard, #112).
+     */
+    public function testResubscribeAllDropsAutoUnsubAtExhaustedMax(): void
+    {
+        $transport = new FakeTransport();
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+
+        (new \ReflectionProperty(NatsConnection::class, 'state'))->setValue($connection, ConnectionState::Connecting);
+        (new \ReflectionProperty(NatsConnection::class, 'subscriptionMeta'))
+            ->setValue($connection, [5 => ['subject' => 'foo', 'queue' => null]]);
+        (new \ReflectionProperty(NatsConnection::class, 'autoUnsubMax'))->setValue($connection, [5 => 3]);
+        // The max (3) was already reached: remaining = 3 - 3 = 0, so the sid must be dropped, not replayed.
+        (new \ReflectionProperty(NatsConnection::class, 'receivedCounts'))->setValue($connection, [5 => 3]);
+
+        $method = new \ReflectionMethod(NatsConnection::class, 'resubscribeAll');
+        async(static fn(): mixed => $method->invoke($connection))->await();
+
+        self::assertStringNotContainsString('SUB foo', implode('', $transport->writes), 'an exhausted auto-unsub must not be re-SUBbed on reconnect');
+    }
+
+    /**
+     * discardPongSlot() removes ONLY the given slot from the pong-correlation queue, preserving every
+     * other queued waiter in order (lines 2686-2687): an unwritten PING drops its own slot without
+     * disturbing the slots owed a PONG.
+     */
+    public function testDiscardPongSlotRemovesOnlyTheGivenSlot(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        /** @var DeferredFuture<null> $slotA */
+        $slotA = new DeferredFuture();
+        /** @var DeferredFuture<null> $slotB */
+        $slotB = new DeferredFuture();
+        (new \ReflectionProperty(NatsConnection::class, 'pongWaiters'))->setValue($connection, [$slotA, $slotB]);
+
+        $method = new \ReflectionMethod(NatsConnection::class, 'discardPongSlot');
+        $method->invoke($connection, $slotA);
+
+        /** @var list<DeferredFuture<null>> $remaining */
+        $remaining = (new \ReflectionProperty(NatsConnection::class, 'pongWaiters'))->getValue($connection);
+        self::assertCount(1, $remaining, 'exactly the discarded slot is removed; the other waiter stays');
+        self::assertSame($slotB, $remaining[0], 'the surviving waiter must be the one that was not discarded');
+    }
+
+    /**
+     * inboundFrameBound() falls back to a generous 64 MiB frame ceiling when the server has not advertised
+     * a usable max_payload (serverInfo null), preserving headroom for large inbound frames (line 2915, #94).
+     */
+    public function testInboundFrameBoundFallsBackToSixtyFourMiB(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+
+        $method = new \ReflectionMethod(NatsConnection::class, 'inboundFrameBound');
+        self::assertSame(64 * 1024 * 1024, $method->invoke($connection), 'the no-max_payload fallback must be exactly 64 MiB');
+    }
 }
