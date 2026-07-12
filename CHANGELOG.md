@@ -15,7 +15,7 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.5.3] - 2026-07-12
 
 ### Fixed
 
