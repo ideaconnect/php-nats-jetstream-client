@@ -1009,6 +1009,17 @@ final class NatsConnection
     }
 
     /**
+     * Reports whether a subscription with the given sid is still registered. False once it has been
+     * dropped by unsubscribe/drain or a terminal close (which clears the registry). Used by the
+     * JetStream idle-heartbeat watchdog to self-cancel the moment the subscription it guards is torn
+     * down, so no timer outlives its subscription (#113).
+     */
+    public function isSubscriptionActive(int $sid): bool
+    {
+        return isset($this->subscriptions[$sid]);
+    }
+
+    /**
      * Registers a subscription callback and sends a SUB command.
      *
      * @param callable(NatsMessage):void $handler

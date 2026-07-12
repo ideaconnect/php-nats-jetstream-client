@@ -7,6 +7,7 @@ namespace IDCT\NATS\JetStream;
 use Amp\CancelledException;
 use Amp\Future;
 use Amp\TimeoutCancellation;
+use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -23,6 +24,7 @@ use IDCT\NATS\JetStream\Models\JsMessageMetadata;
 use IDCT\NATS\JetStream\Models\PubAck;
 use IDCT\NATS\JetStream\Models\StreamInfo;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
+use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
@@ -40,6 +42,13 @@ final class JetStreamContext
 
     /** Base backoff between ordered-consumer recreate attempts, in seconds (#114). */
     private const ORDERED_RECREATE_RETRY_DELAY_S = 0.05;
+
+    /**
+     * Default idle_heartbeat (ns) an ordered consumer requests (nats.go ordered.go parity). The
+     * missed-heartbeat watchdog fires a recreate when 2 x this elapse with no inbound frame (#113).
+     * Overridable per subscription via subscribeOrderedConsumer()'s $idleHeartbeatNs.
+     */
+    private const ORDERED_IDLE_HEARTBEAT_NS = 5_000_000_000;
 
     /**
      * Creates a JetStream API context bound to a NATS client.
@@ -1000,13 +1009,27 @@ final class JetStreamContext
 
             $this->createPushConsumer($stream, $consumer, $deliver, $filterSubject, $consumerOptions)->await();
 
-            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler): void {
+            // When the caller asked for idle heartbeats, guard the subscription: two silent intervals
+            // mean the caller-owned consumer stopped delivering (reaped/deleted/interest lost). The
+            // library cannot recreate a consumer it does not own, so it surfaces the stall (#113).
+            $idleHeartbeatNs = self::idleHeartbeatOf($consumerOptions);
+            $state = $idleHeartbeatNs !== null ? $this->pushWatchdogState($stream, sprintf('"%s"', $consumer)) : null;
+
+            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, $state): void {
+                $state?->touch();
+
                 if ($this->handlePushControlMessage($message)) {
                     return;
                 }
 
                 $handler($message);
             })->await();
+
+            if ($idleHeartbeatNs !== null && $state !== null) {
+                $this->armHeartbeatWatchdog($sid, $idleHeartbeatNs, $state);
+            }
+
+            return $sid;
         });
     }
 
@@ -1039,13 +1062,27 @@ final class JetStreamContext
                 $onConsumerCreated($consumer);
             }
 
-            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler): void {
+            // When the caller asked for idle heartbeats, guard the subscription: two silent intervals
+            // mean the ephemeral consumer was reaped/lost. The library does not own its lifecycle here
+            // (unlike an ordered consumer, which it recreates), so it surfaces the stall (#113).
+            $idleHeartbeatNs = self::idleHeartbeatOf($consumerOptions);
+            $state = $idleHeartbeatNs !== null ? $this->pushWatchdogState($stream, sprintf('"%s"', $consumer->name)) : null;
+
+            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, $state): void {
+                $state?->touch();
+
                 if ($this->handlePushControlMessage($message)) {
                     return;
                 }
 
                 $handler($message);
             })->await();
+
+            if ($idleHeartbeatNs !== null && $state !== null) {
+                $this->armHeartbeatWatchdog($sid, $idleHeartbeatNs, $state);
+            }
+
+            return $sid;
         });
     }
 
@@ -1059,10 +1096,16 @@ final class JetStreamContext
         string $stream,
         callable $handler,
         ?string $filterSubject = null,
+        ?int $idleHeartbeatNs = null,
     ): Future {
         self::assertValidJsName($stream, 'stream');
 
-        return async(function () use ($stream, $handler, $filterSubject): int {
+        if ($idleHeartbeatNs !== null && $idleHeartbeatNs <= 0) {
+            throw new \InvalidArgumentException('idleHeartbeatNs must be a positive integer (nanoseconds)');
+        }
+        $idleHeartbeatNs ??= self::ORDERED_IDLE_HEARTBEAT_NS;
+
+        return async(function () use ($stream, $handler, $filterSubject, $idleHeartbeatNs): int {
             $deliver = Inbox::generate('_INBOX.JS.ORD');
             // Ordered delivery is tracked by the CONSUMER sequence, which increments by one per
             // delivery even for a filtered consumer over a stream that also carries non-matching
@@ -1077,7 +1120,7 @@ final class JetStreamContext
 
             $consumerOptions = [
                 'flow_control' => true,
-                'idle_heartbeat' => 5_000_000_000,
+                'idle_heartbeat' => $idleHeartbeatNs,
                 'ack_policy' => 'none',
                 'max_deliver' => 1,
                 'mem_storage' => true,
@@ -1096,7 +1139,20 @@ final class JetStreamContext
             // and no recreate storm. A failed recreate (stream pruned/deleted, leadership change,
             // transient timeout) is CONTAINED here so it cannot throw out of the shared subscription
             // dispatch loop and abort delivery for every other subscription on the connection.
-            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, $stream, $deliver, $filterSubject): void {
+            // The watchdog (armed below) and the dispatch handler both trigger $recreate; $state carries
+            // the in-flight guard that serializes them, so it is built before $recreate for the closure
+            // to capture. See HeartbeatWatchdogState::$recreateInFlight for the race this closes (#113).
+            $state = new HeartbeatWatchdogState(hrtime(true));
+
+            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, $stream, $deliver, $filterSubject, $state): void {
+                if ($state->recreateInFlight) {
+                    // A recreate is already running (on the dispatch fiber or the watchdog fiber); it
+                    // resumes from the current lastStreamSeq+1, covering this trigger too. A second
+                    // concurrent CONSUMER.CREATE would orphan an ephemeral consumer, so no-op (#113).
+                    return;
+                }
+                $state->recreateInFlight = true;
+
                 $consumerOptions['deliver_policy'] = 'by_start_sequence';
                 $consumerOptions['opt_start_seq'] = $lastStreamSeq + 1;
 
@@ -1119,6 +1175,13 @@ final class JetStreamContext
                             $consumerName = $consumer->name;
                             $expectedConsumerSeq = 1;
                             $ackParseErrorEmitted = false;
+                            // Re-arm the watchdog for the NEW consumer: the watchdog sets the miss latch
+                            // before invoking onMiss and only an inbound frame's touch() clears it, so a
+                            // replacement reaped again before its first heartbeat would leave the latch
+                            // stuck and the watchdog wedged. Clear it and rebase the silence clock from
+                            // now, when the new consumer is live; the in-flight guard prevents a storm (#113).
+                            $state->notified = false;
+                            $state->lastActivityNs = hrtime(true);
 
                             return;
                         } catch (\Throwable $e) {
@@ -1142,10 +1205,25 @@ final class JetStreamContext
                         (int) $e->getCode(),
                         $e,
                     ));
+                } finally {
+                    // Always release the guard - on the success return, the retry-exhausted throw, or a
+                    // teardown cancellation - so a legitimately-needed later recreate is never blocked (#113).
+                    $state->recreateInFlight = false;
                 }
             };
 
-            return $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$ackParseErrorEmitted, $stream, $recreate): void {
+            // The ordered consumer always requests idle heartbeats, so the watchdog recreates it when
+            // two intervals pass with no frame - the missed-heartbeat monitor nats.go's ordered.go runs
+            // to detect a server-side consumer that was reaped/restarted/lost interest, which the gap
+            // logic above can never see because it only runs when a frame arrives (#113).
+            $state->onMiss = $recreate;
+
+            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$ackParseErrorEmitted, $stream, $recreate, $state): void {
+                // Every inbound frame - data, status-100 heartbeat, or flow-control - proves the consumer
+                // is alive; rearm the watchdog before any control handling so a heartbeating-but-quiet
+                // consumer is never falsely recreated (#113).
+                $state->touch();
+
                 if ($this->handlePushControlMessage($message, $controlHeaders)) {
                     // Tail-gap detection: an idle heartbeat reports the server's last delivered consumer
                     // sequence. If it is ahead of what we have processed in order, deliveries at the tail
@@ -1206,6 +1284,10 @@ final class JetStreamContext
                 $lastStreamSeq = $metadata->streamSequence;
                 $handler($message);
             })->await();
+
+            $this->armHeartbeatWatchdog($sid, $idleHeartbeatNs, $state);
+
+            return $sid;
         });
     }
 
@@ -2006,6 +2088,111 @@ final class JetStreamContext
         } catch (\Throwable) {
             // A throwing listener must never break dispatch.
         }
+    }
+
+    /**
+     * Extracts a positive-integer idle_heartbeat (ns) from consumer options, or null when absent or
+     * not a usable positive integer. A subscription only gets a heartbeat watchdog when the caller (or
+     * the ordered consumer) actually requested heartbeats (#113).
+     *
+     * @param array<string,mixed> $consumerOptions
+     */
+    private static function idleHeartbeatOf(array $consumerOptions): ?int
+    {
+        $value = $consumerOptions['idle_heartbeat'] ?? null;
+
+        return (is_int($value) && $value > 0) ? $value : null;
+    }
+
+    /**
+     * Builds a heartbeat-watchdog state for a caller-owned push consumer: on a missed-heartbeat episode
+     * it surfaces an ErrConsumerNotActive-style error through the error listener - the library cannot
+     * recreate a consumer whose lifecycle it does not own, so it makes the stall observable (#113).
+     */
+    private function pushWatchdogState(string $stream, string $consumerLabel): HeartbeatWatchdogState
+    {
+        $state = new HeartbeatWatchdogState(hrtime(true));
+        $state->onMiss = function () use ($stream, $consumerLabel): void {
+            $this->emitClientError(new JetStreamException(sprintf(
+                'Push consumer %s on stream "%s" is not active: no message or idle heartbeat for 2 x idle_heartbeat '
+                    . '(consumer reaped, deleted, or interest lost); the library cannot recreate a caller-owned consumer '
+                    . '- resubscribe or recreate it',
+                $consumerLabel,
+                $stream,
+            )));
+        };
+
+        return $state;
+    }
+
+    /**
+     * Arms a missed-heartbeat watchdog for a subscription that requested idle_heartbeat (#113).
+     *
+     * The server emits a status-100 idle heartbeat at least every $idleHeartbeatNs while the consumer
+     * lives, so a subscription that requested heartbeats yet sees NO inbound frame (data, heartbeat, or
+     * flow-control) for two intervals proves the consumer stopped delivering - reaped after an
+     * inactive_threshold lapse, a mem_storage R1 ordered-consumer restart, or an interest gap - which
+     * the sequence-gap logic can never observe because it only runs when a frame arrives (nats.go's
+     * ErrConsumerNotActive monitor). On a miss the watchdog rebases the activity clock and invokes
+     * $state->onMiss (recreate for ordered; error-listener notification for a caller-owned push) once
+     * per silence episode.
+     *
+     * The repeat timer holds the client and the activity state WEAKLY (mirroring the #126 ping timer)
+     * so it can never root an abandoned connection graph, and it self-cancels the moment the
+     * subscription it guards is dropped (unsubscribe/close), so no timer outlives its subscription.
+     */
+    private function armHeartbeatWatchdog(int $sid, int $idleHeartbeatNs, HeartbeatWatchdogState $state): void
+    {
+        $missThresholdNs = 2 * $idleHeartbeatNs;
+        $intervalSeconds = $idleHeartbeatNs / 1_000_000_000;
+        $weakClient = \WeakReference::create($this->client);
+        $weakState = \WeakReference::create($state);
+
+        EventLoop::repeat($intervalSeconds, static function (string $timerId) use ($weakClient, $weakState, $sid, $missThresholdNs): void {
+            $client = $weakClient->get();
+            $state = $weakState->get();
+            if ($client === null || $state === null) {
+                // The connection, or the subscription whose handler holds the only strong ref to
+                // $state, was released; stop guarding a subscription that no longer exists.
+                EventLoop::cancel($timerId);
+
+                return;
+            }
+
+            $connectionState = $client->state();
+            if ($connectionState === ConnectionState::Closed || !$client->isSubscriptionActive($sid)) {
+                // Torn down (disconnect/drain, or unsubscribe): the subscription is gone for good.
+                EventLoop::cancel($timerId);
+
+                return;
+            }
+
+            if ($connectionState !== ConnectionState::Open) {
+                // Mid-reconnect: no frame can arrive and the consumer is not the culprit. Rebase the
+                // activity clock so the silence window restarts once the connection is Open again.
+                $state->lastActivityNs = hrtime(true);
+
+                return;
+            }
+
+            if ($state->notified || hrtime(true) - $state->lastActivityNs < $missThresholdNs) {
+                // Still inside the window, or this silence episode was already surfaced: wait for a
+                // frame to clear the latch rather than fire onMiss every interval (no recreate/error
+                // storm, and a stale heartbeat from a just-recreated consumer clears the latch).
+                return;
+            }
+
+            // Two intervals of total silence. Rebase the clock and latch BEFORE invoking onMiss so a
+            // recreate that suspends cannot be re-entered by the next tick.
+            $state->lastActivityNs = hrtime(true);
+            $state->notified = true;
+
+            try {
+                ($state->onMiss)();
+            } catch (\Throwable) {
+                // onMiss (recreate/error emit) contains its own failures; guard the loop from escapes.
+            }
+        });
     }
 
     /**

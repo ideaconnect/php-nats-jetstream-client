@@ -48,6 +48,34 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `Closed` still throws (#146); pong-slot correlation (#117) and auto-unsubscribe counting (#112)
   are preserved.
 
+- `[bugfix]` JetStream push/ordered subscriptions now run an idle-heartbeat watchdog, so a consumer
+  that stops delivering is no longer silently dead forever (#113). An ordered consumer, and any push
+  consumer the caller created with `idle_heartbeat`, receives a status-100 heartbeat at least every
+  interval while it is alive; previously nothing noticed when those heartbeats STOPPED, so a
+  consumer reaped after an `inactive_threshold` lapse, a `mem_storage` R1 ordered-consumer restart,
+  or an interest gap left the client holding a live core subscription to a deliver inbox no consumer
+  would ever publish to again - no data, no heartbeat, no error, forever. The sequence-gap logic
+  could never catch this because it only runs when a frame arrives. A monotonic watchdog now fires
+  when no frame (data, heartbeat, or flow-control) has arrived for two heartbeat intervals: for an
+  ordered consumer it triggers the same recreate path the gap logic uses (resuming from the last
+  in-order point via `opt_start_seq`), matching nats.go's `ErrConsumerNotActive` monitor; for a
+  caller-owned push consumer, which the library cannot recreate, it surfaces a descriptive
+  "not active" error through the error listener. The watchdog rearms on every inbound frame (so a
+  quiet-but-alive consumer is never falsely recreated), fires at most once per silence episode (no
+  recreate/error storm; a failed recreate falls back to the existing bounded-retry + error-listener
+  path), and holds the connection weakly and self-cancels the moment its subscription is torn down,
+  so it never leaks a timer or roots an abandoned connection (mirroring the #126 ping timer).
+  `subscribeOrderedConsumer()` gains an optional `idleHeartbeatNs` argument to tune the interval, and
+  KV watchers now request a default idle heartbeat too (tunable via the new
+  `KeyWatchOptions::$idleHeartbeat`), so a silent or reaped watch surfaces a "not active" error instead
+  of hanging forever - previously the default KV watch requested no idle heartbeat, so total silence
+  was indistinguishable from an idle stream and no watchdog armed. The ordered-consumer recreate is
+  serialized by an in-flight guard so the dispatch-handler (sequence-gap / tail-gap) and watchdog-timer
+  paths cannot both drive a recreate at once and orphan a transient ephemeral consumer, and a
+  successful recreate clears the miss latch and rebases the silence clock so the watchdog re-arms for
+  the new consumer - a replacement reaped again before its first heartbeat is recovered rather than
+  leaving the watchdog wedged. The watchdog also rebases (and neither fires nor cancels) while the
+  connection is mid-reconnect, so it survives a transient reconnect.
 - `[bugfix]` `flush()`, `drain()`, `drainSubscription()`, and `rtt()` now correlate PONGs to
   their PINGs through a FIFO slot queue (nats.go `nc.pongs` parity) instead of shared booleans
   that ANY PONG cleared (#117). Previously a stale PONG - one answering an earlier heartbeat

@@ -30,6 +30,15 @@ use function Amp\delay;
 final class KeyValueBucket
 {
     /**
+     * Default idle_heartbeat (ns) the KV watch consumer requests so the missed-heartbeat watchdog (#113)
+     * can notice a silent/reaped watch. nats.go KV watchers receive heartbeats via an ordered consumer;
+     * the default watch config here otherwise requested none, leaving total silence indistinguishable
+     * from an idle stream. Heartbeats are status-100 control frames, filtered before delivery, so this
+     * does not change what a watcher observes. Overridable via KeyWatchOptions::$idleHeartbeat.
+     */
+    public const WATCH_IDLE_HEARTBEAT_NS = 5_000_000_000;
+
+    /**
      * Creates a KV bucket context bound to a client and bucket name.
      *
      * @param NatsClient $client Connected client used for publish/subscribe operations behind KV APIs.
@@ -392,6 +401,11 @@ final class KeyValueBucket
             // delete suppression, and an end-of-initial-data signal.
             $consumerOptions = $options?->toConsumerConfig()
                 ?? ['deliver_policy' => 'new', 'ack_policy' => 'none'];
+            // Request a periodic idle heartbeat so subscribeEphemeralPushConsumer arms the missed-
+            // heartbeat watchdog (#113): a silent or reaped watch consumer then surfaces a "not active"
+            // error instead of hanging forever. Without it the default watch requested no heartbeat, so
+            // no watchdog armed. Heartbeats are status-100 control frames, filtered before delivery.
+            $consumerOptions['idle_heartbeat'] ??= self::WATCH_IDLE_HEARTBEAT_NS;
             $ignoreDeletes = $options !== null && $options->ignoreDeletes;
             $onCaughtUp = $options?->onCaughtUp;
             $caughtUpFired = false;

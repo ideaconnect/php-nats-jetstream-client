@@ -7,13 +7,29 @@ namespace IDCT\NATS\Tests\Unit;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
+
+use function Amp\delay;
 
 final class KeyValueBucketTest extends TestCase
 {
+    /**
+     * A KV watch now arms an idle-heartbeat watchdog (a live EventLoop repeat timer, #113) that outlives
+     * a test if its client is not disconnected. Cancel every registered callback before each test so a
+     * leaked watchdog cannot fire against a later test's clean event loop.
+     */
+    protected function setUp(): void
+    {
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
+    }
+
     /** Builds a Direct Get reply (HMSG): the stored value as the body, with Nats-* + optional KV-Operation. */
     private function kvDirectReply(string $subject, string $value, int $seq, int $sid, ?string $operation = null): string
     {
@@ -586,6 +602,86 @@ final class KeyValueBucketTest extends TestCase
         $createRequest = implode('', $transport->writes);
         self::assertStringContainsString('"deliver_policy":"by_start_sequence"', $createRequest);
         self::assertStringContainsString('"opt_start_seq":42', $createRequest);
+    }
+
+    /**
+     * Verifies a KV watch requests an idle heartbeat and its missed-heartbeat watchdog surfaces a
+     * "not active" error when the watch consumer goes silent (#113). The default KV watch config
+     * previously requested no idle_heartbeat, so a reaped/lost watch consumer left the watcher hanging
+     * forever with no data, heartbeat, or error - total silence indistinguishable from an idle stream.
+     * The watch now requests a heartbeat (tunable via KeyWatchOptions::$idleHeartbeat), arming the same
+     * push watchdog other push subscriptions use. Falsifiable: the branch requested no heartbeat, so no
+     * watchdog armed and no error was ever surfaced.
+     */
+    public function testWatchSilentConsumerSurfacesNotActiveError(): void
+    {
+        $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ], blockWhenEmpty: true);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 30 ms heartbeat -> the watchdog surfaces a stall after ~60 ms of silence.
+        $client->jetStream()->keyValue('cfg')->watch(
+            static function (KeyValueEntry $entry): void {},
+            '>',
+            new KeyWatchOptions(idleHeartbeat: 30_000_000),
+        )->await();
+
+        // The watch consumer must actually request the heartbeat, or the server would never emit the
+        // status-100 frames the watchdog relies on.
+        self::assertStringContainsString('"idle_heartbeat":30000000', implode('', $transport->writes));
+
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while ($errors === [] && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+
+        $client->disconnect()->await();
+
+        self::assertCount(1, $errors, 'a silent KV watch must surface exactly one stall error');
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertStringContainsString('not active', $errors[0]->getMessage());
+        self::assertStringContainsString('KV_cfg', $errors[0]->getMessage());
+        // A KV watch consumer is caller-owned from the library's view; it is never recreated, only surfaced.
+        self::assertSame(0, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE'), 'a KV watch stall must not delete/recreate the consumer');
+    }
+
+    /**
+     * Verifies a default KV watch (no options) still requests the default idle heartbeat so the
+     * watchdog protects it too - the option-less form is the common case (#113).
+     */
+    public function testWatchRequestsDefaultIdleHeartbeat(): void
+    {
+        $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ], blockWhenEmpty: true);
+
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('cfg')->watch(static function (KeyValueEntry $entry): void {})->await();
+
+        self::assertStringContainsString(
+            '"idle_heartbeat":' . KeyValueBucket::WATCH_IDLE_HEARTBEAT_NS,
+            implode('', $transport->writes),
+            'an option-less KV watch must request the default idle heartbeat so the watchdog arms',
+        );
+
+        $client->disconnect()->await();
     }
 
     /**
