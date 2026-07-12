@@ -721,6 +721,34 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
+     * A no-responders reply to the meta-record rollup publish (publishMeta, reached by every
+     * put/link/updateMeta) must surface as JetStreamException(503) - the same taxonomy jsRequest()
+     * produces - not a bare NatsException, so a JetStream-disabled server / unbound subject is
+     * catchable as JetStreamException like every other JS path (#161).
+     */
+    public function testMetaPublishNormalizesNoRespondersTo503(): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // addLink() issues one HPUB meta-publish request on the first request inbox (sid 1); the
+            // server has no responder, so it replies with a 503 no-responders status.
+            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder');
+
+        $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();
+    }
+
+    /**
      * Verifies addBucketLink() writes a link meta record pointing at a whole bucket (#48).
      */
     public function testAddBucketLink(): void

@@ -194,6 +194,14 @@ final class NatsConnection
     private int $inBytes = 0;
     private int $outBytes = 0;
     private int $reconnectCount = 0;
+    /**
+     * Whether the connection has ever completed a handshake and gone Open. Set once by
+     * {@see markConnectionOpen()}. Lets the recovery loop tell a FAILED initial connect() (which
+     * hands off to recoverConnection() and reaches the first-ever open through the reconnect path)
+     * apart from a genuine reconnect: the former must emit Connected, not a spurious
+     * Disconnected/Reconnected, and must not count as a reconnect (#161).
+     */
+    private bool $everConnected = false;
     /** Encoded publishes buffered while reconnecting (flushed on a successful reconnect); see #49. */
     private string $reconnectBuffer = '';
     /**
@@ -1922,6 +1930,9 @@ final class NatsConnection
     private function markConnectionOpen(): void
     {
         $this->state = ConnectionState::Open;
+        // Records the first-ever successful open so the recovery loop can emit Connected (not
+        // Reconnected) for a failed initial connect that recovered here (#161).
+        $this->everConnected = true;
         $this->startPingTimer();
     }
 
@@ -2125,13 +2136,21 @@ final class NatsConnection
             throw new ConnectionException('Reconnect is disabled');
         }
 
+        // A FAILED initial connect() hands off here (ownedByConnect) before the connection was ever
+        // Open. That first-ever open must surface as Connected, never a spurious Disconnected (nothing
+        // was up to disconnect) then Reconnected, and must not bump the reconnect count. everConnected
+        // is captured before markConnectionOpen() sets it below (#161).
+        $firstConnect = !$this->everConnected;
+
         // Leave Open before the first await: the state check is what routes concurrent publishes
         // into the reconnect buffer, so staying Open across the transport close would let them
         // race a socket that is about to disappear (#124).
         $this->state = ConnectionState::Connecting;
 
         $this->cancelPingTimer();
-        $this->emitEvent(ConnectionEvent::Disconnected);
+        if (!$firstConnect) {
+            $this->emitEvent(ConnectionEvent::Disconnected);
+        }
 
         $maxAttempts = max(1, $this->options->maxReconnectAttempts);
         $lastError = null;
@@ -2171,7 +2190,11 @@ final class NatsConnection
                 // in order below) instead of jumping the queue on the wire, and a failed leg falls
                 // to the catch with no Open state / armed ping timer on a dead socket (#148).
                 $this->resubscribeAll();
-                $this->reconnectCount++;
+                // A failed initial connect recovering here is not a reconnect - do not bump the
+                // reconnect count for the first-ever open (#161).
+                if (!$firstConnect) {
+                    $this->reconnectCount++;
+                }
                 $this->flushReconnectBuffer();
 
                 // Re-check close-intent after the replay's suspension points: flipping Open here
@@ -2188,7 +2211,9 @@ final class NatsConnection
                 }
 
                 $this->markConnectionOpen();
-                $this->emitEvent(ConnectionEvent::Reconnected);
+                // The first-ever open reached through the recovery loop (a failed initial connect)
+                // fires Connected, not Reconnected, so listeners keyed on Connected still fire (#161).
+                $this->emitEvent($firstConnect ? ConnectionEvent::Connected : ConnectionEvent::Reconnected);
 
                 return;
             } catch (AuthenticationException $e) {

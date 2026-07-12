@@ -12,6 +12,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\ApiErrCode;
 use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
+use IDCT\NATS\JetStream\JetStreamRequest;
 use IDCT\NATS\JetStream\Models\StreamInfo;
 
 use function Amp\async;
@@ -1057,11 +1058,14 @@ final class ObjectStoreBucket
             unset($info['metadata']);
         }
 
-        $message = $this->client->requestWithHeaders(
+        // Normalize a no-responders failure to JetStreamException(503) like jsRequest(), so a
+        // JetStream-disabled server / unbound subject is catchable as JetStreamException (#161).
+        $message = JetStreamRequest::withHeaders(
+            $this->client,
             $this->metaSubject($name),
             json_encode($info, JSON_THROW_ON_ERROR),
             ['Nats-Rollup' => 'sub'],
-        )->await();
+        );
 
         /** @var array<string,mixed> $data */
         $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);

@@ -579,6 +579,37 @@ final class WebSocketTransportTest extends TestCase
     }
 
     /**
+     * On a server-initiated Close frame the client must echo a Close frame back (RFC 6455 5.5.1,
+     * mirroring the received status code) BEFORE surfacing the closure, so strict intermediaries do
+     * not treat the connection as an abnormal 1006 closure. The TransportClosedException the
+     * connection layer relies on to reconnect must still propagate (#161).
+     */
+    public function testReadLineEchoesCloseFrameOnServerInitiatedClose(): void
+    {
+        // Unmasked server Close frame carrying status 1001 ("going away"); the echo must mirror it.
+        $status = pack('n', 1001);
+        $closeFrame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, $status, false);
+        $socket = new ScriptedChunkSocket([$closeFrame]);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        try {
+            $transport->readLine()->await();
+            self::fail('expected TransportClosedException on the server close frame');
+        } catch (TransportClosedException) {
+            // The closure is still surfaced so the connection layer can reconnect.
+        }
+
+        // The client wrote back a (masked) Close frame mirroring the received status code.
+        $written = $socket->writtenBytes();
+        $frames = WebSocketFrameCodec::decode($written);
+        self::assertNotSame([], $frames, 'no Close echo was written on the server close frame');
+        self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
+        self::assertSame($status, $frames[0]['payload']);
+    }
+
+    /**
      * Connects a WebSocketTransport to a loopback TCP socket and injects the connected client socket
      * (bypassing the HTTP upgrade handshake) so readLine()/the decode loop can be driven with
      * pre-encoded server frames written from the returned server-side socket.

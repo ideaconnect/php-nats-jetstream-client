@@ -134,11 +134,14 @@ final class BatchPublisher
             // single-message batch the lone message is both start and commit (handled below).
             if ($total > 1) {
                 $first = $messages[0];
-                $startReply = $this->client->requestWithHeaders(
+                // Normalize a no-responders failure to JetStreamException(503) like jsRequest() (#161).
+                // The reply-shape detection below (#130/#152) still runs on the returned payload.
+                $startReply = JetStreamRequest::withHeaders(
+                    $this->client,
                     $first['subject'],
                     $first['payload'],
                     $this->batchHeaders($first['headers'], 1, false),
-                )->await();
+                );
                 $this->assertStartAccepted($startReply->payload);
 
                 // Intermediate messages (2..n-1) are fire-and-forget; the server stages them by batch
@@ -165,11 +168,14 @@ final class BatchPublisher
             // The final message carries Nats-Batch-Commit and is sent request/reply; the server commits
             // the whole batch and returns a single PubAck (batch id + committed count).
             $final = $messages[$lastIndex];
-            $reply = $this->client->requestWithHeaders(
+            // Normalize a no-responders failure to JetStreamException(503) like jsRequest() (#161).
+            // parseCommitAck() below still applies the #130 batch-ack reply-shape check.
+            $reply = JetStreamRequest::withHeaders(
+                $this->client,
                 $final['subject'],
                 $final['payload'],
                 $this->batchHeaders($final['headers'], $total, true),
-            )->await();
+            );
 
             // A single-message batch is trivially atomic, so a plain PubAck (no batch fields) is
             // acceptable there; a multi-message commit MUST carry the batch acknowledgement.

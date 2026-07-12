@@ -19,6 +19,30 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` KV, Object Store, and atomic-batch header requests now share the same no-responders
+  exception taxonomy as every other JetStream path (#161). `KeyValueBucket::publishWithHeadersAck`
+  (every KV put/update/delete with headers), `ObjectStoreBucket::publishMeta` (the meta-record
+  rollup publish), and `BatchPublisher`'s start and commit requests called `requestWithHeaders()`
+  directly, so on a JetStream-disabled server or an unbound subject they surfaced a bare
+  `NatsException('No responders...')` instead of the `JetStreamException(503)` that
+  `JetStreamContext::jsRequest()`/`publish()` produce - a caller catching `JetStreamException`
+  missed it. The normalization is extracted into a shared `JetStreamRequest` helper that all four
+  sites (including `jsRequest()`) now funnel through. Only the no-responders case is normalized; the
+  batch start/commit reply-shape detection and version pre-flight (#130/#138/#152) are unchanged.
+- `[bugfix]` A FAILED initial `connect()` that recovers via `recoverConnection()` (reconnect enabled)
+  now emits `Connected` for the first-ever successful handshake instead of `Disconnected` then
+  `Reconnected`, and no longer bumps the reconnect count for what is really an initial connect (#161).
+  A process whose very first dial needed one retry previously observed `Disconnected -> Reconnected`
+  for a connection that was never up and never saw `Connected`, so listener state machines keyed on
+  `Connected` (metrics, readiness gates) never fired. The connection state machine (#144/#145/#148)
+  is untouched: only which lifecycle event fires on the initial-connect recovery path changed,
+  gated on a new "has ever been open" flag set by `markConnectionOpen()`.
+- `[bugfix]` On a server-initiated WebSocket Close frame the transport now writes an echo Close frame
+  (mirroring the received status code) before surfacing `TransportClosedException`, per RFC 6455
+  section 5.5.1 (#161). Previously the client threw without echoing, which strict intermediaries and
+  servers treat as an abnormal closure (1006). The echo is best-effort (write failures are ignored -
+  the socket may already be gone) and the `TransportClosedException` the connection layer relies on
+  to reconnect is unchanged.
 - `[bugfix]` Frames the server coalesces BEHIND the handshake PONG in one TCP segment are no longer
   dropped, and a frame left partly buffered at the handshake boundary no longer corrupts the stream
   (#157). `awaitInitialPong()` returned the moment it saw the PONG, discarding every frame the parser
