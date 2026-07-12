@@ -3264,6 +3264,96 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * The replayed messages from a recreated ordered consumer can arrive on the rotated deliver inbox
+     * DURING the recreate CONSUMER.CREATE's own read-pump - before its reply is processed. The new
+     * instance must therefore be adopted (name + expected-sequence reset) BEFORE the create await, not
+     * after: otherwise those early replay frames are filtered out by the not-yet-adopted consumer name
+     * and a later one trips a spurious gap, cascading into a recreate storm under load where only the
+     * pre-gap message is ever delivered (#122 regression). Modeled deterministically by echoing the
+     * client-chosen name and ordering the first replay frame ahead of the create reply.
+     */
+    public function testSubscribeOrderedConsumerDeliversReplayArrivingDuringRecreateCreate(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        // MSG <subject> <sid> <$JS.ACK reply-to> <len>\r\n<body>\r\n
+        $dataFrame = static fn(int $sid, string $consumer, int $delivered, int $sseq, int $cseq, string $body): string => sprintf(
+            "MSG deliver.ord %d %s %d\r\n%s\r\n",
+            $sid,
+            sprintf('$JS.ACK.EVENTS.%s.%d.%d.%d.0.0', $consumer, $delivered, $sseq, $cseq),
+            strlen($body),
+            $body,
+        );
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        // Dynamic server that echoes the client-chosen consumer name (the real server honours
+        // config.name). On the INITIAL create it also queues an in-order msg1 then a gap-exposing bad3;
+        // on the RECREATE create it queues the first replayed frame (msg2) BEFORE the create reply, so
+        // that frame is dispatched during the create's own read-pump - the race the fix must survive.
+        $createSeen = 0;
+        $transport->onWrite = static function (string $bytes) use (&$createSeen, $dataFrame, $createReply): array {
+            if (str_contains($bytes, '$JS.API.CONSUMER.DELETE.')) {
+                return [sprintf("MSG _INBOX.del 3 %d\r\n%s\r\n", strlen('{"success":true}'), '{"success":true}')];
+            }
+            if (!str_contains($bytes, '$JS.API.CONSUMER.CREATE.')) {
+                return [];
+            }
+
+            preg_match('/"name":"([^"]+)"/', $bytes, $m);
+            $name = $m[1] ?? 'UNKNOWN';
+            $reply = $createReply($name);
+            $createSeen++;
+
+            if ($createSeen === 1) {
+                // Initial consumer create reply (request sid 1), then delivery on the deliver sid 2:
+                // msg1 in order (cseq 1), then bad3 exposing a gap (cseq 3) which triggers the recreate.
+                return [
+                    sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+                    $dataFrame(2, $name, 1, 1, 1, 'msg1'),
+                    $dataFrame(2, $name, 3, 4, 3, 'bad3'),
+                ];
+            }
+
+            // Recreate: msg2 (cseq 1, sseq 2) on the rotated deliver sid 4 BEFORE the create reply on
+            // sid 5, so it is delivered during the create pump - it must not be dropped or storm.
+            return [
+                $dataFrame(4, $name, 1, 2, 1, 'msg2'),
+                sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($reply), $reply),
+            ];
+        };
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 10; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // msg1 delivered in order; the gap-exposer bad3 discarded; the replay msg2 that arrived DURING
+        // the recreate create is delivered (not lost to a name-filter reject then gap storm).
+        self::assertContains('msg1', $received);
+        self::assertContains('msg2', $received);
+        self::assertNotContains('bad3', $received);
+
+        $written = implode('', $transport->writes);
+        // Exactly one recreate - no storm.
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'));
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'));
+    }
+
+    /**
      * Verifies a stale delivery from a previous (deleted) consumer instance - arriving on the reused
      * deliver inbox after a recreate - is ignored by consumer-instance name, so it cannot be
      * mis-delivered or trigger a spurious recreate even when its consumer sequence matches (#86).

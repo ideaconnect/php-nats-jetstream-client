@@ -48,6 +48,15 @@ final class FakeTransport implements TlsAwareTransportInterface
     /** When > 0, close() suspends this many seconds before completing (see close()). */
     public float $closeDelay = 0.0;
 
+    /**
+     * Dynamic write responder: called with each written frame; returns a list of read chunks to append
+     * to the read queue. Lets a test respond to a request whose content is only known at write time
+     * (e.g. a client-chosen consumer name to echo).
+     *
+     * @var (\Closure(string): list<string>)|null
+     */
+    public ?\Closure $onWrite = null;
+
     public bool $closed = false;
 
     public int $upgradeTlsCalls = 0;
@@ -131,6 +140,16 @@ final class FakeTransport implements TlsAwareTransportInterface
                 if (str_contains($bytes, $needle)) {
                     array_push($this->readQueue, ...$chunks);
                     unset($this->enqueueOnWriteContaining[$needle]);
+                }
+            }
+
+            // Dynamic responder: unlike enqueueOnWriteContaining (static chunks), this closure sees the
+            // written bytes and RETURNS read chunks derived from them (e.g. echo a client-chosen
+            // consumer name), letting a test model a server whose reply depends on the request.
+            if ($this->onWrite !== null) {
+                $extra = ($this->onWrite)($bytes);
+                if ($extra !== []) {
+                    array_push($this->readQueue, ...$extra);
                 }
             }
         });

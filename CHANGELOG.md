@@ -15,6 +15,22 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` Ordered-consumer recreate no longer loses the replay under load (a regression in the
+  #122 deliver-inbox rotation, shipped in 2.5.3). The rotation adopted the new instance (its
+  client-chosen name and the reset expected-sequence) only AFTER the CONSUMER.CREATE reply, but the
+  server can begin delivering the replay on the rotated inbox the instant the consumer exists - and
+  those frames are dispatched during the create request's own read-pump, before that reply is
+  processed. The early replay frames were then filtered out by the not-yet-adopted consumer name and
+  a later one tripped a spurious gap, cascading into a recreate storm in which only the pre-gap
+  message was ever delivered (observed as an intermittent, load-dependent failure of the
+  ordered-consumer dropped-delivery recovery). The name is chosen client-side, so the instance is now
+  adopted BEFORE the create await; a new deterministic test pins a replay frame arriving ahead of the
+  create reply, and the recovery now passes reliably under sustained CPU load (#122).
+
 ## [2.5.3] - 2026-07-12
 
 ### Fixed

@@ -1253,12 +1253,25 @@ final class JetStreamContext
                         $candidateName = self::generateOrderedConsumerName();
                         $consumerOptions['name'] = $candidateName;
 
+                        // Adopt the new instance BEFORE the create await, not after. The server can
+                        // begin delivering the replay on $newDeliver the instant the consumer exists,
+                        // and those frames are dispatched to $deliverHandler DURING this create's own
+                        // read-pump - before ->await() returns. If $consumerName/$expectedConsumerSeq
+                        // still named the old instance, the replayed frames would be filtered out by
+                        // name and a later one would trip a spurious gap, cascading into a recreate
+                        // storm under load (only the pre-drop message is ever delivered). The name is
+                        // client-chosen, so it is known here; adopt it up front so the new consumer's
+                        // frames are recognised and sequence-checked from cseq 1 (#122).
+                        $consumerName = $candidateName;
+                        $deliver = $newDeliver;
+                        $expectedConsumerSeq = 1;
+                        $ackParseErrorEmitted = false;
+
                         try {
                             $consumer = $this->createEphemeralPushConsumer($stream, $newDeliver, $filterSubject, $consumerOptions)->await();
+                            // The server echoes config.name, so this equals $candidateName; keep the
+                            // authoritative returned value defensively.
                             $consumerName = $consumer->name;
-                            $deliver = $newDeliver;
-                            $expectedConsumerSeq = 1;
-                            $ackParseErrorEmitted = false;
 
                             // Track the rotated inbox and re-arm the watchdog on the NEW sid (it arms on
                             // the deliver sid, and the old sid is about to be unsubscribed). The watchdog
