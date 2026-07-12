@@ -269,6 +269,69 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
+     * A no-responders reply to the commit request (a single-message batch sends only the commit
+     * request) must surface as JetStreamException(503) - the same taxonomy jsRequest() produces -
+     * not a bare NatsException, so a JetStream-disabled server / unbound subject is catchable as
+     * JetStreamException like every other JS path (#161). The version pre-flight (2.12) is passed, so
+     * the commit request reaches the wire.
+     */
+    public function testCommitNormalizesNoRespondersTo503(): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // The lone commit request (sid 1) hits a subject with no responder -> 503 status reply.
+            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder');
+
+        $client->jetStream()->batch('b-503')
+            ->add('orders.created', 'only')
+            ->commit()
+            ->await();
+    }
+
+    /**
+     * A no-responders reply to the batch-START request (a multi-message batch sends the start request
+     * first) must likewise surface as JetStreamException(503), not a bare NatsException (#161). The
+     * 503 normalization only touches the no-responders case, leaving the #130/#138/#152 reply-shape
+     * and version-preflight semantics unchanged.
+     */
+    public function testStartRequestNormalizesNoRespondersTo503(): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // The batch-start request (sid 1) hits a subject with no responder -> 503 status reply;
+            // the batch aborts here, so the intermediate/commit messages are never sent.
+            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder');
+
+        $client->jetStream()->batch('b-503-start')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b')
+            ->commit()
+            ->await();
+    }
+
+    /**
      * Verifies a committed batch: the START (seq 1) is a request, the intermediate is fire-and-forget,
      * the final carries the commit marker as a request, all share one Nats-Batch-Id, and the commit
      * ack is parsed (issue #8, ADR-50).

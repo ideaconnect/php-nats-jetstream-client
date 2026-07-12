@@ -2623,6 +2623,46 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A FAILED initial connect() that recovers via recoverConnection() (reconnectEnabled) must emit
+     * Connected for the first-ever successful handshake - never a spurious Disconnected (the
+     * connection was never up) followed by Reconnected - and must not bump the reconnect count for
+     * what is really an initial connect (#161). Listener state machines keyed on Connected (metrics,
+     * readiness gates) would otherwise never fire.
+     */
+    public function testFailedThenSuccessfulInitialConnectEmitsConnectedNotReconnected(): void
+    {
+        $transport = new FlakyTransport([
+            ['INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n", "PONG\r\n"],
+        ], connectFailures: 1);
+
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event) use (&$events): void {
+                    $events[] = $event;
+                },
+            ),
+            $transport,
+        );
+
+        $connection->connect()->await();
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        // The first successful handshake surfaces as Connected exactly once, with no pre-connect
+        // Disconnected and no Reconnected for a connection that was never up.
+        self::assertSame([ConnectionEvent::Connected], $events);
+        self::assertNotContains(ConnectionEvent::Disconnected, $events);
+        self::assertNotContains(ConnectionEvent::Reconnected, $events);
+        // A first connect is not a reconnect.
+        self::assertSame(0, $connection->statistics()->reconnects);
+    }
+
+    /**
      * Verifies a failed first connect throws when retryOnFailedInitialConnect is off and reconnect is off (#56).
      */
     public function testFailedInitialConnectThrowsWithoutRetryOption(): void

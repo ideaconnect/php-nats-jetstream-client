@@ -398,6 +398,19 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                     break;
 
                 case WebSocketFrameCodec::OP_CLOSE:
+                    // RFC 6455 5.5.1: an endpoint receiving a Close MUST send a Close in response.
+                    // Echo one mirroring the received status code (the first two payload bytes; empty
+                    // when the peer sent no status), best-effort - the socket may already be gone.
+                    // The TransportClosedException below is unchanged, so the connection layer still
+                    // reconnects on it (#161).
+                    $echo = strlen($frame['payload']) >= 2 ? substr($frame['payload'], 0, 2) : '';
+
+                    try {
+                        $this->socket?->write(WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, $echo));
+                    } catch (\Throwable) {
+                        // The peer may have already dropped the socket; surfacing the close is what matters.
+                    }
+
                     throw new TransportClosedException('WebSocket close frame received');
 
                 case WebSocketFrameCodec::OP_BINARY:

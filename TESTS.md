@@ -46,6 +46,8 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testCommitAbortsWhenBatchStartIsAcknowledgedAsPlainPublish` - Mixed-version cluster: the connected server advertises 2.12.1 (pre-flight passes) but the batch START is acknowledged with a normal PubAck (older JS leader storing it as a plain publish) - aborts with UnsupportedFeatureException (feature allow_atomic, server version reported) before any further batch message is published (#130).
 - `testCommitRejectsMultiMessageAckWithoutBatchFields` - A multi-message commit acknowledged by a PubAck without batch id/count (nothing was committed as a batch) throws UnsupportedFeatureException instead of reporting success, with the INFO version at 2.12.1 and both batch writes asserted on the wire so the commit-leg guard (not the #152 pre-flight) is what fires (#130).
 - `testSingleMessageBatchAcceptsPlainPubAck` - A single-message batch (trivially atomic) accepts a plain PubAck commit ack without batch fields (#130).
+- `testCommitNormalizesNoRespondersTo503` - A no-responders reply to the commit request (single-message batch) surfaces as JetStreamException(503) ("No JetStream responder"), not a bare NatsException, matching jsRequest()'s taxonomy (#161).
+- `testStartRequestNormalizesNoRespondersTo503` - A no-responders reply to the batch-START request (multi-message batch) likewise surfaces as JetStreamException(503); the batch aborts at start so no intermediate/commit frame is sent (#161).
 - `testCommitEmptyBatchThrows` - Committing a batch with no staged messages throws `JetStreamException` ("Cannot commit an empty batch").
 - `testBatchRejectsOversizedId` - Constructing a batch with a 65-character id throws `JetStreamException` ("Batch id must be between 1 and 64 characters").
 - `testAddAfterCommitThrows` - Calling `add()` after a successful `commit()` throws `JetStreamException` ("Cannot add to an already-committed batch").
@@ -294,6 +296,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testBucketCreateAndDelete` - create() and deleteBucket() map to STREAM.CREATE.KV_cfg and STREAM.DELETE.KV_cfg, returning the created stream name and a true delete result.
 - `testBucketCreateSendsKvDefaultsAndAllowsOverride` - create() defaults include deny_delete:true and discard:new (ADR-8/nats.go parity) and an explicit user override (deny_delete:false, discard:old) wins (#132).
 - `testPutGetDelete` - put/get/delete round-trip parses values correctly and uses the right subjects (PUB for put, DIRECT.GET for get, HPUB with KV-Operation:DEL for delete).
+- `testDeleteHeaderRequestNormalizesNoRespondersTo503` - A no-responders reply to a KV header request (delete/update/purge via publishWithHeadersAck) surfaces as JetStreamException(503) ("No JetStream responder"), not a bare NatsException, matching jsRequest()'s taxonomy (#161).
 - `testCreateKeySucceedsWhenAbsent` - createKey() on an absent key publishes with Nats-Expected-Last-Subject-Sequence:0 and returns the ack (#19).
 - `testCreateKeyThrowsWhenKeyExists` - createKey() throws JetStreamException "Key already exists" when the wrong-last-sequence ack is followed by a get() showing a live value (#19).
 - `testCreateKeyDetectsWrongLastSequenceByErrCode` - createKey() detects the wrong-last-sequence rejection by err_code 10071 even when the description shares no wording with "wrong last sequence" (#154).
@@ -497,6 +500,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testServerPoolPreservesOrderWithoutRandomize` - With randomizeServers off, the first dial targets the first configured server (#55).
 - `testRandomizeServersDialsFromPool` - With randomizeServers on, the first dial still targets one of the configured pool members (#55).
 - `testRetryOnFailedInitialConnectSucceedsAfterRetry` - retryOnFailedInitialConnect retries the first connect (reconnect disabled) until Open, with >= 2 connect attempts (#56).
+- `testFailedThenSuccessfulInitialConnectEmitsConnectedNotReconnected` - A failed initial connect() that recovers via recoverConnection() (reconnectEnabled) emits Connected exactly once - no pre-connect Disconnected, no Reconnected - and leaves statistics().reconnects at 0, since a first connect is not a reconnect (#161).
 - `testFailedInitialConnectThrowsWithoutRetryOption` - A failed first connect throws ConnectionException when both retryOnFailedInitialConnect and reconnect are off (#56).
 - `testTerminalInitialConnectFailureClosesTransportSocket` - A terminal initial-connect failure (reconnect and initial-retry off) closes the transport socket best-effort instead of leaving the dialed fd open until GC (#133).
 - `testReconnectExhaustionClosesLastAttemptSocket` - Exhausted recovery closes the LAST attempt's socket (attempts + 1 close calls in total): per-attempt closes happen only at each attempt's start, so the terminal exit must add the final close (#133).
@@ -733,6 +737,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testCreateWithTypedConfig` - create() with a typed ObjectStoreConfig maps ttl/maxBytes/storage/replicas/compression to STREAM.CREATE fields (max_age in ns, max_bytes, storage, num_replicas, compression) (#39).
 - `testSeal` - seal() reads stream config then issues STREAM.UPDATE with sealed:true while preserving existing config (max_bytes:1000) (#38).
 - `testAddLink` - addLink() returns a link ObjectInfo (isLink true, link={bucket,name}) and writes the link meta HPUB under the encoded name subject with "link":{"bucket":"assets","name":"real.bin"} (#48).
+- `testMetaPublishNormalizesNoRespondersTo503` - A no-responders reply to the meta-record rollup publish (publishMeta, reached by every put/link/updateMeta) surfaces as JetStreamException(503) ("No JetStream responder"), not a bare NatsException, matching jsRequest()'s taxonomy (#161).
 - `testAddBucketLink` - addBucketLink() returns a bucket-link ObjectInfo (link={bucket:'other-bucket'}) and serializes "link":{"bucket":"other-bucket"} (#48).
 - `testUpdateMetaRenamesPreservingNuid` - updateMeta() rename preserves the NUID/size, writes new meta under the new encoded subject, tombstones the old name (deleted:true), and does NOT purge chunks (#28).
 - `testUpdateMetaReplacesMetadataInPlace` - updateMeta() with no rename replaces the metadata bag in place (new map returned) writing only one meta HPUB and no tombstone (#28).
@@ -1086,6 +1091,7 @@ Indicative totals: ~860 unit tests, ~131 integration tests, ~46 Behat scenarios.
 - `testReadLineReassemblesFragmentsWithHeadersSplitAcrossReads` - Read-boundary torture pin: with a ScriptedChunkSocket, asserts a fragmented message whose middle masked continuation header is cut inside the 16-bit length bytes and inside the mask key, and whose final continuation header is cut between its two bytes, still reassembles to "HEAD-"+mid+"TAIL" byte-identical (#164).
 - `testReadLineAssemblesLargeMaskedFrameDeliveredInOneByteReads` - Read-boundary torture pin: with a ScriptedChunkSocket, asserts a 64-bit-length masked 70000-byte frame delivered one byte at a time - sized from its length bytes before the mask key arrives, so the mask key spans queued reads - is unmasked and returned byte-identical by the spanning-consume path (#164).
 - `testReadLineThrowsOnCloseFrameFromSocket` - Asserts a server CLOSE frame causes readLine() to throw TransportClosedException.
+- `testReadLineEchoesCloseFrameOnServerInitiatedClose` - Asserts a server CLOSE frame (status 1001) makes the client write back a masked CLOSE echo mirroring the status code (RFC 6455 5.5.1) before readLine() still throws TransportClosedException, so the connection layer keeps reconnecting (#161).
 
 ## Integration Tests (`tests/Integration/`)
 

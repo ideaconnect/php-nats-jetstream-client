@@ -177,6 +177,34 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
+     * A no-responders reply to a KV header request (every put/update/delete with headers routes
+     * through publishWithHeadersAck) must surface as JetStreamException(503) - the same taxonomy
+     * jsRequest() produces - not a bare NatsException, so a caller catching JetStreamException on a
+     * JetStream-disabled server or unbound subject is not surprised (#161).
+     */
+    public function testDeleteHeaderRequestNormalizesNoRespondersTo503(): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // delete() issues an HPUB request on the first request inbox (sid 1); the server has no
+            // responder bound, so it replies with a 503 no-responders status.
+            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder');
+
+        $client->jetStream()->keyValue('cfg')->delete('theme')->await();
+    }
+
+    /**
      * Verifies createKey() succeeds on an absent key, asserting expected-last-subject-sequence 0 (#19).
      */
     public function testCreateKeySucceedsWhenAbsent(): void

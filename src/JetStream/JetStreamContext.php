@@ -1412,16 +1412,7 @@ final class JetStreamContext
         } catch (JetStreamException $e) {
             throw $e;
         } catch (NatsException $e) {
-            if (str_contains($e->getMessage(), 'No responders')) {
-                throw new JetStreamException(
-                    'No JetStream responder for subject ' . $subject
-                    . ' (the subject is not bound to a stream, or JetStream is not enabled)',
-                    503,
-                    $e,
-                );
-            }
-
-            throw $e;
+            throw JetStreamRequest::normalizeNoResponders($e, $subject);
         }
     }
 
