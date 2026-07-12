@@ -767,16 +767,46 @@ final class JetStreamContext
             try {
                 $this->client->publish($subject, $json, $inbox)->await();
 
-                $waitCancellation = new TimeoutCancellation(($expiresMs + 1000) / 1000);
-                try {
-                    while (!$done) {
+                // Progress-based bound: reset the stall clock on each batch frame, so a healthy-but-slow
+                // batch that keeps making progress is never failed - only a server that makes NO
+                // progress for the whole interval throws (mirrors #153's missed-heartbeat approach).
+                // Each wait's cancellation cancels the underlying socket read so a silent server cannot
+                // hang the batch indefinitely.
+                $progressIntervalNs = ($expiresMs + 1000) * 1_000_000;
+                $lastActivityNs = hrtime(true);
+                $seen = count($messages);
+
+                while (!$done) {
+                    $nowNs = hrtime(true);
+                    if ($nowNs - $lastActivityNs >= $progressIntervalNs) {
+                        // No batch frame arrived for the whole progress interval (no 204 EOB, no
+                        // Nats-Num-Pending:0, no error frame - those all set $done and exit the loop
+                        // normally). Returning the collected prefix would silently truncate the result
+                        // as if complete; a stalled server surfaces as an incomplete-result error (#121).
+                        throw new JetStreamException(sprintf(
+                            'Direct Get batch for stream "%s" stalled: no progress for %d ms '
+                                . '(received %d message(s), no end-of-batch marker)',
+                            $stream,
+                            intdiv($progressIntervalNs, 1_000_000),
+                            count($messages),
+                        ));
+                    }
+
+                    $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
+                    try {
                         $frames = $this->client->processIncoming($waitCancellation)->await();
                         if ($frames === 0) {
                             delay(0.001, cancellation: $waitCancellation);
                         }
+                    } catch (CancelledException) {
+                        // This wait segment ended; loop around to re-evaluate the stall deadline.
                     }
-                } catch (CancelledException) {
-                    // Deadline reached; return whatever was collected (or surface a captured error).
+
+                    if (count($messages) > $seen) {
+                        // A batch frame landed: progress. Rebase the stall clock from now.
+                        $seen = count($messages);
+                        $lastActivityNs = hrtime(true);
+                    }
                 }
             } finally {
                 $this->client->unsubscribe($sid)->await();
@@ -1014,11 +1044,17 @@ final class JetStreamContext
             // library cannot recreate a consumer it does not own, so it surfaces the stall (#113).
             $idleHeartbeatNs = self::idleHeartbeatOf($consumerOptions);
             $state = $idleHeartbeatNs !== null ? $this->pushWatchdogState($stream, sprintf('"%s"', $consumer)) : null;
+            $consumerLabel = sprintf('"%s"', $consumer);
 
-            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, $state): void {
+            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, $state, $stream, $consumerLabel): void {
                 $state?->touch();
 
-                if ($this->handlePushControlMessage($message)) {
+                if ($this->handlePushControlMessage($message, $controlHeaders)) {
+                    // A non-100 (4xx/5xx) status frame was intercepted and withheld from the handler.
+                    // For a caller-owned consumer the library cannot recreate, so surface the terminal
+                    // status through the error listener rather than silently dropping it (#121).
+                    $this->surfaceCallerOwnedPushStatus($controlHeaders ?? [], $stream, $consumerLabel);
+
                     return;
                 }
 
@@ -1067,11 +1103,17 @@ final class JetStreamContext
             // (unlike an ordered consumer, which it recreates), so it surfaces the stall (#113).
             $idleHeartbeatNs = self::idleHeartbeatOf($consumerOptions);
             $state = $idleHeartbeatNs !== null ? $this->pushWatchdogState($stream, sprintf('"%s"', $consumer->name)) : null;
+            $consumerLabel = sprintf('"%s"', $consumer->name);
 
-            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, $state): void {
+            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, $state, $stream, $consumerLabel): void {
                 $state?->touch();
 
-                if ($this->handlePushControlMessage($message)) {
+                if ($this->handlePushControlMessage($message, $controlHeaders)) {
+                    // A non-100 (4xx/5xx) status frame was intercepted and withheld from the handler.
+                    // For a caller-owned ephemeral consumer the library cannot recreate, so surface the
+                    // terminal status through the error listener rather than silently dropping it (#121).
+                    $this->surfaceCallerOwnedPushStatus($controlHeaders ?? [], $stream, $consumerLabel);
+
                     return;
                 }
 
@@ -1144,7 +1186,13 @@ final class JetStreamContext
             // to capture. See HeartbeatWatchdogState::$recreateInFlight for the race this closes (#113).
             $state = new HeartbeatWatchdogState(hrtime(true));
 
-            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, $stream, $deliver, $filterSubject, $state): void {
+            // Reassigned to the real dispatch handler just below; captured by reference in $recreate so
+            // the rotation can re-subscribe the fresh deliver inbox with the SAME handler (the two
+            // closures are mutually recursive - the handler triggers $recreate, $recreate re-subscribes
+            // the handler). The no-op placeholder is never invoked; it only fixes the callable type.
+            $deliverHandler = static function (NatsMessage $message): void {};
+
+            $recreate = function () use (&$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$consumerOptions, &$ackParseErrorEmitted, &$deliver, &$deliverHandler, $stream, $filterSubject, $idleHeartbeatNs, $state): void {
                 if ($state->recreateInFlight) {
                     // A recreate is already running (on the dispatch fiber or the watchdog fiber); it
                     // resumes from the current lastStreamSeq+1, covering this trigger too. A second
@@ -1156,35 +1204,97 @@ final class JetStreamContext
                 $consumerOptions['deliver_policy'] = 'by_start_sequence';
                 $consumerOptions['opt_start_seq'] = $lastStreamSeq + 1;
 
+                // Rotate the deliver inbox on every recreate (nats.go ordered.go parity). A fresh inbox
+                // means any consumer bound to the PREVIOUS inbox - the instance being replaced, or an
+                // orphan from a create whose reply was lost - can no longer reach this client once the
+                // old inbox is unsubscribed: neither its data frames NOR its plain idle heartbeats
+                // survive to the tail-gap check, so a non-current heartbeat cannot drive a recreate
+                // storm (#122). Dropping the client's interest on the old inbox also lets the server's
+                // inactive_threshold reap that orphan, so the leak self-heals; the best-effort delete
+                // below is now only faster cleanup. Because only the current consumer's frames arrive
+                // on the current inbox, the tail-gap check is inherently scoped without parsing any
+                // control-frame subject.
+                $oldSid = $state->deliverSid;
+                $oldConsumerName = $consumerName;
+                $newDeliver = Inbox::generate('_INBOX.JS.ORD');
+                $newSid = null;
+
+                // Names this episode asked the server to create but did NOT adopt. A create whose
+                // reply we never saw (timeout / connection loss - NOT a definitive JetStream API
+                // rejection) may have SUCCEEDED server-side, leaving an ephemeral bound to $newDeliver.
+                // Because the name is chosen client-side, that orphan is deletable by name even without
+                // its create reply (#122).
+                $orphanCandidates = [];
+
                 try {
                     try {
-                        $this->deleteConsumer($stream, $consumerName)->await();
+                        $this->deleteConsumer($stream, $oldConsumerName)->await();
                     } catch (\Throwable) {
-                        // Best-effort cleanup for ephemeral consumers that may already be gone. Any
-                        // failure must fall through: TimeoutException/ConnectionException are NOT
-                        // JetStreamExceptions, and only the create leg below restores delivery - a
-                        // timed-out delete may well have succeeded server-side (#151).
+                        // Best-effort cleanup for the ephemeral being replaced. Any failure must fall
+                        // through: TimeoutException/ConnectionException are NOT JetStreamExceptions, a
+                        // timed-out delete may well have succeeded server-side, and the old-inbox
+                        // unsubscribe below already makes inactive_threshold reap it (#151/#122).
                     }
 
-                    // Retry the create: after a successful delete, a failed create leaves NOTHING that
-                    // would ever deliver a message or heartbeat on the inbox again, so a transient
-                    // failure (timeout, leadership change) must not end recovery permanently (#114).
+                    // Establish interest on the fresh inbox BEFORE the create points the consumer at
+                    // it, so no delivery is lost in the create/subscribe window.
+                    $newSid = $this->client->subscribe($newDeliver, $deliverHandler)->await();
+
+                    // Retry the create: after the delete, a failed create leaves NOTHING that would
+                    // ever deliver a message or heartbeat on the inbox again, so a transient failure
+                    // (timeout, leadership change) must not end recovery permanently (#114).
                     for ($attempt = 1; ; $attempt++) {
+                        // A FRESH client-chosen name per attempt (the server honours config.name and
+                        // echoes it). Each attempt therefore uses a DISTINCT name, so a create whose
+                        // reply is lost spawns a DISTINCT server-side consumer - not an idempotent
+                        // no-op on the wire. That orphan is deletable by name (#122): the old-inbox
+                        // unsubscribe drops its interest so inactive_threshold reaps it, and the
+                        // best-effort reap below deletes it faster.
+                        $candidateName = self::generateOrderedConsumerName();
+                        $consumerOptions['name'] = $candidateName;
+
                         try {
-                            $consumer = $this->createEphemeralPushConsumer($stream, $deliver, $filterSubject, $consumerOptions)->await();
+                            $consumer = $this->createEphemeralPushConsumer($stream, $newDeliver, $filterSubject, $consumerOptions)->await();
                             $consumerName = $consumer->name;
+                            $deliver = $newDeliver;
                             $expectedConsumerSeq = 1;
                             $ackParseErrorEmitted = false;
-                            // Re-arm the watchdog for the NEW consumer: the watchdog sets the miss latch
-                            // before invoking onMiss and only an inbound frame's touch() clears it, so a
-                            // replacement reaped again before its first heartbeat would leave the latch
-                            // stuck and the watchdog wedged. Clear it and rebase the silence clock from
-                            // now, when the new consumer is live; the in-flight guard prevents a storm (#113).
+
+                            // Track the rotated inbox and re-arm the watchdog on the NEW sid (it arms on
+                            // the deliver sid, and the old sid is about to be unsubscribed). The watchdog
+                            // sets the miss latch before invoking onMiss and only an inbound frame's
+                            // touch() clears it, so a replacement reaped again before its first heartbeat
+                            // would leave the latch stuck; clear it and rebase the silence clock from
+                            // now, when the new consumer is live. The in-flight guard prevents a storm,
+                            // and the old watchdog self-cancels once its sid goes inactive (#113).
+                            $state->deliverSid = $newSid;
                             $state->notified = false;
                             $state->lastActivityNs = hrtime(true);
+                            $this->armHeartbeatWatchdog($newSid, $idleHeartbeatNs, $state);
+
+                            // Drop interest on the old inbox: the replaced instance and any lost-reply
+                            // orphan on it stop reaching this client, and their inactive_threshold can
+                            // fire. Best-effort - a failed UNSUB must not undo recovery (#122).
+                            if ($oldSid !== null) {
+                                try {
+                                    $this->client->unsubscribe($oldSid)->await();
+                                } catch (\Throwable) {
+                                }
+                            }
+
+                            // Faster-cleanup reap of any orphan from an earlier lost-reply attempt this
+                            // episode. Best-effort: a reap failure must never undo recovery (#122).
+                            $this->reapOrphanedConsumers($stream, $orphanCandidates);
 
                             return;
                         } catch (\Throwable $e) {
+                            if (!$e instanceof JetStreamException) {
+                                // Not a definitive server API rejection (timeout / connection loss): the
+                                // consumer named $candidateName may exist server-side. Remember it to
+                                // reap once we recover, or on terminal failure below (#122).
+                                $orphanCandidates[] = $candidateName;
+                            }
+
                             if ($attempt >= self::ORDERED_RECREATE_ATTEMPTS) {
                                 throw $e;
                             }
@@ -1193,8 +1303,10 @@ final class JetStreamContext
                         }
                     }
                 } catch (\Throwable $e) {
-                    // Containment: see the docblock above. The app must still learn the ordered
-                    // consumer is now permanently silent, so surface through the error listener (#114).
+                    // Containment: see the docblock above. Best-effort reap any orphans this episode
+                    // may have leaked, then surface through the error listener (#114/#122).
+                    $this->reapOrphanedConsumers($stream, $orphanCandidates);
+
                     $this->emitClientError(new JetStreamException(
                         sprintf(
                             'Ordered consumer recreate failed for stream "%s" after %d attempts: %s',
@@ -1205,6 +1317,21 @@ final class JetStreamContext
                         (int) $e->getCode(),
                         $e,
                     ));
+
+                    // Terminal: the ordered consumer is permanently dead. Tear down BOTH the new inbox
+                    // (interest created but never adopted) and the old inbox so neither drains orphan/
+                    // stale traffic - "dead" is actually dead rather than a still-live inbox draining
+                    // noise (#122).
+                    foreach ([$newSid, $oldSid] as $sid) {
+                        if ($sid !== null) {
+                            try {
+                                $this->client->unsubscribe($sid)->await();
+                            } catch (\Throwable) {
+                                // Best-effort teardown; a failed UNSUB must not escape the dispatch loop.
+                            }
+                        }
+                    }
+                    $state->deliverSid = null;
                 } finally {
                     // Always release the guard - on the success return, the retry-exhausted throw, or a
                     // teardown cancellation - so a legitimately-needed later recreate is never blocked (#113).
@@ -1218,18 +1345,33 @@ final class JetStreamContext
             // logic above can never see because it only runs when a frame arrives (#113).
             $state->onMiss = $recreate;
 
-            $sid = $this->client->subscribe($deliver, function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$ackParseErrorEmitted, $stream, $recreate, $state): void {
+            $deliverHandler = function (NatsMessage $message) use ($handler, &$expectedConsumerSeq, &$lastStreamSeq, &$consumerName, &$ackParseErrorEmitted, $stream, $recreate, $state): void {
                 // Every inbound frame - data, status-100 heartbeat, or flow-control - proves the consumer
                 // is alive; rearm the watchdog before any control handling so a heartbeating-but-quiet
                 // consumer is never falsely recreated (#113).
                 $state->touch();
 
                 if ($this->handlePushControlMessage($message, $controlHeaders)) {
-                    // Tail-gap detection: an idle heartbeat reports the server's last delivered consumer
-                    // sequence. If it is ahead of what we have processed in order, deliveries at the tail
-                    // were missed and no further message will arrive to expose the gap on its own -
-                    // recreate proactively from the last in-order point (#86). The headers were already
-                    // parsed by handlePushControlMessage (out-param) - do not re-parse the block (#139).
+                    $status = (int) (($controlHeaders ?? [])['Status'] ?? 0);
+                    if ($status !== 100) {
+                        // A non-100 status control frame (409 Consumer Deleted, 404, 408, 503, ...)
+                        // means this consumer instance is terminal/gone on the server. It is NOT user
+                        // data (handlePushControlMessage already withheld it); recreate from the last
+                        // in-order point rather than waiting for deliveries that will never resume (#121).
+                        $recreate();
+
+                        return;
+                    }
+
+                    // Status-100 tail-gap detection: an idle heartbeat reports the server's last
+                    // delivered consumer sequence. Every frame on THIS inbox is from the current
+                    // consumer - the deliver inbox is rotated on each recreate and the previous inbox
+                    // unsubscribed, so an orphan's / stale instance's frames never arrive here - so the
+                    // check needs no per-frame consumer-name scoping (#122). If the server delivered
+                    // past what we processed in order, deliveries at the tail were missed and no
+                    // further message will expose the gap on its own; recreate proactively from the
+                    // last in-order point (#86). The headers were already parsed by
+                    // handlePushControlMessage (out-param) - do not re-parse the block (#139).
                     $lastDelivered = $this->heartbeatLastConsumerSeq($controlHeaders ?? []);
                     if ($lastDelivered !== null && $lastDelivered > $expectedConsumerSeq - 1) {
                         $recreate();
@@ -1266,9 +1408,11 @@ final class JetStreamContext
                 }
 
                 if ($metadata->consumer !== $consumerName) {
-                    // A stale delivery from a previous (deleted) consumer instance arriving on the
-                    // reused deliver inbox after a recreate - ignore it so it cannot trigger a spurious
-                    // recreate or skew the new consumer-sequence count (#86).
+                    // Belt-and-suspenders after inbox rotation: a frame from a different consumer
+                    // instance should no longer reach this inbox, but a within-episode lost-reply
+                    // orphan (a distinct name bound to the CURRENT inbox until its best-effort delete /
+                    // inactive_threshold reaps it) could still deliver here - ignore it so it cannot
+                    // skew the new consumer-sequence count or trigger a spurious recreate (#86/#122).
                     return;
                 }
 
@@ -1283,7 +1427,14 @@ final class JetStreamContext
                 $expectedConsumerSeq++;
                 $lastStreamSeq = $metadata->streamSequence;
                 $handler($message);
-            })->await();
+            };
+
+            $sid = $this->client->subscribe($deliver, $deliverHandler)->await();
+
+            // Hand the deliver sid to the recreate closure (via the shared state) so a TERMINAL
+            // recreate failure can tear this subscription down, and so each rotation knows which old
+            // inbox to unsubscribe - "dead" is actually dead (#122).
+            $state->deliverSid = $sid;
 
             $this->armHeartbeatWatchdog($sid, $idleHeartbeatNs, $state);
 
@@ -1592,6 +1743,13 @@ final class JetStreamContext
                 (int) ($error['code'] ?? 0),
                 ApiErrCode::fromEnvelope($error),
             );
+        }
+
+        // A publish ack with neither an `error` nor a `stream` is not a valid success - nats.go
+        // rejects an empty-stream ack. Without this, such a reply would hydrate as PubAck('', 0)
+        // and be returned as a bogus success, masking a server/protocol fault (#121).
+        if (!is_string($data['stream'] ?? null) || $data['stream'] === '') {
+            throw new JetStreamException('Invalid JetStream publish ack: missing "stream" field');
         }
 
         return PubAck::fromArray($data);
@@ -2033,8 +2191,18 @@ final class JetStreamContext
         $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
         $status = (int) ($headers['Status'] ?? 0);
 
-        if ($status !== 100) {
+        if ($status === 0) {
+            // No status line: an ordinary data message (possibly with user headers), not a control
+            // frame - deliver it.
             return false;
+        }
+
+        if ($status !== 100) {
+            // A non-100 status frame (e.g. 409 Consumer Deleted, 404, 408, 503) is a JetStream
+            // control/error frame, never user payload. Intercept it so it is NOT forwarded to the
+            // user handler as if it were a message; the ordered consumer inspects the status (via the
+            // out-param headers) to react (recreate/surface) (#121).
+            return true;
         }
 
         $description = strtolower(trim((string) ($headers['Description'] ?? '')));
@@ -2114,6 +2282,38 @@ final class JetStreamContext
         };
 
         return $state;
+    }
+
+    /**
+     * Surfaces a terminal (4xx/5xx) push status frame through the error listener for a CALLER-OWNED
+     * push consumer (subscribePushConsumer / subscribeEphemeralPushConsumer). handlePushControlMessage()
+     * intercepts EVERY non-100 status frame so it is never forwarded to the user handler as bogus data;
+     * for a consumer whose lifecycle the library does not own (it cannot recreate it, unlike an ordered
+     * consumer) the drop would otherwise be silent, so it is made observable here. Status 100 (idle
+     * heartbeat / flow control) is not terminal and is intentionally left silent (#121).
+     *
+     * @param array<string,string> $headers
+     */
+    private function surfaceCallerOwnedPushStatus(array $headers, string $stream, string $consumerLabel): void
+    {
+        $status = (int) ($headers['Status'] ?? 0);
+        if ($status < 400) {
+            return;
+        }
+
+        $description = trim((string) ($headers['Description'] ?? ''));
+
+        $this->emitClientError(new JetStreamException(
+            sprintf(
+                'Push consumer %s on stream "%s" received a terminal status %d%s; delivery has stopped '
+                    . 'and the library cannot recreate a caller-owned consumer - resubscribe or recreate it',
+                $consumerLabel,
+                $stream,
+                $status,
+                $description !== '' ? ' (' . $description . ')' : '',
+            ),
+            $status,
+        ));
     }
 
     /**
@@ -2200,6 +2400,42 @@ final class JetStreamContext
         $value = trim((string) ($headers['Nats-Last-Consumer'] ?? ''));
 
         return ($value !== '' && ctype_digit($value)) ? (int) $value : null;
+    }
+
+    /**
+     * Generates a UNIQUE client-chosen ephemeral consumer name for an ordered-consumer recreate
+     * attempt. Choosing the name client-side (the server honours `config.name` and echoes it) means a
+     * create whose reply is lost is still deletable by name - the basis for orphan reaping (#122). The
+     * name is fresh per attempt (a random 12-byte token), so a lost-reply retry is NOT an idempotent
+     * no-op: it creates a DISTINCT server-side consumer. That orphan is reaped by the rotation's
+     * old-inbox unsubscribe (its `inactive_threshold` fires) plus the best-effort delete-by-name. The
+     * token is a valid JS name (no '.', '*', '>', '/', '\\' or whitespace) and collision-safe.
+     */
+    private static function generateOrderedConsumerName(): string
+    {
+        return 'ord-' . bin2hex(random_bytes(12));
+    }
+
+    /**
+     * Best-effort-deletes ordered-consumer names a recreate episode asked the server to create but
+     * never adopted (a create whose reply was lost may still have succeeded server-side, leaving a
+     * live ephemeral bound to the rotated deliver inbox). Faster cleanup only: the rotation already
+     * unsubscribes that inbox so the orphan's `inactive_threshold` reaps it regardless. Bounded by the
+     * retry count. Each delete tolerates ANY failure - the orphan may already be gone, or a timed-out
+     * delete may still have succeeded server-side - so a failed reap never undoes a successful
+     * recovery (mirror #151) (#122).
+     *
+     * @param list<string> $names
+     */
+    private function reapOrphanedConsumers(string $stream, array $names): void
+    {
+        foreach ($names as $name) {
+            try {
+                $this->deleteConsumer($stream, $name)->await();
+            } catch (\Throwable) {
+                // Best-effort: a reap failure must never break recovery.
+            }
+        }
     }
 
     /**

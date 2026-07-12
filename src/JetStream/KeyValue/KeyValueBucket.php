@@ -40,6 +40,13 @@ final class KeyValueBucket
     public const WATCH_IDLE_HEARTBEAT_NS = 5_000_000_000;
 
     /**
+     * Default bound (seconds) for a single history() replay. A replay that does not catch up within
+     * the bound surfaces as an incomplete-result error rather than a silently truncated prefix (#121).
+     * Overridable per call via the timeout argument.
+     */
+    private const HISTORY_TIMEOUT_S = 5.0;
+
+    /**
      * Creates a KV bucket context bound to a client and bucket name.
      *
      * @param NatsClient $client Connected client used for publish/subscribe operations behind KV APIs.
@@ -542,11 +549,20 @@ final class KeyValueBucket
      * a history-1 bucket yields only the latest record. Mirrors nats.go / nats.java `KeyValue.History`
      * (#41).
      *
+     * The replay is bounded by a PROGRESS timeout, $progressTimeoutSeconds (default
+     * {@see self::HISTORY_TIMEOUT_S}): the bound resets on every replayed revision, so a healthy-but-
+     * slow large history that keeps making progress never fails - only a server that makes NO progress
+     * for the whole interval throws a JetStreamException rather than returning a truncated prefix, so a
+     * genuinely stalled server surfaces as an error instead of a silent partial result (#121).
+     *
+     * @param float|null $progressTimeoutSeconds No-progress bound in seconds (null uses the default).
      * @return Future<list<KeyValueEntry>>
      */
-    public function history(string $key): Future
+    public function history(string $key, ?float $progressTimeoutSeconds = null): Future
     {
-        return async(function () use ($key): array {
+        $progressTimeoutSeconds ??= self::HISTORY_TIMEOUT_S;
+
+        return async(function () use ($key, $progressTimeoutSeconds): array {
             $this->assertValidKey($key);
 
             $deliver = Inbox::generate('_INBOX.KV.HIST');
@@ -583,16 +599,44 @@ final class KeyValueBucket
                 }
             })->await();
 
-            $cancellation = new TimeoutCancellation(5.0);
+            // Progress-based bound: reset the stall clock on each replayed revision, so a healthy-but-
+            // slow large history that keeps making progress is never failed - only a server that makes
+            // NO progress for the whole interval throws (mirrors #153's missed-heartbeat approach).
+            $progressIntervalNs = (int) ($progressTimeoutSeconds * 1_000_000_000);
+            $lastActivityNs = hrtime(true);
+            $seen = count($entries);
             try {
                 while (!$caughtUp) {
-                    $frames = $this->client->processIncoming($cancellation)->await();
-                    if ($frames === 0) {
-                        delay(0.001, cancellation: $cancellation);
+                    $nowNs = hrtime(true);
+                    if ($nowNs - $lastActivityNs >= $progressIntervalNs) {
+                        // No revision arrived for the whole progress interval (num_pending never reached
+                        // 0). Returning the collected prefix would silently truncate the history as if
+                        // complete; a stalled server surfaces as an incomplete-result error (#121).
+                        throw new JetStreamException(sprintf(
+                            'Key history for "%s" stalled: no progress for %.3f s (collected %d '
+                                . 'revision(s), replay not caught up)',
+                            $key,
+                            $progressTimeoutSeconds,
+                            count($entries),
+                        ));
+                    }
+
+                    $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
+                    try {
+                        $frames = $this->client->processIncoming($waitCancellation)->await();
+                        if ($frames === 0) {
+                            delay(0.001, cancellation: $waitCancellation);
+                        }
+                    } catch (CancelledException) {
+                        // This wait segment ended; loop around to re-evaluate the stall deadline.
+                    }
+
+                    if (count($entries) > $seen) {
+                        // A revision landed: progress. Rebase the stall clock from now.
+                        $seen = count($entries);
+                        $lastActivityNs = hrtime(true);
                     }
                 }
-            } catch (CancelledException) {
-                // Bounded wait elapsed; return whatever history was collected.
             } finally {
                 $this->client->unsubscribe($sid)->await();
             }

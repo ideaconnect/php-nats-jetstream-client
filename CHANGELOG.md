@@ -33,6 +33,41 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   number of passes. Wire ordering is unchanged: the already-buffered frames are written before the
   flip, so per-publisher order and buffered-before-direct (#148) still hold, and #123 retain-on-flush-
   failure / loud-exhaustion semantics are untouched.
+- `[bugfix]` Ordered consumers no longer orphan a live server-side ephemeral on a recreate, and a
+  non-current heartbeat can no longer drive a recreate storm (#122). Each recreate now ROTATES the
+  deliver inbox: it generates a fresh deliver subject, subscribes it (a new sid), points the new
+  `CONSUMER.CREATE` at that subject, and unsubscribes the old inbox. An orphan left by a lost
+  `CONSUMER.CREATE` reply (a timeout / connection loss where the create may still have SUCCEEDED
+  server-side) therefore delivers to the OLD inbox that the client no longer subscribes to, so neither
+  its data frames NOR its plain idle heartbeats reach the tail-gap check - the recreate storm #122
+  targets cannot happen - and dropping the client's interest lets the orphan's server-side
+  `inactive_threshold` reap it, so the leak self-heals. Because only the current consumer's frames
+  arrive on the current inbox, the tail-gap check is inherently scoped without parsing control-frame
+  subjects. Each recreate still chooses the consumer name client-side and best-effort-deletes any
+  orphaned prior attempt as a faster-cleanup nice-to-have (mirroring the #151 tolerate-any-failure
+  delete), and on a TERMINAL recreate failure the deliver subscription is torn down so "dead" is
+  actually dead. The #113 watchdog (re-armed on the rotated sid) / `recreateInFlight` guard,
+  #114/#116 recreate retry, and #155 ack-metadata tolerance are all preserved.
+- `[bugfix]` A non-100 status control frame (e.g. `409 Consumer Deleted`, `404`, `408`, `503`) on a
+  push deliver subject is no longer forwarded to the user handler as if it were a message (#121).
+  `handlePushControlMessage()` only intercepted status 100 (idle heartbeat / flow control); other
+  status frames fell through and were delivered as empty "data". They are now intercepted for every
+  push subscription: an ordered consumer treats such a terminal status as a gone consumer and
+  recreates from the last in-order point, while a caller-owned push consumer surfaces a terminal
+  (4xx/5xx) status through the error listener as a descriptive `JetStreamException` instead of
+  silently dropping it. Status-0 data messages (including those carrying user headers) are unaffected.
+- `[bugfix]` A JetStream publish ack that carries neither an `error` nor a `stream` is now rejected
+  with a `JetStreamException` instead of being accepted as a bogus `PubAck('', 0)` success (#121),
+  matching nats.go, which rejects an empty-stream ack as invalid.
+- `[bugfix]` `directGetBatch()` and `KeyValueBucket::history()` no longer silently return a truncated
+  prefix when their bounded wait elapses before completion (#121). A Direct Get batch that never
+  receives its end-of-batch marker (204 / `Nats-Num-Pending: 0`), or a history replay that never
+  catches up (`num_pending` never reaches 0), now throws a `JetStreamException` reporting the
+  incomplete result rather than returning whatever partial data was collected as if it were complete.
+  Both bounds are PROGRESS-BASED (reset on each inbound frame, mirroring #153's missed-heartbeat
+  approach), so a healthy-but-slow large replay that keeps making progress no longer throws - only a
+  genuinely stalled server (no progress for the interval) does. `history()` gained an optional
+  per-call progress-timeout argument (defaulting to the previous bound).
 
 ### Documentation
 
