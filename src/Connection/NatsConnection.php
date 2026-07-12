@@ -868,14 +868,22 @@ final class NatsConnection
      * Publishes payload bytes to the given subject.
      *
      * At-least-once, nats.go-parity semantics while reconnecting: a publish issued while a reconnect is
-     * in flight is buffered and reports success IMMEDIATELY - the returned Future resolves as soon as
-     * the frame is queued, before it has reached any server. If the reconnect then succeeds the
+     * in flight is normally buffered and reports success IMMEDIATELY - the returned Future resolves as
+     * soon as the frame is queued, before it has reached any server. If the reconnect then succeeds the
      * buffered frames are flushed in publish order; if it exhausts every attempt, those frames are
-     * DISCARDED and this reported success is retroactively void. That loss is signalled only
+     * DISCARDED and this reported success is retroactively void. That exhaustion loss is signalled only
      * out-of-band - via the connection-level {@see ConnectionEvent::Closed} event and the
      * "Reconnect exhausted: N bytes ... discarded" async error (#123) - never through this Future. A
      * caller needing end-to-end delivery confirmation must use a JetStream publish-with-ack rather than
      * treating this success as proof the bytes were transmitted.
+     *
+     * The one exception to "resolves immediately" is sustained publish pressure during the reconnect
+     * flush: once the buffer has been drained {@see self::RECONNECT_FLUSH_MAX_PASSES} times it is sealed
+     * so recovery can reach Open in a bounded number of passes (#165). A publish that arrives after the
+     * seal does NOT buffer - it parks on the flush gate until the connection flips Open (then writes
+     * directly, still ordered after the buffered frames) or Closed (then throws ConnectionException
+     * through this Future). So under that narrow window this Future can block, and can surface the
+     * connection-closed failure directly, rather than resolving success out of hand.
      *
      * @return Future<void>
      */
