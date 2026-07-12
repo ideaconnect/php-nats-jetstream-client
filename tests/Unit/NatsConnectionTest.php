@@ -9422,6 +9422,49 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * A lame-duck INFO delivered during the subscription-REPLAY poll (drainImmediateServerFrames,
+     * not coalesced with the handshake PONG) also asks recoverConnection() to reconnect from inside
+     * the recovery fiber. The same-fiber guard must make it a no-op so recovery completes instead of
+     * self-awaiting its own in-flight deferred forever (#166). Bounded so a regression fails, not hangs.
+     */
+    public function testLameDuckDuringReplayPollDoesNotWedgeRecovery(): void
+    {
+        $handshakeInfo = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $transport = new FakeTransport([
+            $handshakeInfo,
+            "PONG\r\n",
+            FakeTransport::EOF,  // drop epoch 0 -> recovery
+            $handshakeInfo,      // reconnect handshake INFO
+            "PONG\r\n",          // reconnect handshake PONG (no coalesced INFO here)
+        ]);
+        // Deliver the lame-duck INFO into the replay window: injected when resubscribeAll() writes the
+        // SUB replay, so drainImmediateServerFrames() reads it and dispatches handleServerInfoUpdate()
+        // from inside the recovery fiber.
+        $transport->enqueueOnWriteContaining = [
+            'SUB events' => ['INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.9:4222"]}' . "\r\n"],
+        ];
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                servers: ['nats://127.0.0.1:4222', 'nats://127.0.0.1:4223'],
+                reconnectEnabled: true,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('events', static function (): void {})->await();
+
+        $connection->processIncoming()->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(ConnectionState::Open, $connection->state(), 'recovery must complete, not wedge on a replay-window lame-duck INFO');
+        self::assertSame(['10.0.0.9:4222'], $connection->discoveredServers());
+    }
+
+    /**
      * A fatal server -ERR co-chunked with a MSG whose handler throws during the per-chunk drain must
      * still surface: the finally-drain could REPLACE the in-flight dispatch exception with the
      * handler's throw, swallowing the fatal error so the connection continued as if the server never

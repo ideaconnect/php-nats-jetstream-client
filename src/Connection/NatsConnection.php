@@ -2021,9 +2021,10 @@ final class NatsConnection
         if ($inProgress !== null) {
             // A recover requested re-entrantly from WITHIN the active recovery fiber must not await its
             // own in-progress future - that would suspend this fiber on a deferred only this fiber can
-            // complete (a deadlock). This reaches here when a lame-duck INFO coalesced behind the
-            // reconnect handshake PONG is dispatched during connectOnce (#157): the recovery is already
-            // underway on this very fiber, so the nested request is a no-op.
+            // complete (a deadlock). This reaches here when a lame-duck INFO is dispatched from inside
+            // the recovery fiber - coalesced behind the reconnect handshake PONG during connectOnce
+            // (#157), or read during the subscription-replay poll drainImmediateServerFrames (#166):
+            // the recovery is already underway on this very fiber, so the nested request is a no-op.
             if ($this->recoveryFiber !== null && $this->recoveryFiber === \Fiber::getCurrent()) {
                 return;
             }
