@@ -21,7 +21,9 @@ use PHPUnit\Framework\TestCase;
  */
 final class ObjectStoreBucket_4MutationTest extends TestCase
 {
-    private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+    // Pre-2.11 server: list() takes the per-subject Direct Get fan-out (the code these mutants pin);
+    // batched multi_last Direct Get requires 2.11+ and is covered separately by the #110 pins.
+    private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /** URL-safe base64 (with padding), matching the Object Store meta-subject encoding. */
     private function encodeName(string $name): string

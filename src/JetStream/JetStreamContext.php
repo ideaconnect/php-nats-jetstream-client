@@ -663,9 +663,34 @@ final class JetStreamContext
     }
 
     /**
-     * Fetches the latest message for each of several subjects in a single batched Direct Get request
-     * (ADR-31 `multi_last`), instead of one Direct Get per subject. Requires the stream to be created
-     * with `allow_direct` and a server that supports batched Direct Get (NATS 2.11+).
+     * Maximum number of exact subjects packed into one batched Direct Get (`multi_last`) request. A
+     * NATS 2.11+ server caps a batched Direct Get at 1024 results and rejects a larger request ("Too
+     * Many Results"), so {@see directGetLastForSubjects()} splits longer exact-subject lists into chunks
+     * of at most this many subjects - held conservatively below 1024 to leave margin for the
+     * end-of-batch marker. Each exact subject matches at most one message, so N subjects yield <= N
+     * results and a chunk of this size never trips the cap.
+     */
+    private const DIRECT_GET_BATCH_MAX_SUBJECTS = 1000;
+
+    /**
+     * Bytes reserved below the negotiated `max_payload` for the batched Direct Get request envelope
+     * (the `{"multi_last":[...],"batch":<int>}` structural characters plus the `batch` integer) when
+     * packing subjects into a chunk, so a full chunk's published request stays within max_payload.
+     */
+    private const DIRECT_GET_BATCH_ENVELOPE_BYTES = 64;
+
+    /**
+     * Fetches the latest message for each of several subjects using batched Direct Get requests (ADR-31
+     * `multi_last`), instead of one Direct Get per subject. Requires the stream to be created with
+     * `allow_direct` and a server that supports batched Direct Get (NATS 2.11+).
+     *
+     * The exact-subject list is split into chunks bounded by the server's 1024-result cap and by the
+     * negotiated `max_payload`, and one batched request is issued per chunk (sequentially): a bucket
+     * with more subjects than a single request may carry is enumerated across several requests rather
+     * than a single oversized one the server would reject with "Too Many Results". Because each exact
+     * subject matches at most one message and lands in exactly one chunk, concatenating the per-chunk
+     * replies yields the same result a single (permitted) request would. The common small bucket
+     * produces exactly one chunk and one request.
      *
      * @param list<string> $subjects
      * @return Future<list<NatsMessage>>
@@ -691,12 +716,73 @@ final class JetStreamContext
                 }
             }
 
-            return $this->directGetBatch(
-                $stream,
-                ['multi_last' => $subjects, 'batch' => count($subjects)],
-                $expiresMs,
-            )->await();
+            $messages = [];
+            foreach ($this->chunkExactSubjectsForBatch($subjects) as $chunk) {
+                $chunkMessages = $this->directGetBatch(
+                    $stream,
+                    ['multi_last' => $chunk, 'batch' => count($chunk)],
+                    $expiresMs,
+                )->await();
+
+                foreach ($chunkMessages as $message) {
+                    $messages[] = $message;
+                }
+            }
+
+            return $messages;
         });
+    }
+
+    /**
+     * Splits an exact-subject list into batched Direct Get chunks bounded by BOTH the server's
+     * per-request result cap ({@see DIRECT_GET_BATCH_MAX_SUBJECTS}) AND the negotiated `max_payload`
+     * (the `{"multi_last":[...],"batch":N}` request must fit one PUB). Each subject lands in exactly one
+     * chunk, so concatenating the chunks' replies reproduces a single request's result. A lone subject
+     * whose own encoding already exceeds the payload budget still occupies its own chunk - the resulting
+     * request is then rejected by publish()'s max_payload guard, a clear failure rather than silent loss.
+     *
+     * @param non-empty-list<string> $subjects Non-empty list of exact (wildcard-free) subjects.
+     * @return non-empty-list<non-empty-list<string>>
+     */
+    private function chunkExactSubjectsForBatch(array $subjects): array
+    {
+        $maxPayload = $this->client->maxPayload();
+        // Fall back to the NATS default max_payload (1 MiB) when the server did not advertise one.
+        $payloadBudget = ($maxPayload !== null && $maxPayload > 0 ? $maxPayload : 1_048_576)
+            - self::DIRECT_GET_BATCH_ENVELOPE_BYTES;
+        if ($payloadBudget < 1) {
+            $payloadBudget = 1;
+        }
+
+        /** @var list<non-empty-list<string>> $chunks */
+        $chunks = [];
+        /** @var list<string> $current */
+        $current = [];
+        $currentBytes = 0;
+        foreach ($subjects as $subject) {
+            // Cost of this subject inside the JSON array, measured with the SAME encoding
+            // directGetBatch() serializes the request with (json_encode, default flags): the encoded,
+            // quoted, escaped string plus one byte for the separating comma. This must be an exact upper
+            // bound, not an approximation - json_encode escapes '/' to '\/' (KV keys legally contain '/'),
+            // so strlen + 2 quotes would UNDER-count a slash-bearing subject and let a chunk overflow
+            // max_payload. Encoding each subject the way it will actually be sent captures every escape.
+            $entryBytes = strlen(json_encode($subject, JSON_THROW_ON_ERROR)) + 1;
+            if ($current !== []
+                && (count($current) >= self::DIRECT_GET_BATCH_MAX_SUBJECTS
+                    || $currentBytes + $entryBytes > $payloadBudget)
+            ) {
+                $chunks[] = $current;
+                $current = [];
+                $currentBytes = 0;
+            }
+
+            $current[] = $subject;
+            $currentBytes += $entryBytes;
+        }
+
+        $chunks[] = $current;
+
+        return $chunks;
     }
 
     /**
@@ -719,6 +805,10 @@ final class JetStreamContext
                 throw new JetStreamException('Direct Get batch expiresMs must be greater than zero');
             }
 
+            // NOTE: chunkExactSubjectsForBatch() sizes each subject's contribution to a `multi_last`
+            // request with this exact call (json_encode, default flags) to keep a chunk within
+            // max_payload. Keep the flags here and there identical - adding e.g. JSON_UNESCAPED_SLASHES
+            // to one but not the other would make that budget under-count and let a chunk overflow.
             $json = json_encode($body, JSON_THROW_ON_ERROR);
             $subject = JetStreamApi::STREAM_DIRECT_GET_PREFIX . $stream;
             $inbox = Inbox::generate('_INBOX.JS.DGET');
@@ -2694,6 +2784,29 @@ final class JetStreamContext
     private function serverVersion(): ?string
     {
         return $this->client->serverInfo()?->version;
+    }
+
+    /**
+     * Whether the connected server supports batched (ADR-31 `multi_last`) Direct Get, which requires
+     * NATS server 2.11+. KV `getAll()` and Object Store `list()` route through a single batched
+     * Direct Get when this is true, and fall back to a per-subject Direct Get fan-out otherwise (#110).
+     *
+     * The check reads the INFO-advertised version's numeric `major.minor` prefix (pre-release tags
+     * ignored, matching the {@see BatchPublisher} comparison). An unknown or unparseable version
+     * (proxies, custom builds) returns false so the conservative fan-out fallback - which works on any
+     * server - is used rather than sending a request an older server cannot honor.
+     */
+    public function supportsBatchedDirectGet(): bool
+    {
+        $version = $this->serverVersion();
+        if ($version === null || preg_match('/^v?(\d+)(?:\.(\d+))?/', $version, $match) !== 1) {
+            return false;
+        }
+
+        $major = (int) $match[1];
+        $minor = (int) ($match[2] ?? 0);
+
+        return $major > 2 || ($major === 2 && $minor >= 11);
     }
 
     /**

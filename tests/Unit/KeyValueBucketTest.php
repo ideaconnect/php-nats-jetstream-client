@@ -548,26 +548,38 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies keys() returns the live key names (deleted keys excluded) (#25).
+     * Verifies keys() returns the live key names (deleted keys excluded) WITHOUT downloading any value
+     * bytes: it drives a last_per_subject + headers_only ephemeral consumer and filters DEL tombstones
+     * by the KV-Operation header alone (#25/#110). The consumer replays each key's latest record with
+     * headers only; the DEL record is excluded and no Direct Get / value body crosses the wire.
      */
     public function testKeysReturnsLiveKeyNames(): void
     {
-        $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":4,"subjects":{"$KV.cfg.username":2,"$KV.cfg.email":2}}}';
-        $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
-        $usernameHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 3\r\nKV-Operation: DEL\r\n\r\n";
-        $emailHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.email\r\nNats-Sequence: 4\r\n\r\n";
-        $emailBody = 'b@example.com';
+        // CONSUMER.CREATE reply (sid 1): a headers-only last_per_subject consumer with four records pending.
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":4,'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+        // Headers-only deliveries on the deliver subscription (sid 2). The $JS.ACK reply subject's last
+        // token is num_pending; the final delivery reports 0, signalling the replay has caught up.
+        // A frame on a subject OUTSIDE this bucket's prefix (keyFromSubject -> null) must be dropped, not
+        // enumerated - a non-null-AND-non-empty guard, so a truthy key is required.
+        $otherHdrs = "NATS/1.0\r\nNats-Sequence: 2\r\n\r\n";                              // $KV.other.k -> non-key (excluded)
+        $usernameHdrs = "NATS/1.0\r\nNats-Sequence: 3\r\nKV-Operation: DEL\r\n\r\n";      // username -> DEL (excluded)
+        $emailHdrs = "NATS/1.0\r\nNats-Sequence: 4\r\n\r\n";                              // email -> live
+        $phoneHdrs = "NATS/1.0\r\nNats-Sequence: 5\r\n\r\n";                              // phone -> live (caught up)
+        $oh = strlen($otherHdrs);
         $uh = strlen($usernameHdrs);
         $eh = strlen($emailHdrs);
-        $et = $eh + strlen($emailBody);
+        $ph = strlen($phoneHdrs);
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
-            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
-            sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),            // username -> DEL (excluded)
-            sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody), // email -> live
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
+            sprintf("HMSG \$KV.other.k 2 \$JS.ACK.KV_cfg.KEYS.1.2.1.0.3 %d %d\r\n%s\r\n", $oh, $oh, $otherHdrs),
+            sprintf("HMSG \$KV.cfg.username 2 \$JS.ACK.KV_cfg.KEYS.1.3.2.0.2 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),
+            sprintf("HMSG \$KV.cfg.email 2 \$JS.ACK.KV_cfg.KEYS.1.4.3.0.1 %d %d\r\n%s\r\n", $eh, $eh, $emailHdrs),
+            sprintf("HMSG \$KV.cfg.phone 2 \$JS.ACK.KV_cfg.KEYS.1.5.4.0.0 %d %d\r\n%s\r\n", $ph, $ph, $phoneHdrs),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -575,7 +587,165 @@ final class KeyValueBucketTest extends TestCase
 
         $keys = $client->jetStream()->keyValue('cfg')->keys()->await();
 
-        self::assertSame(['email'], $keys);
+        // BOTH live keys are returned (the DEL tombstone and the out-of-prefix frame are excluded). The
+        // replay order (stream-sequence order) is unspecified, so compare canonically.
+        self::assertCount(2, $keys);
+        self::assertEqualsCanonicalizing(['email', 'phone'], $keys);
+
+        // The enumeration consumer must filter on this bucket's whole keyspace (prefix + '>'), request
+        // headers_only + last_per_subject (no value bytes), and keys() must never issue a Direct Get.
+        $consumerCreate = '';
+        foreach ($transport->writes as $w) {
+            if (str_contains($w, '$JS.API.CONSUMER.CREATE.KV_cfg')) {
+                $consumerCreate = $w;
+                break;
+            }
+        }
+        self::assertStringContainsString('"$KV.cfg.>"', $consumerCreate);
+        self::assertStringContainsString('"headers_only":true', $consumerCreate);
+        self::assertStringContainsString('"deliver_policy":"last_per_subject"', $consumerCreate);
+        self::assertStringNotContainsString('$JS.API.DIRECT.GET', implode('', $transport->writes));
+
+        // The ephemeral deliver subscription (sid 2) is torn down once enumeration completes.
+        self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
+    }
+
+    /**
+     * Connects a client whose CONSUMER.CREATE reply (sid 1) is $consumerReply and whose deliver
+     * subscription (sid 2) is fed $deliverFrames, for the keys() enumeration tests.
+     *
+     * @param list<string> $deliverFrames
+     * @return array{0: NatsClient, 1: FakeTransport}
+     */
+    private function connectForKeys(string $consumerReply, array $deliverFrames = []): array
+    {
+        $reads = array_merge([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
+        ], $deliverFrames);
+
+        $transport = new FakeTransport($reads);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        return [$client, $transport];
+    }
+
+    /** A single live headers-only delivery on sid 2 whose ACK reports num_pending 0 (immediately caught up). */
+    private function keysLiveTerminatorFrame(string $key): string
+    {
+        $hdrs = "NATS/1.0\r\nNats-Sequence: 3\r\n\r\n";
+        $h = strlen($hdrs);
+
+        return sprintf("HMSG \$KV.cfg.%s 2 \$JS.ACK.KV_cfg.KEYS.1.3.1.0.0 %d %d\r\n%s\r\n", $key, $h, $h, $hdrs);
+    }
+
+    /**
+     * A consumer reporting num_pending 0 means the bucket has no live keys: keys() must short-circuit to
+     * [] WITHOUT ever subscribing to the deliver inbox (no replay to consume). A live frame is seeded so
+     * that any code path which wrongly proceeds past the short-circuit would enumerate it and be caught.
+     *
+     * Falsifies the `=== 0` -> `=== -1` mutation of the short-circuit guard, which would proceed to the
+     * replay, subscribe, drain the seeded frame, and return ['ghost'].
+     */
+    public function testKeysReturnsEmptyWithoutSubscribingWhenConsumerReportsNoPending(): void
+    {
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":0,'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+
+        [$client, $transport] = $this->connectForKeys($consumerReply, [$this->keysLiveTerminatorFrame('ghost')]);
+
+        $keys = $client->jetStream()->keyValue('cfg')->keys()->await();
+
+        self::assertSame([], $keys);
+        self::assertStringNotContainsString('SUB _INBOX.KV.KEYS', implode('', $transport->writes));
+    }
+
+    /**
+     * An ABSENT num_pending must be read as 0 (the `?? 0` default) and short-circuit to []. A seeded live
+     * frame catches any mutation that resolves the absent value to a non-zero pending and proceeds.
+     *
+     * Falsifies the `?? 0` -> `?? -1` and `?? 1` mutations (both make an absent num_pending non-zero, so
+     * keys() would subscribe, drain the seeded frame, and return ['ghost']).
+     */
+    public function testKeysTreatsAbsentNumPendingAsNoLiveKeys(): void
+    {
+        // No num_pending field at all.
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS",'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+
+        [$client, $transport] = $this->connectForKeys($consumerReply, [$this->keysLiveTerminatorFrame('ghost')]);
+
+        $keys = $client->jetStream()->keyValue('cfg')->keys()->await();
+
+        self::assertSame([], $keys);
+        self::assertStringNotContainsString('SUB _INBOX.KV.KEYS', implode('', $transport->writes));
+    }
+
+    /**
+     * num_pending must be coerced with (int) before the `=== 0` test: a JSON float 0.0 (as a proxy or
+     * non-canonical server might send) is a zero pending count and must short-circuit to []. Without the
+     * cast, `0.0 === 0` is false and keys() would wrongly proceed.
+     *
+     * Falsifies the (int) cast removal on the num_pending read.
+     */
+    public function testKeysCastsFloatZeroNumPendingToNoLiveKeys(): void
+    {
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":0.0,'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+
+        [$client, $transport] = $this->connectForKeys($consumerReply, [$this->keysLiveTerminatorFrame('ghost')]);
+
+        $keys = $client->jetStream()->keyValue('cfg')->keys()->await();
+
+        self::assertSame([], $keys);
+        self::assertStringNotContainsString('SUB _INBOX.KV.KEYS', implode('', $transport->writes));
+    }
+
+    /**
+     * When the consumer reports pending records but the replay makes NO progress (no delivery ever
+     * arrives), keys() must fail with a JetStreamException bounded by the CALLER-supplied progress
+     * timeout - and it must still tear down the deliver subscription (the finally), never leak it.
+     *
+     * Falsifies (a) the `??=` -> `=` mutation that discards the caller's timeout and uses the 5 s default
+     * (the message would quote 5.000 s, not the caller's 0.050 s); and (b) the finally-unwrap mutation,
+     * which on the throw path would skip the unsubscribe, leaving no UNSUB for the deliver sid.
+     */
+    public function testKeysThrowsOnStalledReplayAndStillUnsubscribes(): void
+    {
+        // num_pending > 0 so keys() proceeds to the replay, but no deliver frame is ever seeded, so the
+        // consumer never reports "caught up" and the progress clock expires.
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":2,'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+
+        [$client, $transport] = $this->connectForKeys($consumerReply);
+
+        try {
+            $client->jetStream()->keyValue('cfg')->keys(0.05)->await();
+            self::fail('expected a stalled-replay JetStreamException');
+        } catch (JetStreamException $e) {
+            // Pin the whole message shape: it must OPEN with the stalled banner, quote the CALLER's
+            // 0.05 s bound (not the 5 s default), and CLOSE with the not-caught-up tail.
+            self::assertStringStartsWith('Key enumeration stalled', $e->getMessage());
+            self::assertStringContainsString('0.050 s', $e->getMessage());
+            self::assertStringContainsString('replay not caught up', $e->getMessage());
+        }
+
+        // The deliver subscription (sid 2) is unsubscribed even on the throw path.
+        self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
+
+        // Tear the client down and cancel any event-loop timers the timed-out replay may have left
+        // pending (delay()/TimeoutCancellation), so no residual callback fires into a later test's clean
+        // loop and force-closes its fiber - the same quiescing setUp() performs before each test.
+        $client->disconnect()->await();
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
     }
 
     /**
@@ -881,8 +1051,10 @@ final class KeyValueBucketTest extends TestCase
         $eh = strlen($emailHdrs);
         $et = $eh + strlen($emailBody);
 
+        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1 (sid 1)
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty (sid 2)
@@ -941,8 +1113,10 @@ final class KeyValueBucketTest extends TestCase
         $eh = strlen($emailHdrs);
         $et = $eh + strlen($emailBody);
 
+        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
@@ -1307,8 +1481,10 @@ final class KeyValueBucketTest extends TestCase
         $th = strlen($themeHdrs);
         $tt = $th + strlen($themeBody);
 
+        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1 (sid 1)
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty (sid 2)
@@ -1936,8 +2112,10 @@ final class KeyValueBucketTest extends TestCase
         $th = strlen($themeHdrs);
         $tt = $th + strlen($themeBody);
 
+        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
+        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
@@ -1952,6 +2130,64 @@ final class KeyValueBucketTest extends TestCase
 
         // Only 'theme' should appear; the non-KV subject is silently skipped.
         self::assertSame(['theme' => 'dark'], $all);
+    }
+
+    // ─── getAll(): batched multi_last Direct Get on a 2.11+ server (#110) ───────
+
+    /**
+     * Verifies getAll() on a 2.11+ server issues exactly ONE batched multi_last Direct Get for all keys
+     * (instead of one Direct Get per key), returns the identical key => value map, and filters DEL/PURGE
+     * tombstones by header (#110). The single-request assertion FAILS on the pre-#110 per-subject
+     * fan-out, which writes one Direct Get PUB per key.
+     */
+    public function testGetAllUsesSingleBatchedDirectGetOnModernServer(): void
+    {
+        // The subject map leads with a NON-key subject (the bare prefix, keyFromSubject -> '') BEFORE the
+        // real keys: the candidate loop must SKIP it and keep collecting the keys that follow, not stop.
+        $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":4,"subjects":'
+            . '{"$KV.cfg.":1,"$KV.cfg.username":2,"$KV.cfg.email":2,"$KV.cfg.phone":2}}}';
+        $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
+        // One batched reply stream on a single inbox (sid 3): a DEL tombstone (excluded), TWO live values,
+        // and the last frame carrying Nats-Num-Pending: 0 to terminate the batch.
+        $usernameHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 3\r\nKV-Operation: DEL\r\n\r\n";
+        $emailHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.email\r\nNats-Sequence: 4\r\n\r\n";
+        $phoneHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.phone\r\nNats-Sequence: 5\r\nNats-Num-Pending: 0\r\n\r\n";
+        $emailBody = 'e@example.com';
+        $phoneBody = 'p@example.com';
+        $uh = strlen($usernameHdrs);
+        $eh = strlen($emailHdrs);
+        $et = $eh + strlen($emailBody);
+        $ph = strlen($phoneHdrs);
+        $pt = $ph + strlen($phoneBody);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1 (sid 1)
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty (sid 2)
+            sprintf("HMSG \$KV.cfg.username 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),         // batched frame: username -> DEL (excluded)
+            sprintf("HMSG \$KV.cfg.email 3 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody), // batched frame: email -> value
+            sprintf("HMSG \$KV.cfg.phone 3 %d %d\r\n%s%s\r\n", $ph, $pt, $phoneHdrs, $phoneBody), // batched frame: phone -> value (terminator)
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
+
+        // Identical returned data: BOTH live keys, tombstone excluded. Two live keys ensure the result is
+        // not silently truncated to a single entry.
+        self::assertSame(['email' => 'e@example.com', 'phone' => 'p@example.com'], $all);
+
+        // The win: exactly ONE Direct Get request for all keys (the batched multi_last), carrying the
+        // subject list - not one Direct Get PUB per key. The bare-prefix non-key subject is dropped.
+        $directGetPubs = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_starts_with($w, 'PUB $JS.API.DIRECT.GET.KV_cfg'),
+        ));
+        self::assertCount(1, $directGetPubs);
+        self::assertStringContainsString('"multi_last":["$KV.cfg.username","$KV.cfg.email","$KV.cfg.phone"]', $directGetPubs[0]);
+        self::assertStringContainsString('"batch":3', $directGetPubs[0]);
     }
 
     // ─── watch() updatesOnly deliver policy ───────────────────────

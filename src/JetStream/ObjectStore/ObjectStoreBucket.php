@@ -913,38 +913,47 @@ final class ObjectStoreBucket
                 return [];
             }
 
-            // Read the latest meta record per object CONCURRENTLY via the Direct Get API (served by
-            // any replica; the round-trips overlap) instead of N+1 serial leader reads.
-            $lookups = [];
-            foreach ($subjects as $subject) {
-                $lookups[] = async(function () use ($subject): ?ObjectInfo {
-                    try {
-                        $message = $this->jetStream->directGetLastMessageForSubject($this->streamName(), $subject)->await();
-                    } catch (JetStreamException $e) {
-                        if ($e->getCode() === 404) {
+            // Fast path (#110): one batched multi_last Direct Get (ADR-31) returns the latest meta record
+            // of every object in a single request/reply, instead of one Direct Get round-trip per object.
+            // Gated on server support (batched Direct Get needs NATS 2.11+); older servers take the
+            // per-subject fan-out below. The returned objects and deleted-filtering are identical.
+            if ($this->jetStream->supportsBatchedDirectGet()) {
+                /** @var list<?ObjectInfo> $infos */
+                $infos = $this->listBatched($subjects);
+            } else {
+                // Read the latest meta record per object CONCURRENTLY via the Direct Get API (served by
+                // any replica; the round-trips overlap) instead of N+1 serial leader reads.
+                $lookups = [];
+                foreach ($subjects as $subject) {
+                    $lookups[] = async(function () use ($subject): ?ObjectInfo {
+                        try {
+                            $message = $this->jetStream->directGetLastMessageForSubject($this->streamName(), $subject)->await();
+                        } catch (JetStreamException $e) {
+                            if ($e->getCode() === 404) {
+                                return null;
+                            }
+
+                            throw $e;
+                        }
+
+                        // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
+                        /** @var array<string,mixed>|null $metadata */
+                        $metadata = json_decode($message->payload, true);
+                        if (!is_array($metadata)) {
                             return null;
                         }
 
-                        throw $e;
-                    }
+                        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+                        $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
+                        $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
 
-                    // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
-                    /** @var array<string,mixed>|null $metadata */
-                    $metadata = json_decode($message->payload, true);
-                    if (!is_array($metadata)) {
-                        return null;
-                    }
+                        return $info->name === '' ? null : $info;
+                    });
+                }
 
-                    $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-                    $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-                    $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
-
-                    return $info->name === '' ? null : $info;
-                });
+                /** @var list<?ObjectInfo> $infos */
+                $infos = Future\await($lookups);
             }
-
-            /** @var list<?ObjectInfo> $infos */
-            $infos = Future\await($lookups);
 
             $result = [];
             foreach ($infos as $info) {
@@ -961,6 +970,43 @@ final class ObjectStoreBucket
 
             return $result;
         });
+    }
+
+    /**
+     * list() fast path: fetch the latest meta record of every object with ONE batched multi_last
+     * Direct Get (ADR-31) instead of a per-subject fan-out. Produces the identical `list<ObjectInfo>`
+     * before the caller's deleted-filtering: each reply body is the raw meta JSON (as with a single
+     * Direct Get), the revision is read off the Nats-Sequence header, a nameless/malformed record is
+     * dropped, and objects with no stored record are simply absent from the batch reply (mirroring the
+     * fan-out's 404-skip). Only reached when {@see JetStreamContext::supportsBatchedDirectGet()}.
+     *
+     * @param list<string> $subjects
+     * @return list<ObjectInfo>
+     */
+    private function listBatched(array $subjects): array
+    {
+        $messages = $this->jetStream->directGetLastForSubjects($this->streamName(), $subjects)->await();
+
+        $infos = [];
+        foreach ($messages as $message) {
+            // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
+            /** @var array<string,mixed>|null $metadata */
+            $metadata = json_decode($message->payload, true);
+            if (!is_array($metadata)) {
+                continue;
+            }
+
+            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+            $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
+            $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
+            if ($info->name === '') {
+                continue;
+            }
+
+            $infos[] = $info;
+        }
+
+        return $infos;
     }
 
     /**
