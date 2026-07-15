@@ -17,6 +17,9 @@ use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
+use IDCT\NATS\JetStream\Consumers\PullInFlight;
+use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
+use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
 use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
 use IDCT\NATS\JetStream\Models\AccountInfo;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
@@ -2129,6 +2132,413 @@ final class JetStreamContext
 
             return $messages;
         });
+    }
+
+    /**
+     * Pipelined pull-consumer engine backing {@see PullConsumerIterator::handle()}. Generalizes the
+     * single-shot {@see fetchBatch()} to up to `depth` CONSUMER.MSG.NEXT requests in flight at once,
+     * overlapping their network round-trips with handler processing while preserving delivery order.
+     *
+     * One long-lived, slow-consumer-EXEMPT pull inbox ("_INBOX.JS.PULL.<nuid>.*") is subscribed for
+     * the whole run and UNSUBbed once in finally. A non-suspending router buffers each frame by its
+     * reply-suffix token into the owning {@see PullInFlight} (status 100 absorbed, >=400 captured raw,
+     * status 0 buffered, received>=batch retires). The engine fiber - which owns every await - retires
+     * completed head pulls in issue order (draining each buffer to the handler FIRST, even on a
+     * terminal/deadline retire, and capturing a group pin from the first message), issues fresh pulls
+     * up to the effective depth, then pumps {@see \IDCT\NATS\Core\NatsClient::readIncoming()} bounded
+     * by the earliest per-pull deadline.
+     *
+     * Semantics preserved from the serial loop: finite ({@see PullPipelineConfig::$iterations}) runs
+     * strictly serial with an exact issued-pull count and stop-on-any-error (404/408 terminal without
+     * onError); infinite runs poll through routine empties (404/408, non-terminal 409) and stop once
+     * on a terminal 409/error; 423 drops the pin and re-pulls; the #153 escalating idle backoff fires
+     * only when a whole generation came back empty; stop() abandons the in-flight generation and
+     * drain() lets it complete. Infinite mode additionally survives a reconnect by re-issuing the
+     * server-side-lost in-flight pulls (#120).
+     *
+     * @internal Engine entry point for {@see PullConsumerIterator}; not part of the supported public API.
+     *
+     * @param callable(NatsMessage, JetStreamContext):void $handler
+     * @return Future<int> Total number of messages delivered to the handler.
+     */
+    public function consumePipelined(
+        string $stream,
+        string $consumer,
+        PullPipelineConfig $cfg,
+        callable $handler,
+        PullPipelineControl $ctl,
+    ): Future {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
+        return async(function () use ($stream, $consumer, $cfg, $handler, $ctl): int {
+            $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
+            $base = Inbox::generate('_INBOX.JS.PULL');
+            $prefix = $base . '.';
+
+            /** @var array<string, PullInFlight> $inflight */
+            $inflight = [];
+            /** @var list<string> $issueOrder Tokens in issue order; the router attributes token-less data FIFO. */
+            $issueOrder = [];
+            // Route-wide liveness: any frame (data, status, heartbeat) proves the inbox is alive.
+            $lastActivityNs = hrtime(true);
+
+            // Non-suspending router (mirrors the muxed request inbox, #118): it only buffers into the
+            // owning PullInFlight so it is safe to run inside the connection's same-sid dispatch loop.
+            // The engine fiber does every await and every handler call.
+            $router = function (NatsMessage $msg) use (&$inflight, &$issueOrder, &$lastActivityNs, $prefix): void {
+                // Any frame (data, status, heartbeat) on this run's inbox proves it is alive.
+                $lastActivityNs = hrtime(true);
+
+                $frameSubject = $msg->subject;
+
+                if (strncmp($frameSubject, $prefix, strlen($prefix)) === 0) {
+                    // CONTROL frame: JetStream publishes a pull's status/heartbeat replies (404/408/409/
+                    // 423/503/100) ON THE REPLY TOKEN "<base>.<token>", so the subject identifies the
+                    // owning pull directly. (Data messages do NOT arrive here - see below.)
+                    $token = substr($frameSubject, strlen($prefix));
+                    $pull = $inflight[$token] ?? null;
+                    if ($pull === null || $pull->done) {
+                        // Retired / orphaned / already-complete pull: a late or duplicate status -> drop.
+                        return;
+                    }
+
+                    $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
+                    $status = (int) ($headers['Status'] ?? 0);
+
+                    if ($status === 100) {
+                        // Idle heartbeat: liveness already recorded above, nothing to buffer.
+                        return;
+                    }
+
+                    if ($status >= 400) {
+                        $pull->terminalCode = $status;
+                        $pull->terminalDescription = trim((string) ($headers['Description'] ?? ''));
+                        $pull->done = true;
+                    }
+
+                    // Any other frame on the inbox token is unexpected (JS only sends statuses here);
+                    // ignore it defensively rather than mis-count it as a delivered message.
+                    return;
+                }
+
+                // DATA message: JetStream delivers a stored message on its ORIGINAL subject (with a
+                // $JS.ACK reply), NOT on the pull's reply token - so a data frame carries no token to
+                // route by. Attribute it to the OLDEST still-open pull in issue order (FIFO): a single
+                // consumer's overlapping pull requests are served by the server in arrival order, so
+                // wire order == issue order and each pull's batch fills before the next is served. This
+                // keeps delivery ordered and per-pull batch accounting exact.
+                foreach ($issueOrder as $token) {
+                    $pull = $inflight[$token] ?? null;
+                    if ($pull === null || $pull->done) {
+                        continue;
+                    }
+
+                    $pull->buffer[] = $msg;
+                    ++$pull->received;
+                    if ($pull->received >= $pull->batch) {
+                        $pull->done = true;
+                    }
+
+                    return;
+                }
+
+                // No open pull owns this delivery (every requested batch already filled): a straggler.
+                // Drop it - it stays unacked and is redelivered on a later pull, matching fetchBatch
+                // discarding messages received past the requested batch.
+            };
+
+            // A normal subscribe() so the SUB lives in subscriptionMeta and resubscribeAll() replays it
+            // on reconnect (BEFORE reconnectCount++), restoring inbox interest automatically; the
+            // unbounded mark (applied in the same tick, before any reply can enqueue) exempts it from the
+            // per-sub slow-consumer bound so a slow handler never drops a buffered reply (#120).
+            $sid = $this->client->subscribe($base . '.*', $router)->await();
+            $this->client->markSubscriptionUnbounded($sid);
+
+            $totalProcessed = 0;
+            $issued = 0;
+            $tokenSeq = 0;
+            $consecutiveEmptyPulls = 0;
+            // FIX1 latch: an empty pull stops refilling the generation; it drains, backs off, relaunches.
+            $idleDraining = false;
+            // Whether the generation's empties were immediate (no_wait, or a 409) and so need pacing.
+            $backoffWarranted = false;
+            $terminated = false;
+            $finite = $cfg->iterations !== null;
+            // FIX2 reconnect epoch: replayed interest restores the SUB, we only re-issue lost pulls.
+            $reconnectEpoch = $this->client->statistics()->reconnects;
+
+            try {
+                while (true) {
+                    // stop(): abandon the whole in-flight generation immediately, issue nothing more.
+                    if ($ctl->isStopRequested()) {
+                        break;
+                    }
+
+                    // FIX2 (infinite only): a reconnect lost every server-side in-flight pull. Drop them
+                    // WITHOUT onError/terminal (their unacked messages are redelivered), reset the idle
+                    // state, and let the issue phase re-pull fresh. Finite mode keeps today's
+                    // stop-on-reconnect: its silent pull simply deadline-retires as an empty below.
+                    if (!$finite) {
+                        $epoch = $this->client->statistics()->reconnects;
+                        if ($epoch !== $reconnectEpoch) {
+                            $reconnectEpoch = $epoch;
+                            $inflight = [];
+                            $issueOrder = [];
+                            $lastActivityNs = hrtime(true);
+                            $consecutiveEmptyPulls = 0;
+                            $idleDraining = false;
+                            $backoffWarranted = false;
+                        }
+                    }
+
+                    // RETIRE PHASE: retire done / deadline-expired head pulls in issue order so delivery
+                    // stays ordered; a not-yet-ready head blocks the tail (its deadline unblocks it).
+                    $nowNs = hrtime(true);
+                    while ($issueOrder !== []) {
+                        // stop() abandons the rest of the in-flight generation: retire no further pulls
+                        // (their buffers are left undelivered -> unacked -> redelivered later).
+                        if ($ctl->isStopRequested()) {
+                            break;
+                        }
+
+                        $token = $issueOrder[0];
+                        $pull = $inflight[$token];
+                        if (!$pull->done && $nowNs < $pull->deadlineNs) {
+                            break;
+                        }
+
+                        array_shift($issueOrder);
+                        unset($inflight[$token]);
+
+                        // Capture a pinned-group pin from the first message of the batch (before delivery),
+                        // so once resolved the effective depth can fan out past 1.
+                        if ($cfg->grouped && $ctl->getPinId() === null && $pull->buffer !== []) {
+                            $ctl->setPinId($this->pinIdOf($pull->buffer[0]));
+                        }
+
+                        // Drain the buffer to the handler FIRST (so a deadline/terminal retire of a
+                        // partially received pull does not drop already-received messages; mirrors
+                        // fetchBatch returning the partial batch). stop() breaks; drain() does NOT.
+                        $delivered = 0;
+                        foreach ($pull->buffer as $bufferedMsg) {
+                            if ($ctl->isStopRequested()) {
+                                break;
+                            }
+                            $handler($bufferedMsg, $this);
+                            ++$delivered;
+                            ++$totalProcessed;
+                        }
+                        $pull->buffer = [];
+
+                        if ($delivered > 0) {
+                            // A delivery ends the idle streak and clears any latched drain (#153, FIX1).
+                            $consecutiveEmptyPulls = 0;
+                            $idleDraining = false;
+                            $backoffWarranted = false;
+
+                            continue;
+                        }
+
+                        // Empty retire (0 delivered): classify the outcome.
+                        $code = $pull->terminalCode;
+                        $description = $pull->terminalDescription;
+
+                        if ($code === 423) {
+                            // Stale pin (both modes): drop it and re-pull without it. The pull already
+                            // consumed a finite iteration slot (counted at issue time).
+                            $ctl->setPinId(null);
+
+                            continue;
+                        }
+
+                        if ($finite) {
+                            // Finite: 404/408 and a silent deadline are terminal WITHOUT onError; any
+                            // other status (409, 5xx, ...) fires onError. Stop iterating either way.
+                            if (!($code === null || $code === 404 || $code === 408) && $cfg->onError !== null) {
+                                ($cfg->onError)($this->pullStatusException($code, $description));
+                            }
+                            $terminated = true;
+
+                            break;
+                        }
+
+                        // Infinite: keep polling through routine empties; stop once on a terminal error.
+                        $routine = $code === null
+                            || $code === 404
+                            || $code === 408
+                            || ($code === 409 && PullConsumerIterator::isNonTerminalPullStatus($description));
+                        if ($routine) {
+                            // FIX1: latch idleDraining so the generation stops refilling and drains out.
+                            $idleDraining = true;
+                            if ($cfg->noWait || $code === 409) {
+                                // Immediately answered empties (no_wait, or any 409) need pacing (#153); a
+                                // plain waiting 404/408/deadline already spent its expires window server-side.
+                                $backoffWarranted = true;
+                            }
+
+                            continue;
+                        }
+
+                        // Terminal error (terminal 409 "Consumer Deleted", server error, ...): surface
+                        // once and stop the run.
+                        if ($cfg->onError !== null) {
+                            ($cfg->onError)($this->pullStatusException($code, $description));
+                        }
+                        $terminated = true;
+
+                        break;
+                    }
+
+                    if ($terminated) {
+                        break;
+                    }
+
+                    // A stop() latched during the drain above ends the run promptly (no relaunch, no pump).
+                    if ($ctl->isStopRequested()) {
+                        break;
+                    }
+
+                    // #153/FIX1 BACKOFF at a generation boundary: the whole generation came back empty
+                    // (any delivery would have cleared idleDraining), so pace before relaunching. Skipped
+                    // under drain() (which is exiting, not relaunching).
+                    if (!$finite && !$ctl->isDrainRequested() && $inflight === [] && $idleDraining) {
+                        if ($backoffWarranted) {
+                            ++$consecutiveEmptyPulls;
+                            delay(PullConsumerIterator::idleBackoffMs($consecutiveEmptyPulls) / 1000);
+                        }
+                        $idleDraining = false;
+                        $backoffWarranted = false;
+
+                        // Re-evaluate stop()/drain()/reconnect at the loop top before relaunching a fresh
+                        // generation - this also catches a stop()/drain() latched during the backoff delay.
+                        continue;
+                    }
+
+                    // ISSUE PHASE: fill up to the effective depth with fresh pulls. FIX1's !idleDraining
+                    // gate stops mid-generation refills; drain() and the finite budget also gate it (a
+                    // stop() is already handled by the breaks above, before and after any backoff).
+                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls);
+                    while (
+                        count($inflight) < $effectiveDepth
+                        && !$idleDraining
+                        && !$ctl->isDrainRequested()
+                        && ($cfg->iterations === null || $issued < $cfg->iterations)
+                    ) {
+                        $token = dechex($tokenSeq++);
+                        $pull = new PullInFlight(
+                            $token,
+                            $cfg->batch,
+                            hrtime(true) + ($cfg->expiresMs + 1000) * 1_000_000,
+                        );
+                        $inflight[$token] = $pull;
+                        $issueOrder[] = $token;
+                        ++$issued;
+
+                        // Inject the LIVE pin id onto the frozen pull fields: it changes across the run
+                        // (captured on first delivery, dropped on 423), unlike the rest of buildPull().
+                        $fields = $cfg->pullFields;
+                        $pin = $ctl->getPinId();
+                        if ($pin !== null) {
+                            $fields['id'] = $pin;
+                        } else {
+                            unset($fields['id']);
+                        }
+
+                        $requestPayload = $this->buildPullRequest($cfg->batch, $cfg->expiresMs, $fields);
+                        $this->client->publish(
+                            $subject,
+                            json_encode($requestPayload, JSON_THROW_ON_ERROR),
+                            $prefix . $token,
+                        )->await();
+                    }
+
+                    if ($inflight === []) {
+                        // Finite: the iteration budget is spent (or it terminated). Infinite: only reached
+                        // under stop()/drain() with nothing left in flight (steady state always refills).
+                        // Nothing to pump either way -> the run is done.
+                        break;
+                    }
+
+                    // PUMP PHASE: read frames until the head pull completes or the earliest per-pull
+                    // deadline elapses (so the engine never blocks unbounded on a silent server).
+                    $nowNs = hrtime(true);
+                    $waitUntilNs = PHP_INT_MAX;
+                    foreach ($inflight as $inFlightPull) {
+                        if ($inFlightPull->deadlineNs < $waitUntilNs) {
+                            $waitUntilNs = $inFlightPull->deadlineNs;
+                        }
+                    }
+                    if ($cfg->idleHeartbeatNs !== null) {
+                        // Route-wide heartbeat miss is NON-terminal (FIX2): only used to wake and
+                        // re-evaluate, and only while still in the future (a past miss falls back to the
+                        // deadline so a persistently silent route cannot busy-spin here).
+                        $missAtNs = $lastActivityNs + 2 * $cfg->idleHeartbeatNs;
+                        if ($missAtNs > $nowNs && $missAtNs < $waitUntilNs) {
+                            $waitUntilNs = $missAtNs;
+                        }
+                    }
+
+                    if ($nowNs >= $waitUntilNs) {
+                        // A deadline is already due: loop straight back to retire it, no read.
+                        continue;
+                    }
+
+                    $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
+                    try {
+                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        if (!$read->consumedBytes) {
+                            // A genuinely idle read yields 1 ms; a read that consumed bytes but completed no
+                            // frame yet (a chunked payload) loops immediately to drain the rest (#119).
+                            delay(0.001, cancellation: $waitCancellation);
+                        }
+                    } catch (CancelledException) {
+                        // This wait segment ended (the earliest deadline or heartbeat check came due):
+                        // loop to re-evaluate deadlines against any freshly buffered frames.
+                    }
+                }
+
+                return $totalProcessed;
+            } finally {
+                // Plain unsubscribe: release the pull inbox once, on every exit path.
+                $this->client->unsubscribe($sid)->await();
+            }
+        });
+    }
+
+    /**
+     * The number of pull requests {@see consumePipelined()} may keep in flight at once for this turn.
+     * Serial (1) when finite (exact count, stop on any error), when a pinned group has not resolved
+     * its pin yet (a parallel un-pinned fan-out would race the server's pin assignment), or while an
+     * idle streak is active (one pull per backoff window keeps the idle rate at ~2/s, #153); otherwise
+     * the configured depth.
+     */
+    private function effectivePullDepth(PullPipelineConfig $cfg, PullPipelineControl $ctl, int $consecutiveEmptyPulls): int
+    {
+        if ($cfg->iterations !== null) {
+            return 1;
+        }
+
+        if ($cfg->grouped && $ctl->getPinId() === null) {
+            return 1;
+        }
+
+        if ($consecutiveEmptyPulls > 0) {
+            return 1;
+        }
+
+        return max(1, $cfg->depth);
+    }
+
+    /**
+     * Builds the JetStreamException handed to a pull consumer's onError callback for a terminal pull
+     * status, matching the message/code {@see fetchBatch()} would have thrown for the same status.
+     */
+    private function pullStatusException(?int $code, string $description): JetStreamException
+    {
+        $status = $code ?? 0;
+
+        return new JetStreamException($this->formatPullTerminalStatusMessage($status, $description), $status);
     }
 
     /**

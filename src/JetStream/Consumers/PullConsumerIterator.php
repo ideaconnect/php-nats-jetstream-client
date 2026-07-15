@@ -9,11 +9,14 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\JetStreamContext;
 
-use function Amp\async;
-use function Amp\delay;
-
 /**
  * Fluent builder for pull-consumer batch iteration.
+ *
+ * handle() snapshots the configuration into an immutable {@see PullPipelineConfig}, binds a live
+ * {@see PullPipelineControl} to this iterator, and delegates to the pipelined pull engine on
+ * {@see JetStreamContext::consumePipelined()} - which overlaps up to {@see setDepth()} concurrent
+ * pull round-trips with handler processing while preserving message order (#120). All fluent
+ * configuration, lifecycle (stop/drain/pin), and the pull-status/backoff helpers stay here.
  *
  * Usage:
  *   $js->pullConsumer('STREAM', 'CONSUMER')
@@ -39,8 +42,9 @@ final class PullConsumerIterator
      */
     private const IDLE_BACKOFF_MAX_MS = 500;
 
-    private int $batch = 1;
+    private int $batch = 100;
     private int $expiresMs = 3000;
+    private int $depth = 2;
     private ?int $iterations = null;
     private ?string $group = null;
     private ?int $priority = null;
@@ -73,7 +77,8 @@ final class PullConsumerIterator
     ) {}
 
     /**
-     * Sets the number of messages to fetch per pull request.
+     * Sets the number of messages to fetch per pull request. Independent of {@see setDepth()}: even
+     * batch=1 still pipelines, issuing up to `depth` single-message pulls concurrently (#120).
      *
      * @return $this
      */
@@ -83,6 +88,25 @@ final class PullConsumerIterator
             throw new JetStreamException('Batch size must be greater than zero');
         }
         $this->batch = $batch;
+
+        return $this;
+    }
+
+    /**
+     * Sets the pipeline depth: the maximum number of pull requests {@see handle()} keeps in flight at
+     * once in infinite, ungrouped, non-idle steady state, so a fresh pull's network round-trip
+     * overlaps handler processing of the previous pull (#120). depth=1 forces the classic serial
+     * one-pull-at-a-time behavior. Ignored in finite ({@see setIterations()}) mode, which is always
+     * strictly serial, and clamped to 1 until a pinned group's pin id is resolved and while idle.
+     *
+     * @return $this
+     */
+    public function setDepth(int $depth): self
+    {
+        if ($depth <= 0) {
+            throw new JetStreamException('Pipeline depth must be greater than zero');
+        }
+        $this->depth = $depth;
 
         return $this;
     }
@@ -263,114 +287,68 @@ final class PullConsumerIterator
     }
 
     /**
-     * Runs the fetch loop, invoking the handler for each received message. The loop ends when the
+     * Runs the pull loop, invoking the handler for each received message. Thin adapter over the
+     * pipelined engine on {@see JetStreamContext::consumePipelined()}: it clears the stop/drain flags,
+     * freezes the current configuration into an immutable {@see PullPipelineConfig}, and binds a live
+     * {@see PullPipelineControl} so the engine still sees stop()/drain() the handler sets mid-run and
+     * writes any captured pin back onto this iterator. The engine overlaps up to {@see setDepth()}
+     * concurrent pulls while preserving order; behavior is otherwise identical to the classic serial
+     * loop (finite count, 404/408/409/423 handling, #153 idle backoff, onError). The run ends when the
      * configured iteration count is reached, a terminal error occurs, or {@see stop()}/{@see drain()}
-     * is signalled.
+     * is signalled (#120).
      *
      * @param callable(NatsMessage, JetStreamContext):void $handler
      * @return Future<int> Total number of messages processed.
      */
     public function handle(callable $handler): Future
     {
-        return async(function () use ($handler): int {
-            // Reset lifecycle flags so a reused iterator is not pre-stopped from an earlier run.
-            $this->resetLifecycle();
-            $totalProcessed = 0;
-            $iteration = 0;
-            $consecutiveEmptyPulls = 0;
+        // Reset lifecycle flags so a reused iterator is not pre-stopped from an earlier run. The pin
+        // is deliberately NOT reset here: a pinned group keeps its pin across runs.
+        $this->resetLifecycle();
 
-            while (($this->iterations === null || $iteration < $this->iterations)
-                && !$this->stopRequested
-                && !$this->drainRequested
-            ) {
-                ++$iteration;
+        $config = new PullPipelineConfig(
+            batch: $this->batch,
+            expiresMs: $this->expiresMs,
+            depth: $this->depth,
+            iterations: $this->iterations,
+            noWait: $this->noWait,
+            grouped: $this->group !== null,
+            pullFields: $this->buildPull(),
+            // The iterator exposes no idle_heartbeat knob; buildPull() never sets it. Kept explicit so
+            // the engine's route-wide (non-terminal) heartbeat handling stays wired for future use.
+            idleHeartbeatNs: null,
+            onError: $this->onError,
+        );
 
-                try {
-                    $messages = $this->context->fetchBatch(
-                        $this->stream,
-                        $this->consumer,
-                        $this->batch,
-                        $this->expiresMs,
-                        $this->buildPull(),
-                    )->await();
+        $control = new PullPipelineControl(
+            stopFn: fn(): bool => $this->isStopRequested(),
+            drainFn: fn(): bool => $this->isDrainRequested(),
+            getPinFn: fn(): ?string => $this->pinId,
+            setPinFn: function (?string $pinId): void {
+                $this->pinId = $pinId;
+            },
+        );
 
-                    // A delivery ends the idle streak: the next empty window backs off from scratch.
-                    $consecutiveEmptyPulls = 0;
-                } catch (JetStreamException $e) {
-                    // A stale pin (423) is never terminal: drop the pin id and re-pull without it so
-                    // the server re-pins this client (or hands the pin to another). Applies in both
-                    // finite and infinite mode.
-                    if ($e->getCode() === 423) {
-                        $this->pinId = null;
-
-                        continue;
-                    }
-
-                    // In infinite mode keep polling through routine/transient conditions so a
-                    // long-running worker is not killed by a quiet period, backpressure, or a
-                    // failover: 404 (no messages) and 408 (request timeout) are routine empty
-                    // windows, and a 409 may be a pull-completion status (Batch Completed /
-                    // Message Size Exceeds MaxBytes) or transient (MaxAckPending exceeded /
-                    // leadership change / server shutdown / max-waiting) rather than terminal
-                    // (Consumer Deleted). Finite mode keeps the existing stop-on-any-error behavior.
-                    if ($this->iterations === null) {
-                        $code = $e->getCode();
-                        if (in_array($code, [404, 408], true) || ($code === 409 && self::isNonTerminalPullStatus($e->getMessage()))) {
-                            // The server answers a no_wait pull on an empty consumer (and any of the
-                            // non-terminal 409s) immediately, so re-pulling right away would storm an
-                            // idle consumer with thousands of requests per second. Pace consecutive
-                            // empty windows with an escalating, capped backoff (#153); a plain
-                            // waiting pull's 404/408 already spent the expires window on the server.
-                            if ($code === 409 || $this->noWait) {
-                                ++$consecutiveEmptyPulls;
-                                delay(self::idleBackoffMs($consecutiveEmptyPulls) / 1000);
-                            }
-
-                            continue;
-                        }
-                    }
-
-                    // Finite mode, or a terminal error (e.g. 409 Consumer Deleted): stop iterating.
-                    // Surface non-routine terminations (consumer deleted, server error, ...) to the
-                    // diagnostics callback so the app learns WHY the consume loop stopped (#63); routine
-                    // empty windows (404/408) are not errors.
-                    if ($this->onError !== null && !in_array($e->getCode(), [404, 408], true)) {
-                        ($this->onError)($e);
-                    }
-
-                    break;
-                }
-
-                // Capture the pin id from the first message of a newly pinned group so subsequent
-                // pulls retain the pin.
-                if ($this->group !== null && $this->pinId === null && $messages !== []) {
-                    $this->pinId = $this->context->pinIdOf($messages[0]);
-                }
-
-                foreach ($messages as $message) {
-                    $handler($message, $this->context);
-                    ++$totalProcessed;
-
-                    // A hard stop abandons the rest of this batch; a drain lets it finish (the
-                    // while-condition then ends the loop before the next pull). Read through the
-                    // accessor so the flag the handler may have just set is observed.
-                    if ($this->isStopRequested()) {
-                        break;
-                    }
-                }
-            }
-
-            return $totalProcessed;
-        });
+        return $this->context->consumePipelined($this->stream, $this->consumer, $config, $handler, $control);
     }
 
     /**
-     * Whether a hard {@see stop()} has been requested. Exposed as an accessor so the consume loop reads
-     * the live flag (which the handler may set mid-batch) rather than a value narrowed by control flow.
+     * Whether a hard {@see stop()} has been requested. Read through this accessor (by the bound
+     * {@see PullPipelineControl}) so the engine observes the live flag the handler may set mid-run
+     * rather than a value narrowed by control flow.
      */
     private function isStopRequested(): bool
     {
         return $this->stopRequested;
+    }
+
+    /**
+     * Whether a {@see drain()} has been requested. Read through this accessor (by the bound
+     * {@see PullPipelineControl}) so the engine observes the live flag the handler may set mid-run.
+     */
+    private function isDrainRequested(): bool
+    {
+        return $this->drainRequested;
     }
 
     /**
@@ -429,8 +407,11 @@ final class PullConsumerIterator
      * MaxBytes" - nats.go excludes ErrBatchCompleted/ErrMaxBytesExceeded from terminal handling) or
      * a transient, self-clearing one (backpressure/failover). Terminal 409s such as "Consumer
      * Deleted" or "Consumer is push based" stay terminal.
+     *
+     * @internal Shared with the pipelined engine on {@see JetStreamContext::consumePipelined()}; not
+     *           part of the supported public API.
      */
-    private static function isNonTerminalPullStatus(string $message): bool
+    public static function isNonTerminalPullStatus(string $message): bool
     {
         $needles = [
             // Pull-completion statuses: the request ended without messages, the consumer is fine.
@@ -451,8 +432,11 @@ final class PullConsumerIterator
     /**
      * Escalating idle backoff for the Nth consecutive immediately answered empty pull: doubles from
      * {@see self::IDLE_BACKOFF_INITIAL_MS} up to {@see self::IDLE_BACKOFF_MAX_MS}.
+     *
+     * @internal Shared with the pipelined engine on {@see JetStreamContext::consumePipelined()}; not
+     *           part of the supported public API.
      */
-    private static function idleBackoffMs(int $consecutiveEmptyPulls): int
+    public static function idleBackoffMs(int $consecutiveEmptyPulls): int
     {
         // The shift is capped so a long idle streak cannot overflow the integer before min() clamps.
         $exponent = min(6, max(0, $consecutiveEmptyPulls - 1));

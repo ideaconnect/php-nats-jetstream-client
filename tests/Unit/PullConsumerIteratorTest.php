@@ -11,23 +11,20 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\PullServerTrait;
 use PHPUnit\Framework\TestCase;
 
+/**
+ * Behavioral tests for {@see PullConsumerIterator} over the #120 pipelined pull engine
+ * ({@see JetStreamContext::consumePipelined()}). Replies are delivered dynamically by
+ * {@see PullServerTrait::pullServer()} on each pull's captured reply-to (token-routed), not on a fixed
+ * fetch inbox. Infinite tests whose intent is per-pull sequencing pin {@see PullConsumerIterator::setDepth()}
+ * to 1 to keep the classic serial one-pull-at-a-time semantics (overlap itself is covered by
+ * {@see PullPipelineTest}); finite tests are always strictly serial.
+ */
 final class PullConsumerIteratorTest extends TestCase
 {
-    /** @return list<string> */
-    private function infoAndPong(): array
-    {
-        return [
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-            "PONG\r\n",
-        ];
-    }
-
-    private function jsMsg(string $subject, string $payload, string $replyTo): string
-    {
-        return sprintf("MSG %s 1 %s %d\r\n%s\r\n", $subject, $replyTo, strlen($payload), $payload);
-    }
+    use PullServerTrait;
 
     public function testFluentBuilderSetsProperties(): void
     {
@@ -50,7 +47,9 @@ final class PullConsumerIteratorTest extends TestCase
         $client = new NatsClient(new NatsOptions(), new FakeTransport());
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
-        self::assertSame(1, $iter->getBatching());
+        // #120: the default batch is now 100 (was 1) - a single pull fetches a full batch and the engine
+        // pipelines across pulls rather than one message per round-trip.
+        self::assertSame(100, $iter->getBatching());
         self::assertSame(3000, $iter->getExpiresMs());
         self::assertNull($iter->getIterations());
     }
@@ -92,24 +91,27 @@ final class PullConsumerIteratorTest extends TestCase
         self::assertNull($iter->getIterations());
     }
 
+    public function testSetDepthRejectsZero(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $iter = $client->jetStream()->pullConsumer('S', 'C');
+
+        $this->expectException(JetStreamException::class);
+        $iter->setDepth(0);
+    }
+
     public function testHandleProcessesOneIteration(): void
     {
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // First iteration: 1 message delivered.
-            $this->jsMsg('_INBOX.JS.FETCH.any', 'order-1', '$JS.ACK.ORDERS.PROC.1.1.1.123.0'),
-            // Second iteration: terminal 404 status -> JetStreamException breaks loop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        // Finite (serial) run: pull #1 delivers one message; pull #2 gets a terminal 404 that stops it.
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            [['msg' => 'order-1']],
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(500)
@@ -127,23 +129,14 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testStopAbandonsRestOfBatch(): void
     {
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // One fetch (sid 1) delivers a full batch of 3.
-            $this->jsMsg('_INBOX.JS.FETCH.any', 'm1', '$JS.ACK.S.C.1.1.1.123.0')
-                . $this->jsMsg('_INBOX.JS.FETCH.any', 'm2', '$JS.ACK.S.C.1.2.2.123.0')
-                . $this->jsMsg('_INBOX.JS.FETCH.any', 'm3', '$JS.ACK.S.C.1.3.3.123.0'),
-            // Safety terminator if a (buggy) second pull were issued.
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        // A single pull delivers a full batch of 3; the handler stops after the first message.
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'm1'], ['msg' => 'm2'], ['msg' => 'm3']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $iter = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setExpiresMs(200);
+        $iter = $js->pullConsumer('S', 'C')->setBatching(3)->setExpiresMs(200);
         $processed = [];
         $total = $iter->handle(function (NatsMessage $msg) use (&$processed, $iter): void {
             $processed[] = $msg->payload;
@@ -159,21 +152,16 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testDrainFinishesBatchThenStops(): void
     {
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            $this->jsMsg('_INBOX.JS.FETCH.any', 'm1', '$JS.ACK.S.C.1.1.1.123.0')
-                . $this->jsMsg('_INBOX.JS.FETCH.any', 'm2', '$JS.ACK.S.C.1.2.2.123.0')
-                . $this->jsMsg('_INBOX.JS.FETCH.any', 'm3', '$JS.ACK.S.C.1.3.3.123.0'),
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        // A single pull delivers a full batch of 3; the handler drains after the first message.
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'm1'], ['msg' => 'm2'], ['msg' => 'm3']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $iter = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setExpiresMs(200);
+        // setDepth(1) keeps the run serial so exactly one pull is in flight (drain's "finish this batch,
+        // issue no further pull" contract, mirroring the classic loop).
+        $iter = $js->pullConsumer('S', 'C')->setBatching(3)->setExpiresMs(200)->setDepth(1);
         $processed = [];
         $total = $iter->handle(function (NatsMessage $msg) use (&$processed, $iter): void {
             $processed[] = $msg->payload;
@@ -183,6 +171,7 @@ final class PullConsumerIteratorTest extends TestCase
         // The whole in-flight batch finished (drain is graceful), but no second pull was issued.
         self::assertSame(3, $total);
         self::assertSame(['m1', 'm2', 'm3'], $processed);
+        self::assertCount(1, $this->pullWrites($transport), 'drain must not issue a further pull');
     }
 
     /**
@@ -190,19 +179,14 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testOnErrorFiresOnTerminalStatus(): void
     {
-        $statusHeaders = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\nDescription: Consumer Deleted\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'STREAM', 'CONS', [
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $error = null;
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('STREAM', 'CONS')
             ->setBatching(1)
             ->setExpiresMs(200)
@@ -225,19 +209,14 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testOnErrorNotFiredOnRoutineEmptyWindow(): void
     {
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'STREAM', 'CONS', [
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $fired = false;
-        $client->jetStream()
+        $js
             ->pullConsumer('STREAM', 'CONS')
             ->setBatching(1)
             ->setExpiresMs(200)
@@ -252,19 +231,14 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testHandleStopsOnNoMessages(): void
     {
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // Immediately returns terminal 404 status - no messages.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        // Immediately returns a terminal 404 - no messages; finite mode stops on the first empty.
+        $this->pullServer($transport, 'STREAM', 'CONS', [
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('STREAM', 'CONS')
             ->setBatching(5)
             ->setIterations(10)
@@ -278,30 +252,23 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testHandleInfiniteModeContinuesPastEmptyWindow(): void
     {
-        $noMessages = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";
-        $h404 = strlen($noMessages);
-        $h409 = strlen($deleted);
-        $body = 'order-1';
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): empty window (404) - infinite mode must keep polling, not stop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
-            // iter 2 (sid 2): a message arrives after the idle gap.
-            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
-            // iter 3 (sid 3): a terminal error (consumer deleted) stops the loop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $h409, $h409, $deleted),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            // pull 1: empty window (404) - infinite mode must keep polling, not stop.
+            [['status' => 404, 'desc' => 'No Messages']],
+            // pull 2: a message arrives after the idle gap.
+            [['msg' => 'order-1']],
+            // pull 3: a terminal error (consumer deleted) stops the loop.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(100)
+            ->setDepth(1) // serial: one pull per scripted response (per-pull sequencing under test)
             ->setIterations(null) // infinite
             ->handle(function (NatsMessage $msg, JetStreamContext $js) use (&$processed): void {
                 $processed[] = $msg->payload;
@@ -316,30 +283,23 @@ final class PullConsumerIteratorTest extends TestCase
     {
         // A 409 can be transient (backpressure/failover/shutdown) or terminal (Consumer Deleted).
         // The status-line reason flows into the exception message via NatsHeaders::fromWireBlock.
-        $maxAck = "NATS/1.0 409 Exceeded MaxAckPending\r\nStatus: 409\r\n\r\n"; // transient -> keep polling
-        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";      // terminal  -> stop
-        $hMax = strlen($maxAck);
-        $hDel = strlen($deleted);
-        $body = 'job-7';
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): transient 409 (backpressure) - infinite mode must keep polling.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hMax, $hMax, $maxAck),
-            // iter 2 (sid 2): a message arrives once backpressure clears.
-            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
-            // iter 3 (sid 3): a terminal 409 (consumer deleted) stops the loop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $hDel, $hDel, $deleted),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            // pull 1: transient 409 (backpressure) - infinite mode must keep polling.
+            [['status' => 409, 'desc' => 'Exceeded MaxAckPending']],
+            // pull 2: a message arrives once backpressure clears.
+            [['msg' => 'job-7']],
+            // pull 3: a terminal 409 (consumer deleted) stops the loop.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(100)
+            ->setDepth(1)
             ->setIterations(null) // infinite
             ->handle(function (NatsMessage $msg, JetStreamContext $js) use (&$processed): void {
                 $processed[] = $msg->payload;
@@ -357,31 +317,24 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testHandleInfiniteModeContinuesPastMaxBytes409(): void
     {
-        $maxBytes = "NATS/1.0 409 Message Size Exceeds MaxBytes\r\nStatus: 409\r\n\r\n"; // completion -> keep polling
-        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";                // terminal   -> stop
-        $hMax = strlen($maxBytes);
-        $hDel = strlen($deleted);
-        $body = 'fits-now';
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): the pending head message exceeds max_bytes - the pull completes empty.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hMax, $hMax, $maxBytes),
-            // iter 2 (sid 2): a message that fits arrives on the next pull.
-            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
-            // iter 3 (sid 3): a terminal 409 (consumer deleted) stops the loop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $hDel, $hDel, $deleted),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            // pull 1: the pending head message exceeds max_bytes - the pull completes empty.
+            [['status' => 409, 'desc' => 'Message Size Exceeds MaxBytes']],
+            // pull 2: a message that fits arrives on the next pull.
+            [['msg' => 'fits-now']],
+            // pull 3: a terminal 409 (consumer deleted) stops the loop.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(100)
             ->setMaxBytes(1024)
+            ->setDepth(1)
             ->setIterations(null) // infinite
             ->handle(function (NatsMessage $msg) use (&$processed): void {
                 $processed[] = $msg->payload;
@@ -399,30 +352,23 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testHandleInfiniteModeContinuesPastBatchCompleted409(): void
     {
-        $completed = "NATS/1.0 409 Batch Completed\r\nStatus: 409\r\n\r\n"; // completion -> keep polling
-        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";  // terminal   -> stop
-        $hCom = strlen($completed);
-        $hDel = strlen($deleted);
-        $body = 'next-batch';
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): the server closes the pull early with "Batch Completed" and no message.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hCom, $hCom, $completed),
-            // iter 2 (sid 2): the next pull delivers a message.
-            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
-            // iter 3 (sid 3): a terminal 409 (consumer deleted) stops the loop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $hDel, $hDel, $deleted),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            // pull 1: the server closes the pull early with "Batch Completed" and no message.
+            [['status' => 409, 'desc' => 'Batch Completed']],
+            // pull 2: the next pull delivers a message.
+            [['msg' => 'next-batch']],
+            // pull 3: a terminal 409 (consumer deleted) stops the loop.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(100)
+            ->setDepth(1)
             ->setIterations(null) // infinite
             ->handle(function (NatsMessage $msg) use (&$processed): void {
                 $processed[] = $msg->payload;
@@ -438,38 +384,32 @@ final class PullConsumerIteratorTest extends TestCase
      * empty consumer answers each no_wait pull with an immediate 404, and the iterator must apply
      * its escalating idle backoff (10ms doubling, capped at 500ms) between them so an idle stream
      * is not hammered with an unthrottled re-pull storm (#153). Event-driven: the scripted 404s
-     * answer instantly, so any elapsed time is exactly the iterator's own pacing.
+     * answer instantly, so any elapsed time is exactly the iterator's own pacing. setDepth(1) keeps
+     * the pacing serial - one pull per scripted response - so the backoff sequence is deterministic.
      */
     public function testNoWaitInfiniteModePacesConsecutiveEmptyPulls(): void
     {
-        $noMessages = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $deleted = "NATS/1.0 409 Consumer Deleted\r\nStatus: 409\r\n\r\n";
-        $h404 = strlen($noMessages);
-        $h409 = strlen($deleted);
-        $body = 'queued';
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iters 1-3 (sids 1-3): the empty consumer answers each no_wait pull with an immediate 404.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
-            sprintf("HMSG _INBOX.JS.FETCH.any 3 %d %d\r\n%s\r\n", $h404, $h404, $noMessages),
-            // iter 4 (sid 4): a message finally arrives.
-            sprintf("MSG _INBOX.JS.FETCH.any 4 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d\r\n%s\r\n", strlen($body), $body),
-            // iter 5 (sid 5): a terminal 409 (consumer deleted) stops the loop.
-            sprintf("HMSG _INBOX.JS.FETCH.any 5 %d %d\r\n%s\r\n", $h409, $h409, $deleted),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            // pulls 1-3: the empty consumer answers each no_wait pull with an immediate 404.
+            [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 404, 'desc' => 'No Messages']],
+            // pull 4: a message finally arrives.
+            [['msg' => 'queued']],
+            // pull 5: a terminal 409 (consumer deleted) stops the loop.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $startNs = hrtime(true);
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(100)
             ->setNoWait(true)
+            ->setDepth(1)
             ->setIterations(null) // infinite
             ->handle(function (NatsMessage $msg) use (&$processed): void {
                 $processed[] = $msg->payload;
@@ -481,11 +421,7 @@ final class PullConsumerIteratorTest extends TestCase
         self::assertSame(['queued'], $processed);
 
         // ...issuing exactly one pull per scripted response (5 responses -> 5 pulls, no storm)...
-        $pullWrites = array_values(array_filter(
-            $transport->writes,
-            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
-        ));
-        self::assertCount(5, $pullWrites);
+        self::assertCount(5, $this->pullWrites($transport));
 
         // ...and the three consecutive empty pulls were paced by the escalating idle backoff
         // (10ms + 20ms + 40ms = 70ms minimum; the old code re-pulled instantly, elapsed ~0ms).
@@ -669,21 +605,15 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testBuildPullIncludesAllOptionalFields(): void
     {
-        $body = 'order-x';
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // One message so the loop runs one iteration, then a 404 to stop.
-            $this->jsMsg('_INBOX.JS.FETCH.any', $body, '$JS.ACK.ORDERS.PROC.1.1.1.123.0'),
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        // One message so the loop runs one iteration, then a 404 to stop.
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            [['msg' => 'order-x']],
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $client->jetStream()
+        $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(500)
@@ -695,10 +625,7 @@ final class PullConsumerIteratorTest extends TestCase
             ->setNoWait(true)
             ->handle(static function (): void {})->await();
 
-        $pullWrites = array_values(array_filter(
-            $transport->writes,
-            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
-        ));
+        $pullWrites = $this->pullWrites($transport);
 
         self::assertNotEmpty($pullWrites, 'At least one pull request must have been issued');
         $firstPull = $pullWrites[0];
@@ -717,31 +644,22 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testBuildPullOmitsUnsetOptionalFields(): void
     {
-        $body = 'order-y';
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            $this->jsMsg('_INBOX.JS.FETCH.any', $body, '$JS.ACK.ORDERS.PROC.1.1.1.123.0'),
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            [['msg' => 'order-y']],
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         // No optional fields set.
-        $client->jetStream()
+        $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(500)
             ->setIterations(2)
             ->handle(static function (): void {})->await();
 
-        $pullWrites = array_values(array_filter(
-            $transport->writes,
-            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
-        ));
+        $pullWrites = $this->pullWrites($transport);
 
         self::assertNotEmpty($pullWrites);
         $firstPull = $pullWrites[0];
@@ -757,30 +675,21 @@ final class PullConsumerIteratorTest extends TestCase
 
     /**
      * Covers resetLifecycle(): a reused iterator whose stop() was called in the first run must
-     * NOT be pre-stopped during a second handle() call.
-     *
-     * SID note: each fetchBatch() subscribe() increments nextSid. First handle() = SID 1, second = SID 2.
+     * NOT be pre-stopped during a second handle() call. Each handle() run opens its own pull inbox
+     * subscription, so the pull server relearns the sid per run and routes replies by reply-token.
      */
     public function testReusedIteratorAfterStopStartsFresh(): void
     {
-        $body = 'fresh-msg';
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // First run (SID 1): deliver 2 msgs concatenated; handler stops after the first.
-            $this->jsMsg('_INBOX.JS.FETCH.any', 'm1', '$JS.ACK.S.C.1.1.1.0.0')
-                . $this->jsMsg('_INBOX.JS.FETCH.any', 'm2', '$JS.ACK.S.C.1.2.2.0.0'),
-            // Second run (SID 2): deliver 1 msg, then 404 to stop.
-            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.S.C.2.1.1.0.0 %d\r\n%s\r\n", strlen($body), $body),
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // First run: pull delivers a batch of 2; the handler stops after the first (m2 abandoned).
+            [['msg' => 'm1'], ['msg' => 'm2']],
+            // Second run: one message then a 404 completes the (batch=2) pull.
+            [['msg' => 'fresh-msg'], ['status' => 404, 'desc' => 'No Messages']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $iter = $client->jetStream()
+        $iter = $js
             ->pullConsumer('S', 'C')
             ->setBatching(2)
             ->setExpiresMs(200)
@@ -799,33 +708,25 @@ final class PullConsumerIteratorTest extends TestCase
         $iter->handle(function (NatsMessage $msg) use (&$secondRun): void {
             $secondRun[] = $msg->payload;
         })->await();
-        self::assertSame([$body], $secondRun);
+        self::assertSame(['fresh-msg'], $secondRun);
     }
 
     /**
      * Covers resetLifecycle(): a reused iterator whose drain() was called in the first run must
      * NOT be pre-drained during a second handle() call.
-     *
-     * SID note: each fetchBatch() subscribe() increments nextSid. First handle() = SID 1, second = SID 2.
      */
     public function testReusedIteratorAfterDrainStartsFresh(): void
     {
-        $statusHeaders = "NATS/1.0 404 No Messages\r\nStatus: 404\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // First run (SID 1): one message; handler drains, batch finishes, no second pull.
-            sprintf("MSG _INBOX.JS.FETCH.any 1 \$JS.ACK.S.C.1.1.1.0.0 %d\r\n%s\r\n", strlen('run1'), 'run1'),
-            // Second run (SID 2): one message then 404 stop.
-            sprintf("MSG _INBOX.JS.FETCH.any 2 \$JS.ACK.S.C.2.1.1.0.0 %d\r\n%s\r\n", strlen('run2'), 'run2'),
-            sprintf("HMSG _INBOX.JS.FETCH.any 2 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // First run: one message; handler drains, batch finishes, no second pull.
+            [['msg' => 'run1']],
+            // Second run: one message (batch=1 completes on it).
+            [['msg' => 'run2']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $iter = $client->jetStream()
+        $iter = $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(200)
@@ -852,19 +753,14 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testOnErrorNotFiredOnRoutine408(): void
     {
-        $statusHeaders = "NATS/1.0 408 Request Timeout\r\nStatus: 408\r\n\r\n";
-        $hdrLen = strlen($statusHeaders);
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hdrLen, $hdrLen, $statusHeaders),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'STREAM', 'CONS', [
+            [['status' => 408, 'desc' => 'Request Timeout']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $fired = false;
-        $client->jetStream()
+        $js
             ->pullConsumer('STREAM', 'CONS')
             ->setBatching(1)
             ->setExpiresMs(200)
@@ -879,35 +775,24 @@ final class PullConsumerIteratorTest extends TestCase
 
     /**
      * Verifies a stale-pin (423) status drops the pin id and re-pulls without it, capturing the new
-     * pin id from the next delivery (issue #7).
+     * pin id from the next delivery (issue #7). Finite grouped mode is strictly serial, so each pull
+     * maps 1:1 to a scripted response in order.
      */
     public function testHandleRePinsOnStalePin(): void
     {
-        $stalePin = "NATS/1.0 423 Nats-Pin-Id Mismatch\r\nStatus: 423\r\n\r\n";
-        $hStale = strlen($stalePin);
-        $pinHdrs = "NATS/1.0\r\nNats-Pin-Id: pin-new\r\n\r\n";
-
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): stale pin -> drop pin id and retry without it.
-            sprintf("HMSG _INBOX.JS.FETCH.any 1 %d %d\r\n%s\r\n", $hStale, $hStale, $stalePin),
-            // iter 2 (sid 2): re-pinned, a message arrives carrying the new pin id.
-            sprintf(
-                "HMSG _INBOX.JS.FETCH.any 2 \$JS.ACK.ORDERS.PROC.1.1.1.123.0 %d %d\r\n%s%s\r\n",
-                strlen($pinHdrs),
-                strlen($pinHdrs) + strlen('order-9'),
-                $pinHdrs,
-                'order-9',
-            ),
-            // iter 3 (sid 3): a plain message; the pull issued for this iteration must carry the pin id.
-            sprintf("MSG _INBOX.JS.FETCH.any 3 \$JS.ACK.ORDERS.PROC.2.2.2.123.0 %d\r\n%s\r\n", strlen('order-10'), 'order-10'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'ORDERS', 'PROC', [
+            // pull 1: stale pin -> drop pin id and retry without it.
+            [['status' => 423, 'desc' => 'Nats-Pin-Id Mismatch']],
+            // pull 2: re-pinned, a message arrives carrying the new pin id.
+            [['msg' => 'order-9', 'pin' => 'pin-new']],
+            // pull 3: a plain message; the pull issued for it must carry the captured pin id.
+            [['msg' => 'order-10']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('ORDERS', 'PROC')
             ->setBatching(1)
             ->setExpiresMs(100)
@@ -920,17 +805,14 @@ final class PullConsumerIteratorTest extends TestCase
         self::assertSame(2, $total);
         self::assertSame(['order-9', 'order-10'], $processed);
 
-        $pullWrites = array_values(array_filter(
-            $transport->writes,
-            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
-        ));
+        $pullWrites = $this->pullWrites($transport);
 
-        // iter 1 pull: group present, no pin yet.
+        // pull 1: group present, no pin yet.
         self::assertStringContainsString('"group":"g1"', $pullWrites[0]);
         self::assertStringNotContainsString('"id"', $pullWrites[0]);
-        // iter 2 pull (right after the 423): pin was cleared, so still no id.
+        // pull 2 (right after the 423): pin was cleared, so still no id.
         self::assertStringNotContainsString('"id"', $pullWrites[1]);
-        // iter 3 pull: the pin id captured from iter 2's delivery is now re-sent.
+        // pull 3: the pin id captured from pull 2's delivery is now re-sent.
         self::assertStringContainsString('"id":"pin-new"', $pullWrites[2]);
     }
 }
