@@ -3261,6 +3261,22 @@ final class NatsConnection
     /**
      * One heartbeat tick: verify the liveness budget, send PING, and consume the PONG.
      */
+    /**
+     * From the heartbeat timer: cancel the ping timer and attempt recovery, forcing the connection
+     * Closed if recovery itself throws. Shared by the missed-PONG (maxPingsOut) and PING-write-failure
+     * paths of pingTimerTick().
+     */
+    private function recoverFromHeartbeatFailure(): void
+    {
+        $this->cancelPingTimer();
+
+        try {
+            $this->recoverConnection();
+        } catch (\Throwable) {
+            $this->state = ConnectionState::Closed;
+        }
+    }
+
     private function pingTimerTick(): void
     {
         if ($this->state !== ConnectionState::Open) {
@@ -3272,13 +3288,7 @@ final class NatsConnection
         $this->outstandingPings++;
 
         if ($this->outstandingPings > $this->options->maxPingsOut) {
-            $this->cancelPingTimer();
-
-            try {
-                $this->recoverConnection();
-            } catch (\Throwable) {
-                $this->state = ConnectionState::Closed;
-            }
+            $this->recoverFromHeartbeatFailure();
 
             return;
         }
@@ -3295,13 +3305,7 @@ final class NatsConnection
             // The PING never hit the wire: drop its slot so correlation stays aligned (the
             // recovery below clears the rest on the epoch change anyway).
             $this->discardPongSlot($slot);
-            $this->cancelPingTimer();
-
-            try {
-                $this->recoverConnection();
-            } catch (\Throwable) {
-                $this->state = ConnectionState::Closed;
-            }
+            $this->recoverFromHeartbeatFailure();
 
             return;
         }
