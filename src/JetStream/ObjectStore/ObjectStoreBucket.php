@@ -178,6 +178,52 @@ final class ObjectStoreBucket
     }
 
     /**
+     * Builds a live (non-deleted) object meta record with this bucket's chunk-size option and a fresh
+     * mtime. The caller supplies the fields that vary per operation; put()/putStream()/rename() differ
+     * only in where those come from. Add 'description' to the returned record afterwards when present.
+     *
+     * @param array<string,mixed> $metadata
+     * @return array<string,mixed>
+     */
+    private function objectMeta(string $name, string $nuid, int $size, int $chunks, string $digest, array $metadata): array
+    {
+        return [
+            'name' => $name,
+            'bucket' => $this->bucket,
+            'nuid' => $nuid,
+            'size' => $size,
+            'chunks' => $chunks,
+            'digest' => $digest,
+            'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
+            'deleted' => false,
+            'options' => ['max_chunk_size' => $this->chunkSize],
+            'metadata' => $metadata,
+        ];
+    }
+
+    /**
+     * Builds a deleted-object tombstone meta record (empty content, deleted=true) - published by both
+     * delete() and rename()'s old-name tombstone, which were byte-identical hand-built copies.
+     *
+     * @return array<string,mixed>
+     */
+    private function tombstoneMeta(string $name): array
+    {
+        return [
+            'name' => $name,
+            'bucket' => $this->bucket,
+            'nuid' => '',
+            'size' => 0,
+            'chunks' => 0,
+            'digest' => '',
+            'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
+            'deleted' => true,
+            'options' => ['max_chunk_size' => $this->chunkSize],
+            'metadata' => [],
+        ];
+    }
+
+    /**
      * Deletes the underlying Object Store stream.
      *
      * @return Future<bool>
@@ -239,18 +285,7 @@ final class ObjectStoreBucket
                 }
             }
 
-            $info = [
-                'name' => $name,
-                'bucket' => $this->bucket,
-                'nuid' => $nuid,
-                'size' => $totalSize,
-                'chunks' => $chunks,
-                'digest' => $this->digestOf($data),
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => false,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => $metadata,
-            ];
+            $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->digestOf($data), $metadata);
             if ($description !== null && $description !== '') {
                 $info['description'] = $description;
             }
@@ -342,18 +377,7 @@ final class ObjectStoreBucket
                 Future\await($pending);
             }
 
-            $info = [
-                'name' => $name,
-                'bucket' => $this->bucket,
-                'nuid' => $nuid,
-                'size' => $totalSize,
-                'chunks' => $chunks,
-                'digest' => $this->finalizeDigest($hashContext),
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => false,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => $metadata,
-            ];
+            $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->finalizeDigest($hashContext), $metadata);
 
             $this->publishMeta($name, $info);
 
@@ -752,18 +776,7 @@ final class ObjectStoreBucket
             // Run the lookup concurrently with the tombstone publish; only needed for chunk purge.
             $previousFuture = $this->lookupExisting($name);
 
-            $info = [
-                'name' => $name,
-                'bucket' => $this->bucket,
-                'nuid' => '',
-                'size' => 0,
-                'chunks' => 0,
-                'digest' => '',
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => true,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => [],
-            ];
+            $info = $this->tombstoneMeta($name);
 
             $this->publishMeta($name, $info);
 
@@ -809,36 +822,14 @@ final class ObjectStoreBucket
             }
 
             $targetName = $newName ?? $name;
-            $info = [
-                'name' => $targetName,
-                'bucket' => $this->bucket,
-                'nuid' => $existing->nuid,
-                'size' => $existing->size,
-                'chunks' => $existing->chunks,
-                'digest' => $existing->digest,
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => false,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => $metadata ?? $existing->metadata,
-            ];
+            $info = $this->objectMeta($targetName, $existing->nuid, $existing->size, $existing->chunks, $existing->digest, $metadata ?? $existing->metadata);
 
             $this->publishMeta($targetName, $info);
 
             if ($isRename) {
                 // Tombstone the old name so it no longer resolves; the chunks stay (same NUID, now
                 // owned by the renamed object), so this must NOT purge chunks like delete() does.
-                $this->publishMeta($name, [
-                    'name' => $name,
-                    'bucket' => $this->bucket,
-                    'nuid' => '',
-                    'size' => 0,
-                    'chunks' => 0,
-                    'digest' => '',
-                    'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                    'deleted' => true,
-                    'options' => ['max_chunk_size' => $this->chunkSize],
-                    'metadata' => [],
-                ]);
+                $this->publishMeta($name, $this->tombstoneMeta($name));
             }
 
             return ObjectInfo::fromArray($this->bucket, $info);
