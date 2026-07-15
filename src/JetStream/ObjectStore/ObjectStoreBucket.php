@@ -348,7 +348,7 @@ final class ObjectStoreBucket
                 'nuid' => $nuid,
                 'size' => $totalSize,
                 'chunks' => $chunks,
-                'digest' => 'SHA-256=' . $this->base64Url(hash_final($hashContext, true)),
+                'digest' => $this->finalizeDigest($hashContext),
                 'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
                 'deleted' => false,
                 'options' => ['max_chunk_size' => $this->chunkSize],
@@ -508,7 +508,7 @@ final class ObjectStoreBucket
         // bytes. Pulling anyway would block until the batch expiry (no chunk ever arrives), so
         // short-circuit to the empty-content digest (in the same SHA-256=base64url format as below).
         if ($expected <= 0) {
-            return 'SHA-256=' . $this->base64Url(hash_final($hashContext, true));
+            return $this->finalizeDigest($hashContext);
         }
 
         // Fast path for a single-chunk object (the common case for small objects): the lone chunk is
@@ -523,7 +523,7 @@ final class ObjectStoreBucket
                 hash_update($hashContext, $message->payload);
                 $onChunk($message->payload);
 
-                return 'SHA-256=' . $this->base64Url(hash_final($hashContext, true));
+                return $this->finalizeDigest($hashContext);
             } catch (JetStreamException $e) {
                 if ($e->getCode() === 404) {
                     throw new JetStreamException('Incomplete object download: expected 1 chunks, received 0');
@@ -604,7 +604,7 @@ final class ObjectStoreBucket
             ));
         }
 
-        return 'SHA-256=' . $this->base64Url(hash_final($hashContext, true));
+        return $this->finalizeDigest($hashContext);
     }
 
     /**
@@ -1246,11 +1246,28 @@ final class ObjectStoreBucket
     }
 
     /**
-     * Computes the official Object Store content digest ("SHA-256=" + base64url).
+     * Computes the official Object Store content digest ("SHA-256=" + base64url) for a buffer.
      */
     private function digestOf(string $data): string
     {
-        return 'SHA-256=' . $this->base64Url(hash('sha256', $data, true));
+        return $this->formatDigest(hash('sha256', $data, true));
+    }
+
+    /**
+     * Finalizes a streaming SHA-256 {@see \HashContext} into the official Object Store content digest
+     * ("SHA-256=" + base64url) - the terminal step for chunked uploads/downloads.
+     */
+    private function finalizeDigest(\HashContext $hashContext): string
+    {
+        return $this->formatDigest(hash_final($hashContext, true));
+    }
+
+    /**
+     * Formats a raw 32-byte SHA-256 digest as the official Object Store "SHA-256=<base64url>" string.
+     */
+    private function formatDigest(string $rawDigest): string
+    {
+        return 'SHA-256=' . $this->base64Url($rawDigest);
     }
 
     /**
