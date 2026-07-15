@@ -212,6 +212,21 @@ final class JetStreamContext
     }
 
     /**
+     * Validates a pull priority-group name: 1..16 characters of [A-Za-z0-9-_/=]. Throws a
+     * {@see JetStreamException} labelled with $label (e.g. "Pull group", "priority_groups names") so the
+     * message names the offending field. Accepts mixed so array-sourced group values can be checked in
+     * one call.
+     *
+     * @internal Shared validator for setGroup()/pull-request/priority_groups name checks.
+     */
+    public static function assertValidPriorityGroupName(mixed $group, string $label): void
+    {
+        if (!is_string($group) || preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
+            throw new JetStreamException($label . ' must be 1..16 characters of [A-Za-z0-9-_/=]');
+        }
+    }
+
+    /**
      * Creates or updates a stream using a minimal configuration payload.
      *
      * @param list<string> $subjects
@@ -328,26 +343,13 @@ final class JetStreamContext
     public function streamNames(?string $subjectFilter = null): Future
     {
         return async(function () use ($subjectFilter): array {
-            $names = [];
-            $offset = 0;
             $body = $subjectFilter !== null && $subjectFilter !== '' ? ['subject' => $subjectFilter] : [];
 
-            do {
-                $response = $this->requestJson(JetStreamApi::STREAM_NAMES, ['offset' => $offset] + $body);
-                /** @var list<string> $page */
-                $page = is_array($response['streams'] ?? null)
-                    ? array_values(array_filter($response['streams'], 'is_string'))
-                    : [];
+            return $this->paginateList(JetStreamApi::STREAM_NAMES, $body, static function (array $response): array {
+                $raw = $response['streams'] ?? null;
 
-                foreach ($page as $name) {
-                    $names[] = $name;
-                }
-
-                $offset += count($page);
-                $total = is_int($response['total'] ?? null) ? $response['total'] : count($names);
-            } while ($page !== [] && count($names) < $total);
-
-            return $names;
+                return is_array($raw) ? array_values(array_filter($raw, 'is_string')) : [];
+            });
         });
     }
 
@@ -409,25 +411,12 @@ final class JetStreamContext
     public function listStreams(array $options = []): Future
     {
         return async(function () use ($options): array {
-            $streams = [];
-            $offset = 0;
+            return $this->paginateList(JetStreamApi::STREAM_LIST, $options, static function (array $response): array {
+                $raw = $response['streams'] ?? null;
+                $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
-            do {
-                $response = $this->requestJson(JetStreamApi::STREAM_LIST, ['offset' => $offset] + $options);
-                /** @var list<array<string,mixed>> $page */
-                $page = is_array($response['streams'] ?? null) ? $response['streams'] : [];
-
-                foreach ($page as $stream) {
-                    $streams[] = StreamInfo::fromArray($stream);
-                }
-
-                $offset += count($page);
-                $total = is_int($response['total'] ?? null) ? $response['total'] : count($streams);
-                // Stop when the server has no more entries, or a page comes back empty (the empty-page
-                // guard prevents an infinite loop if `total` is inconsistent).
-            } while ($page !== [] && count($streams) < $total);
-
-            return $streams;
+                return array_map(static fn (array $stream): StreamInfo => StreamInfo::fromArray($stream), $arrays);
+            });
         });
     }
 
@@ -441,23 +430,12 @@ final class JetStreamContext
         self::assertValidJsName($stream, 'stream');
 
         return async(function () use ($stream): array {
-            $consumers = [];
-            $offset = 0;
+            return $this->paginateList(JetStreamApi::CONSUMER_LIST_PREFIX . $stream, [], static function (array $response): array {
+                $raw = $response['consumers'] ?? null;
+                $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
-            do {
-                $response = $this->requestJson(JetStreamApi::CONSUMER_LIST_PREFIX . $stream, ['offset' => $offset]);
-                /** @var list<array<string,mixed>> $page */
-                $page = is_array($response['consumers'] ?? null) ? $response['consumers'] : [];
-
-                foreach ($page as $consumer) {
-                    $consumers[] = ConsumerInfo::fromArray($consumer);
-                }
-
-                $offset += count($page);
-                $total = is_int($response['total'] ?? null) ? $response['total'] : count($consumers);
-            } while ($page !== [] && count($consumers) < $total);
-
-            return $consumers;
+                return array_map(static fn (array $consumer): ConsumerInfo => ConsumerInfo::fromArray($consumer), $arrays);
+            });
         });
     }
 
@@ -999,25 +977,11 @@ final class JetStreamContext
         self::assertValidJsName($stream, 'stream');
 
         return async(function () use ($stream): array {
-            $names = [];
-            $offset = 0;
+            return $this->paginateList(JetStreamApi::CONSUMER_NAMES_PREFIX . $stream, [], static function (array $response): array {
+                $raw = $response['consumers'] ?? null;
 
-            do {
-                $response = $this->requestJson(JetStreamApi::CONSUMER_NAMES_PREFIX . $stream, ['offset' => $offset]);
-                /** @var list<string> $page */
-                $page = is_array($response['consumers'] ?? null)
-                    ? array_values(array_filter($response['consumers'], 'is_string'))
-                    : [];
-
-                foreach ($page as $name) {
-                    $names[] = $name;
-                }
-
-                $offset += count($page);
-                $total = is_int($response['total'] ?? null) ? $response['total'] : count($names);
-            } while ($page !== [] && count($names) < $total);
-
-            return $names;
+                return is_array($raw) ? array_values(array_filter($raw, 'is_string')) : [];
+            });
         });
     }
 
@@ -3056,9 +3020,7 @@ final class JetStreamContext
 
         if (isset($pull['group'])) {
             $group = $pull['group'];
-            if (!is_string($group) || preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
-                throw new JetStreamException('Pull group must be 1..16 characters of [A-Za-z0-9-_/=]');
-            }
+            self::assertValidPriorityGroupName($group, 'Pull group');
         }
 
         if (isset($pull['priority'])) {
@@ -3120,9 +3082,7 @@ final class JetStreamContext
         }
 
         foreach ($groups as $group) {
-            if (!is_string($group) || preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
-                throw new JetStreamException('priority_groups names must be 1..16 characters of [A-Za-z0-9-_/=]');
-            }
+            self::assertValidPriorityGroupName($group, 'priority_groups names');
         }
     }
 
@@ -3149,6 +3109,36 @@ final class JetStreamContext
         $suffix = $description !== '' ? ': ' . $description : '';
 
         return sprintf('JetStream pull request ended with status %d%s', $status, $suffix);
+    }
+
+    /**
+     * Runs a JetStream offset-paginated `*.NAMES` / `*.LIST` request to completion. For each page,
+     * $mapPage extracts and maps that response's entries; iteration stops when the server reports no
+     * more (via `total`) or returns an empty page - the empty-page guard prevents an infinite loop if
+     * `total` is inconsistent. The running offset advances by each page's mapped-entry count, matching
+     * the per-endpoint loops it replaces.
+     *
+     * @template T
+     * @param array<string,mixed> $body extra request fields merged with the running offset
+     * @param callable(array<string,mixed>): list<T> $mapPage
+     * @return list<T>
+     */
+    private function paginateList(string $subject, array $body, callable $mapPage): array
+    {
+        $result = [];
+        $offset = 0;
+
+        do {
+            $response = $this->requestJson($subject, ['offset' => $offset] + $body);
+            $page = $mapPage($response);
+            foreach ($page as $item) {
+                $result[] = $item;
+            }
+            $offset += count($page);
+            $total = is_int($response['total'] ?? null) ? $response['total'] : count($result);
+        } while ($page !== [] && count($result) < $total);
+
+        return $result;
     }
 
     /**

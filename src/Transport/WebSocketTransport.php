@@ -6,7 +6,6 @@ namespace IDCT\NATS\Transport;
 
 use Amp\Cancellation;
 use Amp\Future;
-use Amp\Socket\Certificate;
 use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
 use Amp\Socket\ResourceSocket;
@@ -30,6 +29,8 @@ use function Amp\Socket\connect;
  */
 final class WebSocketTransport implements TlsAwareTransportInterface
 {
+    use AssemblesClientTlsContext;
+
     /** Hard cap on a reassembled fragmented message, bounding memory against a hostile/buggy server (#89). */
     private const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
 
@@ -696,34 +697,6 @@ final class WebSocketTransport implements TlsAwareTransportInterface
      */
     private function buildTlsContext(string $host): ClientTlsContext
     {
-        // Honor a caller-supplied TLS context verbatim (in-memory PEM, ALPN, custom verification).
-        if ($this->options->tlsContext !== null) {
-            return $this->options->tlsContext;
-        }
-
-        $peerName = $this->options->tlsPeerName;
-        if ($peerName === null || $peerName === '') {
-            $peerName = $host;
-        }
-
-        $tlsContext = new ClientTlsContext($peerName);
-
-        if (!$this->options->tlsVerifyPeer) {
-            $tlsContext = $tlsContext->withoutPeerVerification();
-        }
-
-        if ($this->options->tlsCaFile !== null && $this->options->tlsCaFile !== '') {
-            $tlsContext = $tlsContext->withCaFile($this->options->tlsCaFile);
-        }
-
-        if ($this->options->tlsCertFile !== null && $this->options->tlsCertFile !== '') {
-            $tlsContext = $tlsContext->withCertificate(new Certificate(
-                $this->options->tlsCertFile,
-                $this->options->tlsKeyFile,
-                $this->options->tlsKeyPassphrase,
-            ));
-        }
-
-        return $tlsContext;
+        return $this->clientTlsContextFromOptions($this->options, $host);
     }
 }

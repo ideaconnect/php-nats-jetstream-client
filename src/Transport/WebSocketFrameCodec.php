@@ -382,8 +382,9 @@ final class WebSocketFrameCodec
      */
     private static function applyMask(string $payload, string $key): string
     {
-        $masked = $payload ^ str_repeat($key, intdiv(strlen($payload), 4) + 1);
-
-        return substr($masked, 0, strlen($payload));
+        // PHP string XOR yields a result the length of the SHORTER operand, and the repeated 4-byte key
+        // is always longer than the payload (len + (4 - len % 4) bytes), so the XOR is already exactly
+        // strlen($payload) - no trailing substr trim is needed.
+        return $payload ^ str_repeat($key, intdiv(strlen($payload), 4) + 1);
     }
 }

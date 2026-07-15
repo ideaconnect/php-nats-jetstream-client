@@ -944,12 +944,7 @@ final class NatsConnection
     public function publish(string $subject, string $payload, ?string $replyTo = null): Future
     {
         return async(function () use ($subject, $payload, $replyTo): void {
-            $this->validateSubjectCached($subject);
-            if ($replyTo !== null) {
-                // Not cached: a publish replyTo is typically a per-request unique inbox, so caching
-                // it would only churn the memo (see validateSubjectCached()).
-                $this->validateSubject($replyTo);
-            }
+            $this->validatePublishSubjects($subject, $replyTo);
             $this->enforceMaxPayload(strlen($payload));
 
             $frame = $this->codec->encodePublish($subject, $payload, $replyTo);
@@ -973,12 +968,7 @@ final class NatsConnection
         ?string $replyTo = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $replyTo): void {
-            $this->validateSubjectCached($subject);
-            if ($replyTo !== null) {
-                // Not cached: a publish replyTo is typically a per-request unique inbox, so caching
-                // it would only churn the memo (see validateSubjectCached()).
-                $this->validateSubject($replyTo);
-            }
+            $this->validatePublishSubjects($subject, $replyTo);
             // A server that does not advertise the `headers` capability treats HPUB as an unknown
             // protocol operation and closes the connection; fail client-side instead (nats.go
             // ErrHeadersNotSupported parity, #132).
@@ -1092,6 +1082,19 @@ final class NatsConnection
      *   - otherwise: buffer while a reconnect is in flight (flushed on reconnect), else fail loudly -
      *     a publish after the connection has Closed still throws (#146).
      */
+    /**
+     * Validates a publish subject (cached) and its optional reply subject. The reply is validated
+     * uncached: a publish replyTo is typically a per-request unique inbox, so caching it would only
+     * churn the memo (see validateSubjectCached()). Shared by publish() and publishWithHeaders().
+     */
+    private function validatePublishSubjects(string $subject, ?string $replyTo): void
+    {
+        $this->validateSubjectCached($subject);
+        if ($replyTo !== null) {
+            $this->validateSubject($replyTo);
+        }
+    }
+
     private function writePublishFrame(string $frame): void
     {
         if ($this->state === ConnectionState::Open) {
@@ -2759,7 +2762,19 @@ final class NatsConnection
      *
      * @return list<ProtocolFrame>
      */
-    private function awaitInitialPong(): array
+    /**
+     * Runs the bounded connect-handshake read loop shared by awaitInitialPong() and awaitServerInfo():
+     * polls readHandshakeChunk() within the handshake deadline / poll budget, parses each chunk, and
+     * feeds every frame to $onFrame - after auto-handling the two frames both callers treat identically,
+     * PING (reply with PONG) and -ERR (throw the connect error). $onFrame returns a non-null value to end
+     * the loop with that result, or null to keep polling. Throws a ConnectionException carrying
+     * $timeoutMessage if the poll budget or deadline is exhausted first.
+     *
+     * @template T
+     * @param callable(ProtocolFrame, int, list<ProtocolFrame>): (T|null) $onFrame
+     * @return T
+     */
+    private function pollHandshake(string $timeoutMessage, callable $onFrame): mixed
     {
         $deadline = $this->handshakeDeadline();
         $remainingPolls = $this->handshakePollBudget();
@@ -2773,35 +2788,51 @@ final class NatsConnection
             $frames = $this->parser->push($chunk);
 
             foreach ($frames as $index => $frame) {
-                if ($frame->type === ProtocolFrameType::Ok) {
-                    continue;
-                }
-
                 if ($frame->type === ProtocolFrameType::Ping) {
                     $this->transport->write($this->codec->encodePong())->await();
-                    continue;
-                }
-
-                if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
-                    $this->serverInfo = $this->decodeServerInfoPayload($frame->infoPayload);
 
                     continue;
-                }
-
-                if ($frame->type === ProtocolFrameType::Pong) {
-                    // Hand back the frames parsed after the PONG in this batch so they are not lost;
-                    // connectOnce() dispatches them once the parser bound is coupled to max_payload.
-                    // array_slice with default keys re-indexes, so the result is already a list.
-                    return array_slice($frames, $index + 1);
                 }
 
                 if ($frame->type === ProtocolFrameType::Err) {
                     throw $this->connectErrorFromFrame($frame->error);
                 }
+
+                $result = $onFrame($frame, $index, $frames);
+                if ($result !== null) {
+                    return $result;
+                }
             }
         }
 
-        throw new ConnectionException('Expected PONG after CONNECT');
+        throw new ConnectionException($timeoutMessage);
+    }
+
+    /**
+     * @return list<ProtocolFrame>
+     */
+    private function awaitInitialPong(): array
+    {
+        return $this->pollHandshake('Expected PONG after CONNECT', function (ProtocolFrame $frame, int $index, array $frames): ?array {
+            if ($frame->type === ProtocolFrameType::Ok) {
+                return null;
+            }
+
+            if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
+                $this->serverInfo = $this->decodeServerInfoPayload($frame->infoPayload);
+
+                return null;
+            }
+
+            if ($frame->type === ProtocolFrameType::Pong) {
+                // Hand back the frames parsed after the PONG in this batch so they are not lost;
+                // connectOnce() dispatches them once the parser bound is coupled to max_payload.
+                // array_slice with default keys re-indexes, so the result is already a list.
+                return array_slice($frames, $index + 1);
+            }
+
+            return null;
+        });
     }
 
     /**
@@ -2809,38 +2840,13 @@ final class NatsConnection
      */
     private function awaitServerInfo(): ServerInfo
     {
-        $deadline = $this->handshakeDeadline();
-        $remainingPolls = $this->handshakePollBudget();
-
-        while ($remainingPolls-- > 0 && $this->monotonicSeconds() < $deadline) {
-            $chunk = $this->readHandshakeChunk($deadline);
-            if ($chunk === null || $chunk === '') {
-                continue;
+        return $this->pollHandshake('Expected INFO during connect', function (ProtocolFrame $frame): ?ServerInfo {
+            if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
+                return $this->decodeServerInfoPayload($frame->infoPayload);
             }
 
-            $frames = $this->parser->push($chunk);
-
-            foreach ($frames as $frame) {
-                if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
-                    /** @var array<string,mixed> $data */
-                    $data = json_decode($frame->infoPayload, true, 512, JSON_THROW_ON_ERROR);
-
-                    return ServerInfo::fromInfoPayload($data);
-                }
-
-                if ($frame->type === ProtocolFrameType::Ping) {
-                    $this->transport->write($this->codec->encodePong())->await();
-
-                    continue;
-                }
-
-                if ($frame->type === ProtocolFrameType::Err) {
-                    throw $this->connectErrorFromFrame($frame->error);
-                }
-            }
-        }
-
-        throw new ConnectionException('Expected INFO during connect');
+            return null;
+        });
     }
 
     /**
@@ -3255,6 +3261,22 @@ final class NatsConnection
     /**
      * One heartbeat tick: verify the liveness budget, send PING, and consume the PONG.
      */
+    /**
+     * From the heartbeat timer: cancel the ping timer and attempt recovery, forcing the connection
+     * Closed if recovery itself throws. Shared by the missed-PONG (maxPingsOut) and PING-write-failure
+     * paths of pingTimerTick().
+     */
+    private function recoverFromHeartbeatFailure(): void
+    {
+        $this->cancelPingTimer();
+
+        try {
+            $this->recoverConnection();
+        } catch (\Throwable) {
+            $this->state = ConnectionState::Closed;
+        }
+    }
+
     private function pingTimerTick(): void
     {
         if ($this->state !== ConnectionState::Open) {
@@ -3266,13 +3288,7 @@ final class NatsConnection
         $this->outstandingPings++;
 
         if ($this->outstandingPings > $this->options->maxPingsOut) {
-            $this->cancelPingTimer();
-
-            try {
-                $this->recoverConnection();
-            } catch (\Throwable) {
-                $this->state = ConnectionState::Closed;
-            }
+            $this->recoverFromHeartbeatFailure();
 
             return;
         }
@@ -3289,13 +3305,7 @@ final class NatsConnection
             // The PING never hit the wire: drop its slot so correlation stays aligned (the
             // recovery below clears the rest on the epoch change anyway).
             $this->discardPongSlot($slot);
-            $this->cancelPingTimer();
-
-            try {
-                $this->recoverConnection();
-            } catch (\Throwable) {
-                $this->state = ConnectionState::Closed;
-            }
+            $this->recoverFromHeartbeatFailure();
 
             return;
         }

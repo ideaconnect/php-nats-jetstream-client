@@ -10,6 +10,7 @@ use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\ApiErrCode;
+use IDCT\NATS\JetStream\DecodesApiErrors;
 use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\JetStreamRequest;
@@ -24,6 +25,8 @@ use function Amp\async;
  */
 final class ObjectStoreBucket
 {
+    use DecodesApiErrors;
+
     private const DEFAULT_CHUNK_SIZE = 131072; // 128 KiB
 
     /**
@@ -178,6 +181,52 @@ final class ObjectStoreBucket
     }
 
     /**
+     * Builds a live (non-deleted) object meta record with this bucket's chunk-size option and a fresh
+     * mtime. The caller supplies the fields that vary per operation; put()/putStream()/rename() differ
+     * only in where those come from. Add 'description' to the returned record afterwards when present.
+     *
+     * @param array<string,mixed> $metadata
+     * @return array<string,mixed>
+     */
+    private function objectMeta(string $name, string $nuid, int $size, int $chunks, string $digest, array $metadata): array
+    {
+        return [
+            'name' => $name,
+            'bucket' => $this->bucket,
+            'nuid' => $nuid,
+            'size' => $size,
+            'chunks' => $chunks,
+            'digest' => $digest,
+            'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
+            'deleted' => false,
+            'options' => ['max_chunk_size' => $this->chunkSize],
+            'metadata' => $metadata,
+        ];
+    }
+
+    /**
+     * Builds a deleted-object tombstone meta record (empty content, deleted=true) - published by both
+     * delete() and rename()'s old-name tombstone, which were byte-identical hand-built copies.
+     *
+     * @return array<string,mixed>
+     */
+    private function tombstoneMeta(string $name): array
+    {
+        return [
+            'name' => $name,
+            'bucket' => $this->bucket,
+            'nuid' => '',
+            'size' => 0,
+            'chunks' => 0,
+            'digest' => '',
+            'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
+            'deleted' => true,
+            'options' => ['max_chunk_size' => $this->chunkSize],
+            'metadata' => [],
+        ];
+    }
+
+    /**
      * Deletes the underlying Object Store stream.
      *
      * @return Future<bool>
@@ -239,18 +288,7 @@ final class ObjectStoreBucket
                 }
             }
 
-            $info = [
-                'name' => $name,
-                'bucket' => $this->bucket,
-                'nuid' => $nuid,
-                'size' => $totalSize,
-                'chunks' => $chunks,
-                'digest' => $this->digestOf($data),
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => false,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => $metadata,
-            ];
+            $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->digestOf($data), $metadata);
             if ($description !== null && $description !== '') {
                 $info['description'] = $description;
             }
@@ -342,18 +380,7 @@ final class ObjectStoreBucket
                 Future\await($pending);
             }
 
-            $info = [
-                'name' => $name,
-                'bucket' => $this->bucket,
-                'nuid' => $nuid,
-                'size' => $totalSize,
-                'chunks' => $chunks,
-                'digest' => 'SHA-256=' . $this->base64Url(hash_final($hashContext, true)),
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => false,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => $metadata,
-            ];
+            $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->finalizeDigest($hashContext), $metadata);
 
             $this->publishMeta($name, $info);
 
@@ -508,7 +535,7 @@ final class ObjectStoreBucket
         // bytes. Pulling anyway would block until the batch expiry (no chunk ever arrives), so
         // short-circuit to the empty-content digest (in the same SHA-256=base64url format as below).
         if ($expected <= 0) {
-            return 'SHA-256=' . $this->base64Url(hash_final($hashContext, true));
+            return $this->finalizeDigest($hashContext);
         }
 
         // Fast path for a single-chunk object (the common case for small objects): the lone chunk is
@@ -523,7 +550,7 @@ final class ObjectStoreBucket
                 hash_update($hashContext, $message->payload);
                 $onChunk($message->payload);
 
-                return 'SHA-256=' . $this->base64Url(hash_final($hashContext, true));
+                return $this->finalizeDigest($hashContext);
             } catch (JetStreamException $e) {
                 if ($e->getCode() === 404) {
                     throw new JetStreamException('Incomplete object download: expected 1 chunks, received 0');
@@ -604,7 +631,7 @@ final class ObjectStoreBucket
             ));
         }
 
-        return 'SHA-256=' . $this->base64Url(hash_final($hashContext, true));
+        return $this->finalizeDigest($hashContext);
     }
 
     /**
@@ -681,25 +708,7 @@ final class ObjectStoreBucket
                 throw $e;
             }
 
-            // The record's stream sequence (its revision) travels in the Direct Get Nats-Sequence
-            // header, not in the meta JSON; surface it on ObjectInfo.
-            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-
-            if (($headers['Nats-Marker-Reason'] ?? '') !== '') {
-                // Server-written subject delete-marker (ADR-43): the object's meta aged out / was
-                // purged, so the object is effectively absent.
-                return null;
-            }
-
-            /** @var array<string,mixed>|null $metadata */
-            $metadata = json_decode($message->payload, true);
-            if (!is_array($metadata)) {
-                return null;
-            }
-
-            $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-
-            return ObjectInfo::fromArray($this->bucket, $metadata, $revision);
+            return $this->decodeDirectGetMeta($message);
         });
     }
 
@@ -752,18 +761,7 @@ final class ObjectStoreBucket
             // Run the lookup concurrently with the tombstone publish; only needed for chunk purge.
             $previousFuture = $this->lookupExisting($name);
 
-            $info = [
-                'name' => $name,
-                'bucket' => $this->bucket,
-                'nuid' => '',
-                'size' => 0,
-                'chunks' => 0,
-                'digest' => '',
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => true,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => [],
-            ];
+            $info = $this->tombstoneMeta($name);
 
             $this->publishMeta($name, $info);
 
@@ -809,36 +807,14 @@ final class ObjectStoreBucket
             }
 
             $targetName = $newName ?? $name;
-            $info = [
-                'name' => $targetName,
-                'bucket' => $this->bucket,
-                'nuid' => $existing->nuid,
-                'size' => $existing->size,
-                'chunks' => $existing->chunks,
-                'digest' => $existing->digest,
-                'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                'deleted' => false,
-                'options' => ['max_chunk_size' => $this->chunkSize],
-                'metadata' => $metadata ?? $existing->metadata,
-            ];
+            $info = $this->objectMeta($targetName, $existing->nuid, $existing->size, $existing->chunks, $existing->digest, $metadata ?? $existing->metadata);
 
             $this->publishMeta($targetName, $info);
 
             if ($isRename) {
                 // Tombstone the old name so it no longer resolves; the chunks stay (same NUID, now
                 // owned by the renamed object), so this must NOT purge chunks like delete() does.
-                $this->publishMeta($name, [
-                    'name' => $name,
-                    'bucket' => $this->bucket,
-                    'nuid' => '',
-                    'size' => 0,
-                    'chunks' => 0,
-                    'digest' => '',
-                    'mtime' => gmdate('Y-m-d\TH:i:s\Z'),
-                    'deleted' => true,
-                    'options' => ['max_chunk_size' => $this->chunkSize],
-                    'metadata' => [],
-                ]);
+                $this->publishMeta($name, $this->tombstoneMeta($name));
             }
 
             return ObjectInfo::fromArray($this->bucket, $info);
@@ -936,18 +912,7 @@ final class ObjectStoreBucket
                             throw $e;
                         }
 
-                        // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
-                        /** @var array<string,mixed>|null $metadata */
-                        $metadata = json_decode($message->payload, true);
-                        if (!is_array($metadata)) {
-                            return null;
-                        }
-
-                        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-                        $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-                        $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
-
-                        return $info->name === '' ? null : $info;
+                        return $this->decodeDirectGetMeta($message);
                     });
                 }
 
@@ -989,21 +954,10 @@ final class ObjectStoreBucket
 
         $infos = [];
         foreach ($messages as $message) {
-            // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
-            /** @var array<string,mixed>|null $metadata */
-            $metadata = json_decode($message->payload, true);
-            if (!is_array($metadata)) {
-                continue;
+            $info = $this->decodeDirectGetMeta($message);
+            if ($info !== null) {
+                $infos[] = $info;
             }
-
-            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-            $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-            $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
-            if ($info->name === '') {
-                continue;
-            }
-
-            $infos[] = $info;
         }
 
         return $infos;
@@ -1116,16 +1070,7 @@ final class ObjectStoreBucket
         /** @var array<string,mixed> $data */
         $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
 
-        /** @var array<string,mixed>|null $error */
-        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-        if ($error !== null) {
-            throw new JetStreamException(
-                (string) ($error['description'] ?? 'JetStream publish error'),
-                (int) ($error['code'] ?? 0),
-                null,
-                ApiErrCode::fromEnvelope($error),
-            );
-        }
+        $this->throwIfApiError($data, 'JetStream publish error');
     }
 
     /**
@@ -1169,16 +1114,7 @@ final class ObjectStoreBucket
             /** @var array<string,mixed> $data */
             $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
 
-            /** @var array<string,mixed>|null $error */
-            $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-            if ($error !== null) {
-                throw new JetStreamException(
-                    (string) ($error['description'] ?? 'JetStream API error'),
-                    (int) ($error['code'] ?? 0),
-                    null,
-                    ApiErrCode::fromEnvelope($error),
-                );
-            }
+            $this->throwIfApiError($data);
 
             /** @var array<string,mixed> $state */
             $state = is_array($data['state'] ?? null) ? $data['state'] : [];
@@ -1224,6 +1160,33 @@ final class ObjectStoreBucket
     }
 
     /**
+     * Decodes a Direct Get meta reply (raw meta JSON body; revision in the Nats-Sequence header) into an
+     * {@see ObjectInfo}, or null when the record is absent/unusable. Unifies the guards that had drifted
+     * between info() and list(): a server-written ADR-43 subject delete-marker (Nats-Marker-Reason set),
+     * a non-JSON body, and a nameless/malformed record all map to null.
+     */
+    private function decodeDirectGetMeta(NatsMessage $message): ?ObjectInfo
+    {
+        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+
+        if (($headers['Nats-Marker-Reason'] ?? '') !== '') {
+            // Server-written subject delete-marker (ADR-43): the object's meta aged out / was purged.
+            return null;
+        }
+
+        /** @var array<string,mixed>|null $metadata */
+        $metadata = json_decode($message->payload, true);
+        if (!is_array($metadata)) {
+            return null;
+        }
+
+        $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
+        $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
+
+        return $info->name === '' ? null : $info;
+    }
+
+    /**
      * @param array<string,mixed> $message
      * @return array<string,mixed>|null
      */
@@ -1246,11 +1209,28 @@ final class ObjectStoreBucket
     }
 
     /**
-     * Computes the official Object Store content digest ("SHA-256=" + base64url).
+     * Computes the official Object Store content digest ("SHA-256=" + base64url) for a buffer.
      */
     private function digestOf(string $data): string
     {
-        return 'SHA-256=' . $this->base64Url(hash('sha256', $data, true));
+        return $this->formatDigest(hash('sha256', $data, true));
+    }
+
+    /**
+     * Finalizes a streaming SHA-256 {@see \HashContext} into the official Object Store content digest
+     * ("SHA-256=" + base64url) - the terminal step for chunked uploads/downloads.
+     */
+    private function finalizeDigest(\HashContext $hashContext): string
+    {
+        return $this->formatDigest(hash_final($hashContext, true));
+    }
+
+    /**
+     * Formats a raw 32-byte SHA-256 digest as the official Object Store "SHA-256=<base64url>" string.
+     */
+    private function formatDigest(string $rawDigest): string
+    {
+        return 'SHA-256=' . $this->base64Url($rawDigest);
     }
 
     /**

@@ -6,8 +6,6 @@ namespace IDCT\NATS\Transport;
 
 use Amp\Cancellation;
 use Amp\Future;
-use Amp\Socket\Certificate;
-use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
 use Amp\Socket\ResourceSocket;
 use Amp\Socket\Socket;
@@ -22,6 +20,8 @@ use function Amp\Socket\connect;
  */
 final class AmpSocketTransport implements TlsAwareTransportInterface
 {
+    use AssemblesClientTlsContext;
+
     private ?Socket $socket = null;
 
     /** Whether the connect context carries a TLS context (TLS is required for this connection). */
@@ -226,30 +226,9 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
             return $context;
         }
 
-        $peerName = $this->options->tlsPeerName;
-        if ($peerName === null || $peerName === '') {
-            $peerName = (string) (parse_url($dsn, PHP_URL_HOST) ?? '');
-        }
+        $peerHost = (string) (parse_url($dsn, PHP_URL_HOST) ?? '');
 
-        $tlsContext = new ClientTlsContext($peerName);
-
-        if (!$this->options->tlsVerifyPeer) {
-            $tlsContext = $tlsContext->withoutPeerVerification();
-        }
-
-        if ($this->options->tlsCaFile !== null && $this->options->tlsCaFile !== '') {
-            $tlsContext = $tlsContext->withCaFile($this->options->tlsCaFile);
-        }
-
-        if ($this->options->tlsCertFile !== null && $this->options->tlsCertFile !== '') {
-            $tlsContext = $tlsContext->withCertificate(new Certificate(
-                $this->options->tlsCertFile,
-                $this->options->tlsKeyFile,
-                $this->options->tlsKeyPassphrase,
-            ));
-        }
-
-        return $context->withTlsContext($tlsContext);
+        return $context->withTlsContext($this->clientTlsContextFromOptions($this->options, $peerHost));
     }
 
     /**
