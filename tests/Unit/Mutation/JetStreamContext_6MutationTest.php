@@ -24,23 +24,53 @@ final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
-     * Builds a single MSG reply frame carrying $json as its payload.
-     */
-    private function reply(string $json): string
-    {
-        return sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($json), $json);
-    }
-
-    /**
      * Connects a client whose single API reply is $json.
+     *
+     * Post-#118 the request inbox is MUXED: request() no longer subscribes a fresh inbox per call;
+     * instead ONE long-lived wildcard "_INBOX.<base>.*" (established lazily on the first request) serves
+     * every reply, and each request publishes reply-to "_INBOX.<base>.<token>" and routes by that token.
+     * A pre-seeded fixed-subject "MSG _INBOX.a 1 ..." therefore no longer reaches the waiting request
+     * (its subject is not the request's random reply-to, so dispatchMuxReply drops it and the request
+     * times out). This installs a dynamic responder that learns the mux sid from the wildcard SUB and
+     * echoes $json ONCE on the request's captured reply-to with that sid - the wire form a real server
+     * returns on the shared request inbox.
      */
     private function connectedClientWithReply(string $json): NatsClient
     {
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $this->reply($json),
         ]);
+
+        $muxSid = 1;
+        $sent = false;
+        $transport->onWrite = static function (string $bytes) use (&$muxSid, &$sent, $json): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            // Learn the mux sid from the lazily-established wildcard inbox SUB "_INBOX.<base>.* <sid>".
+            if (str_starts_with($head, 'SUB _INBOX.') && str_contains($head, '.* ')) {
+                $muxSid = (int) (explode(' ', $head)[2] ?? 1);
+
+                return [];
+            }
+
+            if ($sent || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len> - echo the reply on the captured mux reply-to and sid.
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if ($replyTo === '') {
+                return [];
+            }
+
+            $sent = true;
+
+            return [sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $muxSid, strlen($json), $json)];
+        };
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();

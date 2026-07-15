@@ -111,6 +111,79 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1) serves every reply, and each
+     * request publishes reply-to "<base>.<token>" and routes by that token. A pre-seeded fixed-subject
+     * "MSG/HMSG _INBOX.x <sid>" therefore no longer reaches the waiting request and it times out.
+     *
+     * Every Object Store operation that awaits a reply - JS publish acks (put/putStream chunk+meta),
+     * Direct Get (info/get/list per-subject), STREAM.INFO/PURGE/CREATE/DELETE, CONSUMER.CREATE/DELETE -
+     * funnels through request(), so their replies are mux replies. This installs a dynamic responder
+     * that learns the mux base from the wildcard SUB and, for each request PUB/HPUB (a publish whose
+     * reply-to lives under that base), pops the next reply frame FIFO and re-emits it on the CAPTURED
+     * reply-to with the mux sid (1). Frames are delivered in the order requests are written, matching
+     * the request/SID order the tests already encoded.
+     *
+     * Only request replies belong here; subscription deliveries (a pull fetch inbox, a batched Direct
+     * Get inbox, a watch push-consumer deliver subject) are NOT mux replies - enqueue those on their SUB
+     * via FakeTransport::$enqueueOnWriteContaining so they arrive with the sid the server assigned.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox (fetch/direct-get) - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
+    /**
      * Verifies Object Store bucket create maps to a stream with chunk+meta subjects and rollup.
      */
     public function testBucketCreateAndDelete(): void
@@ -121,6 +194,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($deletePayload), $deletePayload),
         ]);
@@ -136,7 +211,9 @@ final class ObjectStoreBucketTest extends TestCase
         self::assertTrue($deleted);
         self::assertStringContainsString('$JS.API.STREAM.CREATE.OBJ_assets', $transport->writes[3]);
         self::assertStringContainsString('"allow_rollup_hdrs":true', $transport->writes[3]);
-        self::assertStringContainsString('$JS.API.STREAM.DELETE.OBJ_assets', $transport->writes[6]);
+        // Post-#118 the mux inbox has one shared "SUB <base>.* 1" and NO per-request UNSUB, so the
+        // second request's PUB is writes[4] (was writes[6] under the per-request SUB+UNSUB scheme).
+        self::assertStringContainsString('$JS.API.STREAM.DELETE.OBJ_assets', $transport->writes[4]);
     }
 
     /**
@@ -147,6 +224,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // 1) existing-object lookup -> not found
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
             // 2) chunk publish ack
@@ -183,6 +262,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
@@ -206,6 +287,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
@@ -225,7 +308,9 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // lookup (sid 1, concurrent), two chunk acks (sid 2, 3), meta ack (sid 4)
+        ]);
+        // lookup (concurrent), two chunk acks, meta ack - all mux request replies, FIFO by write order.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
@@ -259,11 +344,13 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // lookup (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),       // chunk1 (sid 2)
-            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),       // chunk2 (sid 3)
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),       // chunk3 (sid 4)
-            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),       // meta (sid 5)
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // lookup
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),       // chunk1
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),       // chunk2
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),       // chunk3
+            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),       // meta
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -301,10 +388,11 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // With no chunk to await first, the meta publish is issued before the concurrent lookup:
-            // 1) meta publish ack (sid 1)
+        ]);
+        // With no chunk to await first, the meta publish is issued before the concurrent lookup, so
+        // the mux replies arrive meta-ack first, then the not-found lookup (FIFO by write order).
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
-            // 2) existing-object lookup -> not found (sid 2, awaited after the meta publish)
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
         ]);
 
@@ -332,6 +420,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // 1) existing-object lookup -> returns previous meta with old nuid
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->metaGetResponse('logo.txt', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])), $this->metaGetResponse('logo.txt', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])),
             // 2) chunk publish ack
@@ -367,6 +457,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),     // info() (Direct Get)
             $this->directChunkReply($nuid, 'hello', 2),   // single-chunk fast path (Direct Get on the NUID subject)
         ]);
@@ -400,6 +492,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
@@ -428,6 +522,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
             $this->directChunkReply($nuid, 'CORRUPTED!!', 2), // body does not match the metadata digest
         ]);
@@ -457,6 +553,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
@@ -501,12 +599,20 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            $this->directReplyFromEnvelope($meta, 1),
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nabc\r\n",
-            "MSG _INBOX.JS.FETCH.c 3 3\r\ndef\r\n",
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nghi\r\n",
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),
+        ]);
+        // The three chunks arrive on the pull fetch inbox (sid 2: mux SUB=1, ephemeral consumer create
+        // is a mux request, fetch SUB=2), not on the mux request inbox - enqueue on the fetch SUB.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nabc\r\n",
+                "MSG _INBOX.JS.FETCH.c 2 3\r\ndef\r\n",
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nghi\r\n",
+            ],
+        ];
+        $this->muxReplies($transport, [
+            $this->directReplyFromEnvelope($meta, 1),                                     // info() Direct Get
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),         // CONSUMER.CREATE
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // CONSUMER.DELETE
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -537,6 +643,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
         ]);
 
@@ -566,12 +674,12 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // The tombstone publish is issued before the concurrent lookup (no chunk to await first):
-            // 1) tombstone meta publish ack (sid 1)
+        ]);
+        // The tombstone publish is issued before the concurrent lookup (no chunk to await first), then
+        // the purge; mux replies arrive in that write order.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(7)), $this->pubAck(7)),
-            // 2) existing-object lookup -> previous revision (sid 2), awaited before the purge
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->metaGetResponse('logo.txt', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])), $this->metaGetResponse('logo.txt', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])),
-            // 3) purge ack (sid 3)
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
         ]);
 
@@ -595,6 +703,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),     // lookupExisting -> none
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),       // chunk publish ack
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),       // meta publish ack
@@ -622,11 +732,13 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // info('shortcut') -> link meta pointing at doc.txt (Direct Get, sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // info('shortcut') -> link meta pointing at doc.txt (Direct Get).
             $this->directMetaReply('shortcut', ['options' => ['link' => ['bucket' => 'assets', 'name' => 'doc.txt']]], 1),
-            // info('doc.txt') -> the real object meta (sid 2).
+            // info('doc.txt') -> the real object meta.
             $this->directMetaReply('doc.txt', ['nuid' => $nuid, 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 2),
-            // single-chunk Direct Get on the target NUID subject (sid 3).
+            // single-chunk Direct Get on the target NUID subject.
             $this->directChunkReply($nuid, 'hello', 3),
         ]);
 
@@ -652,6 +764,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -682,6 +796,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($info), $info),       // STREAM.INFO
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updated), $updated), // STREAM.UPDATE
         ]);
@@ -691,9 +807,11 @@ final class ObjectStoreBucketTest extends TestCase
 
         self::assertTrue($client->jetStream()->objectStore('assets')->seal()->await());
 
-        self::assertStringContainsString('$JS.API.STREAM.UPDATE.OBJ_assets', $transport->writes[6]);
-        self::assertStringContainsString('"sealed":true', $transport->writes[6]);
-        self::assertStringContainsString('"max_bytes":1000', $transport->writes[6]);
+        // seal() issues STREAM.INFO then STREAM.UPDATE; post-#118 (one shared mux SUB, no per-request
+        // UNSUB) the second request's PUB is writes[4] (was writes[6] under the old per-request scheme).
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.OBJ_assets', $transport->writes[4]);
+        self::assertStringContainsString('"sealed":true', $transport->writes[4]);
+        self::assertStringContainsString('"max_bytes":1000', $transport->writes[4]);
     }
 
     /**
@@ -704,6 +822,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
@@ -733,8 +853,10 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // addLink() issues one HPUB meta-publish request on the first request inbox (sid 1); the
-            // server has no responder, so it replies with a 503 no-responders status.
+        ]);
+        // addLink() issues one HPUB meta-publish request on the mux inbox; the server has no responder,
+        // so it replies with a 503 no-responders status (echoed on the captured mux reply-to).
+        $this->muxReplies($transport, [
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
@@ -756,6 +878,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
@@ -778,13 +902,15 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // info('logo.txt') Direct Get (sid 1) -> existing object on nuid n1.
+        ]);
+        $this->muxReplies($transport, [
+            // info('logo.txt') Direct Get -> existing object on nuid n1.
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old'), 'metadata' => ['team' => 'design']], 1),
-            // info('brand.txt') clash check Direct Get (sid 2) -> 404 (target free).
+            // info('brand.txt') clash check Direct Get -> 404 (target free).
             $this->directStatusReply(2, 404, 'Message Not Found'),
-            // publishMeta('brand.txt') ack (sid 3).
+            // publishMeta('brand.txt') ack.
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8)),
-            // publishMeta('logo.txt' tombstone) ack (sid 4).
+            // publishMeta('logo.txt' tombstone) ack.
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),
         ]);
 
@@ -814,6 +940,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old'), 'metadata' => ['team' => 'design']], 1),
             sprintf("MSG _INBOX.c 2 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8)),
         ]);
@@ -863,14 +991,15 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // list(): paginated enumeration - page 1 (sid 1) returns the subjects, the empty page 2
-            // (sid 2) terminates the loop - then a concurrent Direct Get per meta subject (logo ->
-            // sid 3, old -> sid 4).
+        ]);
+        // Pre-2.11 per-subject Direct Get fan-out, all mux requests: page 1 returns the subjects, the
+        // empty page 2 terminates the loop, then a concurrent Direct Get per meta subject (logo, old,
+        // in map order). list(includeDeleted: true) repeats the same sequence.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
             $this->directMetaReply('logo.txt', $logoExtra, 3),
             $this->directMetaReply('old.txt', $oldExtra, 4),
-            // list(includeDeleted: true): same again - pages (sid 5, 6) then Direct Gets (sid 7, 8).
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen((string) $streamInfo), (string) $streamInfo),
             sprintf("MSG _INBOX.f 6 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
             $this->directMetaReply('logo.txt', $logoExtra, 7),
@@ -907,9 +1036,11 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($page1), $page1),           // page 1 (sid 1): a.txt
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($page2), $page2),           // page 2 (sid 2): b.txt
-            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),   // page 3 (sid 3): empty -> stop
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($page1), $page1),           // page 1: a.txt
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($page2), $page2),           // page 2: b.txt
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),   // page 3: empty -> stop
             $this->directMetaReply('a.txt', $extra, 4),
             $this->directMetaReply('b.txt', $extra, 5),
         ]);
@@ -966,10 +1097,19 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),   // metaSubjects() page 1 (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),      // terminator page (sid 2)
-            sprintf("HMSG \$O.assets.M.%s 3 %d %d\r\n%s%s\r\n", $logoEnc, $lh, $lh + strlen($logoMeta), $logoHdrs, $logoMeta), // batched: logo (active)
-            sprintf("HMSG \$O.assets.M.%s 3 %d %d\r\n%s%s\r\n", $docEnc, $dh, $dh + strlen($docMeta), $docHdrs, $docMeta),     // batched: doc (active, terminator)
+        ]);
+        // The batched multi_last Direct Get streams its replies on its OWN inbox (sid 2: mux SUB=1, the
+        // two STREAM.INFO enumeration pages are mux requests, the batched Direct Get SUB=2), terminated
+        // by the last frame's Nats-Num-Pending: 0. Enqueue those on the batched Direct Get SUB.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.DGET' => [
+                sprintf("HMSG \$O.assets.M.%s 2 %d %d\r\n%s%s\r\n", $logoEnc, $lh, $lh + strlen($logoMeta), $logoHdrs, $logoMeta), // batched: logo (active)
+                sprintf("HMSG \$O.assets.M.%s 2 %d %d\r\n%s%s\r\n", $docEnc, $dh, $dh + strlen($docMeta), $docHdrs, $docMeta),     // batched: doc (active, terminator)
+            ],
+        ];
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),   // metaSubjects() page 1
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),      // terminator page
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1002,6 +1142,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
         ]);
 
@@ -1023,8 +1165,10 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            $this->directStatusReply(1, 503, 'No Responders'),                       // Direct Get (sid 1)
-            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),            // STREAM.MSG.GET fallback (sid 2)
+        ]);
+        $this->muxReplies($transport, [
+            $this->directStatusReply(1, 503, 'No Responders'),                       // Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),            // STREAM.MSG.GET fallback
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1048,6 +1192,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 404, 'Message Not Found'),
         ]);
 
@@ -1081,8 +1227,17 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // The metadata update is delivered on the push consumer's deliver subscription (sid 2: mux
+        // SUB=1, CONSUMER.CREATE is a mux request, deliver SUB=2), not the mux inbox - enqueue it when
+        // that deliver SUB is written.
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.PUSH' => [
+                sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.7.1.0.0 %d\r\n%s\r\n", $enc, strlen((string) $metadata), (string) $metadata),
+            ],
+        ];
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.7.1.0.0 %d\r\n%s\r\n", $enc, strlen((string) $metadata), (string) $metadata),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1118,6 +1273,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -1152,11 +1309,19 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // Both meta frames arrive on the push consumer's deliver subscription (sid 2), not the mux
+        // inbox; enqueue them when that deliver SUB is written.
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.PUSH' => [
+                // A malformed (non-JSON) meta delivery must be skipped, not throw out of the loop.
+                sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.5.1.0.0 %d\r\n%s\r\n", $enc, strlen('not-json'), 'not-json'),
+                // A subsequent valid meta on the same subscription is still delivered.
+                sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.2.6.2.0.0 %d\r\n%s\r\n", $enc, strlen((string) $valid), (string) $valid),
+            ],
+        ];
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            // A malformed (non-JSON) meta delivery (sid 2) must be skipped, not throw out of the loop.
-            sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.5.1.0.0 %d\r\n%s\r\n", $enc, strlen('not-json'), 'not-json'),
-            // A subsequent valid meta on the same subscription is still delivered.
-            sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.2.6.2.0.0 %d\r\n%s\r\n", $enc, strlen((string) $valid), (string) $valid),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1207,11 +1372,19 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // Both frames arrive on the push consumer's deliver subscription (sid 2), not the mux inbox;
+        // enqueue them when that deliver SUB is written.
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.PUSH' => [
+                // A server delete-marker must be skipped, not surfaced as an ObjectInfo.
+                sprintf("HMSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.5.1.0.0 %d %d\r\n%s%s\r\n", $enc, $mh, $mh + strlen((string) $markerBody), $markerHdrs, (string) $markerBody),
+                // A subsequent valid meta on the same subscription is still delivered.
+                sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.2.6.2.0.0 %d\r\n%s\r\n", $enc, strlen((string) $valid), (string) $valid),
+            ],
+        ];
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            // A server delete-marker (sid 2) must be skipped, not surfaced as an ObjectInfo.
-            sprintf("HMSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.5.1.0.0 %d %d\r\n%s%s\r\n", $enc, $mh, $mh + strlen((string) $markerBody), $markerHdrs, (string) $markerBody),
-            // A subsequent valid meta on the same subscription is still delivered.
-            sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.2.6.2.0.0 %d\r\n%s\r\n", $enc, strlen((string) $valid), (string) $valid),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1247,6 +1420,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.x 1 %d %d\r\n%s%s\r\n", $h, $h + strlen((string) $markerBody), $hdrs, (string) $markerBody),
         ]);
 
@@ -1294,6 +1469,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // existing-object lookup -> not found
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
             // three chunk acks
@@ -1337,12 +1514,19 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // All three chunks arrive on the single fetch-batch inbox (sid 2: mux SUB=1, ephemeral consumer
+        // create is a mux request, fetch SUB=2), no per-chunk pull - enqueue on the fetch SUB.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nabc\r\n",
+                "MSG _INBOX.JS.FETCH.c 2 3\r\ndef\r\n",
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nghi\r\n",
+            ],
+        ];
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),                     // info()
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),             // create ephemeral consumer
-            // All three chunks arrive on the single fetch-batch inbox (sid 3), no per-chunk pull.
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nabc\r\n",
-            "MSG _INBOX.JS.FETCH.c 3 3\r\ndef\r\n",
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nghi\r\n",
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),  // delete consumer
         ]);
 
@@ -1377,8 +1561,10 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),  // metaSubjects() page 1 (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page (sid 2)
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),  // metaSubjects() page 1
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page
             $this->directStatusReply(3, 500, 'boom'),                                 // Direct Get -> non-404 error
         ]);
 
@@ -1400,6 +1586,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($error), $error),  // metaSubjects() -> error
         ]);
 
@@ -1422,8 +1610,12 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($meta), $meta),                       // existing-object lookup
+        ]);
+        // delete() publishes the tombstone before awaiting the concurrent lookup, then purges - so the
+        // mux replies arrive tombstone-ack, lookup, purge (FIFO by write order, not the old sid order).
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(7)), $this->pubAck(7)),  // tombstone ack
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($meta), $meta),                       // existing-object lookup
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($purgeError), $purgeError),            // purge -> error (swallowed)
         ]);
 
@@ -1451,8 +1643,10 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo), // metaSubjects() page 1 (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page (sid 2)
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo), // metaSubjects() page 1
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page
             $this->directStatusReply(3, 404, 'message not found'),                    // gone.txt -> 404 (skipped)
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4), // logo.txt -> present
         ]);
@@ -1476,8 +1670,10 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(7)), $this->pubAck(7)),        // tombstone ack (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($lookupError), $lookupError),               // lookup -> 500 swallowed (sid 2)
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(7)), $this->pubAck(7)),        // tombstone ack
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($lookupError), $lookupError),               // lookup -> 500 swallowed
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1498,8 +1694,10 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($publishError), $publishError),            // tombstone publish -> error (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),    // lookup -> 404 (sid 2)
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($publishError), $publishError),            // tombstone publish -> error
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),    // lookup -> 404
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1525,9 +1723,16 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // The 408 pull-timeout status arrives on the fetch inbox (sid 2), not the mux inbox.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                sprintf("HMSG _INBOX.JS.FETCH.c 2 %d %d\r\n%s\r\n", $hb, $hb, $status), // pull -> 408 (break)
+            ],
+        ];
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),                          // info()
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),                  // create consumer
-            sprintf("HMSG _INBOX.JS.FETCH.c 3 %d %d\r\n%s\r\n", $hb, $hb, $status),                 // pull -> 408 (break)
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),       // delete consumer
         ]);
 
@@ -1555,10 +1760,17 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // The 408 pull-timeout status arrives on the fetch inbox (sid 2), not the mux inbox.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                sprintf("HMSG _INBOX.JS.FETCH.c 2 %d %d\r\n%s\r\n", $hb, $hb, $status), // pull -> 408, 0 of 2 chunks
+            ],
+        ];
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),                          // info() (chunks=2, no digest)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),                  // create consumer (sid 2)
-            sprintf("HMSG _INBOX.JS.FETCH.c 3 %d %d\r\n%s\r\n", $hb, $hb, $status),                 // pull -> 408, 0 of 2 chunks
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),       // delete consumer (sid 4)
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),                  // create consumer
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),       // delete consumer
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1584,9 +1796,16 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // The 409 pull status arrives on the fetch inbox (sid 2), not the mux inbox.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                sprintf("HMSG _INBOX.JS.FETCH.c 2 %d %d\r\n%s\r\n", $hb, $hb, $status), // pull -> 409 (rethrow)
+            ],
+        ];
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),
-            sprintf("HMSG _INBOX.JS.FETCH.c 3 %d %d\r\n%s\r\n", $hb, $hb, $status),                 // pull -> 409 (rethrow)
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),
         ]);
 
@@ -1606,6 +1825,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 404, 'Message Not Found'), // info() -> 404
         ]);
 
@@ -1627,6 +1848,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1), // info() -> deleted tombstone
         ]);
 
@@ -1649,16 +1872,17 @@ final class ObjectStoreBucketTest extends TestCase
         // At depth > MAX_LINK_HOPS (8) the exception fires.
         $linkMeta = ['options' => ['link' => ['bucket' => 'assets', 'name' => 'loop.txt']]];
 
-        $readQueue = [
+        $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-        ];
+        ]);
         // MAX_LINK_HOPS = 8; we need 9 info() replies (depth 0..8) before the 9th depth check fires.
+        // Each info() is a sequential Direct Get mux request, so the replies are FIFO by hop depth.
+        $frames = [];
         for ($i = 1; $i <= 9; $i++) {
-            $readQueue[] = $this->directMetaReply('loop.txt', $linkMeta, $i);
+            $frames[] = $this->directMetaReply('loop.txt', $linkMeta, $i);
         }
-
-        $transport = new FakeTransport($readQueue);
+        $this->muxReplies($transport, $frames);
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
@@ -1676,6 +1900,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directMetaReply('bucket-link', ['options' => ['link' => ['bucket' => 'other-bucket']]], 1),
         ]);
 
@@ -1694,15 +1920,15 @@ final class ObjectStoreBucketTest extends TestCase
     {
         $linkMeta = ['options' => ['link' => ['bucket' => 'assets', 'name' => 'loop.txt']]];
 
-        $readQueue = [
+        $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-        ];
+        ]);
+        $frames = [];
         for ($i = 1; $i <= 9; $i++) {
-            $readQueue[] = $this->directMetaReply('loop.txt', $linkMeta, $i);
+            $frames[] = $this->directMetaReply('loop.txt', $linkMeta, $i);
         }
-
-        $transport = new FakeTransport($readQueue);
+        $this->muxReplies($transport, $frames);
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
@@ -1719,6 +1945,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 404, 'Message Not Found'),
         ]);
 
@@ -1747,11 +1975,13 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // info('shortcut') -> link pointing at doc.txt in same bucket (sid 1)
+        ]);
+        $this->muxReplies($transport, [
+            // info('shortcut') -> link pointing at doc.txt in same bucket
             $this->directMetaReply('shortcut', ['options' => ['link' => ['bucket' => 'assets', 'name' => 'doc.txt']]], 1),
-            // info('doc.txt') -> real object (sid 2)
+            // info('doc.txt') -> real object
             $this->directMetaReply('doc.txt', ['nuid' => $nuid, 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 2),
-            // single-chunk Direct Get on the NUID subject (sid 3)
+            // single-chunk Direct Get on the NUID subject
             $this->directChunkReply($nuid, 'hello', 3),
         ]);
 
@@ -1787,6 +2017,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),          // info() Direct Get
             $this->directStatusReply(2, 404, 'Not Found'),     // single-chunk Direct Get -> 404
         ]);
@@ -1815,6 +2047,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),          // info() Direct Get
             $this->directStatusReply(2, 500, 'Stream Error Occurred'), // single-chunk Direct Get -> 500 (rethrow)
         ]);
@@ -1846,10 +2080,18 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // The lone chunk arrives on the fetch inbox after the 503 fall-through (sid 2: mux SUB=1, the
+        // info + single-chunk Direct Get + CONSUMER.CREATE are mux requests, fetch SUB=2).
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                "MSG _INBOX.JS.FETCH.c 2 5\r\nhello\r\n", // chunk delivered via pull
+            ],
+        ];
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),                                                          // info() Direct Get
             $this->directStatusReply(2, 503, 'No Responders'),                                                 // single-chunk Direct Get -> 503 (fall-through)
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($consumer), $consumer),                            // create ephemeral consumer
-            "MSG _INBOX.JS.FETCH.c 4 5\r\nhello\r\n",                                                         // chunk delivered via pull
             sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),                 // delete consumer
         ]);
 
@@ -1879,6 +2121,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
@@ -1913,6 +2157,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
@@ -1933,6 +2179,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 500, 'Downstream Error'),
         ]);
 
@@ -1958,6 +2206,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $frame,
         ]);
 
@@ -1981,6 +2231,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),                                      // Direct Get -> 503
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($msgGetError), $msgGetError),              // STREAM.MSG.GET -> 500
         ]);
@@ -2005,6 +2257,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($msgGetNoData), $msgGetNoData),
         ]);
@@ -2027,6 +2281,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1), // info('gone.txt') -> deleted tombstone
         ]);
 
@@ -2046,6 +2302,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 404, 'Message Not Found'), // info() -> 404 (null)
         ]);
 
@@ -2065,9 +2323,11 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // info('logo.txt') -> found (sid 1)
+        ]);
+        $this->muxReplies($transport, [
+            // info('logo.txt') -> found
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')], 1),
-            // info('brand.txt') clash check -> found and not deleted (sid 2)
+            // info('brand.txt') clash check -> found and not deleted
             $this->directMetaReply('brand.txt', ['nuid' => 'n2', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 2),
         ]);
 
@@ -2090,6 +2350,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($emptyStreamInfo), $emptyStreamInfo),
         ]);
 
@@ -2126,9 +2388,11 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo), // page 1 (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),   // page 2 terminator (sid 2)
-            $badReply,                                                                  // corrupt.txt -> non-JSON body (sid 3)
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo), // page 1
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),   // page 2 terminator
+            $badReply,                                                                  // corrupt.txt -> non-JSON body
             $this->directMetaReply('good.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4),
         ]);
 
@@ -2160,6 +2424,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamReply), $streamReply),
         ]);
 
@@ -2186,6 +2452,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamReply), $streamReply),
         ]);
 
@@ -2208,11 +2476,13 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // lookup (sid 1) -> not found
+        ]);
+        $this->muxReplies($transport, [
+            // lookup -> not found
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
-            // one chunk ack (sid 2) for the non-empty 'hello' block
+            // one chunk ack for the non-empty 'hello' block
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
-            // meta ack (sid 3)
+            // meta ack
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
@@ -2243,13 +2513,15 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // lookup (sid 1) -> returns previous meta with old nuid
+        ]);
+        $this->muxReplies($transport, [
+            // lookup -> returns previous meta with old nuid
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->metaGetResponse('data.bin', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])), $this->metaGetResponse('data.bin', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])),
-            // chunk ack (sid 2)
+            // chunk ack
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
-            // meta ack (sid 3)
+            // meta ack
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),
-            // purge old chunks ack (sid 4)
+            // purge old chunks ack
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
         ]);
 
@@ -2282,6 +2554,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($msgGetNoMessage), $msgGetNoMessage),
         ]);
@@ -2306,6 +2580,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($invalidB64Data), $invalidB64Data),
         ]);
@@ -2330,11 +2606,13 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // lookup (sid 1) -> returns previous meta
+        ]);
+        $this->muxReplies($transport, [
+            // lookup -> returns previous meta
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->metaGetResponse('f.txt', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])), $this->metaGetResponse('f.txt', ['nuid' => $oldNuid, 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')])),
-            // chunk publish ack (sid 2)
+            // chunk publish ack
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
-            // meta publish ack (sid 3)
+            // meta publish ack
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),
             // purge -> error (must be swallowed)
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"error":{"code":500,"description":"purge failed"}}'), '{"error":{"code":500,"description":"purge failed"}}'),
@@ -2357,13 +2635,15 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // info('logo.txt') -> found (sid 1)
+        ]);
+        $this->muxReplies($transport, [
+            // info('logo.txt') -> found
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')], 1),
-            // info('brand.txt') clash check -> found but DELETED (sid 2)
+            // info('brand.txt') clash check -> found but DELETED
             $this->directMetaReply('brand.txt', ['nuid' => '', 'size' => 0, 'chunks' => 0, 'digest' => '', 'deleted' => true], 2),
-            // publishMeta('brand.txt') ack (sid 3)
+            // publishMeta('brand.txt') ack
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8)),
-            // publishMeta('logo.txt' tombstone) ack (sid 4)
+            // publishMeta('logo.txt' tombstone) ack
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),
         ]);
 
@@ -2389,6 +2669,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directMetaReply('blink', ['options' => ['link' => ['bucket' => 'assets', 'name' => '']]], 1),
         ]);
 
@@ -2419,10 +2701,18 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // The lone chunk arrives on the fetch inbox after the 503 fall-through (sid 2: mux SUB=1, the
+        // info + single-chunk Direct Get + CONSUMER.CREATE are mux requests, fetch SUB=2).
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                "MSG _INBOX.JS.FETCH.c 2 5\r\nhello\r\n", // chunk delivered via pull
+            ],
+        ];
+        $this->muxReplies($transport, [
             $this->directReplyFromEnvelope($meta, 1),                                                      // info() Direct Get
             $this->directStatusReply(2, 503, 'No Responders'),                                             // single-chunk Direct Get -> 503
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($consumer), $consumer),                        // create ephemeral consumer
-            "MSG _INBOX.JS.FETCH.c 4 5\r\nhello\r\n",                                                     // chunk delivered via pull
             sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),             // delete consumer
         ]);
 
@@ -2453,6 +2743,8 @@ final class ObjectStoreBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($emptyStreamInfo), $emptyStreamInfo),
         ]);
 

@@ -15,6 +15,76 @@ use PHPUnit\Framework\TestCase;
 final class BatchPublisherTest extends TestCase
 {
     /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1) serves every reply, and each
+     * request publishes reply-to "<base>.<token>" and routes by that token. A batch commit() funnels its
+     * start/commit legs through request(), so a pre-seeded "MSG _INBOX.x <sid>" no longer reaches the
+     * waiting request (its subject is not the request's random "<base>.<token>", so dispatchMuxReply drops
+     * it and the request times out).
+     *
+     * This installs a dynamic responder that mirrors a real server: it learns the mux base from the
+     * wildcard SUB, and for each request PUB/HPUB (a publish whose reply-to lives under that base) pops the
+     * next reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1). Frames are delivered
+     * FIFO in the order requests are written, so a multi-message batch (start request then commit request)
+     * gets its replies in sequence, while the intermediate fire-and-forget HPUBs (no reply-to) consume
+     * nothing.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a batch intermediate (fire-and-forget, no reply-to) - not a request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
+    /**
      * A parseable pre-2.12 INFO version means the connected server cannot honor batch semantics:
      * commit() must fail the version pre-flight BEFORE anything reaches the wire. The reply-shape
      * detection (#130) fires only AFTER the start message is durably stored, which leaves one
@@ -100,9 +170,10 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0-beta.1","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Zero-byte ack to the batch-start request (sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // Zero-byte ack to the batch-start request, then the commit PubAck (FIFO on the mux inbox).
             "MSG _INBOX.a 1 0\r\n\r\n",
-            // Commit PubAck to the commit request (sid 2).
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
@@ -131,6 +202,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"synadia-custom","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // The batch-incapable server acks the batch-start request with a NORMAL PubAck.
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
@@ -173,6 +246,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.1","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // The pre-2.12 JS leader acks the batch-start request with a NORMAL PubAck.
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
@@ -216,9 +291,11 @@ final class BatchPublisherTest extends TestCase
             // exercised (a pre-2.12 version would short-circuit this test before any write).
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.1","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Zero-byte ack to the batch-start request (sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // Zero-byte ack to the batch-start request, then a plain PubAck (no batch/count) to the
+            // commit request (FIFO on the mux inbox).
             "MSG _INBOX.a 1 0\r\n\r\n",
-            // Plain PubAck (no batch/count) to the commit request (sid 2).
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($plainCommitAck), $plainCommitAck),
         ]);
 
@@ -253,6 +330,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainCommitAck), $plainCommitAck),
         ]);
 
@@ -282,7 +361,9 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // The lone commit request (sid 1) hits a subject with no responder -> 503 status reply.
+        ]);
+        $this->muxReplies($transport, [
+            // The lone commit request hits a subject with no responder -> 503 status reply.
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
@@ -312,7 +393,9 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // The batch-start request (sid 1) hits a subject with no responder -> 503 status reply;
+        ]);
+        $this->muxReplies($transport, [
+            // The batch-start request hits a subject with no responder -> 503 status reply;
             // the batch aborts here, so the intermediate/commit messages are never sent.
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
@@ -343,9 +426,10 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Zero-byte ack to the batch-start request (sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // Zero-byte ack to the batch-start request, then the commit PubAck (FIFO on the mux inbox).
             "MSG _INBOX.a 1 0\r\n\r\n",
-            // Commit PubAck to the commit request (sid 2).
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
@@ -404,9 +488,10 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Zero-byte ack to the batch-start request (sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // Zero-byte ack to the batch-start request, then the commit PubAck (FIFO on the mux inbox).
             "MSG _INBOX.a 1 0\r\n\r\n",
-            // Commit PubAck to the commit request (sid 2).
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
@@ -474,7 +559,9 @@ final class BatchPublisherTest extends TestCase
             // The server advertises max_payload 256; enforceMaxPayload() reads this limit.
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":256,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Zero-byte ack to the batch-start request (sid 1); no further replies - the commit
+        ]);
+        $this->muxReplies($transport, [
+            // Zero-byte ack to the batch-start request; no further replies - the commit
             // must never be sent.
             "MSG _INBOX.a 1 0\r\n\r\n",
         ]);
@@ -521,6 +608,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($startError), $startError),
         ]);
 
@@ -593,6 +682,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
@@ -618,6 +709,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorAck), $errorAck),
         ]);
 
@@ -711,6 +804,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // Reply for the first (and only) commit request.
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
@@ -747,9 +842,10 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Zero-byte ack to the batch-start request (sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // Zero-byte ack to the batch-start request, then the commit PubAck (FIFO on the mux inbox).
             "MSG _INBOX.a 1 0\r\n\r\n",
-            // Commit PubAck to the commit request (sid 2).
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
@@ -792,9 +888,11 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Non-JSON reply to the start request (sid 1): treated as accepted.
+        ]);
+        $this->muxReplies($transport, [
+            // Non-JSON reply to the start request (treated as accepted), then the commit PubAck
+            // (FIFO on the mux inbox).
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($nonJsonStart), $nonJsonStart),
-            // Commit PubAck to the commit request (sid 2).
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
@@ -823,6 +921,8 @@ final class BatchPublisherTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // Commit request reply (single-message batch - no start request).
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($badAck), $badAck),
         ]);

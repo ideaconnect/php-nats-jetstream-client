@@ -45,7 +45,11 @@ final class KeyValueBucket_4MutationTest extends TestCase
      */
     public function testKeysDrainsChunkedRecordWithoutIdleSleepPerChunk(): void
     {
-        // CONSUMER.CREATE reply (sid 1): one record pending, so keys() proceeds into the replay wait loop.
+        // CONSUMER.CREATE reply: one record pending, so keys() proceeds into the replay wait loop. Post-
+        // #118 the request inbox is MUXED (one long-lived wildcard "<base>.*" serves every reply), so a
+        // fixed pre-seeded "MSG _INBOX.a 1" no longer matches the request's random "<base>.<token>" and
+        // would be dropped. The onWrite responder below echoes this reply on the request's CAPTURED mux
+        // reply-to (mux sid 1) instead.
         $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":1,'
             . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
             . '"deliver_policy":"last_per_subject","headers_only":true}}';
@@ -53,10 +57,10 @@ final class KeyValueBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        // Small request timeout so a mis-delivered mux reply fails fast instead of hanging the 10 s default.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $transport);
         $client->connect()->await();
 
         // A single live headers-only delivery on the deliver subscription (sid 2). Its $JS.ACK last
@@ -69,9 +73,40 @@ final class KeyValueBucket_4MutationTest extends TestCase
 
         $chunks = str_split($frame); // one byte per chunk: many partial-progress reads before completion
         self::assertGreaterThan(200, count($chunks), 'need enough chunks that a per-chunk sleep overshoots the bound');
-        foreach ($chunks as $byte) {
-            $transport->pushReadChunk($byte);
-        }
+
+        // Mux request inbox (#118): echo the CONSUMER.CREATE reply on the request's captured reply-to
+        // (mux sid, learned from the wildcard SUB), then release the chunked deliver frame - one transport
+        // byte per read - ONLY once the deliver subscription is written. Emitting the chunks on the deliver
+        // SUB (rather than pre-seeding them) keeps them from being consumed and dropped while the
+        // CONSUMER.CREATE request is still in flight (its reply would otherwise land behind them).
+        $muxSid = 1;
+        $transport->onWrite = static function (string $bytes) use ($consumerReply, $chunks, &$muxSid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            $parts = explode(' ', $head);
+            if (str_starts_with($head, 'SUB ')) {
+                $subject = $parts[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $muxSid = (int) ($parts[2] ?? 1); // learn the mux inbox sid from its wildcard SUB
+                } elseif (str_starts_with($subject, '_INBOX.KV.KEYS')) {
+                    return $chunks; // deliver subscription live: release the record one byte per read
+                }
+
+                return [];
+            }
+
+            if (str_starts_with($head, 'PUB ') && str_contains($head, '$JS.API.CONSUMER.CREATE.')) {
+                $replyTo = $parts[2] ?? ''; // PUB <subject> <replyTo> <len>
+                if ($replyTo !== '') {
+                    return [sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $muxSid, strlen($consumerReply), $consumerReply)];
+                }
+            }
+
+            return [];
+        };
 
         // 0.2 s progress bound: the real path drains all chunks well inside it; a mutant that sleeps 1 ms
         // per chunk cannot.
@@ -103,19 +138,51 @@ final class KeyValueBucket_4MutationTest extends TestCase
      */
     public function testHistoryThrowsOnStalledReplayAndStillUnsubscribes(): void
     {
-        // CONSUMER.CREATE reply (sid 1): num_pending > 0 so history() proceeds to the replay, but no
-        // deliver frame is ever seeded, so the consumer never reports "caught up" and the clock expires.
+        // CONSUMER.CREATE reply: num_pending > 0 so history() proceeds to the replay, but no deliver frame
+        // is ever seeded, so the consumer never reports "caught up" and the clock expires. Post-#118 the
+        // request inbox is MUXED, so this reply is echoed on the request's captured mux reply-to (mux sid 1)
+        // by the onWrite responder below rather than pre-seeded on a fixed "_INBOX.a" subject.
         $consumerReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":1,'
             . '"config":{"deliver_subject":"d","ack_policy":"none"}}';
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        // Small request timeout so a mis-delivered mux reply fails fast instead of hanging the 10 s default.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $transport);
         $client->connect()->await();
+
+        // Mux request inbox (#118): the deliver subscription (sid 2) intentionally gets NO frame - the
+        // replay makes no progress and stalls - so this responder ONLY echoes the CONSUMER.CREATE reply on
+        // the request's captured reply-to (mux sid, learned from the wildcard SUB).
+        $muxSid = 1;
+        $transport->onWrite = static function (string $bytes) use ($consumerReply, &$muxSid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            $parts = explode(' ', $head);
+            if (str_starts_with($head, 'SUB ')) {
+                $subject = $parts[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $muxSid = (int) ($parts[2] ?? 1); // learn the mux inbox sid from its wildcard SUB
+                }
+
+                return [];
+            }
+
+            if (str_starts_with($head, 'PUB ') && str_contains($head, '$JS.API.CONSUMER.CREATE.')) {
+                $replyTo = $parts[2] ?? ''; // PUB <subject> <replyTo> <len>
+                if ($replyTo !== '') {
+                    return [sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $muxSid, strlen($consumerReply), $consumerReply)];
+                }
+            }
+
+            return [];
+        };
 
         try {
             $client->jetStream()->keyValue('cfg')->history('theme', 0.05)->await();

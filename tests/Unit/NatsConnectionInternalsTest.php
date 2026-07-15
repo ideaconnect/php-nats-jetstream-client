@@ -102,29 +102,6 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->invokePrivate($connection, 'extractHeadersAndPayload', $invalid);
     }
 
-    public function testCleanupRequestSubscriptionFallsBackToLocalDropWhenClosed(): void
-    {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
-
-        $sid = 99;
-        $this->setPrivate($connection, 'state', ConnectionState::Closed);
-        $this->setPrivate($connection, 'subscriptions', [
-            $sid => static function (NatsMessage $message): void {},
-        ]);
-        $this->setPrivate($connection, 'subscriptionMeta', [
-            $sid => ['subject' => '_INBOX.x', 'queue' => null],
-        ]);
-        $this->setPrivate($connection, 'pendingMessages', [
-            $sid => new \SplQueue(),
-        ]);
-
-        $this->invokePrivate($connection, 'cleanupRequestSubscription', $sid);
-
-        self::assertSame([], $this->getPrivate($connection, 'subscriptions'));
-        self::assertSame([], $this->getPrivate($connection, 'subscriptionMeta'));
-        self::assertSame([], $this->getPrivate($connection, 'pendingMessages'));
-    }
-
     public function testRecoverConnectionDisabledThrowsImmediately(): void
     {
         $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), new FakeTransport());
@@ -407,71 +384,6 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->expectException(ProtocolException::class);
         $this->expectExceptionMessage('exceeds server max_payload');
         $this->invokePrivate($connection, 'enforceMaxPayload', 9);
-    }
-
-    public function testCleanupRequestSubscriptionNoOpForUnknownSid(): void
-    {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
-
-        $this->invokePrivate($connection, 'cleanupRequestSubscription', 777);
-
-        self::assertSame([], $this->getPrivate($connection, 'subscriptions'));
-        self::assertSame([], $this->getPrivate($connection, 'subscriptionMeta'));
-        self::assertSame([], $this->getPrivate($connection, 'pendingMessages'));
-    }
-
-    public function testCleanupRequestSubscriptionFallsBackWhenUnsubscribeThrows(): void
-    {
-        $transport = new class implements TransportInterface {
-            public function connect(string $dsn, int $timeoutMs): \Amp\Future
-            {
-                return async(static function (): void {});
-            }
-
-            public function write(string $bytes): \Amp\Future
-            {
-                return async(static function () use ($bytes): void {
-                    if (str_starts_with($bytes, 'UNSUB ')) {
-                        throw new \RuntimeException('write failed');
-                    }
-                });
-            }
-
-            public function upgradeTls(): \Amp\Future
-            {
-                return async(static function (): void {});
-            }
-
-            public function readLine(?\Amp\Cancellation $cancellation = null): \Amp\Future
-            {
-                return async(static fn(): string => '');
-            }
-
-            public function close(): \Amp\Future
-            {
-                return async(static function (): void {});
-            }
-        };
-
-        $connection = new NatsConnection(new NatsOptions(), $transport);
-
-        $sid = 77;
-        $this->setPrivate($connection, 'state', ConnectionState::Open);
-        $this->setPrivate($connection, 'subscriptions', [
-            $sid => static function (NatsMessage $message): void {},
-        ]);
-        $this->setPrivate($connection, 'subscriptionMeta', [
-            $sid => ['subject' => '_INBOX.req', 'queue' => null],
-        ]);
-        $this->setPrivate($connection, 'pendingMessages', [
-            $sid => new \SplQueue(),
-        ]);
-
-        $this->invokePrivate($connection, 'cleanupRequestSubscription', $sid);
-
-        self::assertSame([], $this->getPrivate($connection, 'subscriptions'));
-        self::assertSame([], $this->getPrivate($connection, 'subscriptionMeta'));
-        self::assertSame([], $this->getPrivate($connection, 'pendingMessages'));
     }
 
     public function testDrainPendingForSidNoOpWhenStateMissing(): void

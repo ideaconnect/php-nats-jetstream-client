@@ -2830,8 +2830,17 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 5\r\nhello\r\n",
         ]);
+        // The reply is delivered dynamically on the mux sid (1) at the request's captured reply-to (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
+        };
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -2839,9 +2848,13 @@ final class NatsConnectionTest extends TestCase
         $response = $connection->request('svc.echo', '{"x":1}', 50)->await();
 
         self::assertSame('hello', $response->payload);
+        // One shared mux SUB (written lazily on the first request), then the request's PUB; no per-request UNSUB.
         self::assertStringStartsWith('SUB _INBOX.', $transport->writes[2]);
         self::assertStringStartsWith('PUB svc.echo _INBOX.', $transport->writes[3]);
-        self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+        self::assertSame([], array_values(array_filter(
+            $transport->writes,
+            static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+        )));
     }
 
     public function testRequestReturnsReplyDeliveredOnSameTickAsTimeout(): void
@@ -2853,11 +2866,21 @@ final class NatsConnectionTest extends TestCase
             [
                 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
                 "PONG\r\n",
-                "MSG _INBOX.any 1 5\r\nhello\r\n",
             ],
             holdChunkContaining: 'hello',
             holdSeconds: 0.05,
         );
+        // Reply on the mux sid (1) at the captured reply-to; the transport holds this chunk (it contains
+        // 'hello') past the deadline to reproduce the completion-vs-timeout race (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
+        };
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -2886,7 +2909,11 @@ final class NatsConnectionTest extends TestCase
         try {
             $connection->request('svc.echo', '{"x":1}', 5)->await();
         } finally {
-            self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+            // Post-#118 cleanup is removeMuxWaiter (no wire frame): there is no per-request UNSUB.
+            self::assertSame([], array_values(array_filter(
+                $transport->writes,
+                static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+            )));
         }
     }
 
@@ -2898,8 +2925,20 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 1\r\nA\r\nMSG _INBOX.any 1 1\r\nB\r\nMSG _INBOX.any 1 1\r\nC\r\n",
         ]);
+        // Three replies, delivered in one chunk on the mux sid (1) at the captured reply-to (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.scan ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf(
+                "MSG %1\$s 1 1\r\nA\r\nMSG %1\$s 1 1\r\nB\r\nMSG %1\$s 1 1\r\nC\r\n",
+                $replyTo,
+            )];
+        };
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -2909,7 +2948,10 @@ final class NatsConnectionTest extends TestCase
         $payloads = array_map(static fn(NatsMessage $m): string => $m->payload, $replies);
         self::assertSame(['A', 'B', 'C'], $payloads);
         self::assertStringStartsWith('PUB svc.scan _INBOX.', $transport->writes[3]);
-        self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+        self::assertSame([], array_values(array_filter(
+            $transport->writes,
+            static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+        )));
     }
 
     /**
@@ -2923,9 +2965,21 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Three replies in ONE chunk, all dispatched before the wait loop regains control.
-            "MSG _INBOX.any 1 1\r\nA\r\nMSG _INBOX.any 1 1\r\nB\r\nMSG _INBOX.any 1 1\r\nC\r\n",
         ]);
+        // Three replies in ONE chunk on the mux sid (1), all dispatched before the wait loop regains
+        // control - the collector must cap at maxResponses=2 (#160), not the between-reads check.
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.scan ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf(
+                "MSG %1\$s 1 1\r\nA\r\nMSG %1\$s 1 1\r\nB\r\nMSG %1\$s 1 1\r\nC\r\n",
+                $replyTo,
+            )];
+        };
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -2949,8 +3003,20 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 1\r\nA\r\nMSG _INBOX.any 1 1\r\nB\r\n",
         ]);
+        // Two replies in one chunk on the mux sid (1); nothing more arrives, so the stall fires (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.scan ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf(
+                "MSG %1\$s 1 1\r\nA\r\nMSG %1\$s 1 1\r\nB\r\n",
+                $replyTo,
+            )];
+        };
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -3281,8 +3347,17 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG TMPBOX.any 1 5\r\nhello\r\n",
         ]);
+        // Reply on the mux sid (1) at the captured reply-to (which uses the configured TMPBOX prefix).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
+        };
 
         $options = new NatsOptions(inboxPrefix: 'TMPBOX');
         $connection = new NatsConnection($options, $transport);
@@ -3334,7 +3409,10 @@ final class NatsConnectionTest extends TestCase
         try {
             $connection->request('svc.echo', '{"x":1}', 1_000, $deferredCancellation->getCancellation())->await();
         } finally {
-            self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+            // Post-#118 cleanup is removeMuxWaiter (no wire frame). The waiter map must no longer hold
+            // the cancelled request's token - the mux inbox itself stays subscribed for reuse.
+            $waiters = (new \ReflectionProperty($connection, 'muxWaiters'))->getValue($connection);
+            self::assertSame([], $waiters, 'the cancelled request must remove its mux waiter');
         }
     }
 
@@ -3428,10 +3506,11 @@ final class NatsConnectionTest extends TestCase
         self::assertNotSame('', $inboxA);
         self::assertNotSame('', $inboxB);
 
-        // A's reply arrives first; B's follows in a separate chunk that only a handed-over
-        // pump can read (request inbox sids are 1 and 2).
+        // A's reply arrives first; B's follows in a separate chunk that only a handed-over pump can
+        // read. Post-#118 both replies land on the single shared mux sid (1) and are routed to the
+        // right request by the per-request token in their reply-to subject.
         $transport->feed("MSG {$inboxA} 1 2\r\nra\r\n");
-        $transport->feed("MSG {$inboxB} 2 2\r\nrb\r\n");
+        $transport->feed("MSG {$inboxB} 1 2\r\nrb\r\n");
 
         self::assertSame('ra', $a->await()->payload);
         self::assertSame('rb', $b->await()->payload);
@@ -4999,8 +5078,20 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "HMSG _INBOX.any 1 {$headerBytes} {$headerBytes}\r\n{$noRespondersHeader}\r\n",
         ]);
+        // The 503 no-responders sentinel is delivered as an HMSG on the mux sid (1) at the captured
+        // reply-to (#118).
+        $transport->onWrite = static function (string $bytes) use ($noRespondersHeader, $headerBytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.missing ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [
+                "HMSG {$replyTo} 1 {$headerBytes} {$headerBytes}\r\n{$noRespondersHeader}\r\n",
+            ];
+        };
 
         $connection = new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
@@ -5230,8 +5321,19 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
             "MSG events 1 1\r\nA\r\n",       // first delivery (sid 1)
             "MSG events 1 1\r\nB\r\n",       // second delivery (sid 1), read during the awaited request
-            "MSG _INBOX.r 2 1\r\nR\r\n",     // the awaited request's reply (inbox sid 2)
         ]);
+        // The awaited request's reply is delivered on the mux sid at the captured reply-to. The mux
+        // subscription is established lazily on that first request, so - with the 'events' sub already
+        // holding sid 1 - it takes sid 2 (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 2 1\r\nR\r\n", $replyTo)];
+        };
 
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();
@@ -5845,7 +5947,14 @@ final class NatsConnectionTest extends TestCase
             self::assertStringContainsString('Request timed out', $e->getMessage());
         }
 
-        self::assertSame("UNSUB 1\r\n", $transport->writes[4]);
+        // Post-#118 cleanup is removeMuxWaiter (no wire frame): the finally must still run and drop the
+        // timed-out request's waiter, and no per-request UNSUB is written.
+        $waiters = (new \ReflectionProperty($connection, 'muxWaiters'))->getValue($connection);
+        self::assertSame([], $waiters, 'the timed-out request must remove its mux waiter during cleanup');
+        self::assertSame([], array_values(array_filter(
+            $transport->writes,
+            static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+        )));
     }
 
     public function testMalformedHmsgTriggersRecoveryInsteadOfEscaping(): void
@@ -6105,8 +6214,17 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 2\r\nok\r\n",
         ]);
+        // Reply on the mux sid (1) at the reply-to captured from the HPUB frame (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'HPUB svc.echo ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 2\r\nok\r\n", $replyTo)];
+        };
 
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();
@@ -6732,6 +6850,13 @@ final class NatsConnectionTest extends TestCase
             public int $maxConcurrentReads = 0;
             public int $cancelledReads = 0;
             private int $activeReads = 0;
+            /**
+             * Dynamic write responder: echoes a reply derived from a written frame onto the read queue,
+             * so a request's mux reply can be delivered at its captured reply-to (#118).
+             *
+             * @var (\Closure(string): list<string>)|null
+             */
+            public ?\Closure $onWrite = null;
             /** @var list<string> */
             public array $queue = [
                 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -6747,6 +6872,12 @@ final class NatsConnectionTest extends TestCase
             {
                 return async(function () use ($bytes): void {
                     $this->writes[] = $bytes;
+
+                    if ($this->onWrite !== null) {
+                        foreach (($this->onWrite)($bytes) as $chunk) {
+                            $this->queue[] = $chunk;
+                        }
+                    }
                 });
             }
 
@@ -6804,8 +6935,18 @@ final class NatsConnectionTest extends TestCase
 
         self::assertGreaterThanOrEqual(1, $transport->cancelledReads);
 
-        // A subsequent request must succeed with no reconnect and no overlapping read.
-        $transport->pushReply("MSG _INBOX.any 2 2\r\nok\r\n");
+        // A subsequent request must succeed with no reconnect and no overlapping read. Arm the reply
+        // only now (the first request had to time out): the mux inbox is already subscribed as sid 1
+        // from the first request, so this reply is echoed at the second request's captured reply-to.
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 2\r\nok\r\n", $replyTo)];
+        };
 
         $reply = $connection->request('svc.echo', 'x', 500)->await();
 
@@ -7744,8 +7885,17 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 2\r\nok\r\n",
         ]);
+        // Reply on the mux sid (1) at the reply-to captured from the HPUB frame (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'HPUB svc.scan ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 2\r\nok\r\n", $replyTo)];
+        };
 
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();
@@ -8291,8 +8441,18 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 1\r\nA\r\n",
         ]);
+        // A single reply on the mux sid (1) at the captured reply-to; nothing more arrives, so the
+        // stall break fires while the slice TimeoutCancellation exercises the `continue` branch (#118).
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.scan ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 1\r\nA\r\n", $replyTo)];
+        };
 
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();

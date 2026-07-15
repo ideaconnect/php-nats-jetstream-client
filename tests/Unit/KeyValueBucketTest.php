@@ -30,6 +30,101 @@ final class KeyValueBucketTest extends TestCase
         }
     }
 
+    /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" serves every reply, and each request
+     * publishes reply-to "<base>.<token>" and routes by that token. A pre-seeded fixed-subject
+     * "MSG _INBOX.x <sid>" / "HMSG _INBOX.x <sid>" therefore no longer reaches the waiting request (its
+     * subject is not the request's random "<base>.<token>", so dispatchMuxReply drops it and the request
+     * times out).
+     *
+     * This installs a dynamic responder that mirrors a real server: it learns the mux base + sid from the
+     * wildcard SUB, and for each request PUB/HPUB (a publish whose reply-to lives under that base) pops the
+     * next reply frame and re-emits it on the CAPTURED reply-to with the learned mux sid. Frames are
+     * delivered FIFO in the order requests are written, so a method that issues several requests (KV get's
+     * Direct-Get->STREAM.MSG.GET fallback, createKey's put->get->put, getAll's STREAM.INFO pages then the
+     * per-key Direct-Get fan-out) still gets its replies in sequence.
+     *
+     * Subscription deliveries are NOT mux replies (a push consumer's deliver subject for keys/history/
+     * watch, or the batched Direct-Get inbox); pass those via $deliverOnSub keyed by a substring of their
+     * own SUB subject, and they are enqueued VERBATIM (own sid preserved) once that SUB is written - after
+     * the request that created the consumer has already drained its own reply, so they land on the live
+     * deliver subscription instead of being dropped during the request read.
+     *
+     * @param list<string> $replyFrames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     * @param array<string,list<string>> $deliverOnSub SUB-subject substring => frames emitted on that SUB.
+     */
+    private function muxServer(FakeTransport $transport, array $replyFrames, array $deliverOnSub = []): void
+    {
+        $queue = $replyFrames;
+        $base = null;
+        $muxSid = 1;
+        // Tracks which $deliverOnSub groups have already fired (each emits at most once). Kept separate
+        // from $deliverOnSub - captured by reference for persistence - so the map itself stays captured by
+        // value and its precise list<string> frame type is preserved for the closure's return.
+        $fired = [];
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, $deliverOnSub, &$fired, &$base, &$muxSid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    // Learn the mux base "<hex>." (strip trailing "*") and the sid the server assigned it.
+                    $base = substr($subject, 0, -1);
+                    $muxSid = (int) (explode(' ', $head)[2] ?? 1);
+
+                    return [];
+                }
+
+                // A non-mux SUB (a push deliver subject / Direct-Get inbox): emit its scripted frames now,
+                // once the subscription that will receive them exists.
+                foreach ($deliverOnSub as $needle => $frames) {
+                    if (!isset($fired[$needle]) && str_contains($subject, $needle)) {
+                        $fired[$needle] = true;
+
+                        return $frames;
+                    }
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox (Direct-Get batch) - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo, $muxSid)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the learned mux sid, preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo, int $muxSid): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo;          // subject
+        $tokens[2] = (string) $muxSid;  // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
     /** Builds a Direct Get reply (HMSG): the stored value as the body, with Nats-* + optional KV-Operation. */
     private function kvDirectReply(string $subject, string $value, int $seq, int $sid, ?string $operation = null): string
     {
@@ -64,8 +159,10 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            $this->kvDirectStatus(1, 503, 'No Responders'),                          // Direct Get (sid 1)
-            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),    // STREAM.MSG.GET fallback (sid 2)
+        ]);
+        $this->muxServer($transport, [
+            $this->kvDirectStatus(1, 503, 'No Responders'),                          // Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),    // STREAM.MSG.GET fallback
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -94,6 +191,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($deletePayload), $deletePayload),
         ]);
@@ -107,8 +206,10 @@ final class KeyValueBucketTest extends TestCase
 
         self::assertSame('KV_cfg', $created->name);
         self::assertTrue($deleted);
+        // Post-#118 there is one shared mux SUB (writes[2]) and no per-request SUB/UNSUB, so the two
+        // request PUBs are consecutive: create at writes[3], delete at writes[4].
         self::assertStringContainsString('$JS.API.STREAM.CREATE.KV_cfg', $transport->writes[3]);
-        self::assertStringContainsString('$JS.API.STREAM.DELETE.KV_cfg', $transport->writes[6]);
+        self::assertStringContainsString('$JS.API.STREAM.DELETE.KV_cfg', $transport->writes[4]);
     }
 
     /**
@@ -122,6 +223,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
@@ -133,10 +236,11 @@ final class KeyValueBucketTest extends TestCase
         $kv->create()->await();
         $kv->create(['deny_delete' => false, 'discard' => 'old'])->await();
 
+        // Two consecutive request PUBs over the shared mux inbox: default create at writes[3], override at [4].
         self::assertStringContainsString('"deny_delete":true', $transport->writes[3]);
         self::assertStringContainsString('"discard":"new"', $transport->writes[3]);
-        self::assertStringContainsString('"deny_delete":false', $transport->writes[6]);
-        self::assertStringContainsString('"discard":"old"', $transport->writes[6]);
+        self::assertStringContainsString('"deny_delete":false', $transport->writes[4]);
+        self::assertStringContainsString('"discard":"old"', $transport->writes[4]);
     }
 
     /**
@@ -150,6 +254,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
             $this->kvDirectReply('$KV.cfg.theme', 'blue', 1, 2),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($deleteAck), $deleteAck),
@@ -170,10 +276,12 @@ final class KeyValueBucketTest extends TestCase
         self::assertSame('PUT', $entry->operation);
         self::assertSame('KV_cfg', $delete->stream);
 
+        // Three consecutive request publishes over the shared mux inbox (writes[2] is the mux SUB):
+        // put HPUB at [3], Direct-Get PUB at [4], delete HPUB at [5].
         self::assertStringStartsWith('PUB $KV.cfg.theme _INBOX.', $transport->writes[3]);
-        self::assertStringStartsWith('PUB $JS.API.DIRECT.GET.KV_cfg _INBOX.', $transport->writes[6]);
-        self::assertStringStartsWith('HPUB $KV.cfg.theme _INBOX.', $transport->writes[9]);
-        self::assertStringContainsString('KV-Operation:DEL', $transport->writes[9]);
+        self::assertStringStartsWith('PUB $JS.API.DIRECT.GET.KV_cfg _INBOX.', $transport->writes[4]);
+        self::assertStringStartsWith('HPUB $KV.cfg.theme _INBOX.', $transport->writes[5]);
+        self::assertStringContainsString('KV-Operation:DEL', $transport->writes[5]);
     }
 
     /**
@@ -189,8 +297,10 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // delete() issues an HPUB request on the first request inbox (sid 1); the server has no
-            // responder bound, so it replies with a 503 no-responders status.
+        ]);
+        // delete() issues an HPUB request over the mux inbox; the server has no responder bound, so it
+        // replies with a 503 no-responders status echoed on the captured reply-to.
+        $this->muxServer($transport, [
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
@@ -214,6 +324,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
@@ -238,6 +350,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             // ...then get() (Direct Get) shows a live value, so the key really exists.
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
@@ -264,6 +378,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
@@ -287,6 +403,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
@@ -311,6 +429,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
         ]);
 
@@ -337,6 +457,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
@@ -364,6 +486,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -388,6 +512,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -416,6 +542,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -442,6 +570,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -461,6 +591,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
 
@@ -484,6 +616,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -503,10 +637,17 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CONSUMER.CREATE is a mux request; the two replay deliveries land on the push deliver
+        // subscription (sid 2), enqueued once its SUB is written so the request read cannot drain them.
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            // Two deliveries on the push deliver subject (sid 2); pending counts down to 0.
-            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.5.1.0.1 2\r\nv1\r\n",
-            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.2.0.0 2\r\nv2\r\n",
+        ], [
+            '_INBOX.KV.HIST' => [
+                // Two deliveries on the push deliver subject (sid 2); pending counts down to 0.
+                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.5.1.0.1 2\r\nv1\r\n",
+                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.2.0.0 2\r\nv2\r\n",
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -529,11 +670,16 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            // A metadata-less delivery (no $JS.ACK reply subject) on the history subscription (sid 2).
-            "MSG dlv 2 2\r\nxx\r\n",
-            // A well-formed delivery follows and completes the replay (num_pending=0, last token).
-            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
+        ], [
+            '_INBOX.KV.HIST' => [
+                // A metadata-less delivery (no $JS.ACK reply subject) on the history subscription (sid 2).
+                "MSG dlv 2 2\r\nxx\r\n",
+                // A well-formed delivery follows and completes the replay (num_pending=0, last token).
+                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -575,11 +721,18 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CONSUMER.CREATE is a mux request; the headers-only replay lands on the deliver subscription
+        // (sid 2), enqueued once its SUB is written so the request read cannot drain it first.
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
-            sprintf("HMSG \$KV.other.k 2 \$JS.ACK.KV_cfg.KEYS.1.2.1.0.3 %d %d\r\n%s\r\n", $oh, $oh, $otherHdrs),
-            sprintf("HMSG \$KV.cfg.username 2 \$JS.ACK.KV_cfg.KEYS.1.3.2.0.2 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),
-            sprintf("HMSG \$KV.cfg.email 2 \$JS.ACK.KV_cfg.KEYS.1.4.3.0.1 %d %d\r\n%s\r\n", $eh, $eh, $emailHdrs),
-            sprintf("HMSG \$KV.cfg.phone 2 \$JS.ACK.KV_cfg.KEYS.1.5.4.0.0 %d %d\r\n%s\r\n", $ph, $ph, $phoneHdrs),
+        ], [
+            '_INBOX.KV.KEYS' => [
+                sprintf("HMSG \$KV.other.k 2 \$JS.ACK.KV_cfg.KEYS.1.2.1.0.3 %d %d\r\n%s\r\n", $oh, $oh, $otherHdrs),
+                sprintf("HMSG \$KV.cfg.username 2 \$JS.ACK.KV_cfg.KEYS.1.3.2.0.2 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),
+                sprintf("HMSG \$KV.cfg.email 2 \$JS.ACK.KV_cfg.KEYS.1.4.3.0.1 %d %d\r\n%s\r\n", $eh, $eh, $emailHdrs),
+                sprintf("HMSG \$KV.cfg.phone 2 \$JS.ACK.KV_cfg.KEYS.1.5.4.0.0 %d %d\r\n%s\r\n", $ph, $ph, $phoneHdrs),
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -611,21 +764,25 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Connects a client whose CONSUMER.CREATE reply (sid 1) is $consumerReply and whose deliver
-     * subscription (sid 2) is fed $deliverFrames, for the keys() enumeration tests.
+     * Connects a client whose CONSUMER.CREATE reply is $consumerReply (a mux request, echoed on its
+     * captured reply-to) and whose deliver subscription (sid 2) is fed $deliverFrames once its SUB is
+     * written, for the keys() enumeration tests. When keys() short-circuits without subscribing (no live
+     * keys), $deliverFrames are never enqueued - so a seeded "ghost" frame stays unconsumed unless a
+     * mutant wrongly proceeds to subscribe.
      *
      * @param list<string> $deliverFrames
      * @return array{0: NatsClient, 1: FakeTransport}
      */
     private function connectForKeys(string $consumerReply, array $deliverFrames = []): array
     {
-        $reads = array_merge([
+        $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
-        ], $deliverFrames);
+        ], $deliverFrames === [] ? [] : ['_INBOX.KV.KEYS' => $deliverFrames]);
 
-        $transport = new FakeTransport($reads);
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
@@ -758,6 +915,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -785,6 +944,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -818,8 +979,10 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], blockWhenEmpty: true);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
 
         $errors = [];
         $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -865,8 +1028,10 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], blockWhenEmpty: true);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
 
         $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $client->connect()->await();
@@ -890,6 +1055,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 404, 'Message Not Found'),
         ]);
 
@@ -930,6 +1097,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($updateAck), $updateAck),
         ]);
 
@@ -953,6 +1122,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($purgeAck), $purgeAck),
         ]);
 
@@ -976,6 +1147,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
@@ -998,6 +1171,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($delAck), $delAck),
         ]);
 
@@ -1020,6 +1195,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
         ]);
 
@@ -1056,8 +1233,12 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1 (sid 1)
-            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty (sid 2)
+        ]);
+        // All four replies are mux requests (two STREAM.INFO pages, then the per-key Direct Get fan-out,
+        // written username-then-email in iteration order), echoed FIFO on each captured reply-to.
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),                  // username -> PURGE (skipped)
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody),       // email -> value
         ]);
@@ -1083,6 +1264,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("HMSG _INBOX.x 1 %d %d\r\n%s\r\n", $h, $h, $hdrs),
         ]);
 
@@ -1118,6 +1301,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),
@@ -1145,8 +1330,15 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CONSUMER.CREATE is a mux request; the marker delivery lands on the push deliver subscription
+        // (sid 2), enqueued once its SUB is written.
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            sprintf("HMSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 %d %d\r\n%s\r\n", $mh, $mh, $markerHdrs),
+        ], [
+            '_INBOX.JS.PUSH' => [
+                sprintf("HMSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 %d %d\r\n%s\r\n", $mh, $mh, $markerHdrs),
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1175,6 +1367,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -1195,6 +1389,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
@@ -1314,6 +1510,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -1349,8 +1547,13 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
+        ], [
+            '_INBOX.JS.PUSH' => [
+                "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1387,6 +1590,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 500, 'internal error'),
         ]);
 
@@ -1404,6 +1609,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             "MSG _INBOX.a 1 7\r\nnotjson\r\n", // a non-JSON ack
         ]);
 
@@ -1425,6 +1632,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectReply('$KV.cfg.theme', 'ignored', 3, 1, 'DEL'),
         ]);
 
@@ -1486,8 +1695,10 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1 (sid 1)
-            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty (sid 2)
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $nf, $nf, $notFound),                      // gone -> 404 (skipped)
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $th, $tt, $themeHdrs, $themeBody),       // theme -> value
         ]);
@@ -1508,6 +1719,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($error), $error),
         ]);
 
@@ -1527,6 +1740,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
         ]);
 
@@ -1546,6 +1761,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -1571,6 +1788,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -1602,6 +1821,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -1633,6 +1854,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($purgeAck), $purgeAck),
         ]);
 
@@ -1678,6 +1901,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorReply), $errorReply),
         ]);
 
@@ -1699,6 +1924,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorReply), $errorReply),
         ]);
 
@@ -1722,6 +1949,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 503, 'No Responders'),                                     // Direct Get -> 503 fallback trigger
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($errorReply), $errorReply),           // STREAM.MSG.GET -> 404
         ]);
@@ -1744,6 +1973,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($errorReply), $errorReply),
         ]);
@@ -1766,6 +1997,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($emptyReply), $emptyReply),
         ]);
@@ -1796,6 +2029,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),
         ]);
@@ -1823,6 +2058,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             $this->kvDirectStatus(1, 503, 'No Responders'),                                     // Direct Get -> 503 fallback trigger
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),              // STREAM.MSG.GET -> malformed data
         ]);
@@ -1848,9 +2085,14 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ], [
             // A message on a completely different subject - keyFromSubject() will return null.
-            "MSG some.other.subject 2 \$JS.ACK.KV_cfg.KVWATCH.1.1.1.0.0 4\r\ndata\r\n",
+            '_INBOX.JS.PUSH' => [
+                "MSG some.other.subject 2 \$JS.ACK.KV_cfg.KVWATCH.1.1.1.0.0 4\r\ndata\r\n",
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -1880,6 +2122,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
         ]);
 
@@ -1907,6 +2151,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),   // first put -> wrong-last-seq
             $this->kvDirectStatus(2, 404, 'Message Not Found'),                   // get() -> null
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck), $putAck),   // second put -> success
@@ -1938,6 +2184,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),          // first put -> wrong-last-seq
             $this->kvDirectReply('$KV.cfg.theme', '', 5, 2, 'DEL'),                      // get() -> DEL tombstone at seq 5
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck2), $putAck2),         // second put -> success
@@ -1949,8 +2197,10 @@ final class KeyValueBucketTest extends TestCase
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'newval')->await();
 
         self::assertSame(6, $ack->seq);
-        // The second put must use expected-seq 5 (the tombstone's revision).
-        self::assertStringContainsString('Nats-Expected-Last-Subject-Sequence:5', $transport->writes[9]);
+        // The second put must use expected-seq 5 (the tombstone's revision). Over the shared mux inbox the
+        // three request publishes are consecutive (writes[2] is the mux SUB): put1 HPUB [3], Direct-Get [4],
+        // put2 HPUB [5].
+        self::assertStringContainsString('Nats-Expected-Last-Subject-Sequence:5', $transport->writes[5]);
     }
 
     // ─── mapKvOptions: description and max_bytes ─────────────
@@ -1965,6 +2215,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2032,6 +2284,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
         ]);
@@ -2058,6 +2312,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $eh, $eh, $errHdrs),
@@ -2082,6 +2338,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
@@ -2117,6 +2375,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
             // Only theme gets a Direct Get request (the non-KV subject is skipped).
@@ -2147,8 +2407,9 @@ final class KeyValueBucketTest extends TestCase
         $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":4,"subjects":'
             . '{"$KV.cfg.":1,"$KV.cfg.username":2,"$KV.cfg.email":2,"$KV.cfg.phone":2}}}';
         $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
-        // One batched reply stream on a single inbox (sid 3): a DEL tombstone (excluded), TWO live values,
-        // and the last frame carrying Nats-Num-Pending: 0 to terminate the batch.
+        // One batched reply stream on the batched Direct-Get inbox subscription (sid 2 - the mux inbox
+        // is sid 1): a DEL tombstone (excluded), TWO live values, and the last frame carrying
+        // Nats-Num-Pending: 0 to terminate the batch.
         $usernameHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 3\r\nKV-Operation: DEL\r\n\r\n";
         $emailHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.email\r\nNats-Sequence: 4\r\n\r\n";
         $phoneHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.phone\r\nNats-Sequence: 5\r\nNats-Num-Pending: 0\r\n\r\n";
@@ -2163,11 +2424,18 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1 (sid 1)
-            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty (sid 2)
-            sprintf("HMSG \$KV.cfg.username 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),         // batched frame: username -> DEL (excluded)
-            sprintf("HMSG \$KV.cfg.email 3 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody), // batched frame: email -> value
-            sprintf("HMSG \$KV.cfg.phone 3 %d %d\r\n%s%s\r\n", $ph, $pt, $phoneHdrs, $phoneBody), // batched frame: phone -> value (terminator)
+        ]);
+        // Two STREAM.INFO pages are mux requests; the single batched multi_last Direct Get uses its own
+        // inbox subscription (sid 2), whose frames are emitted once that SUB is written.
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),   // STREAM.INFO page 1
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),   // STREAM.INFO page 2 empty
+        ], [
+            '_INBOX.JS.DGET' => [
+                sprintf("HMSG \$KV.cfg.username 2 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),         // batched frame: username -> DEL (excluded)
+                sprintf("HMSG \$KV.cfg.email 2 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody), // batched frame: email -> value
+                sprintf("HMSG \$KV.cfg.phone 2 %d %d\r\n%s%s\r\n", $ph, $pt, $phoneHdrs, $phoneBody), // batched frame: phone -> value (terminator)
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -2202,6 +2470,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -2231,6 +2501,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -2264,9 +2536,14 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ], [
             // Delivered WITHOUT a $JS.ACK reply subject -> JsMessageMetadata::fromMessage() returns null.
-            "MSG \$KV.cfg.theme 2 4\r\nblue\r\n",
+            '_INBOX.JS.PUSH' => [
+                "MSG \$KV.cfg.theme 2 4\r\nblue\r\n",
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -2307,6 +2584,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
@@ -2341,9 +2620,14 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            // One revision (num_pending token = 1, NOT 0) then silence.
-            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.5.1.0.1 2\r\nv1\r\n",
+        ], [
+            // One revision (num_pending token = 1, NOT 0) on the deliver subscription, then silence.
+            '_INBOX.KV.HIST' => [
+                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.5.1.0.1 2\r\nv1\r\n",
+            ],
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -2369,6 +2653,8 @@ final class KeyValueBucketTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 

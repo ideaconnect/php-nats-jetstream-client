@@ -61,6 +61,24 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   each loop's deadline/cancellation bound, the #117 pong-slot flush semantics, #147 frame retention, #148
   Connecting-window reads, and #135 parking are preserved, and a truly empty socket still yields the 1 ms
   so the event loop advances and deadlines fire (#119).
+- `[feature]` `request()`/`requestMany()` now share ONE long-lived muxed reply inbox per connection
+  instead of creating a fresh inbox subscription (SUB + UNSUB) for every call (#118). A single wildcard
+  subscription `_INBOX.<base>.*` is established lazily on the first request; each request publishes its
+  reply-to as `_INBOX.<base>.<token>` and the reply is routed back by that per-request token. This
+  removes two control-plane frames and a server-side interest change per request - a large throughput win
+  for JetStream, which funnels every API call, KV, and Object Store operation through `request()`. Reply
+  delivery, timeouts, no-responders (503) handling, cancellation, and `requestMany` semantics are
+  unchanged. A delayed or duplicate reply for a completed/timed-out request is discarded by token (it can
+  never reach a later request), and the shared mux queue is exempt from the slow-consumer drop so a reply
+  is never dropped. NOTE (permission requirement): the mux inbox subscribes to a wildcard under the inbox
+  prefix, so an account permissioned to *subscribe* only to exact `_INBOX.<...>` subjects (not the
+  `_INBOX.>`/`_INBOX.*` wildcard) will have the mux SUB rejected where per-request exact-subject inboxes
+  previously succeeded. Because the client does not block on the SUB's server acknowledgement, that
+  rejection arrives as an asynchronous `-ERR` (delivered to the error listener), after which every
+  `request()`/`requestMany()` on the connection times out (the server has no interest on the wildcard) -
+  a silent regression relative to the pre-mux exact-inbox path for such accounts. Grant `_INBOX.>`
+  subscribe permission (the same requirement as nats.go's muxed responder) to use this client's
+  request/reply on a restricted account.
 
 ## [2.5.4] - 2026-07-13
 

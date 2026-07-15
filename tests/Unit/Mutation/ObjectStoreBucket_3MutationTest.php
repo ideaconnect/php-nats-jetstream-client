@@ -102,10 +102,103 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
             "PONG\r\n",
         ], $reads));
 
-        $client = new NatsClient(new NatsOptions(), $this->transport);
+        // Small request timeout so a mis-routed reply fails fast instead of hanging on the 10 s default.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $this->transport);
         $client->connect()->await();
 
         return $client;
+    }
+
+    /**
+     * Installs a mux-aware server for the post-#118 request inbox. request()/requestMany() no longer
+     * subscribe a fresh inbox per call: ONE long-lived wildcard "<base>.*" serves every reply, each
+     * request publishes reply-to "<base>.<token>", and dispatchMuxReply routes by that token. A
+     * pre-seeded fixed-subject reply ("MSG _INBOX.x <sid> ...") therefore no longer matches the
+     * request's "<base>.<token>", so it is dropped and the request times out.
+     *
+     * This responder mirrors a real server: it learns the mux base AND sid from the wildcard SUB, then
+     * for each request PUB/HPUB (whose reply-to lives under that base) matches the request SUBJECT
+     * against the FIRST unconsumed route and re-emits that route's reply frame on the request's CAPTURED
+     * reply-to with the learned mux sid. Matching by subject (not pure position) keeps concurrent
+     * requests order-independent (e.g. delete()'s tombstone publish racing its chunk-purge lookup),
+     * while repeated identical subjects (the two Direct Gets of one get()) still consume FIFO.
+     *
+     * @param list<array{0: string, 1: string}> $routes [subjectNeedle, prebuilt MSG/HMSG reply frame]
+     */
+    private function muxServer(FakeTransport $transport, array $routes): void
+    {
+        $base = null;
+        $sid = '1';
+
+        $transport->onWrite = static function (string $bytes) use (&$routes, &$base, &$sid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base + sid from the wildcard registration "SUB <base>.* <sid>".
+                $parts = explode(' ', $head);
+                $subject = $parts[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                    $sid = $parts[2] ?? '1';
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $parts = explode(' ', $head);
+            $subject = $parts[1] ?? '';
+            $replyTo = $parts[2] ?? '';
+            if (!str_starts_with($replyTo, $base)) {
+                // A plain publish, or a subscription's own inbox - not a mux request.
+                return [];
+            }
+
+            foreach ($routes as $i => $route) {
+                if (str_contains($subject, $route[0])) {
+                    unset($routes[$i]);
+
+                    return [self::rewriteReplyFrame($route[1], $replyTo, $sid)];
+                }
+            }
+
+            return [];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the learned mux sid, preserving the payload/header bytes and declared lengths verbatim so only
+     * the reply's addressing changes for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo, string $sid): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = $sid;     // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
+    /**
+     * Returns the created FakeTransport, asserting it exists (narrows the nullable property for callers).
+     */
+    private function requireTransport(): FakeTransport
+    {
+        $transport = $this->transport;
+        self::assertInstanceOf(FakeTransport::class, $transport);
+
+        return $transport;
     }
 
     /**
@@ -121,9 +214,10 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
         $badDigest = 'BADPFX9=' . $body;                                         // wrong 8-char prefix
         $meta = $this->metaGetResponse('doc.txt', ['nuid' => $nuid, 'size' => 5, 'chunks' => 1, 'digest' => $badDigest]);
 
-        $client = $this->connectedClient([
-            $this->directMetaReply($meta, 1),
-            $this->directChunkReply($nuid, 'hello', 2),
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directMetaReply($meta, 1)],       // info() meta (first Direct Get)
+            ['DIRECT.GET', $this->directChunkReply($nuid, 'hello', 2)], // single-chunk fetch (second Direct Get)
         ]);
 
         // kills ReturnRemoval @ 638
@@ -153,9 +247,10 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
      */
     public function testInfoFallbackTreats404AsAbsent(): void
     {
-        $client = $this->connectedClient([
-            $this->directStatusReply(1, 503, 'No Responders'),  // Direct Get unavailable -> fallback
-            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()), // STREAM.MSG.GET -> 404
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directStatusReply(1, 503, 'No Responders')],  // Direct Get unavailable -> fallback
+            ['STREAM.MSG.GET', sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound())], // STREAM.MSG.GET -> 404
         ]);
 
         // kills DecrementInteger/IncrementInteger @ 717 (404 -> 403/405)
@@ -171,9 +266,10 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
     {
         $meta = $this->metaGetResponse('doc.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 42);
 
-        $client = $this->connectedClient([
-            $this->directStatusReply(1, 503, 'No Responders'),                  // Direct Get -> fallback
-            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),       // STREAM.MSG.GET success, seq=42
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directStatusReply(1, 503, 'No Responders')],           // Direct Get -> fallback
+            ['STREAM.MSG.GET', sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta)], // STREAM.MSG.GET success, seq=42
         ]);
 
         $info = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -203,10 +299,12 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
      */
     public function testDeleteTombstoneFieldsArePinned(): void
     {
-        $client = $this->connectedClient([
-            // No chunk to await first, so the tombstone publish is issued before the concurrent lookup.
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(7)), $this->pubAck(7)),       // tombstone ack (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),     // lookup -> 404 (sid 2)
+        // The tombstone publish and the chunk-purge lookup race, so route by subject (order-independent):
+        // the tombstone HPUB ($O.assets.M.<enc>) gets the ack, the STREAM.MSG.GET lookup gets the 404.
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['$O.assets.M.' . $this->encodeName('logo.txt'), sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(7)), $this->pubAck(7))], // tombstone ack
+            ['STREAM.MSG.GET', sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound())],                             // lookup -> 404
         ]);
 
         $store = new \IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket($client, $client->jetStream(), 'assets', 4096);
@@ -248,8 +346,9 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
      */
     public function testUpdateMetaMissingObjectThrowsWith404Code(): void
     {
-        $client = $this->connectedClient([
-            $this->directStatusReply(1, 404, 'Message Not Found'), // info() -> not found
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directStatusReply(1, 404, 'Message Not Found')], // info() -> not found
         ]);
 
         try {
@@ -270,8 +369,9 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
     {
         $meta = $this->metaGetResponse('logo.txt', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')]);
 
-        $client = $this->connectedClient([
-            $this->directMetaReply($meta, 1), // info('logo.txt') -> exists
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directMetaReply($meta, 1)], // info('logo.txt') -> exists
         ]);
 
         // kills MethodCallRemoval @ 802
@@ -295,9 +395,10 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
             'metadata' => ['team' => 'design'],
         ]);
 
-        $client = $this->connectedClient([
-            $this->directMetaReply($meta, 1),                                                  // info('logo.txt')
-            sprintf("MSG _INBOX.c 2 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8)), // publishMeta ack
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directMetaReply($meta, 1)],                                                                                        // info('logo.txt')
+            ['$O.assets.M.' . $this->encodeName('logo.txt'), sprintf("MSG _INBOX.c 2 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8))], // publishMeta ack
         ]);
 
         $store = new \IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket($client, $client->jetStream(), 'assets', 4096);
@@ -324,11 +425,12 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
     {
         $meta = $this->metaGetResponse('logo.txt', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('old')]);
 
-        $client = $this->connectedClient([
-            $this->directMetaReply($meta, 1),                                                  // info('logo.txt') -> exists
-            $this->directStatusReply(2, 404, 'Message Not Found'),                             // info('brand.txt') clash -> free
-            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8)), // publishMeta('brand.txt') ack
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)), // publishMeta(old tombstone) ack
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['DIRECT.GET', $this->directMetaReply($meta, 1)],                      // info('logo.txt') -> exists (first Direct Get)
+            ['DIRECT.GET', $this->directStatusReply(2, 404, 'Message Not Found')], // info('brand.txt') clash -> free (second Direct Get)
+            ['$O.assets.M.' . $this->encodeName('brand.txt'), sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8))], // publishMeta('brand.txt') ack
+            ['$O.assets.M.' . $this->encodeName('logo.txt'), sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9))],  // publishMeta(old tombstone) ack
         ]);
 
         $store = new \IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket($client, $client->jetStream(), 'assets', 4096);
@@ -360,8 +462,9 @@ final class ObjectStoreBucket_3MutationTest extends TestCase
     {
         $createReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
 
-        $client = $this->connectedClient([
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        $client = $this->connectedClient([]);
+        $this->muxServer($this->requireTransport(), [
+            ['$JS.API.CONSUMER.CREATE', sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply)],
         ]);
 
         $client->jetStream()->objectStore('assets')->watch(static function (ObjectInfo $info): void {})->await();
