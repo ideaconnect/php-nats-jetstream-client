@@ -132,6 +132,19 @@ final class NatsClient
     }
 
     /**
+     * Exempts a subscription from the slow-consumer pending-queue bound (its replies are never
+     * dropped). For the muxed request inbox (#118) and the pipelined pull inbox (#120), where a
+     * dropped reply silently breaks a request/pull. Synchronous so it applies in the same tick the
+     * sid was returned by {@see subscribe()}.
+     *
+     * @internal Low-level mechanism for the JetStream request/pull inboxes; not general API.
+     */
+    public function markSubscriptionUnbounded(int $sid): void
+    {
+        $this->connection->markSubscriptionUnbounded($sid);
+    }
+
+    /**
      * Subscribes and returns a SubscriptionQueue for polling-style message consumption.
      *
      * @return Future<SubscriptionQueue>

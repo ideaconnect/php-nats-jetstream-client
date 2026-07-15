@@ -4,67 +4,24 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit\Mutation;
 
-use IDCT\NATS\Connection\NatsOptions;
-use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\PullServerTrait;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Mutation-killing tests for {@see \IDCT\NATS\JetStream\Consumers\PullConsumerIterator}.
+ * Mutation-killing tests for {@see \IDCT\NATS\JetStream\Consumers\PullConsumerIterator} over the #120
+ * pipelined pull engine ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}).
  *
- * Every test pins a single observable behavior that a surviving Infection mutant would change:
- * an exact pull count, the bytes of the issued pull request, or the captured/retained pin id.
+ * Every test pins a single observable behavior that a surviving Infection mutant would change: an exact
+ * pull count, the bytes of the issued pull request, or the captured/retained pin id. Replies are
+ * delivered by {@see PullServerTrait::pullServer()} on each pull's captured reply-to (token-routed);
+ * where per-pull sequencing is the point (an infinite run), the iterator pins setDepth(1) so the run
+ * stays serial and each pull maps 1:1 to a scripted response. Finite runs are always strictly serial.
  */
 final class PullConsumerIteratorMutationTest extends TestCase
 {
-    /** @return list<string> */
-    private function infoAndPong(): array
-    {
-        return [
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-            "PONG\r\n",
-        ];
-    }
-
-    private function jsMsg(string $payload, string $sid, string $replyTo): string
-    {
-        return sprintf("MSG _INBOX.JS.FETCH.any %s %s %d\r\n%s\r\n", $sid, $replyTo, strlen($payload), $payload);
-    }
-
-    private function statusFrame(int $code, string $reason, string $sid): string
-    {
-        $headers = sprintf("NATS/1.0 %d %s\r\nStatus: %d\r\n\r\n", $code, $reason, $code);
-        $len = strlen($headers);
-
-        return sprintf("HMSG _INBOX.JS.FETCH.any %s %d %d\r\n%s\r\n", $sid, $len, $len, $headers);
-    }
-
-    /**
-     * Message carrying a Nats-Pin-Id header (and an ACK reply-to) so pinIdOf() returns a non-null id.
-     */
-    private function pinnedMsg(string $payload, string $sid, string $pinId): string
-    {
-        $hdrs = sprintf("NATS/1.0\r\nNats-Pin-Id: %s\r\n\r\n", $pinId);
-
-        return sprintf(
-            "HMSG _INBOX.JS.FETCH.any %s \$JS.ACK.S.C.1.1.1.0.0 %d %d\r\n%s%s\r\n",
-            $sid,
-            strlen($hdrs),
-            strlen($hdrs) + strlen($payload),
-            $hdrs,
-            $payload,
-        );
-    }
-
-    /** @return list<string> The CONSUMER.MSG.NEXT pull requests recorded on the transport, in order. */
-    private function pullWrites(FakeTransport $transport): array
-    {
-        return array_values(array_filter(
-            $transport->writes,
-            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
-        ));
-    }
+    use PullServerTrait;
 
     /**
      * Pins the finite-mode iteration boundary. With iterations=1 the loop must run EXACTLY once: a
@@ -78,19 +35,17 @@ final class PullConsumerIteratorMutationTest extends TestCase
      */
     public function testFiniteIterationsRunsLoopExactlyOnce(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): one real message.
-            $this->jsMsg('only-one', '1', '$JS.ACK.S.C.1.1.1.0.0'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // pull 1: one real message.
+            [['msg' => 'only-one']],
             // Safety net: any (buggy) 2nd pull immediately gets a 404 so the test stays bounded/fast.
-            $this->statusFrame(404, 'No Messages', '2'),
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
@@ -114,19 +69,17 @@ final class PullConsumerIteratorMutationTest extends TestCase
      */
     public function testFiniteIterationsRunsLoopExactlyTwice(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            $this->jsMsg('a', '1', '$JS.ACK.S.C.1.1.1.0.0'),
-            $this->jsMsg('b', '2', '$JS.ACK.S.C.1.2.2.0.0'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a']],
+            [['msg' => 'b']],
             // Safety net for an over-running 3rd pull.
-            $this->statusFrame(404, 'No Messages', '3'),
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
@@ -149,16 +102,14 @@ final class PullConsumerIteratorMutationTest extends TestCase
      */
     public function testSetNoWaitDefaultEmitsNoWaitTrueInPull(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            $this->jsMsg('m', '1', '$JS.ACK.S.C.1.1.1.0.0'),
-            $this->statusFrame(404, 'No Messages', '2'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'm']],
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $client->jetStream()
+        $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
@@ -184,24 +135,23 @@ final class PullConsumerIteratorMutationTest extends TestCase
      */
     public function testInfiniteModeContinuesPast408Timeout(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): routine 408 timeout - infinite mode must keep polling, not stop.
-            $this->statusFrame(408, 'Request Timeout', '1'),
-            // iter 2 (sid 2): the message arrives on the next pull.
-            $this->jsMsg('after-timeout', '2', '$JS.ACK.S.C.1.1.1.0.0'),
-            // iter 3 (sid 3): a terminal 409 (consumer deleted) stops the loop.
-            $this->statusFrame(409, 'Consumer Deleted', '3'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // pull 1: routine 408 timeout - infinite mode must keep polling, not stop.
+            [['status' => 408, 'desc' => 'Request Timeout']],
+            // pull 2: the message arrives on the next pull.
+            [['msg' => 'after-timeout']],
+            // pull 3: a terminal 409 (consumer deleted) stops the loop.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $processed = [];
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
+            ->setDepth(1) // serial: one pull per scripted response (per-pull sequencing under test)
             ->setIterations(null) // infinite
             ->handle(function (NatsMessage $msg) use (&$processed): void {
                 $processed[] = $msg->payload;
@@ -215,29 +165,31 @@ final class PullConsumerIteratorMutationTest extends TestCase
     /**
      * Pins the IncrementInteger@296 mutant specifically: [404,408] -> [404,409] would also make a
      * TERMINAL 409 "Consumer Deleted" be treated as routine in infinite mode and keep polling. The
-     * real code must stop on a terminal 409 (it is NOT in the routine list and isTransientPullStatus()
+     * real code must stop on a terminal 409 (it is NOT in the routine list and isNonTerminalPullStatus()
      * is false for "Consumer Deleted"). We prove the loop stops: no message is delivered after it.
+     *
+     * setDepth(1) keeps the run serial so a stop on the very first pull means exactly one pull was
+     * issued (a depth>1 run would fan out extra pulls before retiring the terminal head).
      *
      * Kills: IncrementInteger @ 296 (corroborates).
      */
     public function testInfiniteModeStopsOnTerminal409(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): terminal 409 must stop the loop immediately.
-            $this->statusFrame(409, 'Consumer Deleted', '1'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // pull 1: terminal 409 must stop the loop immediately.
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
             // If the loop (wrongly) kept polling, it would deliver this - it must NOT be reached.
-            $this->jsMsg('should-not-arrive', '2', '$JS.ACK.S.C.1.1.1.0.0'),
+            [['msg' => 'should-not-arrive']],
         ]);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $js = $this->context($transport);
 
         $delivered = false;
-        $total = $client->jetStream()
+        $total = $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
+            ->setDepth(1)
             ->setIterations(null) // infinite
             ->handle(function () use (&$delivered): void {
                 $delivered = true;
@@ -262,19 +214,17 @@ final class PullConsumerIteratorMutationTest extends TestCase
      */
     public function testPinNotCapturedWhenNoGroupConfigured(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): a message that DOES carry a pin id, but no group is configured.
-            $this->pinnedMsg('p1', '1', 'leaked-pin'),
-            // iter 2 (sid 2): a plain message; its pull must NOT carry an "id" under the real code.
-            $this->jsMsg('p2', '2', '$JS.ACK.S.C.1.2.2.0.0'),
-            $this->statusFrame(404, 'No Messages', '3'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // pull 1: a message that DOES carry a pin id, but no group is configured.
+            [['msg' => 'p1', 'pin' => 'leaked-pin']],
+            // pull 2: a plain message; its pull must NOT carry an "id" under the real code.
+            [['msg' => 'p2']],
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $client->jetStream()
+        $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
@@ -303,21 +253,19 @@ final class PullConsumerIteratorMutationTest extends TestCase
      */
     public function testCapturedPinIdIsRetainedAcrossIterations(): void
     {
-        $transport = new FakeTransport([
-            ...$this->infoAndPong(),
-            // iter 1 (sid 1): first delivery pins the group with "pin-1".
-            $this->pinnedMsg('m1', '1', 'pin-1'),
-            // iter 2 (sid 2): a message advertising a DIFFERENT pin "pin-2"; real code must ignore it.
-            $this->pinnedMsg('m2', '2', 'pin-2'),
-            // iter 3 (sid 3): a plain message; its pull must still carry the ORIGINAL "pin-1".
-            $this->jsMsg('m3', '3', '$JS.ACK.S.C.1.3.3.0.0'),
-            $this->statusFrame(404, 'No Messages', '4'),
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            // pull 1: first delivery pins the group with "pin-1".
+            [['msg' => 'm1', 'pin' => 'pin-1']],
+            // pull 2: a message advertising a DIFFERENT pin "pin-2"; real code must ignore it.
+            [['msg' => 'm2', 'pin' => 'pin-2']],
+            // pull 3: a plain message; its pull must still carry the ORIGINAL "pin-1".
+            [['msg' => 'm3']],
+            [['status' => 404, 'desc' => 'No Messages']],
         ]);
+        $js = $this->context($transport);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        $client->jetStream()
+        $js
             ->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setExpiresMs(100)
@@ -328,7 +276,7 @@ final class PullConsumerIteratorMutationTest extends TestCase
         $pulls = $this->pullWrites($transport);
         self::assertGreaterThanOrEqual(3, count($pulls));
 
-        // iter 2 pull carries the pin captured in iter 1.
+        // pull 2 carries the pin captured in pull 1.
         self::assertStringContainsString('"id":"pin-1"', $pulls[1]);
         // kills LogicalAnd@314 (second conjunction): pin must NOT be re-captured to "pin-2".
         self::assertStringContainsString('"id":"pin-1"', $pulls[2], 'captured pin id must be retained, not overwritten');

@@ -15,6 +15,28 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Changed
+
+- `[feature]` Pull consumers now PIPELINE their pull requests (#120). `PullConsumerIterator::handle()` no
+  longer creates a fresh inbox + SUB, publishes one pull, waits, and UNSUBs per pull. It opens ONE
+  long-lived pull inbox subscription `_INBOX.JS.PULL.<base>.*` for the whole run and keeps several pulls
+  in flight at once (see `setDepth()`, default 2), issuing the next pull as soon as one retires - so there
+  is no inter-batch round-trip stall and no SUB/UNSUB churn per pull. The consumer's throughput ceiling
+  rises from ~1 batch per RTT to overlapping pulls (a large gain on higher-latency links). Status replies
+  route by a per-pull token, while delivered messages (which the server sends on their original subject)
+  are matched to the oldest in-flight pull in order; the shared pull inbox is exempt from the slow-consumer
+  drop so a slow handler never loses a buffered message. All existing semantics are preserved:
+  `stop()`/`drain()`, the escalating
+  idle backoff, finite `setIterations()` (still serial and stop-on-any-error), pinned priority groups
+  (`setGroup()`), 423 stale-pin re-pull, terminal-status `onError`, and reconnect survival. The
+  single-shot `fetchBatch()`/`fetchNext()` primitives are unchanged.
+- `[feature]` The default pull batch size is now **100** (was 1) and a new `setDepth()` controls pull
+  overlap (default 2). `setBatching(1)` still works and still pipelines. A consumer that relied on the
+  old batch=1 default now fetches up to 100 messages per pull - size it against your `MaxAckPending` and
+  `ack_wait`; call `setBatching(1)` to restore one-message pulls.
+
 ## [2.6.0] - 2026-07-15
 
 ### Added

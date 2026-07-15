@@ -1225,6 +1225,22 @@ final class NatsConnection
     }
 
     /**
+     * Exempts a subscription from the per-subscription slow-consumer pending-queue bound, so its
+     * replies are never dropped by {@see enqueueMessage()}'s overflow policy. Used for the muxed
+     * request inbox (#118) and the pipelined pull inbox (#120), where every in-flight reply shares
+     * one sid's queue and a dropped reply silently breaks a request/pull with no backpressure path.
+     * Synchronous (no await) so it takes effect in the same tick the caller received the sid from
+     * {@see subscribe()}, before any reply can be enqueued. Memory is then bounded by the caller's
+     * in-flight concurrency, not by the queue cap (#159).
+     *
+     * @internal Low-level mechanism for the JetStream request/pull inboxes; not general API.
+     */
+    public function markSubscriptionUnbounded(int $sid): void
+    {
+        $this->unboundedSids[$sid] = true;
+    }
+
+    /**
      * Removes a subscription callback and sends an UNSUB command.
      *
      * With $maxMessages, arms auto-unsubscribe instead of removing immediately: the server keeps
