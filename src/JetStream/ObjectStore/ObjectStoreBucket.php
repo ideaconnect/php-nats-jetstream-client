@@ -708,25 +708,7 @@ final class ObjectStoreBucket
                 throw $e;
             }
 
-            // The record's stream sequence (its revision) travels in the Direct Get Nats-Sequence
-            // header, not in the meta JSON; surface it on ObjectInfo.
-            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-
-            if (($headers['Nats-Marker-Reason'] ?? '') !== '') {
-                // Server-written subject delete-marker (ADR-43): the object's meta aged out / was
-                // purged, so the object is effectively absent.
-                return null;
-            }
-
-            /** @var array<string,mixed>|null $metadata */
-            $metadata = json_decode($message->payload, true);
-            if (!is_array($metadata)) {
-                return null;
-            }
-
-            $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-
-            return ObjectInfo::fromArray($this->bucket, $metadata, $revision);
+            return $this->decodeDirectGetMeta($message);
         });
     }
 
@@ -930,18 +912,7 @@ final class ObjectStoreBucket
                             throw $e;
                         }
 
-                        // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
-                        /** @var array<string,mixed>|null $metadata */
-                        $metadata = json_decode($message->payload, true);
-                        if (!is_array($metadata)) {
-                            return null;
-                        }
-
-                        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-                        $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-                        $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
-
-                        return $info->name === '' ? null : $info;
+                        return $this->decodeDirectGetMeta($message);
                     });
                 }
 
@@ -983,21 +954,10 @@ final class ObjectStoreBucket
 
         $infos = [];
         foreach ($messages as $message) {
-            // The Direct Get body is the raw meta JSON (not the base64 STREAM.MSG.GET envelope).
-            /** @var array<string,mixed>|null $metadata */
-            $metadata = json_decode($message->payload, true);
-            if (!is_array($metadata)) {
-                continue;
+            $info = $this->decodeDirectGetMeta($message);
+            if ($info !== null) {
+                $infos[] = $info;
             }
-
-            $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
-            $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
-            $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
-            if ($info->name === '') {
-                continue;
-            }
-
-            $infos[] = $info;
         }
 
         return $infos;
@@ -1197,6 +1157,33 @@ final class ObjectStoreBucket
         }
 
         return $data;
+    }
+
+    /**
+     * Decodes a Direct Get meta reply (raw meta JSON body; revision in the Nats-Sequence header) into an
+     * {@see ObjectInfo}, or null when the record is absent/unusable. Unifies the guards that had drifted
+     * between info() and list(): a server-written ADR-43 subject delete-marker (Nats-Marker-Reason set),
+     * a non-JSON body, and a nameless/malformed record all map to null.
+     */
+    private function decodeDirectGetMeta(NatsMessage $message): ?ObjectInfo
+    {
+        $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
+
+        if (($headers['Nats-Marker-Reason'] ?? '') !== '') {
+            // Server-written subject delete-marker (ADR-43): the object's meta aged out / was purged.
+            return null;
+        }
+
+        /** @var array<string,mixed>|null $metadata */
+        $metadata = json_decode($message->payload, true);
+        if (!is_array($metadata)) {
+            return null;
+        }
+
+        $revision = isset($headers['Nats-Sequence']) ? (int) $headers['Nats-Sequence'] : null;
+        $info = ObjectInfo::fromArray($this->bucket, $metadata, $revision);
+
+        return $info->name === '' ? null : $info;
     }
 
     /**
