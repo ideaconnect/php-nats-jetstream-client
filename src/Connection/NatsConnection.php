@@ -944,12 +944,7 @@ final class NatsConnection
     public function publish(string $subject, string $payload, ?string $replyTo = null): Future
     {
         return async(function () use ($subject, $payload, $replyTo): void {
-            $this->validateSubjectCached($subject);
-            if ($replyTo !== null) {
-                // Not cached: a publish replyTo is typically a per-request unique inbox, so caching
-                // it would only churn the memo (see validateSubjectCached()).
-                $this->validateSubject($replyTo);
-            }
+            $this->validatePublishSubjects($subject, $replyTo);
             $this->enforceMaxPayload(strlen($payload));
 
             $frame = $this->codec->encodePublish($subject, $payload, $replyTo);
@@ -973,12 +968,7 @@ final class NatsConnection
         ?string $replyTo = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $replyTo): void {
-            $this->validateSubjectCached($subject);
-            if ($replyTo !== null) {
-                // Not cached: a publish replyTo is typically a per-request unique inbox, so caching
-                // it would only churn the memo (see validateSubjectCached()).
-                $this->validateSubject($replyTo);
-            }
+            $this->validatePublishSubjects($subject, $replyTo);
             // A server that does not advertise the `headers` capability treats HPUB as an unknown
             // protocol operation and closes the connection; fail client-side instead (nats.go
             // ErrHeadersNotSupported parity, #132).
@@ -1092,6 +1082,19 @@ final class NatsConnection
      *   - otherwise: buffer while a reconnect is in flight (flushed on reconnect), else fail loudly -
      *     a publish after the connection has Closed still throws (#146).
      */
+    /**
+     * Validates a publish subject (cached) and its optional reply subject. The reply is validated
+     * uncached: a publish replyTo is typically a per-request unique inbox, so caching it would only
+     * churn the memo (see validateSubjectCached()). Shared by publish() and publishWithHeaders().
+     */
+    private function validatePublishSubjects(string $subject, ?string $replyTo): void
+    {
+        $this->validateSubjectCached($subject);
+        if ($replyTo !== null) {
+            $this->validateSubject($replyTo);
+        }
+    }
+
     private function writePublishFrame(string $frame): void
     {
         if ($this->state === ConnectionState::Open) {
