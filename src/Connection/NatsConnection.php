@@ -2762,7 +2762,19 @@ final class NatsConnection
      *
      * @return list<ProtocolFrame>
      */
-    private function awaitInitialPong(): array
+    /**
+     * Runs the bounded connect-handshake read loop shared by awaitInitialPong() and awaitServerInfo():
+     * polls readHandshakeChunk() within the handshake deadline / poll budget, parses each chunk, and
+     * feeds every frame to $onFrame - after auto-handling the two frames both callers treat identically,
+     * PING (reply with PONG) and -ERR (throw the connect error). $onFrame returns a non-null value to end
+     * the loop with that result, or null to keep polling. Throws a ConnectionException carrying
+     * $timeoutMessage if the poll budget or deadline is exhausted first.
+     *
+     * @template T
+     * @param callable(ProtocolFrame, int, list<ProtocolFrame>): (T|null) $onFrame
+     * @return T
+     */
+    private function pollHandshake(string $timeoutMessage, callable $onFrame): mixed
     {
         $deadline = $this->handshakeDeadline();
         $remainingPolls = $this->handshakePollBudget();
@@ -2776,35 +2788,51 @@ final class NatsConnection
             $frames = $this->parser->push($chunk);
 
             foreach ($frames as $index => $frame) {
-                if ($frame->type === ProtocolFrameType::Ok) {
-                    continue;
-                }
-
                 if ($frame->type === ProtocolFrameType::Ping) {
                     $this->transport->write($this->codec->encodePong())->await();
-                    continue;
-                }
-
-                if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
-                    $this->serverInfo = $this->decodeServerInfoPayload($frame->infoPayload);
 
                     continue;
-                }
-
-                if ($frame->type === ProtocolFrameType::Pong) {
-                    // Hand back the frames parsed after the PONG in this batch so they are not lost;
-                    // connectOnce() dispatches them once the parser bound is coupled to max_payload.
-                    // array_slice with default keys re-indexes, so the result is already a list.
-                    return array_slice($frames, $index + 1);
                 }
 
                 if ($frame->type === ProtocolFrameType::Err) {
                     throw $this->connectErrorFromFrame($frame->error);
                 }
+
+                $result = $onFrame($frame, $index, $frames);
+                if ($result !== null) {
+                    return $result;
+                }
             }
         }
 
-        throw new ConnectionException('Expected PONG after CONNECT');
+        throw new ConnectionException($timeoutMessage);
+    }
+
+    /**
+     * @return list<ProtocolFrame>
+     */
+    private function awaitInitialPong(): array
+    {
+        return $this->pollHandshake('Expected PONG after CONNECT', function (ProtocolFrame $frame, int $index, array $frames): ?array {
+            if ($frame->type === ProtocolFrameType::Ok) {
+                return null;
+            }
+
+            if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
+                $this->serverInfo = $this->decodeServerInfoPayload($frame->infoPayload);
+
+                return null;
+            }
+
+            if ($frame->type === ProtocolFrameType::Pong) {
+                // Hand back the frames parsed after the PONG in this batch so they are not lost;
+                // connectOnce() dispatches them once the parser bound is coupled to max_payload.
+                // array_slice with default keys re-indexes, so the result is already a list.
+                return array_slice($frames, $index + 1);
+            }
+
+            return null;
+        });
     }
 
     /**
@@ -2812,38 +2840,13 @@ final class NatsConnection
      */
     private function awaitServerInfo(): ServerInfo
     {
-        $deadline = $this->handshakeDeadline();
-        $remainingPolls = $this->handshakePollBudget();
-
-        while ($remainingPolls-- > 0 && $this->monotonicSeconds() < $deadline) {
-            $chunk = $this->readHandshakeChunk($deadline);
-            if ($chunk === null || $chunk === '') {
-                continue;
+        return $this->pollHandshake('Expected INFO during connect', function (ProtocolFrame $frame): ?ServerInfo {
+            if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
+                return $this->decodeServerInfoPayload($frame->infoPayload);
             }
 
-            $frames = $this->parser->push($chunk);
-
-            foreach ($frames as $frame) {
-                if ($frame->type === ProtocolFrameType::Info && $frame->infoPayload !== null) {
-                    /** @var array<string,mixed> $data */
-                    $data = json_decode($frame->infoPayload, true, 512, JSON_THROW_ON_ERROR);
-
-                    return ServerInfo::fromInfoPayload($data);
-                }
-
-                if ($frame->type === ProtocolFrameType::Ping) {
-                    $this->transport->write($this->codec->encodePong())->await();
-
-                    continue;
-                }
-
-                if ($frame->type === ProtocolFrameType::Err) {
-                    throw $this->connectErrorFromFrame($frame->error);
-                }
-            }
-        }
-
-        throw new ConnectionException('Expected INFO during connect');
+            return null;
+        });
     }
 
     /**
