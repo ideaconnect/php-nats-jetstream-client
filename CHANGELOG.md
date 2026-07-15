@@ -15,7 +15,7 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.7.0] - 2026-07-15
 
 ### Changed
 
@@ -36,6 +36,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   overlap (default 2). `setBatching(1)` still works and still pipelines. A consumer that relied on the
   old batch=1 default now fetches up to 100 messages per pull - size it against your `MaxAckPending` and
   `ack_wait`; call `setBatching(1)` to restore one-message pulls.
+- Internal: consolidated duplicated boilerplate across the connection, JetStream, and transport layers
+  into shared helpers/traits (#111) - the ObjectStore digest and meta-record builders, the JetStream
+  offset-pagination loop, the connect-handshake poll loop, the API-error decode, the Direct Get meta
+  decode (unifying guards that had drifted between `info()`/`list()`), and the client TLS-context
+  assembly. No public API or wire-format change; behavior is unchanged.
 
 ## [2.6.0] - 2026-07-15
 
