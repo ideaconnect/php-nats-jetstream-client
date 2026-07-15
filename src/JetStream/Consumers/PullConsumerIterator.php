@@ -148,8 +148,8 @@ final class PullConsumerIterator
      */
     public function setGroup(?string $group): self
     {
-        if ($group !== null && preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
-            throw new JetStreamException('Pull group must be 1..16 characters of [A-Za-z0-9-_/=]');
+        if ($group !== null) {
+            JetStreamContext::assertValidPriorityGroupName($group, 'Pull group');
         }
 
         $this->group = $group;

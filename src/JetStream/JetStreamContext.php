@@ -212,6 +212,21 @@ final class JetStreamContext
     }
 
     /**
+     * Validates a pull priority-group name: 1..16 characters of [A-Za-z0-9-_/=]. Throws a
+     * {@see JetStreamException} labelled with $label (e.g. "Pull group", "priority_groups names") so the
+     * message names the offending field. Accepts mixed so array-sourced group values can be checked in
+     * one call.
+     *
+     * @internal Shared validator for setGroup()/pull-request/priority_groups name checks.
+     */
+    public static function assertValidPriorityGroupName(mixed $group, string $label): void
+    {
+        if (!is_string($group) || preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
+            throw new JetStreamException($label . ' must be 1..16 characters of [A-Za-z0-9-_/=]');
+        }
+    }
+
+    /**
      * Creates or updates a stream using a minimal configuration payload.
      *
      * @param list<string> $subjects
@@ -3056,9 +3071,7 @@ final class JetStreamContext
 
         if (isset($pull['group'])) {
             $group = $pull['group'];
-            if (!is_string($group) || preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
-                throw new JetStreamException('Pull group must be 1..16 characters of [A-Za-z0-9-_/=]');
-            }
+            self::assertValidPriorityGroupName($group, 'Pull group');
         }
 
         if (isset($pull['priority'])) {
@@ -3120,9 +3133,7 @@ final class JetStreamContext
         }
 
         foreach ($groups as $group) {
-            if (!is_string($group) || preg_match('/^[A-Za-z0-9\-_\/=]{1,16}$/', $group) !== 1) {
-                throw new JetStreamException('priority_groups names must be 1..16 characters of [A-Za-z0-9-_/=]');
-            }
+            self::assertValidPriorityGroupName($group, 'priority_groups names');
         }
     }
 
