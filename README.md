@@ -1988,6 +1988,7 @@ A separate idle-heartbeat watchdog covers the case the sequence-gap logic cannot
 | `webSocketHeaders` | `array<string,string>` | `[]` | Extra headers sent on the WebSocket upgrade request (only used by the WebSocket transport). |
 | `webSocketCompression` | `bool` | `false` | Negotiate permessage-deflate on the WebSocket transport (requires `ext-zlib`). |
 | `logger` | `?Psr\Log\LoggerInterface` | `null` | PSR-3 logger for lifecycle/reconnect/error events; defaults to a `NullLogger`. |
+| `readChunkSizeBytes` | `int` | `131072` | Max bytes a single transport socket read may return (Amp socket chunk size), up from Amp's 8 KiB default. Larger reads divide the per-chunk syscall/fiber/parser overhead for large payloads without forcing larger reads, so small messages are unaffected. Must be at least 1. |
 
 ## Performance Benchmark Recipe
 

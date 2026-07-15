@@ -17,6 +17,19 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Added
+
+- `[feature]` `NatsOptions::$readChunkSizeBytes` (default 128 KiB, up from Amp's 8 KiB) caps the bytes a
+  single transport socket read may return; both the TCP and WebSocket transports apply it via the Amp
+  socket's chunk size after connecting. Large inbound payloads (e.g. an ObjectStore download) now arrive
+  in far fewer chunks, dividing the per-chunk syscall + fiber-spawn + parser-push overhead ~8-32x. It
+  raises only the MAXIMUM a read may return - the socket still returns just what is available, so
+  small-message behavior is unchanged (#119).
+- `[feature]` `NatsClient::readIncoming()` / `NatsConnection::readIncoming()` expose one read-and-dispatch
+  cycle as an `IncomingChunkResult` (the frame count PLUS whether the read consumed bytes off the wire),
+  the progress signal the wait loops use to decide whether to yield. `processIncoming()` is unchanged - it
+  remains the frame-count-only view of the same cycle (#119).
+
 ### Changed
 
 - `[feature]` KV `keys()`/`listKeys()` no longer download every value just to list names (#110). They now
@@ -37,6 +50,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   and 404/missing handling are identical on both paths. Measured against a 100-key bucket, `getAll()`
   issued 1 Direct Get request instead of 100 (the value bytes it must transfer are unchanged, since it
   returns the values).
+- `[feature]` The read-path wait loops (`flush()`, `drain()`, `request()`, `requestMany()`,
+  `JetStreamContext` pull-fetch and direct-get-batch, `KeyValueBucket::history()` and `keys()`,
+  `SubscriptionQueue`, `Service::run()`) no longer pay a 1 ms idle sleep on partial-frame progress. A frame spanning N socket
+  chunks previously cost ~N ms (~125 ms/MB at the 8 KiB default; ObjectStore downloads were capped near
+  8 MB/s) because each partial read reported 0 frames and every loop treated 0 frames as "idle" and slept
+  1 ms - even when the rest of the payload was already in the kernel buffer. The loops now sleep 1 ms ONLY
+  on a genuinely idle read (an empty read, or another fiber owning the socket) and loop immediately when
+  bytes were consumed but no full frame completed yet. Delivery/enumeration is byte-for-byte identical;
+  each loop's deadline/cancellation bound, the #117 pong-slot flush semantics, #147 frame retention, #148
+  Connecting-window reads, and #135 parking are preserved, and a truly empty socket still yields the 1 ms
+  so the event loop advances and deadlines fire (#119).
 
 ## [2.5.4] - 2026-07-13
 

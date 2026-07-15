@@ -9,6 +9,7 @@ use Amp\Future;
 use Amp\Socket\Certificate;
 use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
+use Amp\Socket\ResourceSocket;
 use Amp\Socket\Socket;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
@@ -154,15 +155,33 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 $context = $context->withTlsContext($this->buildTlsContext($host));
             }
 
-            $this->socket = connect("tcp://{$host}:{$port}", $context);
+            $socket = connect("tcp://{$host}:{$port}", $context);
+            $this->socket = $socket;
+            $this->applyReadChunkSize();
 
             if ($secure) {
-                $this->socket->setupTls(new TimeoutCancellation($this->lastConnectTimeoutMs / 1000));
+                $socket->setupTls(new TimeoutCancellation($this->lastConnectTimeoutMs / 1000));
                 $this->tlsEstablished = true;
             }
 
             $this->performHandshake($host, $port, $path);
         });
+    }
+
+    /**
+     * Raises the underlying socket read chunk size to the configured value (default 128 KiB, up from
+     * Amp's 8 KiB default) so large inbound WebSocket frames arrive in far fewer socket reads, dividing
+     * the per-chunk syscall + parser-push overhead (#119). A no-op for a Socket implementation that is
+     * not a ResourceSocket, since setChunkSize is not on the Socket interface. Only the MAXIMUM a read
+     * may return is raised; the socket still returns just what is available, so small frames are
+     * unaffected.
+     */
+    private function applyReadChunkSize(): void
+    {
+        $chunkSize = $this->options->readChunkSizeBytes;
+        if ($this->socket instanceof ResourceSocket && $chunkSize > 0) {
+            $this->socket->setChunkSize($chunkSize);
+        }
     }
 
     /**

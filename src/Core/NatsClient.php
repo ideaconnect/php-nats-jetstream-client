@@ -8,6 +8,7 @@ use Amp\Cancellation;
 use Amp\Future;
 use IDCT\NATS\Connection\ConnectionStats;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\JetStream\JetStreamContext;
@@ -225,6 +226,21 @@ final class NatsClient
     public function processIncoming(?Cancellation $cancellation = null): Future
     {
         return $this->connection->processIncoming($cancellation);
+    }
+
+    /**
+     * Processes a single incoming transport chunk and dispatches parsed frames, reporting both the
+     * frame count and whether the read consumed bytes off the wire. A wait loop uses the latter to
+     * skip its 1 ms idle sleep on partial-frame progress (a large payload arriving in socket-sized
+     * chunks) and yield only on a genuinely idle read (#119). {@see processIncoming()} is the
+     * frame-count-only view of the same cycle.
+     *
+     * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read.
+     * @return Future<IncomingChunkResult>
+     */
+    public function readIncoming(?Cancellation $cancellation = null): Future
+    {
+        return $this->connection->readIncoming($cancellation);
     }
 
     /**

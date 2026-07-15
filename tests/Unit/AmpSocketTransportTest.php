@@ -150,6 +150,73 @@ final class AmpSocketTransportTest extends TestCase
         self::assertSame('tcp://example.org:4222', $this->invokeNormalizeSocketUri($transport, 'nats://example.org:4222'));
     }
 
+    /**
+     * The configured readChunkSizeBytes controls the MAXIMUM a single socket read may return (#119): a
+     * 128 KiB chunk size lets one read pull far more than Amp's 8 KiB default off the wire, dividing the
+     * per-chunk syscall/fiber/parser overhead, while an 8 KiB chunk size caps every read at 8 KiB.
+     *
+     * FALSIFIABILITY: without the setChunkSize() call the transport keeps Amp's 8 KiB default, so no
+     * read could ever exceed 8 KiB and the 128 KiB assertion (a single read > 8 KiB) would fail.
+     */
+    public function testReadChunkSizeControlsMaxBytesPerRead(): void
+    {
+        $payload = str_repeat('x', 256 * 1024); // 256 KiB, far larger than one 8 KiB chunk
+
+        $measure = static function (int $chunkBytes) use ($payload): array {
+            $server = listen('tcp://127.0.0.1:0');
+            $address = (string) $server->getAddress();
+
+            async(static function () use ($server, $payload): void {
+                $client = $server->accept();
+                if ($client !== null) {
+                    $client->write($payload);
+                    // Hold the peer open so the reader drains the whole payload before EOF.
+                    delay(0.3);
+                    $client->close();
+                }
+            });
+
+            $transport = new AmpSocketTransport(new NatsOptions(readChunkSizeBytes: $chunkBytes));
+            $transport->connect('tcp://' . $address, 1000)->await();
+
+            $received = 0;
+            $reads = 0;
+            $maxRead = 0;
+            try {
+                while ($received < strlen($payload)) {
+                    $chunk = $transport->readLine(new TimeoutCancellation(2.0))->await();
+                    $length = strlen($chunk);
+                    if ($length === 0) {
+                        break;
+                    }
+                    $received += $length;
+                    $reads++;
+                    $maxRead = max($maxRead, $length);
+                }
+            } catch (\Throwable) {
+                // A late EOF/timeout after the payload is drained is irrelevant to the measurement.
+            } finally {
+                $transport->close()->await();
+                $server->close();
+            }
+
+            return ['reads' => $reads, 'maxRead' => $maxRead, 'received' => $received];
+        };
+
+        $large = $measure(128 * 1024);
+        $small = $measure(8 * 1024);
+
+        self::assertSame(strlen($payload), $large['received'], 'the full payload must arrive with a 128 KiB chunk size');
+        self::assertSame(strlen($payload), $small['received'], 'the full payload must arrive with an 8 KiB chunk size');
+
+        // A 128 KiB chunk size lets a single read exceed 8 KiB; an 8 KiB chunk size never does.
+        self::assertGreaterThan(8 * 1024, $large['maxRead'], '128 KiB chunk size must allow a single read larger than 8 KiB');
+        self::assertLessThanOrEqual(8 * 1024, $small['maxRead'], '8 KiB chunk size must cap every read at 8 KiB');
+
+        // Fewer, larger reads for the larger chunk size (256 KiB needs >= 32 reads at 8 KiB).
+        self::assertLessThan($small['reads'], $large['reads'], 'a larger chunk size must divide the read count');
+    }
+
     private function invokeWithTlsContext(AmpSocketTransport $transport, ConnectContext $context, string $dsn): ConnectContext
     {
         $method = new \ReflectionMethod(AmpSocketTransport::class, 'withTlsContext');

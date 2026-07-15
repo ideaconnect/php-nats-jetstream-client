@@ -884,8 +884,11 @@ final class JetStreamContext
 
                     $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
                     try {
-                        $frames = $this->client->processIncoming($waitCancellation)->await();
-                        if ($frames === 0) {
+                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        if (!$read->consumedBytes) {
+                            // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
+                            // completed no frame yet (a chunked batch payload) loops immediately so the
+                            // rest of the payload already buffered is drained without an idle sleep (#119).
                             delay(0.001, cancellation: $waitCancellation);
                         }
                     } catch (CancelledException) {
@@ -2090,8 +2093,11 @@ final class JetStreamContext
 
                     $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
                     try {
-                        $frames = $this->client->processIncoming($waitCancellation)->await();
-                        if ($frames === 0) {
+                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        if (!$read->consumedBytes) {
+                            // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
+                            // completed no frame yet (a chunked batch payload) loops immediately so the
+                            // rest of the payload already buffered is drained without an idle sleep (#119).
                             delay(0.001, cancellation: $waitCancellation);
                         }
                     } catch (CancelledException) {
