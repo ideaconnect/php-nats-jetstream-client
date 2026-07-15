@@ -13,6 +13,7 @@ use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\ApiErrCode;
+use IDCT\NATS\JetStream\DecodesApiErrors;
 use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\JetStreamRequest;
@@ -30,6 +31,8 @@ use function Amp\delay;
  */
 final class KeyValueBucket
 {
+    use DecodesApiErrors;
+
     /**
      * Default idle_heartbeat (ns) the KV watch consumer requests so the missed-heartbeat watchdog (#113)
      * can notice a silent/reaped watch. nats.go KV watchers receive heartbeats via an ordered consumer;
@@ -345,21 +348,11 @@ final class KeyValueBucket
         $payload = json_encode(['last_by_subj' => $this->subjectForKey($key)], JSON_THROW_ON_ERROR);
         $data = $this->decodeReply($this->client->request($subject, $payload)->await()->payload);
 
-        /** @var array<string,mixed>|null $error */
         $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-        if ($error !== null) {
-            $code = (int) ($error['code'] ?? 0);
-            if ($code === 404) {
-                return null;
-            }
-
-            throw new JetStreamException(
-                (string) ($error['description'] ?? 'JetStream API error'),
-                $code,
-                null,
-                ApiErrCode::fromEnvelope($error),
-            );
+        if ($error !== null && (int) ($error['code'] ?? 0) === 404) {
+            return null;
         }
+        $this->throwIfApiError($data);
 
         /** @var array<string,mixed>|null $message */
         $message = is_array($data['message'] ?? null) ? $data['message'] : null;
@@ -939,16 +932,7 @@ final class KeyValueBucket
             ], JSON_THROW_ON_ERROR);
             $data = $this->decodeReply($this->client->request($subject, $payload)->await()->payload);
 
-            /** @var array<string,mixed>|null $error */
-            $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-            if ($error !== null) {
-                throw new JetStreamException(
-                    (string) ($error['description'] ?? 'JetStream API error'),
-                    (int) ($error['code'] ?? 0),
-                    null,
-                    ApiErrCode::fromEnvelope($error),
-                );
-            }
+            $this->throwIfApiError($data);
 
             /** @var array<string,mixed> $state */
             $state = is_array($data['state'] ?? null) ? $data['state'] : [];
@@ -1048,13 +1032,7 @@ final class KeyValueBucket
 
             $data = $this->decodeReply($message->payload);
 
-            /** @var array<string,mixed>|null $error */
-            $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-            if ($error !== null) {
-                $description = (string) ($error['description'] ?? 'JetStream publish error');
-                $code = (int) ($error['code'] ?? 0);
-                throw new JetStreamException($description, $code, null, ApiErrCode::fromEnvelope($error));
-            }
+            $this->throwIfApiError($data, 'JetStream publish error');
 
             return PubAck::fromArray($data);
         });

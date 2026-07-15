@@ -10,6 +10,7 @@ use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\ApiErrCode;
+use IDCT\NATS\JetStream\DecodesApiErrors;
 use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\JetStreamRequest;
@@ -24,6 +25,8 @@ use function Amp\async;
  */
 final class ObjectStoreBucket
 {
+    use DecodesApiErrors;
+
     private const DEFAULT_CHUNK_SIZE = 131072; // 128 KiB
 
     /**
@@ -1107,16 +1110,7 @@ final class ObjectStoreBucket
         /** @var array<string,mixed> $data */
         $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
 
-        /** @var array<string,mixed>|null $error */
-        $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-        if ($error !== null) {
-            throw new JetStreamException(
-                (string) ($error['description'] ?? 'JetStream publish error'),
-                (int) ($error['code'] ?? 0),
-                null,
-                ApiErrCode::fromEnvelope($error),
-            );
-        }
+        $this->throwIfApiError($data, 'JetStream publish error');
     }
 
     /**
@@ -1160,16 +1154,7 @@ final class ObjectStoreBucket
             /** @var array<string,mixed> $data */
             $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
 
-            /** @var array<string,mixed>|null $error */
-            $error = is_array($data['error'] ?? null) ? $data['error'] : null;
-            if ($error !== null) {
-                throw new JetStreamException(
-                    (string) ($error['description'] ?? 'JetStream API error'),
-                    (int) ($error['code'] ?? 0),
-                    null,
-                    ApiErrCode::fromEnvelope($error),
-                );
-            }
+            $this->throwIfApiError($data);
 
             /** @var array<string,mixed> $state */
             $state = is_array($data['state'] ?? null) ? $data['state'] : [];
