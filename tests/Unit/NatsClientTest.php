@@ -73,8 +73,20 @@ final class NatsClientTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "MSG _INBOX.any 1 5\r\nhello\r\n",
         ]);
+        // Muxed request inbox (#118): the reply arrives on the request's captured reply-to over the
+        // single mux sid 1, not on a guessed fixed subject. Echo it dynamically from the PUB frame.
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
+        };
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -113,8 +125,21 @@ final class NatsClientTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($replyPayload), $replyPayload),
         ]);
+        // Muxed request inbox (#118): the header request's reply arrives on its captured reply-to over
+        // the single mux sid 1. Echo it dynamically from the request's HPUB frame (svc.echo only - the
+        // headers-only publishWithHeaders to orders.created carries no reply-to and must be ignored).
+        $transport->onWrite = static function (string $bytes) use ($replyPayload): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'HPUB svc.echo ')) {
+                return [];
+            }
+
+            // HPUB <subject> <replyTo> <hdrLen> <totalLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 %d\r\n%s\r\n", $replyTo, strlen($replyPayload), $replyPayload)];
+        };
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();

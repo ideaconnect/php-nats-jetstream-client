@@ -28,6 +28,51 @@ final class NatsConnection_3MutationTest extends TestCase
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
+     * Installs a #118 mux responder: for every `PUB <subject> <replyTo> ...` written, echoes one plain
+     * `MSG <replyTo> 1 ...` on the mux sid (1 - the first, wildcard subscription after connect). Mirrors
+     * a real server delivering the reply to the request's captured reply-to on the shared subscription,
+     * so the reply routes through dispatchMuxReply instead of a (now non-existent) per-request SUB.
+     */
+    private function echoReply(FakeTransport $transport, string $subject, string $payload): void
+    {
+        $transport->onWrite = static function (string $bytes) use ($subject, $payload): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB ' . $subject . ' ')) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s 1 %d\r\n%s\r\n", $replyTo, strlen($payload), $payload)];
+        };
+    }
+
+    /**
+     * Like {@see echoReply()} but delivers the reply as an HMSG whose header block is $status and whose
+     * payload is empty (hdr_len === total_len), on the mux sid (1). Drives the no-responders / status-line
+     * classification path with the reply addressed to the request's captured reply-to.
+     */
+    private function echoHeaderReply(FakeTransport $transport, string $subject, string $status): void
+    {
+        $transport->onWrite = static function (string $bytes) use ($subject, $status): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB ' . $subject . ' ')) {
+                return [];
+            }
+
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if ($replyTo === '') {
+                return [];
+            }
+
+            $len = strlen($status);
+
+            return [sprintf("HMSG %s 1 %d %d\r\n%s\r\n", $replyTo, $len, $len, $status)];
+        };
+    }
+
+    /**
      * isNoRespondersStatus uses an anchored regex (`^NATS/1.0 503`). A header whose first line merely
      * CONTAINS the 503 status (not at the start) is a normal reply, NOT a no-responders sentinel.
      *
@@ -41,15 +86,18 @@ final class NatsConnection_3MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            'HMSG _INBOX.any 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
+        // #118 mux: deliver the status reply on the request's captured reply-to (mux sid 1) rather than
+        // a pre-seeded fixed-subject HMSG, which would route to the random mux base and be dropped.
+        $this->echoHeaderReply($transport, 'svc.scan', $status);
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
 
         // kills PregMatchRemoveCaret @ 982: real treats this as a normal reply (collected),
         // the mutant treats it as a no-responders sentinel (empty result).
-        $replies = $connection->requestMany('svc.scan', 'q', null, null, 1000)->await();
+        // No maxResponses/stall: the loop collects the one reply then runs to the (small) total deadline.
+        $replies = $connection->requestMany('svc.scan', 'q', null, null, 200)->await();
         self::assertCount(1, $replies);
         self::assertSame('', $replies[0]->payload);
     }
@@ -64,13 +112,15 @@ final class NatsConnection_3MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            'HMSG _INBOX.any 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
+        // #118 mux: the genuine 503 sentinel is delivered on the request's captured reply-to (mux sid 1),
+        // so it is really classified as no-responders (not merely dropped) - preserving the positive pin.
+        $this->echoHeaderReply($transport, 'svc.scan', $status);
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
 
-        $replies = $connection->requestMany('svc.scan', 'q', null, null, 1000)->await();
+        $replies = $connection->requestMany('svc.scan', 'q', null, null, 200)->await();
         self::assertSame([], $replies);
     }
 
@@ -177,10 +227,11 @@ final class NatsConnection_3MutationTest extends TestCase
             [
                 self::INFO,
                 "PONG\r\n",
-                "MSG _INBOX.any 1 1\r\nA\r\n",
             ],
             blockWhenEmpty: true, // after the single reply, reads suspend until the slice cancellation fires
         );
+        // #118 mux: the single reply is echoed on the request's captured reply-to (mux sid 1).
+        $this->echoReply($transport, 'svc.scan', 'A');
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -206,10 +257,11 @@ final class NatsConnection_3MutationTest extends TestCase
             [
                 self::INFO,
                 "PONG\r\n",
-                "MSG _INBOX.any 1 1\r\nA\r\n",
             ],
             blockWhenEmpty: true,
         );
+        // #118 mux: the single reply is echoed on the request's captured reply-to (mux sid 1).
+        $this->echoReply($transport, 'svc.scan', 'A');
 
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();

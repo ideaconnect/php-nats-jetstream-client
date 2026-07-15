@@ -38,7 +38,15 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     /** @param list<string> $reads */
     private function client(array $reads): NatsClient
     {
-        $transport = new FakeTransport(array_merge([self::INFO_LINE, "PONG\r\n"], $reads));
+        // Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a
+        // fresh inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1) serves every reply,
+        // and each request publishes reply-to "<base>.<token>" and routes by that token. Every Object
+        // Store operation that awaits a reply (lookup STREAM.MSG.GET, chunk/meta JS publish acks,
+        // STREAM.CREATE/UPDATE) funnels through request(), so a pre-seeded fixed-subject "MSG _INBOX.x
+        // <sid>" no longer reaches the waiting request and it would time out. Deliver the same reply
+        // frames DYNAMICALLY on the captured mux reply-to instead of pre-seeding them (see muxReplies()).
+        $transport = new FakeTransport([self::INFO_LINE, "PONG\r\n"]);
+        $this->muxReplies($transport, $reads);
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
         $this->lastTransport = $transport;
@@ -47,6 +55,69 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     }
 
     private FakeTransport $lastTransport;
+
+    /**
+     * Installs a dynamic responder that mirrors a real mux server: it learns the mux base from the
+     * wildcard SUB "<base>.* <sid>" and, for each request PUB/HPUB (a publish whose reply-to lives under
+     * that base), pops the next reply frame FIFO and re-emits it on the CAPTURED reply-to with the mux
+     * sid (1). Frames are delivered in the order requests are written - the same request/SID order these
+     * tests already encoded when they pre-seeded MSG _INBOX.a/b/c with sids 1/2/3 (put() runs its
+     * previous-revision lookup eagerly first, then the chunk publish(es), then the meta publish).
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
 
     private function writes(): string
     {

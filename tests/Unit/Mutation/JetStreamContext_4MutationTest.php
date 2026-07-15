@@ -11,6 +11,7 @@ use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 /**
  * Mutation-killing tests for src/JetStream/JetStreamContext.php (chunk 4).
@@ -24,15 +25,15 @@ final class JetStreamContext_4MutationTest extends TestCase
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
-     * @param list<string> $frames
+     * A subscription's idle-heartbeat watchdog (#113) is a live EventLoop timer that outlives a test
+     * whose client is never disconnect()ed. Cancel every callback left registered so the shared loop
+     * starts each test clean and a leaked watchdog cannot fire against a lingering client.
      */
-    private function connectedClient(array $frames): NatsClient
+    protected function tearDown(): void
     {
-        $transport = new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $frames));
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
-
-        return $client;
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
     }
 
     /**
@@ -46,6 +47,77 @@ final class JetStreamContext_4MutationTest extends TestCase
         $client->connect()->await();
 
         return $client;
+    }
+
+    /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1) serves every reply, and each
+     * request publishes reply-to "<base>.<token>" and routes by that token. A pre-seeded
+     * "MSG/HMSG _INBOX.x <sid>" therefore no longer reaches the waiting request (its subject is not the
+     * request's random "<base>.<token>", so dispatchMuxReply drops it and the request times out).
+     *
+     * This installs a dynamic responder that mirrors a real server: it learns the mux base from the
+     * wildcard SUB, and for each request PUB/HPUB (a publish whose reply-to lives under that base)
+     * pops the next reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1). Frames
+     * are delivered FIFO in the order requests are written, so a method that issues several requests
+     * (e.g. a 503 retry then the success ack) still gets its replies in sequence.
+     *
+     * Only request replies belong here; subscription deliveries (a pull fetch inbox) are NOT mux replies -
+     * keep those pre-seeded on the read queue.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
     }
 
     // -----------------------------------------------------------------------------------------
@@ -62,9 +134,10 @@ final class JetStreamContext_4MutationTest extends TestCase
         // A 503 no-responders status with NO retry exhausts immediately and surfaces the message.
         $status = "NATS/1.0 503\r\n\r\n";
         $transport = null;
-        $client = $this->connectedClientWith([
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
-        ], $transport);
+        ]);
 
         $js = new JetStreamContext($client, publishRetryAttempts: 1, publishRetryWaitMs: 1);
 
@@ -94,7 +167,9 @@ final class JetStreamContext_4MutationTest extends TestCase
         $status = "NATS/1.0 503\r\n\r\n";
         $ackPayload = '{"stream":"ORDERS","seq":7,"duplicate":false}';
 
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
@@ -116,7 +191,9 @@ final class JetStreamContext_4MutationTest extends TestCase
         $status = "NATS/1.0 503\r\n\r\n";
         $ackPayload = '{"stream":"ORDERS","seq":51,"duplicate":false}';
 
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
@@ -140,9 +217,10 @@ final class JetStreamContext_4MutationTest extends TestCase
     {
         $ackPayload = '{"stream":"SCHED","seq":1,"duplicate":false}';
         $transport = null;
-        $client = $this->connectedClientWith([
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
-        ], $transport);
+        ]);
 
         $client->jetStream()->publishScheduled(
             'schedules.x',
@@ -163,9 +241,10 @@ final class JetStreamContext_4MutationTest extends TestCase
     {
         $ackPayload = '{"stream":"SCHED","seq":2,"duplicate":false}';
         $transport = null;
-        $client = $this->connectedClientWith([
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
-        ], $transport);
+        ]);
 
         $client->jetStream()->publishScheduled(
             'schedules.x',
@@ -190,7 +269,9 @@ final class JetStreamContext_4MutationTest extends TestCase
      */
     public function testMalformedPublishAckMessageAndCode(): void
     {
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             "MSG _INBOX.a 1 7\r\nnotjson\r\n",
         ]);
 
@@ -217,7 +298,9 @@ final class JetStreamContext_4MutationTest extends TestCase
     public function testPublishApiErrorWithoutCodeDefaultsToZero(): void
     {
         $errorPayload = '{"error":{"description":"publish failed"}}';
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -237,7 +320,9 @@ final class JetStreamContext_4MutationTest extends TestCase
     public function testPublishApiErrorPropagatesProvidedCode(): void
     {
         $errorPayload = '{"error":{"code":500,"description":"publish failed"}}';
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -263,9 +348,10 @@ final class JetStreamContext_4MutationTest extends TestCase
     {
         $ackPayload = '{"stream":"COUNTERS","seq":1,"val":"10"}';
         $transport = null;
-        $client = $this->connectedClientWith([
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
-        ], $transport);
+        ]);
 
         // kills UnwrapTrim @ 1375 - without trim, ' 10 ' fails the /^[+-]?\d+$/ check and throws.
         $value = $client->jetStream()->incrementCounter('counters.visits', ' 10 ')->await();
@@ -303,7 +389,9 @@ final class JetStreamContext_4MutationTest extends TestCase
      */
     public function testMalformedCounterResponseMessageAndCode(): void
     {
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             "MSG _INBOX.a 1 7\r\nnotjson\r\n",
         ]);
 
@@ -330,7 +418,9 @@ final class JetStreamContext_4MutationTest extends TestCase
     public function testCounterApiErrorWithoutCodeDefaultsToZero(): void
     {
         $errorPayload = '{"error":{"description":"counter failed"}}';
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -350,7 +440,9 @@ final class JetStreamContext_4MutationTest extends TestCase
     public function testCounterApiErrorPropagatesProvidedCode(): void
     {
         $errorPayload = '{"error":{"code":503,"description":"counter failed"}}';
-        $client = $this->connectedClient([
+        $transport = null;
+        $client = $this->connectedClientWith([], $transport);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 

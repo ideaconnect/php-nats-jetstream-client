@@ -67,6 +67,177 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1) serves every reply, and each
+     * request publishes reply-to "<base>.<token>" and routes by that token. A pre-seeded
+     * "MSG _INBOX.x <sid>" therefore no longer reaches the waiting request (its subject is not the
+     * request's random "<base>.<token>", so dispatchMuxReply drops it and the request times out).
+     *
+     * This installs a dynamic responder that mirrors a real server: it learns the mux base from the
+     * wildcard SUB, and for each request PUB/HPUB (a publish whose reply-to lives under that base)
+     * pops the next reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1). Frames
+     * are delivered FIFO in the order requests are written, so a method that issues several requests
+     * (e.g. create->update, create->info->delete) still gets its replies in sequence.
+     *
+     * Only request replies belong here; subscription deliveries (a push consumer's deliver subject,
+     * a pull fetch inbox) are NOT mux replies - keep those pre-seeded, or enqueue them on their SUB via
+     * FakeTransport::$enqueueOnWriteContaining so they arrive after the deliver subscription exists.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox (fetch/direct-get) - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
+    /**
+     * Extracts the mux reply-to (the 3rd token) from a written PUB/HPUB request frame, or '' when the
+     * frame is not a request publish. Lets a dynamic onWrite responder echo a reply on the request's
+     * actual reply-to (the mux "<base>.<token>") instead of a guessed inbox subject (#118).
+     */
+    private static function requestReplyTo(string $bytes): string
+    {
+        $head = strtok($bytes, "\r\n");
+        if ($head === false || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+            return '';
+        }
+
+        return explode(' ', $head)[2] ?? '';
+    }
+
+    /**
+     * Builds a mux reply frame (MSG on the given reply-to, mux sid 1) carrying $payload - the wire form
+     * the server sends back on the shared request inbox (#118).
+     */
+    private static function muxMsg(string $replyTo, string $payload): string
+    {
+        return sprintf("MSG %s 1 %d\r\n%s\r\n", $replyTo, strlen($payload), $payload);
+    }
+
+    /**
+     * Installs a mux-aware server for ordered/push consumer recreate tests. Pre-#118 each request owned
+     * a per-request SUB, so a CONSUMER.CREATE/DELETE reply routed by a fixed sid and the rotated deliver
+     * inbox landed at a sid shifted by those per-request subs (2,4,7,...). Post-#118 all requests share
+     * the mux inbox (no per-request SUB), so: (a) CREATE/DELETE replies must be echoed on the request's
+     * captured reply-to, and (b) the rotated deliver sid collapses to the next free sid (2,3,4,...). This
+     * responder removes both hazards by construction: request replies go on the captured reply-to, and
+     * each deliver epoch's frames are emitted on the deliver SUB using the sid the server ACTUALLY
+     * assigned (captured live), so tests never hard-code a sid.
+     *
+     * @param list<callable(string):list<string>> $onCreate FIFO, one per CONSUMER.CREATE PUB; gets the reply-to.
+     * @param list<callable(string):list<string>> $onDelete FIFO, one per CONSUMER.DELETE PUB; gets the reply-to.
+     * @param list<callable(int):list<string>> $deliverEpochs FIFO, one per deliver SUB; gets the captured sid.
+     */
+    private function orderedConsumerServer(
+        FakeTransport $transport,
+        array $onCreate,
+        array $onDelete = [],
+        array $deliverEpochs = [],
+    ): void {
+        // The callback arrays are captured BY VALUE (so PHPStan keeps their callable return types); FIFO
+        // consumption is tracked by the by-reference cursors below.
+        $createIdx = 0;
+        $deleteIdx = 0;
+        $deliverIdx = 0;
+        $transport->onWrite = static function (string $bytes) use (
+            $onCreate,
+            $onDelete,
+            $deliverEpochs,
+            &$createIdx,
+            &$deleteIdx,
+            &$deliverIdx,
+        ): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                $parts = explode(' ', $head);
+                $subject = $parts[1] ?? '';
+                // The mux wildcard SUB ends with ".*"; every other SUB here is a (rotated) deliver inbox.
+                $epoch = $deliverEpochs[$deliverIdx] ?? null;
+                if ($epoch !== null && !str_ends_with($subject, '.*')) {
+                    $deliverIdx++;
+
+                    return $epoch((int) ($parts[2] ?? 0));
+                }
+
+                return [];
+            }
+
+            $replyTo = self::requestReplyTo($bytes);
+            if ($replyTo === '') {
+                return [];
+            }
+
+            $create = $onCreate[$createIdx] ?? null;
+            if ($create !== null && str_contains($bytes, '$JS.API.CONSUMER.CREATE.')) {
+                $createIdx++;
+
+                return $create($replyTo);
+            }
+
+            $delete = $onDelete[$deleteIdx] ?? null;
+            if ($delete !== null && str_contains($bytes, '$JS.API.CONSUMER.DELETE.')) {
+                $deleteIdx++;
+
+                return $delete($replyTo);
+            }
+
+            return [];
+        };
+    }
+
+    /**
      * Verifies accountInfo() returns parsed account metrics.
      */
     public function testAccountInfo(): void
@@ -76,6 +247,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($accountPayload), $accountPayload),
         ]);
 
@@ -99,6 +272,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -136,6 +311,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -171,6 +348,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -190,6 +369,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -209,6 +390,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -231,6 +414,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -253,6 +438,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -289,8 +476,11 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),   // CREATE -> already in use
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),     // UPDATE -> ok
+        ]);
+        // Muxed replies, FIFO: CREATE -> already-in-use, then UPDATE -> ok (#118).
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
 
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -299,8 +489,9 @@ final class JetStreamContextTest extends TestCase
         $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*', 'orders.archive'])->await();
 
         self::assertSame('ORDERS', $info->name);
+        // writes: [0]=CONNECT [1]=PING [2]=mux SUB [3]=CREATE PUB [4]=UPDATE PUB (no per-request SUB/UNSUB).
         self::assertStringContainsString('$JS.API.STREAM.CREATE.ORDERS', $transport->writes[3]);
-        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[6]);
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[4]);
     }
 
     /**
@@ -314,6 +505,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($err), $err),
         ]);
 
@@ -341,6 +534,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($withErrCode), $withErrCode),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($withoutErrCode), $withoutErrCode),
         ]);
@@ -377,6 +572,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
@@ -387,7 +584,7 @@ final class JetStreamContextTest extends TestCase
         $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
 
         self::assertSame('ORDERS', $info->name);
-        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[6]);
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[4]);
     }
 
     /**
@@ -403,6 +600,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
             // An UPDATE reply is queued so a wrong fallback would succeed silently instead of hanging.
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
@@ -429,6 +628,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
@@ -439,7 +640,7 @@ final class JetStreamContextTest extends TestCase
         $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
 
         self::assertSame('ORDERS', $info->name);
-        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[6]);
+        self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $transport->writes[4]);
     }
 
     /**
@@ -450,6 +651,9 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // Muxed replies, FIFO: CREATE, INFO, DELETE (#118).
+        $this->muxReplies($transport, [
             "MSG _INBOX.a 1 52\r\n{\"config\":{\"name\":\"ORDERS\",\"subjects\":[\"orders.*\"]}}\r\n",
             "MSG _INBOX.b 2 52\r\n{\"config\":{\"name\":\"ORDERS\",\"subjects\":[\"orders.*\"]}}\r\n",
             "MSG _INBOX.c 3 16\r\n{\"success\":true}\r\n",
@@ -467,9 +671,10 @@ final class JetStreamContextTest extends TestCase
         self::assertSame(['orders.*'], $created->subjects);
         self::assertSame('ORDERS', $fetched->name);
         self::assertTrue($deleted);
+        // writes: [0]=CONNECT [1]=PING [2]=mux SUB [3]=CREATE [4]=INFO [5]=DELETE (one mux SUB, no UNSUB).
         self::assertStringContainsString('$JS.API.STREAM.CREATE.ORDERS', $transport->writes[3]);
-        self::assertStringContainsString('$JS.API.STREAM.INFO.ORDERS', $transport->writes[6]);
-        self::assertStringContainsString('$JS.API.STREAM.DELETE.ORDERS', $transport->writes[9]);
+        self::assertStringContainsString('$JS.API.STREAM.INFO.ORDERS', $transport->writes[4]);
+        self::assertStringContainsString('$JS.API.STREAM.DELETE.ORDERS', $transport->writes[5]);
     }
 
     /**
@@ -480,6 +685,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             "MSG _INBOX.a 1 48\r\n{\"error\":{\"code\":404,\"description\":\"not found\"}}\r\n",
         ]);
 
@@ -575,6 +782,9 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // Muxed replies, FIFO: CREATE, INFO, DELETE (#118).
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($infoPayload), $infoPayload),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($deletePayload), $deletePayload),
@@ -592,9 +802,10 @@ final class JetStreamContextTest extends TestCase
         self::assertSame('PROC', $created->name);
         self::assertSame('PROC', $fetched->name);
         self::assertTrue($deleted);
+        // writes: [0]=CONNECT [1]=PING [2]=mux SUB [3]=CREATE [4]=INFO [5]=DELETE (one mux SUB, no UNSUB).
         self::assertStringContainsString('$JS.API.CONSUMER.CREATE.ORDERS.PROC', $transport->writes[3]);
-        self::assertStringContainsString('$JS.API.CONSUMER.INFO.ORDERS.PROC', $transport->writes[6]);
-        self::assertStringContainsString('$JS.API.CONSUMER.DELETE.ORDERS.PROC', $transport->writes[9]);
+        self::assertStringContainsString('$JS.API.CONSUMER.INFO.ORDERS.PROC', $transport->writes[4]);
+        self::assertStringContainsString('$JS.API.CONSUMER.DELETE.ORDERS.PROC', $transport->writes[5]);
     }
 
     /**
@@ -608,6 +819,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -726,6 +939,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -750,6 +965,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -1005,6 +1222,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen('{}'), '{}'),
         ]);
 
@@ -1489,6 +1708,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1508,6 +1729,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             "MSG _INBOX.a 1 7\r\nnotjson\r\n", // a non-JSON publish ack
         ]);
 
@@ -1529,6 +1752,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -1551,6 +1776,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
@@ -1578,6 +1805,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.5","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -1607,6 +1836,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1670,6 +1901,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1702,6 +1935,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1730,6 +1965,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1758,6 +1995,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1813,6 +2052,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1836,6 +2077,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -1869,6 +2112,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorAck), $errorAck),
         ]);
 
@@ -1891,6 +2136,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // First publish request -> 503 no-responders on inbox sid 1.
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
             // Retry publish request -> success ack on inbox sid 2.
@@ -1915,6 +2162,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // Empty confirmation reply on the double-ack inbox (sid 1).
             "MSG _INBOX.any 1 0\r\n\r\n",
         ]);
@@ -1941,6 +2190,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ok), $ok),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ok), $ok),
         ]);
@@ -1956,8 +2207,8 @@ final class JetStreamContextTest extends TestCase
         self::assertStringContainsString('"no_erase":true', $transport->writes[3]);
         self::assertStringContainsString('"seq":7', $transport->writes[3]);
         // Secure erase omits no_erase so the server overwrites the data (second request's PUB).
-        self::assertStringNotContainsString('no_erase', $transport->writes[6]);
-        self::assertStringContainsString('"seq":8', $transport->writes[6]);
+        self::assertStringNotContainsString('no_erase', $transport->writes[4]);
+        self::assertStringContainsString('"seq":8', $transport->writes[4]);
     }
 
     /**
@@ -2010,6 +2261,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -2032,6 +2285,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -2099,6 +2354,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -2124,6 +2381,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -2170,6 +2429,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s%s\r\n", $h, $h + strlen($body), $hdrs, $body),
         ]);
 
@@ -2193,6 +2454,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s\r\n", $h, $h, $hdrs),
         ]);
 
@@ -2214,6 +2477,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
@@ -2243,6 +2508,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -2314,6 +2581,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 reply.ack %d\r\n%s\r\n", strlen($deliveryPayload), $deliveryPayload),
         ]);
 
@@ -2394,6 +2663,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2419,6 +2690,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2447,7 +2720,14 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply travels through the mux inbox (#118); the deliver-subject frames (sid 2, the sub
+        // after the mux sid 1) must arrive only once the deliver subscription exists, so enqueue them on
+        // its SUB rather than pre-seeding them (a pre-seeded frame would be drained+dropped by CREATE).
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.proc '] = [
             sprintf(
                 "HMSG deliver.proc 2 fc.reply %d %d\r\n%s\r\n",
                 strlen($flowHeaders),
@@ -2455,7 +2735,7 @@ final class JetStreamContextTest extends TestCase
                 $flowHeaders,
             ),
             "MSG deliver.proc 2 5\r\nhello\r\n",
-        ]);
+        ];
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -2496,14 +2776,19 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); the deliver frame (sid 2) arrives after its SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.proc '] = [
             sprintf(
                 "HMSG deliver.proc 2 %d %d\r\n%s\r\n", // no reply subject
                 strlen($stalledHeaders),
                 strlen($stalledHeaders),
                 $stalledHeaders,
             ),
-        ]);
+        ];
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -2539,14 +2824,19 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); the deliver frame (sid 2) arrives after its SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.proc '] = [
             sprintf(
                 "HMSG deliver.proc 2 hb.reply %d %d\r\n%s\r\n",
                 strlen($heartbeatHeaders),
                 strlen($heartbeatHeaders),
                 $heartbeatHeaders,
             ),
-        ]);
+        ];
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -2578,6 +2868,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2604,9 +2896,14 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
-            "MSG deliver.ephemeral 2 5\r\nhello\r\n",
         ]);
+        // CREATE reply via the mux inbox (#118); the deliver frame (sid 2) arrives after its SUB.
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.ephemeral '] = [
+            "MSG deliver.ephemeral 2 5\r\nhello\r\n",
+        ];
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -2655,6 +2952,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
@@ -2681,6 +2980,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
@@ -2719,6 +3020,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($malformedPayload), $malformedPayload),
         ]);
 
@@ -2739,6 +3042,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($responsePayload), $responsePayload),
         ]);
 
@@ -2761,6 +3066,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2790,6 +3097,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2809,6 +3118,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -2997,6 +3308,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse('{"paused":true,"pause_until":"2026-12-01T00:00:00Z"}'),
         ]);
 
@@ -3017,6 +3330,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse('{"paused":false}'),
         ]);
 
@@ -3050,6 +3365,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse($consumerCreateResponse),
         ]);
 
@@ -3075,6 +3392,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse('{"purged":42}'),
         ]);
 
@@ -3092,6 +3411,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse('{"purged":10}'),
         ]);
 
@@ -3116,6 +3437,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse($listPayload),
         ]);
 
@@ -3141,6 +3464,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse($listPayload),
         ]);
 
@@ -3166,6 +3491,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse($listPayload),
         ]);
 
@@ -3203,6 +3530,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $page1), (string) $page1),
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen((string) $page2), (string) $page2),
         ]);
@@ -3232,6 +3561,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->jsOkResponse($msgPayload),
         ]);
 
@@ -3417,6 +3748,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($apiResponse), $apiResponse),
         ]);
 
@@ -3448,6 +3781,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($apiResponse), $apiResponse),
         ]);
 
@@ -3473,6 +3808,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($apiResponse), $apiResponse),
         ]);
 
@@ -3495,6 +3832,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.any 1 %d %d\r\n%s%s\r\n", $hdrLen, $totalLen, $headerBlock, $body),
         ]);
 
@@ -3523,6 +3862,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.any 1 %d %d\r\n%s%s\r\n", $hdrLen, $totalLen, $headerBlock, $body),
         ]);
 
@@ -3547,6 +3888,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.any 1 %d %d\r\n%s\r\n", $len, $len, $statusBlock),
         ]);
 
@@ -3570,20 +3913,30 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Initial ephemeral push consumer create (request sid 1).
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            // In-order delivery: consumer seq 1 / stream seq 1 -> next expected consumer seq 2.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // A missed push: consumer seq jumps to 3 (expected 2). The consumer is recreated from the
-            // stream sequence after the last in-order message (1+1=2) and THIS message is DISCARDED.
-            // Reply tokens: num_delivered=3, stream_seq=4, consumer_seq=3.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            // Gap recovery deletes the old consumer (request sid 3) ...
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            // ... subscribes the ROTATED deliver inbox (sid 4) and recreates it from the expected
-            // sequence (create request sid 5, shifted by the inserted new-inbox subscribe) (#122).
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
+        // Mux inbox (#118): CREATE/DELETE replies echo on the request's captured reply-to; the deliver
+        // frames use the sid the server actually assigned to the deliver SUB (no per-request SUB shift).
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order delivery: consumer seq 1 / stream seq 1 -> next expected consumer seq 2.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // A missed push: consumer seq jumps to 3 (expected 2). The consumer is recreated from
+                    // the stream sequence after the last in-order message (1+1=2) and THIS is DISCARDED.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+                // The rotated (second) epoch delivers nothing here: the server-side replay from
+                // opt_start_seq is exercised against a real server in JetStreamIntegrationTest.
+            ],
+        );
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -3648,8 +4001,10 @@ final class JetStreamContextTest extends TestCase
         // that frame is dispatched during the create's own read-pump - the race the fix must survive.
         $createSeen = 0;
         $transport->onWrite = static function (string $bytes) use (&$createSeen, $dataFrame, $createReply): array {
+            $replyTo = self::requestReplyTo($bytes);
             if (str_contains($bytes, '$JS.API.CONSUMER.DELETE.')) {
-                return [sprintf("MSG _INBOX.del 3 %d\r\n%s\r\n", strlen('{"success":true}'), '{"success":true}')];
+                // Mux inbox (#118): the DELETE reply echoes on the request's captured reply-to.
+                return [self::muxMsg($replyTo, '{"success":true}')];
             }
             if (!str_contains($bytes, '$JS.API.CONSUMER.CREATE.')) {
                 return [];
@@ -3661,20 +4016,21 @@ final class JetStreamContextTest extends TestCase
             $createSeen++;
 
             if ($createSeen === 1) {
-                // Initial consumer create reply (request sid 1), then delivery on the deliver sid 2:
+                // Initial create reply on the mux inbox, then delivery on the deliver sid 2:
                 // msg1 in order (cseq 1), then bad3 exposing a gap (cseq 3) which triggers the recreate.
                 return [
-                    sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+                    self::muxMsg($replyTo, $reply),
                     $dataFrame(2, $name, 1, 1, 1, 'msg1'),
                     $dataFrame(2, $name, 3, 4, 3, 'bad3'),
                 ];
             }
 
-            // Recreate: msg2 (cseq 1, sseq 2) on the rotated deliver sid 4 BEFORE the create reply on
-            // sid 5, so it is delivered during the create pump - it must not be dropped or storm.
+            // Recreate: msg2 (cseq 1, sseq 2) on the ROTATED deliver sid 3 (mux has no per-request subs,
+            // so the second deliver SUB collapses from the old sid 4 to 3) BEFORE the create reply, so it
+            // is delivered during the create pump - it must not be dropped or storm.
             return [
-                $dataFrame(4, $name, 1, 2, 1, 'msg2'),
-                sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($reply), $reply),
+                $dataFrame(3, $name, 1, 2, 1, 'msg2'),
+                self::muxMsg($replyTo, $reply),
             ];
         };
 
@@ -3718,13 +4074,21 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            // In-order delivery from the current consumer ORD1 (consumer seq 1 -> expected next 2).
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // A STALE delivery from a DIFFERENT consumer instance (ORDX) whose consumer seq (2) would
-            // otherwise match the expected next sequence and be (wrongly) delivered/advanced.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORDX.1.2.2.0.0 5\r\nstale\r\n",
         ]);
+        // Mux inbox (#118): CREATE reply on the captured reply-to; deliveries on the actual deliver sid.
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order delivery from the current consumer ORD1 (consumer seq 1 -> expected next 2).
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // A STALE delivery from a DIFFERENT consumer instance (ORDX) whose consumer seq (2)
+                    // would otherwise match the expected next sequence and be (wrongly) delivered.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORDX.1.2.2.0.0 5\r\nstale\r\n",
+                ],
+            ],
+        );
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -3770,16 +4134,25 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            // In-order msg1 (consumer seq 1, stream seq 1) -> expected next 2, lastStreamSeq 1.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Idle heartbeat: last delivered consumer seq 3 > processed (1) -> tail gap -> recreate.
-            sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
-            // Delete old (sid 3); the create reply is sid 5 - the rotated new-inbox subscribe takes
-            // sid 4 ahead of the create request (#122).
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
+        // Mux inbox (#118): CREATE/DELETE replies on captured reply-tos; deliveries on the actual sid.
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order msg1 (consumer seq 1, stream seq 1) -> expected next 2, lastStreamSeq 1.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Idle heartbeat: last delivered consumer seq 3 > processed (1) -> tail gap -> recreate.
+                    sprintf("HMSG deliver.ord $sid %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
+                ],
+                // Rotated epoch: no further delivery in this test.
+            ],
+        );
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -3815,19 +4188,27 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Initial create (sid 1).
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            // In-order msg1 (consumer seq 1).
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap (consumer seq 3) triggers recovery: delete OK (sid 3), the rotated new-inbox
-            // subscribe takes sid 4, then EVERY create attempt fails (sids 5-7, one per retry) so the
-            // recreate is terminally dead (#114/#122).
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.d 6 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.e 7 %d\r\n%s\r\n", strlen($createError), $createError),
         ]);
+        // Mux inbox (#118): initial create OK, then EVERY recreate create attempt fails (3 retries) so
+        // the recreate is terminally dead; replies echo on captured reply-tos, deliveries on the sid.
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $createError)],
+                static fn (string $rt): array => [self::muxMsg($rt, $createError)],
+                static fn (string $rt): array => [self::muxMsg($rt, $createError)],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order msg1 (consumer seq 1).
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (consumer seq 3) triggers recovery.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -3875,17 +4256,31 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap: delete OK (sid 3), the rotated new-inbox subscribe takes sid 4, the first create
-            // attempt fails (sid 5), the RETRY succeeds (sid 6) as ORD2, and delivery resumes on the
-            // ROTATED deliver inbox (sid 4) from the new consumer instance (#114/#122).
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.d 6 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
-            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
         ]);
+        // Mux inbox (#118): delete OK, first recreate create fails, the retry succeeds as ORD2. The
+        // resumed delivery must arrive AFTER the successful create reply (the recreate adopts a fresh
+        // client-chosen name before each create await and only re-adopts the response name once it
+        // returns), so msg4 rides the successful create's reply on the rotated deliver sid (mux: no
+        // per-request subs, so the single recreate's deliver SUB is sid 3, not 4).
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $createError)],
+                static fn (string $rt): array => [
+                    self::muxMsg($rt, (string) $recreateReply),
+                    "MSG deliver.ord 3 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+                ],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap exposes a missed push -> recovery.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -3929,27 +4324,32 @@ final class JetStreamContextTest extends TestCase
             'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
         ], JSON_THROW_ON_ERROR);
 
-        // The delete request (sid 3) gets NO reply: its wait loop spins on an empty read queue
-        // until the 25 ms request deadline fires -> TimeoutException. The recreate reply and the
-        // resumed delivery are enqueued only when the recreate CREATE request is actually written
-        // (its payload is the only one carrying opt_start_seq 2), so the delete's timeout wait
-        // cannot drain them from the queue first.
+        // Mux inbox (#118): the DELETE request gets NO reply (onDelete omitted), so its wait loop spins
+        // on an empty queue until the 25 ms request deadline fires -> TimeoutException. The recreate
+        // reply and the resumed delivery ride the recreate CREATE's own reply, so the delete's timeout
+        // wait cannot drain them first. The single recreate's rotated deliver SUB is sid 3 under the mux
+        // (no per-request subs), and msg4 must land after the successful create reply (re-adopt point).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap (consumer seq 3) triggers recovery; the queue is empty from here on.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
         ]);
-        $transport->enqueueOnWriteContaining = [
-            // The create request is sid 5 (the rotated new-inbox subscribe took sid 4 after the timed-
-            // out delete's sid 3), and delivery resumes on the rotated inbox sid 4 (#122).
-            '"opt_start_seq":2' => [
-                sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
-                "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+                static fn (string $rt): array => [
+                    self::muxMsg($rt, (string) $recreateReply),
+                    "MSG deliver.ord 3 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+                ],
             ],
-        ];
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (consumer seq 3) triggers recovery; the queue is empty from here on.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(requestTimeoutMs: 25, errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -3998,21 +4398,33 @@ final class JetStreamContextTest extends TestCase
             'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
         ], JSON_THROW_ON_ERROR);
 
+        // Mux inbox (#118): the DELETE reply wait reads a fatal -ERR frame, which handleFrame() raises
+        // as a ConnectionException out of deleteConsumer() without closing the connection; the create-
+        // retry loop still runs and succeeds as ORD2. Replies echo on captured reply-tos; the single
+        // recreate's rotated deliver SUB is sid 3 (no per-request subs), and msg4 rides the successful
+        // create reply (the re-adopt point).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap (consumer seq 3) triggers recovery. The delete request's (sid 3) reply wait
-            // reads the next chunk: a fatal -ERR frame, which handleFrame() raises as a
-            // ConnectionException out of deleteConsumer() without closing the connection.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            "-ERR 'Stale Connection'\r\n",
-            // The rotated new-inbox subscribe took sid 4; the create-retry loop still runs and succeeds
-            // (sid 5) as ORD2; delivery resumes on the rotated inbox (sid 4) (#122).
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen((string) $recreateReply), (string) $recreateReply),
-            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+                static fn (string $rt): array => [
+                    self::muxMsg($rt, (string) $recreateReply),
+                    "MSG deliver.ord 3 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
+                ],
+            ],
+            onDelete: [static fn (string $rt): array => ["-ERR 'Stale Connection'\r\n"]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (consumer seq 3) triggers recovery.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -4057,11 +4469,19 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.2.1.0.0 4\r\nmsg1\r\n", // cseq 1, sseq 2
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.2.4.2.0.0 4\r\nmsg2\r\n", // cseq 2, sseq 4
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.6.3.0.0 4\r\nmsg3\r\n", // cseq 3, sseq 6
         ]);
+        // Mux inbox (#118): CREATE reply on the captured reply-to; deliveries on the actual deliver sid.
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [static fn (string $rt): array => [self::muxMsg($rt, $createReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.2.1.0.0 4\r\nmsg1\r\n", // cseq 1, sseq 2
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.2.4.2.0.0 4\r\nmsg2\r\n", // cseq 2, sseq 4
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.6.3.0.0 4\r\nmsg3\r\n", // cseq 3, sseq 6
+                ],
+            ],
+        );
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -4096,6 +4516,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
         ]);
 
@@ -4120,6 +4542,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -4145,6 +4569,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s%s\r\n", $h, $h + strlen($body), $hdrs, $body),
         ]);
 
@@ -4220,6 +4646,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
@@ -4243,6 +4671,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
@@ -4266,7 +4696,12 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); deliver frames (sid 2) arrive after their SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.eph '] = [
             sprintf(
                 "HMSG deliver.eph 2 fc.reply %d %d\r\n%s\r\n",
                 strlen($fcHeaders),
@@ -4274,7 +4709,7 @@ final class JetStreamContextTest extends TestCase
                 $fcHeaders,
             ),
             "MSG deliver.eph 2 5\r\nhello\r\n",
-        ]);
+        ];
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -4312,14 +4747,20 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); the ordered deliver inbox (_INBOX.JS.PUSH.*) is sid 2,
+        // so its frame arrives after the deliver SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB _INBOX.JS.ORD'] = [
             sprintf(
                 "HMSG _INBOX.JS.ORD.x 2 %d %d\r\n%s\r\n",
                 strlen($hbHeaders),
                 strlen($hbHeaders),
                 $hbHeaders,
             ),
-        ]);
+        ];
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -4354,13 +4795,18 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); deliver frames (sid 2) arrive after the deliver SUB.
+        $this->muxReplies($transport, [
             // Ephemeral push consumer create response.
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB _INBOX.JS.ORD'] = [
             // A delivery with no $JS.ACK reply subject - no ordering metadata.
             "MSG _INBOX.JS.ORD.x 2 5\r\nhello\r\n",
             // A delivery with a plain (non-$JS.ACK) reply subject - also no ordering metadata.
             "MSG _INBOX.JS.ORD.x 2 plain.reply 6\r\nhello2\r\n",
-        ]);
+        ];
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -4404,11 +4850,16 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); the deliver frame (sid 2) arrives after the deliver SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB _INBOX.JS.ORD'] = [
             // 10 tokens: claims the $JS.ACK form but matches neither the 9-token v1 form nor the
             // >= 11-token v2 form, so it is unparseable even for the tolerant parser.
             "MSG _INBOX.JS.ORD.x 2 \$JS.ACK.EVENTS.ORD_BAD_ACK.1.1.1.0.0.X 4\r\nmsg1\r\n",
-        ]);
+        ];
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -4457,11 +4908,16 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); deliver frames (sid 2) arrive after the deliver SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB _INBOX.JS.ORD'] = [
             // Two consecutive 10-token (unparseable) ack subjects on the same consumer instance.
             "MSG _INBOX.JS.ORD.x 2 \$JS.ACK.EVENTS.ORD_BAD_ACK.1.1.1.0.0.X 4\r\nmsg1\r\n",
             "MSG _INBOX.JS.ORD.x 2 \$JS.ACK.EVENTS.ORD_BAD_ACK.2.2.2.0.0.X 4\r\nmsg2\r\n",
-        ]);
+        ];
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -4508,24 +4964,35 @@ final class JetStreamContextTest extends TestCase
             'Nats-Last-Consumer' => '3',
         ]);
 
+        // Mux inbox (#118): CREATE/DELETE replies on captured reply-tos. Both epochs' unparseable ack
+        // frames are delivered best-effort (the null-metadata branch runs before the name filter), so
+        // the rotated epoch's frame can land on its deliver sid regardless of the re-adopt point.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            // Unparseable (10-token) ack subject on the first epoch -> first error.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0.X 4\r\nbad1\r\n",
-            // In-order delivery (consumer seq 1 / stream seq 1) so the tail-gap heartbeat below has
-            // a processed baseline to compare against.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Tail-gap heartbeat -> recreate: delete ORD1 (sid 3), rotate the deliver inbox (new
-            // subscribe sid 4), create ORD2 (sid 5). The second epoch delivers on the rotated inbox
-            // sid 4 (#122).
-            sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
-            // Unparseable ack subject on the SECOND epoch -> the latch re-armed, second error.
-            "MSG deliver.ord 4 \$JS.ACK.EVENTS.ORD2.1.1.1.0.0.X 4\r\nbad2\r\n",
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // Unparseable (10-token) ack subject on the first epoch -> first error.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0.X 4\r\nbad1\r\n",
+                    // In-order delivery so the tail-gap heartbeat below has a processed baseline.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Tail-gap heartbeat -> recreate (a new consumer epoch).
+                    sprintf("HMSG deliver.ord $sid %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
+                ],
+                static fn (int $sid): array => [
+                    // Unparseable ack subject on the SECOND epoch -> the latch re-armed, second error.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD2.1.1.1.0.0.X 4\r\nbad2\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -4568,21 +5035,29 @@ final class JetStreamContextTest extends TestCase
         $deleteError = '{"error":{"code":404,"description":"consumer not found"}}';
         $recreateReply = $createReply('ORD2');
 
+        // Mux inbox (#118): CREATE replies and the DELETE error echo on captured reply-tos; deliveries
+        // ride the deliver SUB on its actual sid. deleteConsumer's JetStreamException is caught and the
+        // recreate still proceeds and succeeds.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Initial create (sid 1).
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            // In-order message (consumer seq 1 / stream seq 1).
-            "MSG _INBOX.JS.ORD.test 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Out-of-order message (consumer seq jumps to 3, triggers recreation).
-            "MSG _INBOX.JS.ORD.test 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            // deleteConsumer returns an error - JetStreamException caught.
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteError), $deleteError),
-            // createEphemeralPushConsumer still proceeds and succeeds (sid 5 - the rotated new-inbox
-            // subscribe took sid 4 ahead of the create request) (#122).
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $recreateReply)],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteError)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order message (consumer seq 1 / stream seq 1).
+                    "MSG _INBOX.JS.ORD.test $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Out-of-order message (consumer seq jumps to 3, triggers recreation).
+                    "MSG _INBOX.JS.ORD.test $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -4628,13 +5103,17 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
         ], blockWhenEmpty: true);
-        $transport->enqueueOnWriteContaining = [
-            '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply)],
-            // The create request is sid 5: the rotated deliver-inbox subscribe takes sid 4 first (#122).
-            'by_start_sequence' => [sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
-        ];
+        // Mux inbox (#118): the watchdog recreate's DELETE and CREATE replies echo on the request's
+        // captured reply-to (no per-request sids); no delivery frames (the consumer stays silent).
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+        );
 
         $errors = [];
         $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -4682,6 +5161,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
         ]);
 
@@ -4726,8 +5207,10 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], blockWhenEmpty: true);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
 
         $errors = [];
         $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -4777,8 +5260,10 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
         ], blockWhenEmpty: true);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+        ]);
 
         // pingIntervalSeconds: 0 disables the connection ping timer, so the only repeat timer the
         // subscription can add is the watchdog.
@@ -4830,14 +5315,16 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
         ], blockWhenEmpty: true);
-        // Feed the gap frame only once the watchdog recreate has written its DELETE.ORD1 - i.e. while
-        // that recreate is suspended on its delete await (no delete reply is enqueued, so it stays
-        // parked). That is exactly the window in which a concurrent second recreate must be suppressed.
-        $transport->enqueueOnWriteContaining = [
-            '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [$gapFrame],
-        ];
+        // Mux inbox (#118): the initial create reply echoes on its captured reply-to. The DELETE.ORD1's
+        // reply is NEVER sent (onDelete emits only the gap frame, no reply), so the watchdog recreate
+        // stays parked on its delete await - exactly the window in which the concurrent dispatch-driven
+        // recreate must be suppressed. The gap frame rides that DELETE write on the still-current sid 2.
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))]],
+            onDelete: [static fn (string $rt): array => [$gapFrame]],
+        );
 
         $errors = [];
         // Short request timeout so the parked delete/create fall through quickly for clean teardown.
@@ -4887,16 +5374,18 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
         ], blockWhenEmpty: true);
-        // Answer the first (watchdog) recreate's DELETE.ORD1 (request sid 3) and its by_start_sequence
-        // CREATE (request sid 4) so it SUCCEEDS, leaving ORD2 live. The second recreate's DELETE.ORD2 is
-        // intentionally never answered - its presence on the wire is all this test needs.
-        $transport->enqueueOnWriteContaining = [
-            '$JS.API.CONSUMER.DELETE.EVENTS.ORD1' => [sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply)],
-            // The create request is sid 5: the rotated deliver-inbox subscribe takes sid 4 first (#122).
-            'by_start_sequence' => [sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2'))],
-        ];
+        // Mux inbox (#118): answer the first (watchdog) recreate's DELETE.ORD1 and CREATE (as ORD2) on
+        // their captured reply-tos so it SUCCEEDS, leaving ORD2 live. The second recreate's DELETE.ORD2
+        // is intentionally never answered (onDelete has one entry) - its presence on the wire suffices.
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+        );
 
         $errors = [];
         $options = new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -4946,8 +5435,10 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
         ], blockWhenEmpty: true);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
+        ]);
 
         $errors = [];
         $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -5016,6 +5507,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorAck), $errorAck),
         ]);
 
@@ -5046,6 +5539,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s\r\n", $h, $h, $hdrs),
         ]);
 
@@ -5070,6 +5565,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($badPayload), $badPayload),
         ]);
 
@@ -5093,6 +5590,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
@@ -5117,6 +5616,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($payload), $payload),
         ]);
 
@@ -5139,6 +5640,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($payload), $payload),
         ]);
 
@@ -5390,6 +5893,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
             'HMSG _INBOX.b 2 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
@@ -5585,6 +6090,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
@@ -5614,25 +6121,36 @@ final class JetStreamContextTest extends TestCase
         ], JSON_THROW_ON_ERROR);
         $deleteReply = '{"success":true}';
 
+        // Mux inbox (#118): replies echo on captured reply-tos; deliver1 is sid 2. The recreate deletes
+        // ORD1, create attempt 1's reply is "lost" (a -ERR raised as ConnectionException), attempt 2
+        // succeeds as ORD2, then the orphaned attempt-1 name is best-effort-reaped (a second DELETE).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            // Initial ephemeral create (sid 1) -> current consumer ORD1.
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            // In-order msg1 (consumer seq 1, stream seq 1) -> expected next 2, lastStreamSeq 1.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap (consumer seq 3) triggers recovery.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            // Recreate: delete the current ORD1 (sid 3) ...
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            // ... create attempt 1 (sid 4) -> a -ERR raised as ConnectionException: its reply is
-            // "lost" but the consumer may already exist server-side (the orphan).
-            "-ERR 'Stale Connection'\r\n",
-            // ... create attempt 2 (sid 5) succeeds as ORD2 and is adopted.
-            sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
-            // ... best-effort reap of the orphaned attempt-1 name (sid 6).
-            sprintf("MSG _INBOX.e 6 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                // Attempt 1: a -ERR (ConnectionException) - the reply is lost, the consumer may exist.
+                static fn (string $rt): array => ["-ERR 'Stale Connection'\r\n"],
+                // Attempt 2 succeeds as ORD2 and is adopted.
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            // The current ORD1 delete, then the best-effort reap of the orphaned attempt-1 name.
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order msg1 (consumer seq 1, stream seq 1) -> expected next 2, lastStreamSeq 1.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (consumer seq 3) triggers recovery.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -5692,22 +6210,33 @@ final class JetStreamContextTest extends TestCase
             'Nats-Last-Consumer' => '9',
         ]);
 
+        // Mux inbox (#118): CREATE/DELETE replies echo on captured reply-tos; deliver1 is sid 2. The
+        // orphan's PLAIN idle heartbeat must arrive on the OLD inbox AFTER the recreate unsubscribes it,
+        // so it rides the successful recreate create's reply (which precedes the sid-2 UNSUB) - it must
+        // then be dropped: no tail-gap check, no second recreate.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            // In-order msg1 (consumer seq 1, stream seq 1) on the ORIGINAL inbox (sid 2).
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Data gap (consumer seq 3) -> the ONE legitimate recreate: delete ORD1 (sid 3), rotate the
-            // deliver inbox (subscribe sid 4), create ORD2 (sid 5); the original inbox (sid 2) is
-            // unsubscribed.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
-            // The orphan's PLAIN idle heartbeat arrives on the OLD, now-unsubscribed inbox (sid 2). It
-            // must be dropped - no tail-gap check, no second recreate.
-            sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($orphanHb), strlen($orphanHb), $orphanHb),
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [
+                    self::muxMsg($rt, $createReply('ORD2')),
+                    sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($orphanHb), strlen($orphanHb), $orphanHb),
+                ],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order msg1 (consumer seq 1, stream seq 1) on the ORIGINAL inbox (sid 2).
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Data gap (consumer seq 3) -> the ONE legitimate recreate.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(requestTimeoutMs: 50, errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -5750,17 +6279,27 @@ final class JetStreamContextTest extends TestCase
         ], JSON_THROW_ON_ERROR);
         $deleteReply = '{"success":true}';
 
+        // Mux inbox (#118): CREATE/DELETE replies echo on captured reply-tos; deliveries ride the
+        // deliver SUB sid. deliver1 is sid 2 (mux is sid 1), so the rotation still UNSUBs sid 2.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('ORD1')), $createReply('ORD1')),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Data gap -> recreate: delete ORD1 (sid 3), subscribe the rotated inbox (sid 4), create
-            // ORD2 (sid 5). The original inbox (sid 2) is then unsubscribed.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createReply('ORD2')), $createReply('ORD2')),
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Data gap -> recreate.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -5799,22 +6338,33 @@ final class JetStreamContextTest extends TestCase
         $deleteReply = '{"success":true}';
         $createError = '{"error":{"code":404,"description":"stream not found"}}';
 
+        // Mux inbox (#118): initial create OK, every recreate create fails (terminal). Replies echo on
+        // captured reply-tos; deliver1 is sid 2. The late "tail" frame must arrive AFTER the terminal
+        // teardown unsubscribes sid 2, so it rides the LAST failing create's reply (post-teardown drop).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Gap triggers recovery: delete OK (sid 3), the rotated deliver-inbox subscribe takes sid 4,
-            // every create attempt fails (sids 5-7) -> the recreate is terminally dead (#122).
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
-            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
-            sprintf("MSG _INBOX.c 5 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.d 6 %d\r\n%s\r\n", strlen($createError), $createError),
-            sprintf("MSG _INBOX.e 7 %d\r\n%s\r\n", strlen($createError), $createError),
-            // A late frame on the (now torn-down) ORIGINAL deliver inbox (sid 2): it must NOT be
-            // delivered - the terminal teardown unsubscribed both the rotated and the original inbox.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.2.2.2.0.0 4\r\ntail\r\n",
         ]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $createError)],
+                static fn (string $rt): array => [self::muxMsg($rt, $createError)],
+                static fn (string $rt): array => [
+                    self::muxMsg($rt, $createError),
+                    "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.2.2.2.0.0 4\r\ntail\r\n",
+                ],
+            ],
+            onDelete: [static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)]],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap triggers recovery.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -5854,17 +6404,21 @@ final class JetStreamContextTest extends TestCase
             'Description' => $desc,
         ]);
 
-        $frames = [
+        $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); the status frames (sid 2) arrive after the deliver SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-        ];
+        ]);
+        $statusFrames = [];
         foreach ([['409', 'Consumer Deleted'], ['503', 'No Responders'], ['408', 'Request Timeout']] as [$code, $desc]) {
             $block = $status($code, $desc);
-            $frames[] = sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($block), strlen($block), $block);
+            $statusFrames[] = sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($block), strlen($block), $block);
         }
+        $transport->enqueueOnWriteContaining['SUB deliver.eph '] = $statusFrames;
 
-        $transport = new FakeTransport($frames);
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
@@ -5901,12 +6455,17 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        // CREATE reply via the mux inbox (#118); the status frames (sid 2) arrive after the deliver SUB.
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.eph '] = [
             // A status-100 idle heartbeat: intercepted and NOT surfaced.
             sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb),
             // A terminal 409 Consumer Deleted: intercepted AND surfaced via the error listener.
             sprintf("HMSG deliver.eph 2 %d %d\r\n%s\r\n", strlen($terminal), strlen($terminal), $terminal),
-        ]);
+        ];
 
         $errors = [];
         $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -5951,6 +6510,8 @@ final class JetStreamContextTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 

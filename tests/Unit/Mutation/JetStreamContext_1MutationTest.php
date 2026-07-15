@@ -22,15 +22,25 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
-     * @param list<string> $extraFrames
+     * Connects a client and arms the muxed request-inbox responder (#118) with the given reply frames.
+     *
+     * Post-#118 request()/requestMany() no longer subscribe a fresh inbox per call: ONE long-lived
+     * wildcard "<base>.*" serves every reply and each request publishes reply-to "<base>.<token>". A
+     * pre-seeded fixed-subject "MSG _INBOX.a <sid> ..." therefore never reaches the waiting request and
+     * it times out. So instead of seeding the reply frames into the read queue, they are handed to
+     * {@see muxReplies()}, which rewrites each frame's subject+sid onto the actual captured reply-to and
+     * delivers them FIFO in request order (mirroring a real server).
+     *
+     * @param list<string> $muxFrames Pre-built MSG/HMSG reply frames; only their subject+sid get rewritten.
      *
      * @return array{NatsClient, FakeTransport}
      */
-    private function connect(array $extraFrames): array
+    private function connect(array $muxFrames): array
     {
-        $transport = new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $extraFrames));
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
+        $this->muxReplies($transport, $muxFrames);
 
         return [$client, $transport];
     }
@@ -38,6 +48,72 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
     private static function msg(string $json, string $inbox = '_INBOX.a', int $sid = 1): string
     {
         return sprintf("MSG %s %d %d\r\n%s\r\n", $inbox, $sid, strlen($json), $json);
+    }
+
+    /**
+     * Installs a dynamic responder that mirrors a real NATS server against the muxed request inbox
+     * (#118). It learns the mux base and sid from the wildcard "SUB <base>.* <sid>" frame; then, for
+     * each request PUB/HPUB whose reply-to lives under that base, it pops the next queued reply frame
+     * and re-emits it on the CAPTURED reply-to with the mux sid. Frames are delivered FIFO in the order
+     * requests are written, so a method that issues several requests (retry loop, create->update,
+     * pagination) still gets its replies in sequence. Surplus frames stay unconsumed - a trap frame that
+     * a correct control flow must never reach is simply never delivered.
+     *
+     * @param list<string> $frames
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+        $muxSid = 1;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base, &$muxSid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base+sid from the wildcard registration "SUB <base>.* <sid>".
+                $parts = explode(' ', $head);
+                $subject = $parts[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip trailing "*" -> "_INBOX.<hex>."
+                    $muxSid = (int) ($parts[2] ?? 1);
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo, $muxSid)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid, preserving the payload/header bytes and declared lengths verbatim so the reply's
+     * content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo, int $sid): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = (string) $sid; // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
     }
 
     // ── Constructor default: publishRetryAttempts == 3 (lines 54) ─────────────────────────────────
@@ -209,7 +285,9 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
 
         $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'], ['max_age' => 777])->await();
 
-        $update = $transport->writes[6];
+        // Post-#118 there is ONE mux SUB (writes[2]) and NO per-request SUB/UNSUB, so the two request
+        // PUBs are writes[3] (create) and writes[4] (update) - the update is no longer at writes[6].
+        $update = $transport->writes[4];
         self::assertStringContainsString('$JS.API.STREAM.UPDATE.ORDERS', $update);
         self::assertStringContainsString('"subjects":["orders.*"]', $update); // kills subjects-drop mutants
         self::assertStringContainsString('"max_age":777', $update);           // kills options-drop mutant

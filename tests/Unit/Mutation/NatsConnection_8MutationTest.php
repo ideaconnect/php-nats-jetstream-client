@@ -175,28 +175,28 @@ final class NatsConnection_8MutationTest extends TestCase
     {
         $transport = new FakeTransport($this->infoAndPong());
 
-        $inbox = null;
-        $sid = null;
         $payload = str_repeat('x', 300);
 
-        // Model the responder: capture the request-inbox subscription's subject+sid from its SUB, then
-        // - the instant the request PUB hits the wire - enqueue the reply split into one-byte chunks so
-        // every read but the last is a partial (byte-consuming, frame-incomplete) read.
-        $transport->onWrite = function (string $bytes) use (&$inbox, &$sid, $payload): array {
-            if (preg_match('/^SUB (\S+) (\d+)\r\n$/', $bytes, $m) === 1) {
-                $inbox = $m[1];
-                $sid = $m[2];
-
+        // Model the responder under the muxed request inbox (#118): the request PUB carries its
+        // reply-to ("<muxBase>.<token>") as the 3rd header token, and every reply is delivered on the
+        // one long-lived wildcard subscription "<muxBase>.*" (sid 1). The instant the request PUB hits
+        // the wire, echo the reply on that captured reply-to, split into one-byte chunks so every read
+        // but the last is a partial (byte-consuming, frame-incomplete) read.
+        $transport->onWrite = static function (string $bytes) use ($payload): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB request.subject ')) {
                 return [];
             }
 
-            if ($inbox !== null && str_starts_with($bytes, 'PUB request.subject ')) {
-                $frame = 'MSG ' . $inbox . ' ' . $sid . ' ' . strlen($payload) . "\r\n" . $payload . "\r\n";
-
-                return str_split($frame); // one byte per chunk: ~327 partial reads before completion
+            $replyTo = explode(' ', $head)[2] ?? ''; // PUB <subject> <replyTo> <len>
+            if ($replyTo === '') {
+                return [];
             }
 
-            return [];
+            // Routed by the suffix token to this request's waiter on the mux sid (1).
+            $frame = 'MSG ' . $replyTo . ' 1 ' . strlen($payload) . "\r\n" . $payload . "\r\n";
+
+            return str_split($frame); // one byte per chunk: ~347 partial reads before completion
         };
 
         $connection = $this->connect($transport);

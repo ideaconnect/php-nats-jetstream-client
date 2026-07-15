@@ -21,6 +21,74 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
 {
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
+    /**
+     * Post-#118 the request inbox is MUXED: request()/requestJson() no longer subscribe a fresh inbox
+     * per call; instead ONE long-lived wildcard "<base>.*" (sid 1 for a request-first test) serves every
+     * reply, and each request publishes reply-to "<base>.<token>" and routes by that token. A pre-seeded
+     * "MSG _INBOX.a 1 ..." therefore no longer reaches the waiting request (its subject is not the
+     * request's "<base>.<token>", so dispatchMuxReply drops it and the request times out).
+     *
+     * This installs a dynamic responder mirroring a real server: it learns the mux base from the wildcard
+     * SUB and, for each request PUB/HPUB (a publish whose reply-to lives under that base), pops the next
+     * reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1). Frames are delivered FIFO
+     * in write order, so a method issuing several requests still gets its replies in sequence. Only request
+     * replies belong here; subscription deliveries (a push/pull deliver subject) are NOT mux replies.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox (fetch/direct-get) - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
     // ─── fetchBatch: terminal status boundary (>= 400) ──────────────────────
 
     /**
@@ -84,9 +152,8 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         // kills UnwrapTrim @ 1658
         $ack = '{"stream":"SCHED","seq":1,"duplicate":false}';
 
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -225,9 +292,8 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills PregMatchRemoveCaret @ 1696
         $ack = '{"stream":"SCHED","seq":2,"duplicate":false}';
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -273,15 +339,52 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
             'Nats-Last-Consumer' => '9x',
         ]);
 
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen((string) $createReply), (string) $createReply),
-            // In-order msg1 -> expectedConsumerSeq advances to 2.
-            "MSG deliver.ord 2 \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
-            // Heartbeat with non-numeric last-consumer "9x".
-            sprintf("HMSG deliver.ord 2 %d %d\r\n%s\r\n", strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
-        ]);
+        $createReplyStr = (string) $createReply;
+
+        // Post-#118 the request inbox is MUXED, so the CONSUMER.CREATE reply must be echoed on the
+        // request's captured mux reply-to (sid learned from the wildcard SUB), and the deliver frames must
+        // be emitted only once the deliver subscription exists - otherwise they would be read (and dropped,
+        // their sid not yet subscribed) while the CREATE request is still awaiting its reply. The deliver
+        // subject is client-generated ("_INBOX.JS.ORD.<hex>"); frames dispatch by SID, so each is emitted
+        // on the sid the server actually assigned rather than a hard-coded value.
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $muxSid = 1;
+        $transport->onWrite = static function (string $bytes) use ($createReplyStr, $hbHeaders, &$muxSid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+            $parts = explode(' ', $head);
+
+            if (str_starts_with($head, 'SUB ')) {
+                $subject = $parts[1] ?? '';
+                if (str_ends_with($subject, '.*')) {
+                    $muxSid = (int) ($parts[2] ?? 1); // learn the mux sid from its wildcard SUB
+                } elseif (str_starts_with($subject, '_INBOX.JS.ORD.')) {
+                    // In-order msg1 -> expectedConsumerSeq advances to 2; then the non-numeric heartbeat.
+                    $sid = (int) ($parts[2] ?? 0);
+
+                    return [
+                        sprintf("MSG deliver.ord %d \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n", $sid),
+                        sprintf("HMSG deliver.ord %d %d %d\r\n%s\r\n", $sid, strlen($hbHeaders), strlen($hbHeaders), $hbHeaders),
+                    ];
+                }
+
+                return [];
+            }
+
+            if ((str_starts_with($head, 'PUB ') || str_starts_with($head, 'HPUB '))
+                && str_contains($bytes, '$JS.API.CONSUMER.CREATE.EVENTS')
+            ) {
+                $replyTo = $parts[2] ?? '';
+
+                return $replyTo === ''
+                    ? []
+                    : [sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $muxSid, strlen($createReplyStr), $createReplyStr)];
+            }
+
+            return [];
+        };
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
 
@@ -314,9 +417,8 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         // kills UnwrapArrayValues @ 1799
         $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC"}}';
 
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -341,9 +443,8 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         // kills ArrayOneItem @ 1801
         $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC"}}';
 
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
         $client = new NatsClient(new NatsOptions(), $transport);
@@ -483,9 +584,8 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     public function testEmptyRequestBodyEncodesAsObject(): void
     {
         // kills CastObject @ 1918
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen('{"paused":false}'), '{"paused":false}'),
         ]);
         $client = new NatsClient(new NatsOptions(), $transport);

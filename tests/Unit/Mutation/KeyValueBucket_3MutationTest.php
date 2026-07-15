@@ -20,27 +20,110 @@ use PHPUnit\Framework\TestCase;
  */
 final class KeyValueBucket_3MutationTest extends TestCase
 {
+    /**
+     * Reply frames stashed by {@see queue()} for {@see connected()} to deliver over the muxed request
+     * inbox (#118). Post-#118 request()/requestMany() no longer subscribe a fresh inbox per call; one
+     * long-lived wildcard "_INBOX.<base>.*" (sid 1) serves every reply and each request routes by its
+     * "_INBOX.<base>.<token>" reply-to. A pre-seeded fixed-subject frame therefore no longer reaches the
+     * waiting request, so replies are echoed dynamically on each request's captured reply-to instead.
+     *
+     * @var list<string>
+     */
+    private array $pendingReplies = [];
+
     /** A minimal connected client driven by a pre-seeded FakeTransport (no real sockets). */
     private function connected(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        // Deliver the stashed reply frames over the mux inbox (echoed on each request's captured reply-to
+        // with the mux sid 1), not as pre-seeded fixed-subject reads which the mux router would drop.
+        $this->muxReplies($transport, $this->pendingReplies);
+        $this->pendingReplies = [];
+
+        // A small request timeout keeps any genuine timeout (e.g. a wiring mistake) failing fast instead
+        // of stalling on the 10 s default; every test here delivers all of its replies, so it never fires.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1_500), $transport);
         $client->connect()->await();
 
         return $client;
     }
 
     /**
-     * Builds a transport read queue: the INFO + PONG handshake followed by the supplied reply frames.
+     * Seeds only the INFO + PONG handshake reads on the transport and stashes the supplied reply frames
+     * for {@see connected()} to deliver dynamically over the mux inbox (the handshake precedes any
+     * request or mux subscription, so it is the only content that can be safely pre-queued).
      *
      * @return list<string>
      */
     private function queue(string ...$frames): array
     {
-        return array_values([
+        $this->pendingReplies = array_values($frames);
+
+        return [
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            ...$frames,
-        ]);
+        ];
+    }
+
+    /**
+     * Installs a dynamic mux-aware responder mirroring a real server (#118): it learns the mux base from
+     * the wildcard "SUB _INBOX.<base>.* <sid>" and, for each request PUB/HPUB whose reply-to lives under
+     * that base, pops the next stashed frame FIFO and re-emits it on the CAPTURED reply-to with the mux
+     * sid. Frames are delivered in the order requests are written, so a method issuing several requests
+     * (createKey's put -> get -> put) still receives its replies in sequence.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB _INBOX.<base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox - not a mux request awaiting a reply.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
     }
 
     /** Builds a plain MSG reply frame on the given sid. */

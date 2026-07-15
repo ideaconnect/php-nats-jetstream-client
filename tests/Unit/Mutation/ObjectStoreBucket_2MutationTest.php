@@ -75,10 +75,79 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
 
     private function connect(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        // A small request timeout keeps a genuinely mis-wired reply from hanging on the 10 s default.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $transport);
         $client->connect()->await();
 
         return $client;
+    }
+
+    /**
+     * Installs a dynamic mux-inbox responder (#118). Post-#118 every Object Store operation that awaits a
+     * reply - Direct Get (info/single-chunk get), JS publish acks (put/putStream chunk+meta), and
+     * CONSUMER.CREATE/DELETE - funnels through request(), so their replies land on the ONE shared wildcard
+     * inbox "_INBOX.<base>.*" rather than a per-request inbox. This learns the mux base from the wildcard
+     * SUB and, for each request PUB/HPUB (a publish whose reply-to lives under that base), pops the next
+     * reply frame FIFO and re-emits it on the CAPTURED reply-to with the mux sid (1), so a pre-built reply
+     * reaches its request unchanged in content - only its addressing is corrected.
+     *
+     * Only request replies belong here; subscription deliveries (the pull fetch inbox used by the
+     * multi-chunk download path) are NOT mux replies - enqueue those on their SUB via
+     * FakeTransport::$enqueueOnWriteContaining so they arrive with the sid the server assigned.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox (the fetch inbox) - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
     }
 
     // ------------------------------------------------------------------------------------------
@@ -94,10 +163,15 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()), // lookup (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),     // chunk1 (sid 2)
-            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),     // chunk2 (sid 3)
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),     // meta  (sid 4)
+        ]);
+        // All four awaited replies are mux request replies, popped FIFO in write order: the concurrent
+        // previous-revision lookup issues its Direct Get first, then the two chunk publish acks, then the
+        // meta publish ack.
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()), // lookup
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),     // chunk1
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),     // chunk2
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),     // meta
         ]);
 
         $client = $this->connect($transport);
@@ -137,19 +211,22 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
     public function testGetResolvesExactlyEightLinkHopsToRealObject(): void
     {
         $nuid = 'nuidhops008';
-        $queue = [self::INFO, "PONG\r\n"];
 
-        // 8 links: l0 -> l1 -> ... -> l7 -> obj. info() reply per hop (sids 1..8), then the real object.
+        // 8 links: l0 -> l1 -> ... -> l7 -> obj. One Direct Get info() reply per hop, then the real
+        // object, then its single chunk - all mux request replies, popped FIFO in hop order.
+        $frames = [];
         $sid = 1;
         for ($i = 0; $i < 8; $i++) {
             $target = $i === 7 ? 'obj' : 'l' . ($i + 1);
-            $queue[] = $this->directMetaReply('assets', 'l' . $i, ['options' => ['link' => ['bucket' => 'assets', 'name' => $target]]], $sid++);
+            $frames[] = $this->directMetaReply('assets', 'l' . $i, ['options' => ['link' => ['bucket' => 'assets', 'name' => $target]]], $sid++);
         }
         // Real single-chunk object reached at depth 8.
-        $queue[] = $this->directMetaReply('assets', 'obj', ['nuid' => $nuid, 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], $sid++);
-        $queue[] = $this->directChunkReply('hello', $sid++);
+        $frames[] = $this->directMetaReply('assets', 'obj', ['nuid' => $nuid, 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], $sid++);
+        $frames[] = $this->directChunkReply('hello', $sid++);
 
-        $client = $this->connect(new FakeTransport($queue));
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, $frames);
+        $client = $this->connect($transport);
 
         // kills IncrementInteger @ 374 (start depth 0, not 1), GreaterThan @ 386 (> not >=),
         // IncrementInteger @ 398 (depth + 1, not + 2): all three would throw before reaching depth 8.
@@ -166,12 +243,14 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
     public function testGetTooManyHopsMessageIsExact(): void
     {
         $linkMeta = ['options' => ['link' => ['bucket' => 'assets', 'name' => 'loop.txt']]];
-        $queue = [self::INFO, "PONG\r\n"];
+        $frames = [];
         for ($i = 1; $i <= 9; $i++) {
-            $queue[] = $this->directMetaReply('assets', 'loop.txt', $linkMeta, $i);
+            $frames[] = $this->directMetaReply('assets', 'loop.txt', $linkMeta, $i);
         }
 
-        $client = $this->connect(new FakeTransport($queue));
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, $frames);
+        $client = $this->connect($transport);
 
         // kills Concat/ConcatOperandRemoval @ 387 (x4) - exact message, name interpolated in place.
         try {
@@ -197,11 +276,13 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            // info('shortcut') in assets -> object link pointing at bucket 'other', name 'doc.txt' (sid 1).
+        ]);
+        $this->muxReplies($transport, [
+            // info('shortcut') in assets -> object link pointing at bucket 'other', name 'doc.txt'.
             $this->directMetaReply('assets', 'shortcut', ['options' => ['link' => ['bucket' => 'other', 'name' => 'doc.txt']]], 1),
-            // info('doc.txt') resolved in the OTHER bucket (sid 2).
+            // info('doc.txt') resolved in the OTHER bucket.
             $this->directMetaReply('other', 'doc.txt', ['nuid' => $nuid, 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 2),
-            // single chunk Direct Get (sid 3).
+            // single chunk Direct Get.
             $this->directChunkReply('hello', 3),
         ]);
 
@@ -227,6 +308,8 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directMetaReply('assets', 'bucket-link', ['options' => ['link' => ['bucket' => 'other-bucket']]], 1),
         ]);
 
@@ -254,16 +337,18 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
      */
     public function testGetToCallbackResolvesExactlyEightLinkHops(): void
     {
-        $queue = [self::INFO, "PONG\r\n"];
+        $frames = [];
         $sid = 1;
         for ($i = 0; $i < 8; $i++) {
             $target = $i === 7 ? 'obj' : 'l' . ($i + 1);
-            $queue[] = $this->directMetaReply('assets', 'l' . $i, ['options' => ['link' => ['bucket' => 'assets', 'name' => $target]]], $sid++);
+            $frames[] = $this->directMetaReply('assets', 'l' . $i, ['options' => ['link' => ['bucket' => 'assets', 'name' => $target]]], $sid++);
         }
-        $queue[] = $this->directMetaReply('assets', 'obj', ['nuid' => 'nuidcbhops8', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], $sid++);
-        $queue[] = $this->directChunkReply('hello', $sid++);
+        $frames[] = $this->directMetaReply('assets', 'obj', ['nuid' => 'nuidcbhops8', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], $sid++);
+        $frames[] = $this->directChunkReply('hello', $sid++);
 
-        $client = $this->connect(new FakeTransport($queue));
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, $frames);
+        $client = $this->connect($transport);
 
         $captured = '';
         // kills IncrementInteger @ 446, GreaterThan @ 459, IncrementInteger @ 471.
@@ -285,12 +370,14 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
     public function testGetToCallbackTooManyHopsMessageIsExact(): void
     {
         $linkMeta = ['options' => ['link' => ['bucket' => 'assets', 'name' => 'loop.txt']]];
-        $queue = [self::INFO, "PONG\r\n"];
+        $frames = [];
         for ($i = 1; $i <= 9; $i++) {
-            $queue[] = $this->directMetaReply('assets', 'loop.txt', $linkMeta, $i);
+            $frames[] = $this->directMetaReply('assets', 'loop.txt', $linkMeta, $i);
         }
 
-        $client = $this->connect(new FakeTransport($queue));
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, $frames);
+        $client = $this->connect($transport);
 
         // kills Concat/ConcatOperandRemoval @ 460 (x4).
         try {
@@ -316,11 +403,19 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $meta,                                                                          // info() (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),           // create consumer (sid 2)
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nXXX\r\n",                                         // corrupted chunk 1
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nYYY\r\n",                                         // corrupted chunk 2
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // delete consumer (sid 4)
+        ]);
+        // The two chunks arrive on the pull fetch inbox (sid 2: mux SUB=1, the ephemeral CONSUMER.CREATE
+        // is a mux request, fetch SUB=2), not the mux inbox - enqueue on the fetch SUB. Bodies corrupted.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nXXX\r\n",
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nYYY\r\n",
+            ],
+        ];
+        $this->muxReplies($transport, [
+            $meta,                                                                          // info() Direct Get
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),           // CONSUMER.CREATE
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // CONSUMER.DELETE
         ]);
 
         $client = $this->connect($transport);
@@ -347,7 +442,10 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $meta, // info() (sid 1) - no further frames; the real code must not pull anything.
+        ]);
+        // Only the info() Direct Get is answered; the real code must not pull anything for a 0-chunk object.
+        $this->muxReplies($transport, [
+            $meta,
         ]);
 
         $client = $this->connect($transport);
@@ -382,11 +480,19 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $meta,                                                                          // info() (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),           // create consumer (sid 2)
-            "MSG _INBOX.JS.FETCH.c 3 3\r\nabc\r\n",
-            "MSG _INBOX.JS.FETCH.c 3 3\r\ndef\r\n",
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // delete consumer (sid 4)
+        ]);
+        // The two chunks arrive on the pull fetch inbox (sid 2: mux SUB=1, CONSUMER.CREATE is a mux
+        // request, fetch SUB=2), not the mux inbox - enqueue them on the fetch SUB.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                "MSG _INBOX.JS.FETCH.c 2 3\r\nabc\r\n",
+                "MSG _INBOX.JS.FETCH.c 2 3\r\ndef\r\n",
+            ],
+        ];
+        $this->muxReplies($transport, [
+            $meta,                                                                          // info() Direct Get
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),           // CONSUMER.CREATE
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // CONSUMER.DELETE
         ]);
 
         $client = $this->connect($transport);
@@ -420,8 +526,10 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $meta,                                                                      // info() (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($createError), $createError), // create consumer -> error (sid 2)
+        ]);
+        $this->muxReplies($transport, [
+            $meta,                                                                      // info() Direct Get
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($createError), $createError), // CONSUMER.CREATE -> error
             // No delete reply queued: the real code never deletes a null-named consumer.
         ]);
 
@@ -458,10 +566,18 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            $meta,                                                                          // info() (sid 1)
-            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),           // create consumer (sid 2)
-            sprintf("HMSG _INBOX.JS.FETCH.c 3 %d %d\r\n%s\r\n", $hb, $hb, $status),          // fetch -> 409 (rethrow)
-            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // delete consumer in finally (sid 4)
+        ]);
+        // The 409 terminal status arrives on the pull fetch inbox (sid 2: mux SUB=1, CONSUMER.CREATE is a
+        // mux request, fetch SUB=2), not the mux inbox - enqueue it on the fetch SUB.
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.FETCH' => [
+                sprintf("HMSG _INBOX.JS.FETCH.c 2 %d %d\r\n%s\r\n", $hb, $hb, $status), // fetch -> 409 (rethrow)
+            ],
+        ];
+        $this->muxReplies($transport, [
+            $meta,                                                                          // info() Direct Get
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($consumer), $consumer),           // CONSUMER.CREATE
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // CONSUMER.DELETE in finally
         ]);
 
         $client = $this->connect($transport);
@@ -501,6 +617,8 @@ final class ObjectStoreBucket_2MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $meta,
             $this->directChunkReply($body, 2),
         ]);

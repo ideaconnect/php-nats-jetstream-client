@@ -20,15 +20,87 @@ final class BatchPublisherMutationTest extends TestCase
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
-     * @param list<string> $reads
+     * Builds a connected client whose muxed request inbox (#118) echoes the given reply frames FIFO on
+     * each request's captured reply-to (see {@see muxReplies()}). Post-#118 request()/requestWithHeaders()
+     * share ONE long-lived wildcard "<base>.*" subscription instead of a per-request inbox, so a
+     * pre-seeded fixed-subject "MSG _INBOX.x <sid>" no longer reaches the waiting request - the reply
+     * must be delivered on the request's actual reply-to. A small requestTimeoutMs keeps any accidental
+     * misroute failing fast instead of hanging on the 10 s default.
+     *
+     * @param list<string> $reads Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
      */
     private function connectedClient(array $reads = []): NatsClient
     {
-        $transport = new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $reads));
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, $reads);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $transport);
         $client->connect()->await();
 
         return $client;
+    }
+
+    /**
+     * Post-#118 the request inbox is MUXED: one wildcard "<base>.*" (sid 1) serves every reply, and each
+     * request publishes reply-to "<base>.<token>" and routes by that token, so a pre-seeded fixed-subject
+     * frame is dropped. This installs a dynamic responder mirroring a real server: it learns the mux base
+     * from the wildcard SUB and, for each request PUB/HPUB (a publish whose reply-to lives under that
+     * base), pops the next reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1).
+     * Frames are delivered FIFO in write order, so a multi-request commit (start then commit) still gets
+     * its replies in sequence.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish (e.g. a coalesced intermediate) - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject (token 1) to the request's captured mux
+     * reply-to and its sid (token 2) to the mux sid (1), preserving the payload/header bytes and declared
+     * lengths verbatim so only the reply's addressing is corrected for the mux inbox (#118).
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
     }
 
     /** Builds a NATS MSG frame for sid with the given payload. */
@@ -87,15 +159,15 @@ final class BatchPublisherMutationTest extends TestCase
     {
         $commitAck = '{"stream":"ORDERS","seq":2,"batch":"b-start","count":2}';
 
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
-            // Zero-byte accept for the START request (sid 1).
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        // Muxed replies (#118), delivered FIFO on each request's captured reply-to:
+        $this->muxReplies($transport, [
+            // Zero-byte accept for the START request.
             "MSG _INBOX.a 1 0\r\n\r\n",
-            // Commit PubAck for the commit request (sid 2).
+            // Commit PubAck for the commit request.
             self::msg('_INBOX.b', 2, $commitAck),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->batch('b-start')

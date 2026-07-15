@@ -55,6 +55,80 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
     }
 
     /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1) serves every reply, and each
+     * request publishes reply-to "<base>.<token>" and routes by that token. A pre-seeded fixed-subject
+     * "MSG _INBOX.x <sid>" / "HMSG _INBOX.x <sid>" therefore no longer reaches the waiting request (its
+     * subject is not the request's random "<base>.<token>", so dispatchMuxReply drops it and the request
+     * times out).
+     *
+     * This installs a dynamic responder that mirrors a real server: it learns the mux base from the
+     * wildcard SUB, and for each request PUB/HPUB (a publish whose reply-to lives under that base) pops
+     * the next reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1). Frames are
+     * delivered FIFO in the order requests are WRITTEN - which is exactly the order this file already
+     * pre-seeded its replies (the original per-request-inbox sids 1,2,3,... were assigned in that same
+     * request order), so keeping the frame order verbatim preserves each test's request/reply mapping.
+     *
+     * All replies in this file are request replies (STREAM.INFO enumeration, per-subject Direct Get,
+     * STREAM.MSG.GET, publish acks) - every ObjectStore read/write here funnels through request(); none
+     * arrive on a separate consumer subscription, so every non-INFO/PONG frame belongs here.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish, or a subscription's own inbox - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
+    /**
      * Direct Get reply (HMSG) whose body is the raw meta JSON, with a Nats-Sequence header. list()
      * reads the revision off that header; the body carries the object metadata.
      *
@@ -118,6 +192,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $p1,
             $p2,
             // Direct Get for the one meta subject: Nats-Sequence: 11 is present -> revision must be 11.
@@ -149,9 +225,11 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $p1,
             $p2,
-            // Concurrent Direct Gets, one per subject, in subjects-map order (sid 3 then sid 4).
+            // Concurrent Direct Gets, one per subject, in subjects-map (and therefore request) order.
             $this->directMetaReply('gone.txt', ['nuid' => '', 'size' => 0, 'chunks' => 0, 'digest' => '', 'deleted' => true], 3),
             $this->directMetaReply('live.txt', ['nuid' => 'n2', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4),
         ]);
@@ -189,6 +267,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamReply), $streamReply),
         ]);
 
@@ -216,6 +296,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($publishError), $publishError),  // meta publish -> error
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()), // lookup -> 404
         ]);
@@ -240,6 +322,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($publishError), $publishError),  // meta publish -> error with code
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
         ]);
@@ -269,6 +353,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             // First page already empty -> list() returns [] after the single enumeration request.
             $p1,
         ]);
@@ -290,6 +376,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($error), $error),
         ]);
 
@@ -312,6 +400,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($error), $error),
         ]);
 
@@ -339,11 +429,13 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
-            // Page 1 (sid 1): seeds a.txt (newCount 1).
+        ]);
+        $this->muxReplies($transport, [
+            // Page 1: seeds a.txt (newCount 1).
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($page), $page),
-            // Page 2 (sid 2): SAME subject again -> newCount 0 -> loop must stop here.
+            // Page 2: SAME subject again -> newCount 0 -> loop must stop here.
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($page), $page),
-            // Direct Get for the one unique subject (sid 3).
+            // Direct Get for the one unique subject.
             $this->directMetaReply('a.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 3),
         ]);
 
@@ -386,6 +478,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),                  // info() Direct Get -> 503 fallback
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),       // STREAM.MSG.GET reply
         ]);
@@ -415,6 +509,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),               // info() Direct Get -> 503 fallback
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($error), $error),  // STREAM.MSG.GET -> error
         ]);
@@ -440,6 +536,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($error), $error),
         ]);
@@ -480,6 +578,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             $this->directStatusReply(1, 503, 'No Responders'),                  // info() Direct Get -> 503 fallback
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($response), $response),
         ]);
@@ -506,6 +606,8 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $transport = new FakeTransport([
             self::INFO,
             "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // lookup -> 404
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),      // chunk ack
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),      // meta ack

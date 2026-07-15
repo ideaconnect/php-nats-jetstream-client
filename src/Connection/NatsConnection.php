@@ -132,6 +132,48 @@ final class NatsConnection
      * @var array<int, true>
      */
     private array $dispatchingSids = [];
+    /**
+     * Muxed request inbox base subject for the current connection epoch (e.g. "_INBOX.<24hex>"), null
+     * until the first request establishes it. One long-lived wildcard subscription "<base>.*" serves
+     * EVERY request()/requestMany() reply instead of a fresh inbox + SUB/UNSUB per request (#118).
+     * Retained across reconnect; only releaseRuntimeState() clears it, so a fresh connect() starts a
+     * new random base.
+     */
+    private ?string $muxBase = null;
+    /**
+     * sid of the long-lived "<muxBase>.*" subscription, null until established. Stable across reconnect:
+     * it is a normal subscribe() registration in subscriptionMeta[$muxSid], replayed by resubscribeAll()
+     * with the same sid and subject (the map key is reused, nextSid is not consulted) (#118).
+     */
+    private ?int $muxSid = null;
+    /**
+     * In-flight request waiters keyed by per-request suffix token. Each value routes one reply: a single
+     * request completes its DeferredFuture; requestMany appends to its collector. Removed on EVERY request
+     * exit - the no-late-leak mechanism that replaces per-request sid removal (#118).
+     *
+     * @var array<string, callable(NatsMessage):void>
+     */
+    private array $muxWaiters = [];
+    /**
+     * Strictly-increasing per-connection token counter. Guarantees pairwise-distinct request tokens
+     * within an epoch by construction (never reset); the random $muxBase provides unguessability (#118).
+     */
+    private int $muxTokenSeq = 0;
+    /**
+     * Serializes concurrent first-request mux establishment so exactly one "<base>.*" SUB is written
+     * even when several requests race before any completes (subscribe()->await() suspends) (#118).
+     *
+     * @var Future<void>|null
+     */
+    private ?Future $muxInboxSetup = null;
+    /**
+     * SIDs exempt from the per-subscription slow-consumer count bound - only the mux inbox sid. Every
+     * in-flight reply shares that single sid's queue, and a dropped reply silently breaks whichever
+     * request owns it with no backpressure path, so the mux queue must never drop (#118).
+     *
+     * @var array<int, true>
+     */
+    private array $unboundedSids = [];
     private int $outstandingPings = 0;
     private ?string $pingTimerId = null;
     /**
@@ -640,6 +682,15 @@ final class NatsConnection
         $this->receivedCounts = [];
         $this->deliveredCounts = [];
         $this->autoUnsubMax = [];
+        // Mux request inbox (#118): a terminal close ends the epoch. Clearing muxSid/muxBase forces a
+        // fresh ensureMuxInbox() (new random base + sid) on the next connect(); clearing muxWaiters drops
+        // any still-registered in-flight waiter - its request fiber terminates via the wait-loop state
+        // gate / recovery exception, not via the map. muxTokenSeq is intentionally NOT reset (the new
+        // random base makes any cross-epoch token undeliverable regardless).
+        $this->muxBase = null;
+        $this->muxSid = null;
+        $this->muxWaiters = [];
+        $this->unboundedSids = [];
         $this->reconnectBuffer = '';
         $this->parser = new ProtocolParser();
         // Terminal close: no PONG will ever arrive for a queued PING, so parked flush/rtt waiters
@@ -1582,6 +1633,116 @@ final class NatsConnection
     }
 
     /**
+     * Establishes the per-connection mux request inbox on first use: one wildcard subscription
+     * "<base>.*" whose handler ({@see dispatchMuxReply()}) routes every reply to its per-token waiter.
+     * Idempotent - a no-op once established, so it survives reconnect (muxSid/muxBase are retained,
+     * only {@see releaseRuntimeState()} nulls them). Serialized via $muxInboxSetup so concurrent first
+     * requests write exactly one SUB even though subscribe()->await() suspends (#118).
+     *
+     * Precondition: the caller has checked state === Open; subscribe() re-checks and throws otherwise.
+     */
+    private function ensureMuxInbox(): void
+    {
+        if ($this->muxSid !== null) {
+            return;
+        }
+
+        if ($this->muxInboxSetup !== null) {
+            // Another fiber is mid-establishment; join it instead of writing a second SUB.
+            $this->muxInboxSetup->await();
+
+            return;
+        }
+
+        $deferred = new DeferredFuture();
+        $this->muxInboxSetup = $deferred->getFuture();
+        $this->muxInboxSetup->ignore();
+
+        try {
+            $base = Inbox::generate($this->options->inboxPrefix);
+            // dispatchMuxReply is non-suspending, so it is safe to invoke inside drainPendingForSid()'s
+            // dequeue loop. The handler lives in subscriptions[$muxSid] and persists across reconnect
+            // (resubscribeAll replays only the SUB bytes; only releaseRuntimeState clears the handler).
+            $sid = $this->subscribe($base . '.*', $this->dispatchMuxReply(...))->await();
+            $this->muxBase = $base;
+            $this->muxSid = $sid;
+            // Slow-consumer exemption: the mux queue must never drop a reply (breaks a request).
+            $this->unboundedSids[$sid] = true;
+            $deferred->complete();
+        } catch (\Throwable $e) {
+            $deferred->error($e);
+
+            throw $e;
+        } finally {
+            // Cleared so a failed establishment retries on the next request.
+            $this->muxInboxSetup = null;
+        }
+    }
+
+    /**
+     * Mints a per-request suffix token unique within the connection epoch. Sequential (not random) so
+     * uniqueness is guaranteed by construction, not probabilistically; the random $muxBase provides
+     * unguessability - an attacker cannot address "<base>.<n>" without knowing the base (#118).
+     */
+    private function newMuxToken(): string
+    {
+        return dechex($this->muxTokenSeq++);
+    }
+
+    /**
+     * Registers a request's reply-dispatch callback under its suffix token, before its PUB is written.
+     *
+     * @param callable(NatsMessage):void $handler
+     */
+    private function registerMuxWaiter(string $token, callable $handler): void
+    {
+        $this->muxWaiters[$token] = $handler;
+    }
+
+    /**
+     * Removes a request's waiter. Runs in the finally of both request methods, on every exit path -
+     * the removal that makes a later/duplicate reply for a terminated request undeliverable (#118).
+     */
+    private function removeMuxWaiter(string $token): void
+    {
+        unset($this->muxWaiters[$token]);
+    }
+
+    /**
+     * Mux subscription handler: routes one reply to the request that owns it, keyed on the suffix token
+     * in the reply subject "<muxBase>.<token>". A reply whose token has no live waiter (the owning
+     * request already completed / timed out / was cancelled, or it is a duplicate) is discarded - the
+     * no-late-leak guard that replaces the per-request unknown-sid discard (#118).
+     *
+     * MUST NOT suspend: it runs inside drainPendingForSid()'s dequeue loop over the single mux sid, so
+     * suspending here would stall every other reply behind the same-sid dispatch guard.
+     */
+    private function dispatchMuxReply(NatsMessage $message): void
+    {
+        $base = $this->muxBase;
+        if ($base === null) {
+            // Torn down (terminal close) between enqueue and drain.
+            return;
+        }
+
+        $prefix = $base . '.';
+        $subject = $message->subject;
+        if (strncmp($subject, $prefix, strlen($prefix)) !== 0) {
+            // Not addressed to this epoch's base (defensive; the server only delivers "<base>.*").
+            return;
+        }
+
+        $token = substr($subject, strlen($prefix));
+        $waiter = $this->muxWaiters[$token] ?? null;
+        if ($waiter === null) {
+            // Late / duplicate / stale reply for a terminated request -> drop.
+            return;
+        }
+
+        $waiter($message);
+    }
+
+    /**
      * Executes request/reply flow using plain publish or header publish variants.
      *
      * @param array<string,string>|null $headers
@@ -1597,7 +1758,10 @@ final class NatsConnection
             throw new ConnectionException('Connection is not open');
         }
 
-        $inbox = Inbox::generate($this->options->inboxPrefix);
+        $this->ensureMuxInbox();
+        $token = $this->newMuxToken();
+        $replyTo = $this->muxBase . '.' . $token;
+
         /** @var DeferredFuture<NatsMessage> $deferred */
         $deferred = new DeferredFuture();
         // Set by the handler when the reply is delivered. The wait loop checks this rather than
@@ -1605,18 +1769,21 @@ final class NatsConnection
         // returned instead of being discarded as a spurious timeout.
         $replyReceived = false;
 
-        $sid = $this->subscribe($inbox, static function (NatsMessage $message) use ($deferred, &$replyReceived): void {
+        // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118). The
+        // handler body is unchanged and idempotent: a coalesced duplicate arriving in the same drain
+        // batch (before the finally removes the waiter) is ignored by the isComplete() guard.
+        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived): void {
             if (!$deferred->isComplete()) {
                 $deferred->complete($message);
                 $replyReceived = true;
             }
-        })->await();
+        });
 
         try {
             if ($headers === null) {
-                $this->publish($subject, $payload, $inbox)->await();
+                $this->publish($subject, $payload, $replyTo)->await();
             } else {
-                $this->publishWithHeaders($subject, $payload, $headers, $inbox)->await();
+                $this->publishWithHeaders($subject, $payload, $headers, $replyTo)->await();
             }
 
             $deadlineMs = $timeoutMs ?? $this->options->requestTimeoutMs;
@@ -1690,7 +1857,7 @@ final class NatsConnection
 
             return $response;
         } finally {
-            $this->cleanupRequestSubscription($sid);
+            $this->removeMuxWaiter($token);
         }
     }
 
@@ -1755,7 +1922,10 @@ final class NatsConnection
             throw new TimeoutException('Request timeout must be greater than zero');
         }
 
-        $inbox = Inbox::generate($this->options->inboxPrefix);
+        $this->ensureMuxInbox();
+        $token = $this->newMuxToken();
+        $replyTo = $this->muxBase . '.' . $token;
+
         /** @var list<NatsMessage> $messages */
         $messages = [];
         $lastAt = null;
@@ -1767,7 +1937,9 @@ final class NatsConnection
         $replyTick = new DeferredFuture();
         $replyTick->getFuture()->ignore();
 
-        $sid = $this->subscribe($inbox, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, $maxResponses): void {
+        // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118); the
+        // collector body (incl. the #160 cap and #135 tick rotation) is unchanged.
+        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, $maxResponses): void {
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
@@ -1785,13 +1957,13 @@ final class NatsConnection
             $replyTick = new DeferredFuture();
             $replyTick->getFuture()->ignore();
             $tick->complete();
-        })->await();
+        });
 
         try {
             if ($headers === null) {
-                $this->publish($subject, $payload, $inbox)->await();
+                $this->publish($subject, $payload, $replyTo)->await();
             } else {
-                $this->publishWithHeaders($subject, $payload, $headers, $inbox)->await();
+                $this->publishWithHeaders($subject, $payload, $headers, $replyTo)->await();
             }
 
             $deadline = $this->monotonicSeconds() + $totalMs / 1000;
@@ -1870,7 +2042,7 @@ final class NatsConnection
 
             return $messages;
         } finally {
-            $this->cleanupRequestSubscription($sid);
+            $this->removeMuxWaiter($token);
         }
     }
 
@@ -2879,6 +3051,20 @@ final class NatsConnection
         }
 
         $queue = $this->pendingMessages[$sid];
+
+        if (isset($this->unboundedSids[$sid])) {
+            // Mux request inbox (#118): every in-flight reply shares this single sid's queue, so the
+            // per-subscription count bound must NOT apply - dropping here would silently break whichever
+            // request owns the dropped reply, and there is no backpressure path (the server already sent
+            // it). Memory is bounded by outstanding request concurrency: one read cycle enqueues at most
+            // a chunk's worth of replies, all drained before the next read, so the queue does not grow
+            // across reads; a pinned reply is strictly better than a lost one (#159 caveat).
+            $queue->enqueue($message);
+            $this->pendingDirty[$sid] = true;
+
+            return;
+        }
+
         $limit = max(1, $this->options->maxPendingMessagesPerSubscription);
 
         if ($queue->count() >= $limit) {
@@ -3521,28 +3707,6 @@ final class NatsConnection
         $this->dropSubscriptionState($sid);
     }
 
-    private function cleanupRequestSubscription(int $sid): void
-    {
-        // Clean up based on the subscription itself, not on a pending message queue: the queue is
-        // delivery bookkeeping that lives and dies with the subscription state (#139), and keying
-        // the UNSUB on its presence would skip cleanup whenever the entry is missing.
-        if (!isset($this->subscriptionMeta[$sid], $this->subscriptions[$sid])) {
-            return;
-        }
-
-        if ($this->state === ConnectionState::Open) {
-            try {
-                $this->unsubscribe($sid)->await();
-
-                return;
-            } catch (\Throwable) {
-                // Preserve the original request failure and fall back to local cleanup.
-            }
-        }
-
-        $this->dropSubscriptionState($sid);
-    }
-
     private function dropSubscriptionState(int $sid): void
     {
         unset($this->subscriptions[$sid]);
@@ -3552,5 +3716,7 @@ final class NatsConnection
         unset($this->receivedCounts[$sid]);
         unset($this->deliveredCounts[$sid]);
         unset($this->autoUnsubMax[$sid]);
+        // Hygiene: the slow-consumer exemption flag must never outlive its sid (#118).
+        unset($this->unboundedSids[$sid]);
     }
 }

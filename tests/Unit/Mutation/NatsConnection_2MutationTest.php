@@ -125,9 +125,10 @@ final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
     // kills TrueValue @ 886 ($noResponders flag must stop collection immediately on a 503 sentinel)
     public function testRequestManyStopsImmediatelyOnNoRespondersSentinel(): void
     {
-        $status = "NATS/1.0 503\r\n\r\n";
-        $sentinel = 'HMSG _INBOX.any 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n";
-        [$connection] = $this->openConnection([$sentinel]);
+        [$connection, $transport] = $this->openConnection();
+        // Post-#118 the reply routes through the mux sid on the request's captured reply-to, not a fixed
+        // inbox subject: echo the server's 503 no-responders sentinel there as an HMSG on sid 1.
+        $this->respondNoResponders($transport, 'svc.scan');
 
         $start = hrtime(true);
         // Large total budget: the real code returns [] the instant the 503 arrives. If $noResponders is
@@ -141,7 +142,9 @@ final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
     // kills GreaterThanOrEqualTo @ 913 and LogicalAndAllSubExprNegation @ 913 (maxResponses cap "count >= max")
     public function testRequestManyStopsExactlyAtMaxResponses(): void
     {
-        [$connection] = $this->openConnection(["MSG _INBOX.any 1 1\r\nA\r\n"]);
+        [$connection, $transport] = $this->openConnection();
+        // Deliver exactly one reply ('A') on the mux sid via the captured per-request reply-to (#118).
+        $this->respondWith($transport, 'svc.scan', 'A');
 
         $start = hrtime(true);
         // Exactly one reply with maxResponses=1: "count >= max" breaks at the boundary. With ">" or the
@@ -157,11 +160,10 @@ final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
     // (these mutants make the stall fire immediately after the first reply)
     public function testRequestManyDoesNotStallBeforeStallIntervalElapses(): void
     {
-        // Two replies in SEPARATE reads so the loop re-evaluates the stall guard between them.
-        [$connection] = $this->openConnection([
-            "MSG _INBOX.any 1 1\r\nA\r\n",
-            "MSG _INBOX.any 1 1\r\nB\r\n",
-        ]);
+        // Two replies echoed on the mux sid via the captured reply-to, enqueued as SEPARATE read chunks
+        // so the loop re-evaluates the stall guard between them (#118 reply delivery).
+        [$connection, $transport] = $this->openConnection();
+        $this->respondWith($transport, 'svc.scan', 'A', 'B');
 
         // Large stall (5s) so the genuine gap between the two reads never trips it; maxResponses=2 makes
         // the real code stop promptly after collecting both. Mutants that compute the gap as
@@ -179,13 +181,11 @@ final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
     //  runs until the full total budget instead of stopping shortly after the stall interval)
     public function testRequestManyStopsShortlyAfterStallInterval(): void
     {
-        // One reply, then the socket blocks (idle). The stall must wake us ~15ms later and stop. The
-        // blocking transport makes the wake-slice computation load-bearing, so the @936/@937 slice
-        // mutants are observable too.
-        [$connection] = $this->openConnection(
-            ["MSG _INBOX.any 1 1\r\nA\r\n"],
-            blockWhenEmpty: true,
-        );
+        // One reply on the mux sid via the captured reply-to, then the socket blocks (idle). The stall
+        // must wake us ~15ms later and stop. The blocking transport makes the wake-slice computation
+        // load-bearing, so the @936/@937 slice mutants are observable too.
+        [$connection, $transport] = $this->openConnection(blockWhenEmpty: true);
+        $this->respondWith($transport, 'svc.scan', 'A');
 
         $start = hrtime(true);
         // stall=15ms, total=3000ms: the real code returns ~15-40ms after the reply. Any mutant that
@@ -210,6 +210,63 @@ final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
         $replies = $connection->requestMany('svc.scan', 'q', null, null, 50, null, $external->getCancellation())->await();
 
         self::assertSame([], $replies);
+    }
+
+    /**
+     * Installs a mux reply responder (#118): for every `PUB <subject> <replyTo> ...` frame written,
+     * enqueues one `MSG <replyTo> 1 ...` reply per payload on the mux sid (sid 1 - the first, wildcard
+     * subscription established after connect). Post-#118 a reply is delivered on the request's captured
+     * per-request reply-to, never a guessed fixed inbox subject; separate payloads land as separate read
+     * chunks so the collection loop re-evaluates its termination conditions between them.
+     */
+    private function respondWith(FakeTransport $transport, string $subject, string ...$payloads): void
+    {
+        $transport->onWrite = static function (string $bytes) use ($subject, $payloads): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB ' . $subject . ' ')) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>
+            $parts = explode(' ', $head);
+            $replyTo = $parts[2] ?? '';
+            if ($replyTo === '') {
+                return [];
+            }
+
+            $chunks = [];
+            foreach ($payloads as $payload) {
+                $chunks[] = sprintf("MSG %s 1 %d\r\n%s\r\n", $replyTo, strlen($payload), $payload);
+            }
+
+            return $chunks;
+        };
+    }
+
+    /**
+     * Installs a mux 503 no-responders responder (#118): echoes the server's `NATS/1.0 503` status
+     * sentinel as an HMSG on the request's captured per-request reply-to (mux sid 1).
+     */
+    private function respondNoResponders(FakeTransport $transport, string $subject): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+        $transport->onWrite = static function (string $bytes) use ($subject, $status): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB ' . $subject . ' ')) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>
+            $parts = explode(' ', $head);
+            $replyTo = $parts[2] ?? '';
+            if ($replyTo === '') {
+                return [];
+            }
+
+            $len = strlen($status);
+
+            return [sprintf("HMSG %s 1 %d %d\r\n%s\r\n", $replyTo, $len, $len, $status)];
+        };
     }
 
     /**

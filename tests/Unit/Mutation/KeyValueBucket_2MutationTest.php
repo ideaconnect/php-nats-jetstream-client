@@ -10,6 +10,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use Revolt\EventLoop;
 
 /**
  * Mutation-killing tests for {@see \IDCT\NATS\JetStream\KeyValue\KeyValueBucket} (chunk 2).
@@ -71,6 +72,97 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         return $client;
     }
 
+    /**
+     * A watch()'s idle-heartbeat watchdog (#113) is a live EventLoop repeat timer that outlives a test
+     * whose client is never disconnect()ed. Cancel every callback left registered so a leaked watchdog
+     * from one test cannot fire against a lingering client during another.
+     */
+    protected function tearDown(): void
+    {
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
+    }
+
+    /**
+     * Post-#118 the request inbox is MUXED: request()/requestWithHeaders() no longer subscribe a fresh
+     * inbox per call; instead ONE long-lived wildcard "<base>.*" (sid 1, established on the FIRST request
+     * before any deliver subscription in every test here) serves every reply, and each request publishes
+     * reply-to "<base>.<token>" and routes by that token. A pre-seeded "MSG _INBOX.x <sid>" therefore no
+     * longer reaches the waiting request (its subject is not the request's random "<base>.<token>", so the
+     * reply is dropped and the request times out). This builds a client whose FakeTransport mirrors a real
+     * server: it learns the mux base from the wildcard SUB and, for each request PUB/HPUB, pops the next
+     * reply frame and re-emits it FIFO on the CAPTURED reply-to with the mux sid (1). Subscription
+     * deliveries (a push consumer's deliver subject) are NOT mux replies - enqueue those on their SUB via
+     * $transport->enqueueOnWriteContaining so they arrive after the deliver subscription exists.
+     *
+     * @param list<string> $muxFrames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     * @return array{NatsClient, FakeTransport}
+     */
+    private function connectMux(array $muxFrames): array
+    {
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->muxReplies($transport, $muxFrames);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        return [$client, $transport];
+    }
+
+    /** @param list<string> $frames */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                // A plain publish or a subscription's own inbox - not a mux request.
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
     // ─── createKey(): validation, "exists" error, recreate revision ─────────────────────────────
 
     public function testCreateKeyValidatesKeyBeforePublishing(): void
@@ -88,10 +180,11 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // First exclusive create (expected seq 0) is rejected wrong-last-sequence; get() then shows a
         // live value, so the key really exists.
         $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 4"}}';
-        $kv = $this->connect([
+        [$client] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
-        ])->jetStream()->keyValue('cfg');
+        ]);
+        $kv = $client->jetStream()->keyValue('cfg');
 
         try {
             $kv->createKey('theme', 'blue')->await();
@@ -111,15 +204,11 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // The latest record is a DEL tombstone at revision 4; recreate must assert that revision.
         $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence: 4"}}';
         $putAck = '{"stream":"KV_cfg","seq":5,"duplicate":false}';
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectReply('$KV.cfg.theme', 'ignored', 4, 2, 'DEL'),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
 
@@ -137,15 +226,11 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence"}}';
         $putAck = '{"stream":"KV_cfg","seq":9,"duplicate":false}';
         // A DEL tombstone with NO Nats-Sequence header => revision resolves to null -> ?? 0.
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectReply('$KV.cfg.theme', '', null, 2, 'DEL'),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
 
@@ -160,15 +245,11 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // first create fails wrong-last-seq, then get() races to a 404 (entry null) => expected seq 0.
         $errAck = '{"error":{"code":400,"err_code":10071,"description":"wrong last sequence"}}';
         $putAck = '{"stream":"KV_cfg","seq":11,"duplicate":false}';
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
             $this->kvDirectStatus(2, 404, 'Message Not Found'),
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
 
@@ -193,13 +274,9 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills ArrayItemRemoval @ 513 - dropping 'deliver_policy' => 'all' changes the consumer config.
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":0,"config":{"deliver_subject":"d","ack_policy":"none"}}';
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->history('theme')->await();
 
@@ -214,10 +291,16 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // that skips/changes the guard would subscribe, process it, and return a 1-entry list.
         // kills DecrementInteger @ 517 ($pending === -1), ReturnRemoval @ 518 (return []).
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":0,"config":{"deliver_subject":"d","ack_policy":"none"}}';
-        $kv = $this->connect([
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        // The delivery is NOT a mux reply: it can only be seen by a mutant that skips the guard and
+        // subscribes to the deliver subject (sid 2). Enqueue it on that SUB so it lands only if such a
+        // subscription is ever written - real code returns [] first and never subscribes.
+        $transport->enqueueOnWriteContaining['SUB _INBOX.KV.HIST'] = [
             "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
-        ])->jetStream()->keyValue('cfg');
+        ];
+        $kv = $client->jetStream()->keyValue('cfg');
 
         self::assertSame([], $kv->history('theme')->await());
     }
@@ -227,10 +310,13 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // kills IncrementInteger + DecrementInteger @ 516 (`num_pending ?? 0`): absent num_pending must
         // default to 0 -> []. A mutant default of 1/-1 would proceed and collect the queued delivery.
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","config":{"deliver_subject":"d","ack_policy":"none"}}';
-        $kv = $this->connect([
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB _INBOX.KV.HIST'] = [
             "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
-        ])->jetStream()->keyValue('cfg');
+        ];
+        $kv = $client->jetStream()->keyValue('cfg');
 
         self::assertSame([], $kv->history('theme')->await());
     }
@@ -240,10 +326,13 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // kills CastInt @ 516: a float 0.0 must (int)-cast to 0 (=== 0 true). Without the cast, 0.0 === 0
         // is false in PHP, so the mutant would proceed and collect the queued delivery.
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":0.0,"config":{"deliver_subject":"d","ack_policy":"none"}}';
-        $kv = $this->connect([
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB _INBOX.KV.HIST'] = [
             "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
-        ])->jetStream()->keyValue('cfg');
+        ];
+        $kv = $client->jetStream()->keyValue('cfg');
 
         self::assertSame([], $kv->history('theme')->await());
     }
@@ -252,14 +341,14 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills MethodCallRemoval @ 553 - the finally must unsubscribe the history delivery sid (2).
         $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":1,"config":{"deliver_subject":"d","ack_policy":"none"}}';
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        // The single replayed revision is a subscription delivery (sid 2 = the deliver sub; the mux inbox
+        // is sid 1). Enqueue it on the deliver SUB so it arrives after that subscription exists.
+        $transport->enqueueOnWriteContaining['SUB _INBOX.KV.HIST'] = [
+            "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.1.6.1.0.0 2\r\nv1\r\n",
+        ];
 
         $history = $client->jetStream()->keyValue('cfg')->history('theme')->await();
 
@@ -281,12 +370,16 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         $ev = 'bob';
         $uh = strlen($uHdrs);
         $eh = strlen($eHdrs);
-        $kv = $this->connect([
+        // FIFO mux replies: the two STREAM.INFO pages are requested first (offset 0 then 2), then the
+        // per-key Direct Gets are written in subject order (username, then email), so each reply lands
+        // on the matching request's captured reply-to.
+        [$client] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($page1), $page1),
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($page2), $page2),
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s%s\r\n", $uh, $uh + strlen($uv), $uHdrs, $uv),
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $eh + strlen($ev), $eHdrs, $ev),
-        ])->jetStream()->keyValue('cfg');
+        ]);
+        $kv = $client->jetStream()->keyValue('cfg');
 
         $all = $kv->getAll()->await();
 
@@ -298,13 +391,9 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     public function testStreamInfoRequestSubjectAndPayloadAreExact(): void
     {
         $page = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
-        $transport = new FakeTransport([
-            self::INFO,
-            "PONG\r\n",
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($page), $page),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->getAll()->await();
 
@@ -330,9 +419,10 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         // Floats exercise the (int) casts; last_seq (12) differs from messages (7) to pin coalescing.
         $streamInfo = '{"config":{"name":"KV_cfg"},"state":{"messages":7.0,"last_seq":12,"bytes":128.0}}';
-        $status = $this->connect([
+        [$client] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
-        ])->jetStream()->keyValue('cfg')->getStatus()->await();
+        ]);
+        $status = $client->jetStream()->keyValue('cfg')->getStatus()->await();
 
         // kills CastInt @ 639/640/641 - strict identity fails against float 7.0/12.0/128.0.
         self::assertSame(7, $status['messages']);
@@ -345,9 +435,10 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         // State carries none of messages/last_seq/bytes => every counter must default to 0.
         $streamInfo = '{"config":{"name":"KV_cfg"},"state":{}}';
-        $status = $this->connect([
+        [$client] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
-        ])->jetStream()->keyValue('cfg')->getStatus()->await();
+        ]);
+        $status = $client->jetStream()->keyValue('cfg')->getStatus()->await();
 
         // kills IncrementInteger + DecrementInteger @ 639 (messages ?? 0).
         self::assertSame(0, $status['messages']);
@@ -365,10 +456,15 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
         // A subsequent delivery (numPending=0) must NOT re-fire it.
         // kills TrueValue @ 430 - flipping the latch to false would let the in-handler check re-fire.
         $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","num_pending":0,"config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
-        $client = $this->connect([
+        [$client, $transport] = $this->connectMux([
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
-            "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
         ]);
+        // The later delivery is a push-consumer delivery (sid 2 = the deliver sub; the mux inbox is sid 1),
+        // not a mux reply. Enqueue it on the deliver SUB so it exists only once the watch subscribes, then
+        // pump it explicitly below - it must NOT re-fire onCaughtUp (the latch is already set).
+        $transport->enqueueOnWriteContaining['SUB _INBOX.JS.PUSH'] = [
+            "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
+        ];
 
         $caught = 0;
         $options = new KeyWatchOptions(includeHistory: true, onCaughtUp: function () use (&$caught): void {

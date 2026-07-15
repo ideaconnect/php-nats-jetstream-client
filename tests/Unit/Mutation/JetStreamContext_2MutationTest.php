@@ -51,6 +51,74 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
     }
 
     /**
+     * Post-#118 the request inbox is MUXED: request() no longer subscribes a fresh inbox per call;
+     * instead ONE long-lived wildcard "<base>.*" (sid 1, established lazily on the first request)
+     * serves every reply, and each request publishes reply-to "<base>.<token>" and routes by that
+     * token. A pre-seeded "MSG _INBOX.x <sid>" / "HMSG _INBOX.x <sid>" therefore no longer reaches the
+     * waiting request (its subject is not the request's random "<base>.<token>", so dispatchMuxReply
+     * drops it and the request times out).
+     *
+     * This installs a dynamic responder that mirrors a real server: it learns the mux base from the
+     * wildcard SUB, and for each request PUB/HPUB (a publish whose reply-to lives under that base) pops
+     * the next reply frame and re-emits it on the CAPTURED reply-to with the mux sid (1). Frames are
+     * delivered FIFO in the order requests are written, so a method that issues several requests (e.g.
+     * listConsumers paging create->offset+=2->...) still gets its replies in sequence.
+     *
+     * @param list<string> $frames Pre-built MSG/HMSG reply frames; only their subject+sid are rewritten.
+     */
+    private function muxReplies(FakeTransport $transport, array $frames): void
+    {
+        $queue = $frames;
+        $base = null;
+
+        $transport->onWrite = static function (string $bytes) use (&$queue, &$base): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                // Learn the mux base from the wildcard registration "SUB <base>.* <sid>".
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1); // strip the trailing "*" -> "_INBOX.<hex>."
+                }
+
+                return [];
+            }
+
+            if ($base === null || (!str_starts_with($head, 'PUB ') && !str_starts_with($head, 'HPUB '))) {
+                return [];
+            }
+
+            // PUB <subject> <replyTo> <len>  |  HPUB <subject> <replyTo> <hdrLen> <totLen>
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if (!str_starts_with($replyTo, $base) || $queue === []) {
+                return [];
+            }
+
+            return [self::rewriteReplyFrame(array_shift($queue), $replyTo)];
+        };
+    }
+
+    /**
+     * Rewrites a pre-built MSG/HMSG reply frame's subject and sid to the request's captured mux reply-to
+     * and the mux sid (1), preserving the payload/header bytes and declared lengths verbatim so the
+     * reply's content is delivered unchanged - only its addressing is corrected for the mux inbox.
+     */
+    private static function rewriteReplyFrame(string $frame, string $replyTo): string
+    {
+        $pos = strpos($frame, "\r\n");
+        self::assertNotFalse($pos, 'reply frame must have a head line');
+
+        $tokens = explode(' ', substr($frame, 0, $pos));
+        $tokens[1] = $replyTo; // subject
+        $tokens[2] = '1';      // mux sid
+
+        return implode(' ', $tokens) . substr($frame, $pos);
+    }
+
+    /**
      * listConsumers paginates across multiple pages.
      *
      * kills DoWhile @ line 383 (while(false) would stop after page 1 -> 2 instead of 5 consumers)
@@ -70,10 +138,12 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
             ),
         ], JSON_THROW_ON_ERROR);
 
-        [$client, $transport] = $this->connectedClient([
-            self::msg($page(['a', 'b']), 1),   // offset 0 -> 2 consumers
-            self::msg($page(['c', 'd']), 2),   // offset 2 -> 2 consumers
-            self::msg($page(['e']), 3),        // offset 4 -> 1 consumer (total 5 reached)
+        [$client, $transport] = $this->connectedClient([]);
+        // Three paginated CONSUMER.LIST requests share the mux inbox; replies come back FIFO.
+        $this->muxReplies($transport, [
+            self::msg($page(['a', 'b'])),   // offset 0 -> 2 consumers
+            self::msg($page(['c', 'd'])),   // offset 2 -> 2 consumers
+            self::msg($page(['e'])),        // offset 4 -> 1 consumer (total 5 reached)
         ]);
 
         $consumers = $client->jetStream()->listConsumers('ORDERS')->await();
@@ -106,7 +176,8 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
         // "1234" is a valid 4-char base64 token, so an || mutant would decode it to 3 garbage bytes.
         $json = '{"message":{"subject":"orders.x","data":1234}}';
 
-        [$client] = $this->connectedClient([self::msg($json)]);
+        [$client, $transport] = $this->connectedClient([]);
+        $this->muxReplies($transport, [self::msg($json)]);
 
         $message = $client->jetStream()->getStreamMessage('ORDERS', 1)->await();
 
@@ -125,7 +196,8 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         $json = '{"message":{"subject":"orders.x","data":"' . base64_encode('hi') . '"}}';
 
-        [$client] = $this->connectedClient([self::msg($json)]);
+        [$client, $transport] = $this->connectedClient([]);
+        $this->muxReplies($transport, [self::msg($json)]);
 
         $message = $client->jetStream()->getStreamMessage('ORDERS', 1)->await();
 
@@ -140,7 +212,8 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testDeleteMessageReturnsFalseWhenSuccessAbsent(): void
     {
-        [$client] = $this->connectedClient([self::msg('{}')]);
+        [$client, $transport] = $this->connectedClient([]);
+        $this->muxReplies($transport, [self::msg('{}')]);
 
         self::assertFalse($client->jetStream()->deleteMessage('ORDERS', 7)->await());
     }
@@ -155,7 +228,8 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
     public function testDirectGetNoRespondersMessageIsExact(): void
     {
         // A no-responders reply is an HMSG carrying a "NATS/1.0 503" status line.
-        [$client] = $this->connectedClient([self::hmsg("NATS/1.0 503\r\n\r\n")]);
+        [$client, $transport] = $this->connectedClient([]);
+        $this->muxReplies($transport, [self::hmsg("NATS/1.0 503\r\n\r\n")]);
 
         try {
             $client->jetStream()->directGetLastMessageForSubject('ORDERS', 'orders.1')->await();
@@ -178,7 +252,8 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testDirectGetThrowsAtStatus400Boundary(): void
     {
-        [$client] = $this->connectedClient([self::hmsg("NATS/1.0 400 Bad Request\r\n\r\n")]);
+        [$client, $transport] = $this->connectedClient([]);
+        $this->muxReplies($transport, [self::hmsg("NATS/1.0 400 Bad Request\r\n\r\n")]);
 
         try {
             $client->jetStream()->directGetLastMessageForSubject('ORDERS', 'orders.1')->await();
@@ -202,7 +277,8 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
     public function testDirectGetAcceptsResponseWithOnlyNatsStreamAndSidIsZero(): void
     {
         $headers = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.kept\r\n\r\n";
-        [$client] = $this->connectedClient([self::hmsg($headers, 'body')]);
+        [$client, $transport] = $this->connectedClient([]);
+        $this->muxReplies($transport, [self::hmsg($headers, 'body')]);
 
         // Real (&&): Nats-Stream present, so it does NOT throw and returns the message.
         $message = $client->jetStream()->directGetLastMessageForSubject('ORDERS', 'orders.kept')->await();
