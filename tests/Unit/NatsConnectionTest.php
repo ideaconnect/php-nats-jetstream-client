@@ -2857,6 +2857,52 @@ final class NatsConnectionTest extends TestCase
         )));
     }
 
+    /**
+     * #167: when the account cannot subscribe to the mux reply-inbox wildcard, the server rejects the
+     * lazily-written "<muxBase>.*" SUB with an async permissions -ERR. Instead of the pre-fix silent
+     * request timeout, the connection latches the rejection and request() fails fast with a clear,
+     * catchable ConnectionException naming the reply-inbox wildcard permission needed. A large
+     * requestTimeoutMs is deliberately NOT waited out, and the latch keeps failing later requests.
+     */
+    public function testRequestSurfacesMuxInboxPermissionRejection(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // Reject the mux inbox SUB "<base>.* <sid>" with a permissions -ERR (async), as a server would
+        // for an account lacking _INBOX.> subscribe permission.
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'SUB _INBOX.') || !str_contains($head, '.* ')) {
+                return [];
+            }
+            $subject = explode(' ', $head)[1] ?? '';
+
+            return ["-ERR 'Permissions Violation for Subscription to \"$subject\"'\r\n"];
+        };
+
+        // 5 s timeout: a regressed fix would wait it out and throw TimeoutException instead.
+        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection->connect()->await();
+
+        try {
+            $connection->request('svc.echo', 'ping')->await();
+            self::fail('expected a ConnectionException surfacing the mux-inbox permission rejection');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsStringIgnoringCase('permissions violation', $e->getMessage());
+            self::assertStringContainsString('_INBOX.>', $e->getMessage());
+        }
+
+        // The rejection is latched: a subsequent request fails fast the same way (no re-SUB attempt).
+        try {
+            $connection->request('svc.echo', 'ping2')->await();
+            self::fail('expected the latched rejection to keep failing request()');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsStringIgnoringCase('permissions violation', $e->getMessage());
+        }
+    }
+
     public function testRequestReturnsReplyDeliveredOnSameTickAsTimeout(): void
     {
         // A reply delivered in the same processIncoming() call the deadline fires in must be returned,
