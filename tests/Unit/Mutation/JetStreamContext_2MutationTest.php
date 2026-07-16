@@ -28,7 +28,7 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
     private function connectedClient(array $readQueue): array
     {
         $transport = new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $readQueue));
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return [$client, $transport];

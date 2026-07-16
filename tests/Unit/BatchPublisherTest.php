@@ -103,7 +103,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b-old')
@@ -143,7 +143,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b-two-segment')->add('orders.created', 'only');
@@ -177,7 +177,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->batch('b-beta')
@@ -208,7 +208,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b-unparseable')
@@ -252,7 +252,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b-old')
@@ -299,7 +299,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($plainCommitAck), $plainCommitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -335,7 +335,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainCommitAck), $plainCommitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->batch('b-single')
@@ -367,7 +367,7 @@ final class BatchPublisherTest extends TestCase
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -400,7 +400,7 @@ final class BatchPublisherTest extends TestCase
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -433,7 +433,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('batch-xyz');
@@ -495,7 +495,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->batch('b-coalesce')
@@ -566,7 +566,7 @@ final class BatchPublisherTest extends TestCase
             "MSG _INBOX.a 1 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b-toolarge')
@@ -613,7 +613,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($startError), $startError),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('batch-rej')
@@ -644,7 +644,7 @@ final class BatchPublisherTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -663,7 +663,7 @@ final class BatchPublisherTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -687,7 +687,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b');
@@ -714,7 +714,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorAck), $errorAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -733,7 +733,7 @@ final class BatchPublisherTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('batch-overflow');
@@ -762,7 +762,7 @@ final class BatchPublisherTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('batch-count');
@@ -786,7 +786,7 @@ final class BatchPublisherTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('my-explicit-id');
@@ -810,7 +810,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b2');
@@ -849,7 +849,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $batch = $client->jetStream()->batch('b-release')
@@ -896,7 +896,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($commitAck), $commitAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->batch('batch-nonjson')
@@ -927,7 +927,7 @@ final class BatchPublisherTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($badAck), $badAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);

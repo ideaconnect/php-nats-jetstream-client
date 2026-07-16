@@ -165,7 +165,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),    // STREAM.MSG.GET fallback
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
@@ -197,7 +197,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($deletePayload), $deletePayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $kv = $client->jetStream()->keyValue('cfg');
@@ -229,7 +229,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $kv = $client->jetStream()->keyValue('cfg');
@@ -261,7 +261,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($deleteAck), $deleteAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $kv = $client->jetStream()->keyValue('cfg');
@@ -304,7 +304,7 @@ final class KeyValueBucketTest extends TestCase
             'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -329,7 +329,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
@@ -357,7 +357,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -384,7 +384,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -409,7 +409,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -434,7 +434,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -463,7 +463,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectReply('$KV.cfg.theme', 'green', 4, 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -491,7 +491,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('dst')->create(['mirror' => 'src'])->await();
@@ -517,7 +517,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('agg')->create([
@@ -547,7 +547,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->getRevision('theme', 2)->await();
@@ -575,7 +575,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         self::assertNull($client->jetStream()->keyValue('cfg')->getRevision('theme', 2)->await());
@@ -596,7 +596,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->delete('theme', null, 4)->await();
@@ -621,7 +621,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         self::assertSame([], $client->jetStream()->keyValue('cfg')->history('theme')->await());
@@ -650,7 +650,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $history = $client->jetStream()->keyValue('cfg')->history('theme')->await();
@@ -682,7 +682,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $history = $client->jetStream()->keyValue('cfg')->history('theme')->await();
@@ -735,7 +735,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $keys = $client->jetStream()->keyValue('cfg')->keys()->await();
@@ -783,7 +783,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
         ], $deliverFrames === [] ? [] : ['_INBOX.KV.KEYS' => $deliverFrames]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return [$client, $transport];
@@ -920,7 +920,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->watch(
@@ -949,7 +949,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->watch(
@@ -1060,7 +1060,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectStatus(1, 404, 'Message Not Found'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('missing')->await();
@@ -1078,7 +1078,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1102,7 +1102,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($updateAck), $updateAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->update('theme', 'green', 2)->await();
@@ -1127,7 +1127,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($purgeAck), $purgeAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->purge('theme')->await();
@@ -1152,7 +1152,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->put('theme', 'green', ttl: 60)->await();
@@ -1176,7 +1176,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($delAck), $delAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->delete('theme', tombstoneTtl: 120)->await();
@@ -1200,7 +1200,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $status = $client->jetStream()->keyValue('cfg')->getStatus()->await();
@@ -1243,7 +1243,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody),       // email -> value
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
@@ -1269,7 +1269,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.x 1 %d %d\r\n%s\r\n", $h, $h, $hdrs),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
@@ -1309,7 +1309,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
@@ -1341,7 +1341,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $seen = null;
@@ -1372,7 +1372,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->create(['subject_delete_marker_ttl' => 3_600_000_000_000])->await();
@@ -1394,7 +1394,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // Full ADR-8 charset: dots, hyphens, underscores, equals, slashes, mixed case, digits.
@@ -1412,7 +1412,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $kv = $client->jetStream()->keyValue('cfg');
 
@@ -1439,7 +1439,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1455,7 +1455,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1470,7 +1470,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $kv = $client->jetStream()->keyValue('cfg');
 
@@ -1493,7 +1493,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1515,7 +1515,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->create([
@@ -1556,7 +1556,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $seen = null;
@@ -1595,7 +1595,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectStatus(1, 500, 'internal error'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1614,7 +1614,7 @@ final class KeyValueBucketTest extends TestCase
             "MSG _INBOX.a 1 7\r\nnotjson\r\n", // a non-JSON ack
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // A malformed ack must surface as the library's JetStreamException, not a raw \JsonException.
@@ -1637,7 +1637,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectReply('$KV.cfg.theme', 'ignored', 3, 1, 'DEL'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
@@ -1655,7 +1655,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $kv = $client->jetStream()->keyValue('cfg');
@@ -1670,7 +1670,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1703,7 +1703,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $th, $tt, $themeHdrs, $themeBody),       // theme -> value
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
@@ -1724,7 +1724,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($error), $error),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1745,7 +1745,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $status = $client->jetStream()->keyValue('cfg')->getStatus()->await();
@@ -1766,7 +1766,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1793,7 +1793,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // 'mirror' is an array with 'bucket' key - kvSourceConfig should replace
@@ -1826,7 +1826,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('agg')->create([
@@ -1859,7 +1859,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($purgeAck), $purgeAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->purge('theme', tombstoneTtl: 300, expectedRevision: 6)->await();
@@ -1882,7 +1882,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1906,7 +1906,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorReply), $errorReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->getRevision('theme', 99)->await();
@@ -1929,7 +1929,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorReply), $errorReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1955,7 +1955,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($errorReply), $errorReply),           // STREAM.MSG.GET -> 404
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
@@ -1979,7 +1979,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($errorReply), $errorReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2003,7 +2003,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($emptyReply), $emptyReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
@@ -2035,7 +2035,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
@@ -2064,7 +2064,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),              // STREAM.MSG.GET -> malformed data
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2095,7 +2095,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $called = false;
@@ -2127,7 +2127,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errAck), $errAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2158,7 +2158,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck), $putAck),   // second put -> success
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'blue')->await();
@@ -2191,7 +2191,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($putAck2), $putAck2),         // second put -> success
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('theme', 'newval')->await();
@@ -2220,7 +2220,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->create([
@@ -2245,7 +2245,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2263,7 +2263,7 @@ final class KeyValueBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2290,7 +2290,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
@@ -2319,7 +2319,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $eh, $eh, $errHdrs),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2343,7 +2343,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->keyValue('cfg')->createKey('session', 'tok', ttl: 3600)->await();
@@ -2383,7 +2383,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s%s\r\n", $th, $tt, $themeHdrs, $themeBody),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
@@ -2438,7 +2438,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
@@ -2475,7 +2475,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->keyValue('cfg')->watch(
@@ -2506,7 +2506,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // Passing a default KeyWatchOptions() (no fields set) triggers deliver_policy=last_per_subject.
@@ -2546,7 +2546,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $seen = null;
@@ -2589,7 +2589,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $caughtUp = false;
@@ -2630,7 +2630,7 @@ final class KeyValueBucketTest extends TestCase
             ],
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2658,7 +2658,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // Start the replay with a 0.5 s PROGRESS bound but do not await yet.

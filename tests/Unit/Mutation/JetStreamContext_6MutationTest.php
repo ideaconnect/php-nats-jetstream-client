@@ -72,7 +72,7 @@ final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
             return [sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $muxSid, strlen($json), $json)];
         };
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return $client;

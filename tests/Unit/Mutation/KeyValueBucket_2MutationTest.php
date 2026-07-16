@@ -103,7 +103,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $this->muxReplies($transport, $muxFrames);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return [$client, $transport];

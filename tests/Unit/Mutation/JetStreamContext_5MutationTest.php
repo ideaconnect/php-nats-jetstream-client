@@ -105,7 +105,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
             sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $bytes, $bytes, $status),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -133,7 +133,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500)->await();
@@ -156,7 +156,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // Real: trim('  @daily  ') -> '@daily' -> alias matches -> publishes.
@@ -180,7 +180,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         // kills PregMatchRemoveCaret @ 1662 (leading junk) and PregMatchRemoveDollar @ 1662 (trailing junk)
         foreach (['xxx@at 2030-01-01T00:00:00Z', '@at 2030-01-01T00:00:00Z trailing'] as $bad) {
             $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-            $client = new NatsClient(new NatsOptions(), $transport);
+            $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
             $client->connect()->await();
 
             try {
@@ -201,7 +201,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills PregMatchRemoveCaret @ 1667
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -222,7 +222,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         // kills PregMatchRemoveCaret @ 1672 (leading junk) and PregMatchRemoveDollar @ 1672 (trailing junk)
         foreach (['x@daily', '@dailyz'] as $bad) {
             $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-            $client = new NatsClient(new NatsOptions(), $transport);
+            $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
             $client->connect()->await();
 
             try {
@@ -244,7 +244,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills Concat @ 1683 (3 variants) and ConcatOperandRemoval @ 1683 (3 variants)
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -270,7 +270,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills UnwrapTrim @ 1696
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -296,7 +296,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // 'a @at b c d e' is a valid 6-field cron expression. With the start anchor it is cron-class,
@@ -385,7 +385,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
 
             return [];
         };
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -421,7 +421,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // A non-zero-indexed array: array_values() reindexes to [0=>...]; without it the JSON encoder
@@ -447,7 +447,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // config carries ack_policy (default), durable_name, and filter_subjects: a one-key slice would
@@ -471,7 +471,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills PregMatchRemoveCaret @ 1834
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -497,7 +497,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // Real: 0 < 0 is false -> valid -> request dispatched.
@@ -520,7 +520,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // Real: 9 > 9 is false -> valid. Mutant (>= 9): 9 rejected -> throws.
@@ -538,7 +538,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills LogicalOr @ 1841
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -561,7 +561,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills PregMatchRemoveCaret @ 1879
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -588,7 +588,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen('{"paused":false}'), '{"paused":false}'),
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // resumeConsumer issues a requestJson with an empty ([]) body.

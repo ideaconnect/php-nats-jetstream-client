@@ -43,7 +43,7 @@ final class JetStreamContext_4MutationTest extends TestCase
     private function connectedClientWith(array $frames, ?FakeTransport &$transport = null): NatsClient
     {
         $transport = new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $frames));
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return $client;

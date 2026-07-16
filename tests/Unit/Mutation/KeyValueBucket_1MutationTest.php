@@ -46,7 +46,7 @@ final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
 
     private function connect(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return $client;
