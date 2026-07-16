@@ -2035,9 +2035,15 @@ final class NatsConnection
                 : new CompositeCancellation($cancellation, $totalCancellation);
 
             while (true) {
-                // The mux reply inbox was permission-rejected (the async -ERR was just read); no reply
-                // can arrive, so fail fast with the clear error rather than waiting out the deadline (#167).
+                // The mux reply inbox was permission-rejected (the async -ERR was just read); no further
+                // reply can arrive. Return whatever this scatter-gather has already collected rather than
+                // discarding it; the clear permission error surfaces only when nothing was collected -
+                // e.g. a rejection at first use, or a reconnect re-SUB rejected mid-collection (#167/review).
                 if ($this->muxRejected) {
+                    if ($messages !== []) {
+                        break;
+                    }
+
                     throw $this->muxRejectedException();
                 }
 
