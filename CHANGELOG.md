@@ -27,6 +27,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `-ERR`, drops the dead mux state (so a reconnect does not replay the rejected wildcard SUB), and fails
   requests fast with a message naming the wildcard permission required. The in-flight request that
   triggers the rejection also fails fast rather than waiting out its full timeout.
+- `[bugfix]` Pull consumers with a priority group under the `overflow` or `prioritized` policy now honor
+  `setDepth()` instead of pulling strictly serially. Those policies never emit a `Nats-Pin-Id`, so the
+  "grouped-and-unpinned" serialization guard (meant to let a `pinned_client` group capture its pin before
+  fanning out) previously held for the whole run and silently disabled pipelining. A grouped run now pulls
+  serially only until its first delivery, then fans out to the configured depth if no pin was captured.
+- `[bugfix]` `requestMany()` no longer discards already-collected replies if the mux reply inbox is
+  permission-rejected mid-collection (e.g. a reconnect re-SUB is rejected after some replies arrived): it
+  returns the partial batch it has, and surfaces the clear permission error only when nothing was collected.
 
 ## [2.7.0] - 2026-07-15
 

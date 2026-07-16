@@ -2227,6 +2227,10 @@ final class JetStreamContext
             $idleDraining = false;
             // Whether the generation's empties were immediate (no_wait, or a 409) and so need pacing.
             $backoffWarranted = false;
+            // Whole-run bootstrap latch: a grouped run pulls serially only until its FIRST delivery, so a
+            // pinned_client group captures its pin before any fan-out; once delivered, a still-unpinned
+            // group (overflow/prioritized never emit Nats-Pin-Id) fans out to the full depth (review).
+            $anyDelivered = false;
             $terminated = false;
             $finite = $cfg->iterations !== null;
             // FIX2 reconnect epoch: replayed interest restores the SUB, we only re-issue lost pulls.
@@ -2253,6 +2257,8 @@ final class JetStreamContext
                             $consecutiveEmptyPulls = 0;
                             $idleDraining = false;
                             $backoffWarranted = false;
+                            // $anyDelivered persists across reconnect (a group already bootstrapped its
+                            // pin / fan-out), so depth is not needlessly re-clamped (review).
                         }
                     }
 
@@ -2300,6 +2306,7 @@ final class JetStreamContext
                             $consecutiveEmptyPulls = 0;
                             $idleDraining = false;
                             $backoffWarranted = false;
+                            $anyDelivered = true;
 
                             continue;
                         }
@@ -2382,7 +2389,7 @@ final class JetStreamContext
                     // ISSUE PHASE: fill up to the effective depth with fresh pulls. FIX1's !idleDraining
                     // gate stops mid-generation refills; drain() and the finite budget also gate it (a
                     // stop() is already handled by the breaks above, before and after any backoff).
-                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls);
+                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered);
                     while (
                         count($inflight) < $effectiveDepth
                         && !$idleDraining
@@ -2477,13 +2484,18 @@ final class JetStreamContext
      * idle streak is active (one pull per backoff window keeps the idle rate at ~2/s, #153); otherwise
      * the configured depth.
      */
-    private function effectivePullDepth(PullPipelineConfig $cfg, PullPipelineControl $ctl, int $consecutiveEmptyPulls): int
+    private function effectivePullDepth(PullPipelineConfig $cfg, PullPipelineControl $ctl, int $consecutiveEmptyPulls, bool $anyDelivered): int
     {
         if ($cfg->iterations !== null) {
             return 1;
         }
 
-        if ($cfg->grouped && $ctl->getPinId() === null) {
+        // A grouped run pulls serially ONLY until its first delivery: that lets a `pinned_client` group
+        // capture its pin (from the first batch's Nats-Pin-Id) before any parallel fan-out could race the
+        // server's pin assignment. Once a batch has been delivered and the group is still unpinned, it is an
+        // `overflow`/`prioritized` group (those policies never emit Nats-Pin-Id), which pipelines safely -
+        // so it fans out to the configured depth rather than staying serial forever (review).
+        if ($cfg->grouped && $ctl->getPinId() === null && !$anyDelivered) {
             return 1;
         }
 

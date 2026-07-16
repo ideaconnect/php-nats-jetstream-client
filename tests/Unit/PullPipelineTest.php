@@ -142,6 +142,39 @@ final class PullPipelineTest extends TestCase
         self::assertSame(['a'], $received);
     }
 
+    public function testGroupedUnpinnedRunFansOutAfterFirstDelivery(): void
+    {
+        // Review finding #1 (#120): a priority group under the overflow/prioritized policy never emits a
+        // Nats-Pin-Id, so its pin stays null for the whole run. The engine must pull serially ONLY until
+        // its first (bootstrap) delivery - not forever - then fan out to setDepth(). gen1 (serial): pull#0
+        // delivers 'a'; gen2 (fanned to depth 2): pull#1 delivers 'b' and pull#2 is a terminal 409, so BOTH
+        // gen2 pulls are already on the wire by the time 'b' is delivered (3 pull PUBs). If depth stayed
+        // clamped to 1 (the bug), only 2 pulls would be on the wire at 'b'.
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a']],
+            [['msg' => 'b']],
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
+        ]);
+        $js = $this->context($transport);
+
+        $pubsAtB = null;
+        $received = [];
+        $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setGroup('g')
+            ->handle(function (NatsMessage $m) use (&$pubsAtB, &$received, $transport): void {
+                $received[] = $m->payload;
+                if ($m->payload === 'b') {
+                    $pubsAtB = $this->pullPubCount($transport);
+                }
+            })->await();
+
+        self::assertSame(['a', 'b'], $received);
+        self::assertSame(3, $pubsAtB, 'an un-pinned group must fan out to setDepth() after its first delivery, not stay serial');
+    }
+
     public function testDrainFinishesInFlightBatchThenStops(): void
     {
         // One pull of batch 3; the handler drains after the first message -> the whole in-flight batch

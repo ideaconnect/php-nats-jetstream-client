@@ -2903,6 +2903,51 @@ final class NatsConnectionTest extends TestCase
         }
     }
 
+    /**
+     * Review finding #3 (#167): if the mux reply inbox is permission-rejected MID-collection (e.g. a
+     * reconnect re-SUB is rejected after some replies already arrived), requestMany() must RETURN the
+     * replies it has already collected rather than discarding them by throwing. The clear permission
+     * error surfaces only when nothing was collected.
+     */
+    public function testRequestManyReturnsPartialBatchOnMidCollectionMuxRejection(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $muxBase = null;
+        $transport->onWrite = static function (string $bytes) use (&$muxBase): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+            if (str_starts_with($head, 'SUB _INBOX.') && str_contains($head, '.* ')) {
+                $muxBase = substr(explode(' ', $head)[1] ?? '', 0, -2);
+
+                return [];
+            }
+            if (str_starts_with($head, 'PUB svc.scatter ')) {
+                $replyTo = explode(' ', $head)[2] ?? '';
+
+                // One reply lands on the mux sid (1), THEN the mux SUB is permission-rejected.
+                return [
+                    sprintf("MSG %s 1 2\r\nr1\r\n", $replyTo),
+                    "-ERR 'Permissions Violation for Subscription to \"{$muxBase}.*\"'\r\n",
+                ];
+            }
+
+            return [];
+        };
+
+        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection->connect()->await();
+
+        $replies = $connection->requestMany('svc.scatter', 'go', null, 5, 5000)->await();
+
+        self::assertCount(1, $replies);
+        self::assertSame('r1', $replies[0]->payload);
+    }
+
     public function testRequestReturnsReplyDeliveredOnSameTickAsTimeout(): void
     {
         // A reply delivered in the same processIncoming() call the deadline fires in must be returned,
