@@ -175,6 +175,44 @@ final class PullPipelineTest extends TestCase
         self::assertSame(3, $pubsAtB, 'an un-pinned group must fan out to setDepth() after its first delivery, not stay serial');
     }
 
+    public function testPinnedGroupReserializesPinRecaptureAfterStalePin(): void
+    {
+        // #170: a pinned_client group (its deliveries carry a Nats-Pin-Id) captures a pin and fans out to
+        // setDepth(). If a later 423 CLEARS the pin, the group must RE-SERIALIZE - pull one at a time to
+        // re-capture the pin cleanly - rather than racing pin-less pulls at full depth again. gen1 (serial):
+        // pull#0 delivers 'a' + pin p1 -> pinned, everPinned latched. gen2 (fanned to 2): pull#1 & pull#2
+        // both 423 -> the pin is cleared. gen3 MUST be serial (everPinned && pin===null): pull#3 alone
+        // re-captures with 'b' + p2. So exactly 4 pull PUBs are on the wire when 'b' is delivered. Without
+        // the #170 re-serialization, gen3 would fan out (anyDelivered && pin===null), issuing pull#3 AND
+        // pull#4 before 'b' -> 5 PUBs at 'b'.
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a', 'pin' => 'p1']],                        // pull#0: bootstrap (serial), captures p1
+            [['status' => 423, 'desc' => 'Nats-Pin-Id Mismatch']], // pull#1: stale pin -> clears pin
+            [['status' => 423, 'desc' => 'Nats-Pin-Id Mismatch']], // pull#2: stale pin (fanned sibling)
+            [['msg' => 'b', 'pin' => 'p2']],                       // pull#3: re-capture (must be serial)
+            [['status' => 409, 'desc' => 'Consumer Deleted']],     // terminal
+            [['status' => 409, 'desc' => 'Consumer Deleted']],     // terminal (spare, in case of fan-out)
+        ]);
+        $js = $this->context($transport);
+
+        $pubsAtB = null;
+        $received = [];
+        $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setGroup('g')
+            ->handle(function (NatsMessage $m) use (&$pubsAtB, &$received, $transport): void {
+                $received[] = $m->payload;
+                if ($m->payload === 'b') {
+                    $pubsAtB = $this->pullPubCount($transport);
+                }
+            })->await();
+
+        self::assertSame(['a', 'b'], $received);
+        self::assertSame(4, $pubsAtB, 'after a 423 pin loss, a pinned group must re-serialize its pin re-capture, not fan out');
+    }
+
     public function testDrainFinishesInFlightBatchThenStops(): void
     {
         // One pull of batch 3; the handler drains after the first message -> the whole in-flight batch
