@@ -2871,16 +2871,25 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
         // Reject the mux inbox SUB "<base>.* <sid>" with a permissions -ERR (async), as a server would
-        // for an account lacking _INBOX.> subscribe permission.
-        $transport->onWrite = static function (string $bytes): array {
+        // for an account lacking _INBOX.> subscribe permission. Capture the mux sid to assert the dead
+        // subscription state is dropped (not left dangling to be replayed on a later reconnect).
+        $muxSid = null;
+        $transport->onWrite = static function (string $bytes) use (&$muxSid): array {
             $head = strtok($bytes, "\r\n");
             if ($head === false || !str_starts_with($head, 'SUB _INBOX.') || !str_contains($head, '.* ')) {
                 return [];
             }
-            $subject = explode(' ', $head)[1] ?? '';
+            $parts = explode(' ', $head); // SUB <subject> <sid>
+            $subject = $parts[1] ?? '';
+            $muxSid = (int) ($parts[2] ?? 0);
 
             return ["-ERR 'Permissions Violation for Subscription to \"$subject\"'\r\n"];
         };
+
+        $muxSubs = static fn (): int => count(array_filter(
+            $transport->writes,
+            static fn (string $w): bool => str_starts_with($w, 'SUB _INBOX.') && str_contains($w, '.* '),
+        ));
 
         // 5 s timeout: a regressed fix would wait it out and throw TimeoutException instead.
         $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
@@ -2891,16 +2900,79 @@ final class NatsConnectionTest extends TestCase
             self::fail('expected a ConnectionException surfacing the mux-inbox permission rejection');
         } catch (ConnectionException $e) {
             self::assertStringContainsStringIgnoringCase('permissions violation', $e->getMessage());
-            self::assertStringContainsString('_INBOX.>', $e->getMessage());
+            // Pin the full message shape (both halves, in order) so the reply-inbox pattern and the exact
+            // wildcard permission needed are named for the operator - the default inbox prefix is _INBOX.
+            self::assertStringContainsString(
+                'the shared reply-inbox subscription "_INBOX.<inbox>.*" was rejected by the server (permissions violation).',
+                $e->getMessage(),
+            );
+            self::assertStringContainsString(
+                'reply-inbox wildcard "_INBOX.>" to use request()/requestMany().',
+                $e->getMessage(),
+            );
         }
+        self::assertSame(1, $muxSubs(), 'exactly one mux SUB was attempted before the rejection latched');
+        // The dead mux subscription state is dropped, not left dangling: otherwise resubscribeAll() would
+        // replay the rejected "<base>.*" SUB on the next reconnect (the reason the detection drops it).
+        self::assertNotNull($muxSid);
+        self::assertFalse(
+            $connection->isSubscriptionActive($muxSid),
+            'the permission-rejected mux subscription must be dropped from active subscription state',
+        );
 
-        // The rejection is latched: a subsequent request fails fast the same way (no re-SUB attempt).
+        // The rejection is latched: a subsequent request fails fast at entry - same error, and crucially
+        // NO fresh mux SUB is attempted (the whole point of the latch).
         try {
             $connection->request('svc.echo', 'ping2')->await();
             self::fail('expected the latched rejection to keep failing request()');
         } catch (ConnectionException $e) {
             self::assertStringContainsStringIgnoringCase('permissions violation', $e->getMessage());
         }
+        self::assertSame(1, $muxSubs(), 'the latched request() must not attempt another mux SUB');
+    }
+
+    /**
+     * The mux-rejection detection keys STRICTLY on the connection's random mux base (#167): a recoverable
+     * permissions -ERR for some OTHER subscription (not the reply-inbox wildcard) must not latch the
+     * mux-rejected state and disable request/reply. Here an unrelated violation is delivered on the
+     * request's write, immediately followed by a valid reply on the mux sid; the request must still
+     * return that reply. If the detection's null/substring guard were loosened (e.g. && -> ||), the
+     * unrelated error would wrongly latch the rejection and request() would throw instead of replying.
+     */
+    public function testUnrelatedSubscriptionPermissionViolationDoesNotLatchMuxRejection(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // On the request PUB: first a recoverable permission -ERR naming an UNRELATED subject (never the
+        // mux base), then a valid reply on the mux sid (1) at the captured reply-to.
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+            if ($replyTo === '') {
+                return [];
+            }
+
+            return [
+                "-ERR 'Permissions Violation for Subscription to \"unrelated.subject\"'\r\n",
+                sprintf("MSG %s 1 4\r\npong\r\n", $replyTo),
+            ];
+        };
+
+        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection->connect()->await();
+
+        try {
+            $response = $connection->request('svc.echo', 'ping')->await();
+        } catch (ConnectionException $e) {
+            self::fail('an unrelated permission violation must not disable request/reply: ' . $e->getMessage());
+        }
+
+        self::assertSame('pong', $response->payload);
     }
 
     /**
@@ -2946,6 +3018,59 @@ final class NatsConnectionTest extends TestCase
 
         self::assertCount(1, $replies);
         self::assertSame('r1', $replies[0]->payload);
+    }
+
+    /**
+     * The requestMany() counterpart of {@see testRequestSurfacesMuxInboxPermissionRejection} for the
+     * NOTHING-collected case (#167). When the mux reply-inbox SUB is permission-rejected and no reply has
+     * arrived, requestMany() must surface the clear ConnectionException, not wait out its timeout and
+     * return an empty batch: first via the wait-loop throw (rejection read mid-wait on first use), then
+     * fast at entry once the rejection is latched - and the entry fast-fail must NOT attempt a fresh SUB.
+     */
+    public function testRequestManySurfacesMuxInboxPermissionRejectionWhenNothingCollected(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // Reject any mux inbox SUB "<base>.* <sid>" with a permissions -ERR (async); never deliver a reply.
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'SUB _INBOX.') || !str_contains($head, '.* ')) {
+                return [];
+            }
+            $subject = explode(' ', $head)[1] ?? '';
+
+            return ["-ERR 'Permissions Violation for Subscription to \"$subject\"'\r\n"];
+        };
+
+        $muxSubs = static fn (): int => count(array_filter(
+            $transport->writes,
+            static fn (string $w): bool => str_starts_with($w, 'SUB _INBOX.') && str_contains($w, '.* '),
+        ));
+
+        // 5 s timeout: a regressed fix (no wait-loop guard) would wait it out and return [] instead.
+        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection->connect()->await();
+
+        // First use: the rejection is read mid-wait with nothing collected -> the wait-loop throw.
+        try {
+            $connection->requestMany('svc.scatter', 'go', null, 5, 5000)->await();
+            self::fail('expected a ConnectionException surfacing the mux-inbox permission rejection');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsStringIgnoringCase('permissions violation', $e->getMessage());
+            self::assertStringContainsString('_INBOX.>', $e->getMessage());
+        }
+        self::assertSame(1, $muxSubs(), 'exactly one mux SUB was attempted before the rejection latched');
+
+        // Latched: a subsequent requestMany fails fast at entry - no fresh SUB, still nothing collected.
+        try {
+            $connection->requestMany('svc.scatter', 'go2', null, 5, 5000)->await();
+            self::fail('expected the latched rejection to keep failing requestMany()');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsStringIgnoringCase('permissions violation', $e->getMessage());
+        }
+        self::assertSame(1, $muxSubs(), 'the entry fast-fail must not attempt another mux SUB');
     }
 
     public function testRequestReturnsReplyDeliveredOnSameTickAsTimeout(): void
