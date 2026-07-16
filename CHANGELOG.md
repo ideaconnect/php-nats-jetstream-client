@@ -32,6 +32,9 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   "grouped-and-unpinned" serialization guard (meant to let a `pinned_client` group capture its pin before
   fanning out) previously held for the whole run and silently disabled pipelining. A grouped run now pulls
   serially only until its first delivery, then fans out to the configured depth if no pin was captured.
+  Conversely, a `pinned_client` group that captured a pin and then LOST it (a `423` stale-pin cleared the
+  pin mid-run) now RE-SERIALIZES its pin re-capture - pulling one at a time until it re-pins - instead of
+  racing pin-less pulls at full depth, matching the bootstrap behavior (#170).
 - `[bugfix]` `requestMany()` no longer discards already-collected replies if the mux reply inbox is
   permission-rejected mid-collection (e.g. a reconnect re-SUB is rejected after some replies arrived): it
   returns the partial batch it has, and surfaces the clear permission error only when nothing was collected.

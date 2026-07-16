@@ -2231,6 +2231,11 @@ final class JetStreamContext
             // pinned_client group captures its pin before any fan-out; once delivered, a still-unpinned
             // group (overflow/prioritized never emit Nats-Pin-Id) fans out to the full depth (review).
             $anyDelivered = false;
+            // Set once a pin is ever captured, i.e. this IS a pinned_client group. Distinguishes a
+            // pinned group that has LOST its pin (a 423 cleared it) from an overflow/prioritized group
+            // that never pins: the former must re-serialize to re-capture cleanly, the latter pipelines
+            // freely. Persists across a pin loss and reconnect (#170).
+            $everPinned = false;
             $terminated = false;
             $finite = $cfg->iterations !== null;
             // FIX2 reconnect epoch: replayed interest restores the SUB, we only re-issue lost pulls.
@@ -2282,9 +2287,15 @@ final class JetStreamContext
                         unset($inflight[$token]);
 
                         // Capture a pinned-group pin from the first message of the batch (before delivery),
-                        // so once resolved the effective depth can fan out past 1.
+                        // so once resolved the effective depth can fan out past 1. A non-null capture marks
+                        // this a pinned_client group for the rest of the run (#170), so a later pin loss
+                        // re-serializes rather than racing pin-less pulls.
                         if ($cfg->grouped && $ctl->getPinId() === null && $pull->buffer !== []) {
-                            $ctl->setPinId($this->pinIdOf($pull->buffer[0]));
+                            $capturedPin = $this->pinIdOf($pull->buffer[0]);
+                            $ctl->setPinId($capturedPin);
+                            if ($capturedPin !== null) {
+                                $everPinned = true;
+                            }
                         }
 
                         // Drain the buffer to the handler FIRST (so a deadline/terminal retire of a
@@ -2389,7 +2400,7 @@ final class JetStreamContext
                     // ISSUE PHASE: fill up to the effective depth with fresh pulls. FIX1's !idleDraining
                     // gate stops mid-generation refills; drain() and the finite budget also gate it (a
                     // stop() is already handled by the breaks above, before and after any backoff).
-                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered);
+                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered, $everPinned);
                     while (
                         count($inflight) < $effectiveDepth
                         && !$idleDraining
@@ -2484,18 +2495,19 @@ final class JetStreamContext
      * idle streak is active (one pull per backoff window keeps the idle rate at ~2/s, #153); otherwise
      * the configured depth.
      */
-    private function effectivePullDepth(PullPipelineConfig $cfg, PullPipelineControl $ctl, int $consecutiveEmptyPulls, bool $anyDelivered): int
+    private function effectivePullDepth(PullPipelineConfig $cfg, PullPipelineControl $ctl, int $consecutiveEmptyPulls, bool $anyDelivered, bool $everPinned): int
     {
         if ($cfg->iterations !== null) {
             return 1;
         }
 
-        // A grouped run pulls serially ONLY until its first delivery: that lets a `pinned_client` group
-        // capture its pin (from the first batch's Nats-Pin-Id) before any parallel fan-out could race the
-        // server's pin assignment. Once a batch has been delivered and the group is still unpinned, it is an
-        // `overflow`/`prioritized` group (those policies never emit Nats-Pin-Id), which pipelines safely -
-        // so it fans out to the configured depth rather than staying serial forever (review).
-        if ($cfg->grouped && $ctl->getPinId() === null && !$anyDelivered) {
+        // A grouped run pulls serially while it is unpinned AND either (a) it has not yet delivered - the
+        // bootstrap window, where a `pinned_client` group must capture its pin (from the first batch's
+        // Nats-Pin-Id) before any parallel fan-out could race the server's pin assignment - or (b) it has
+        // pinned before and since LOST the pin (a 423 cleared it), where it must likewise re-capture
+        // serially (#170). A group that delivered but never pinned is `overflow`/`prioritized` (those
+        // policies never emit Nats-Pin-Id); it pipelines safely and fans out to the configured depth.
+        if ($cfg->grouped && $ctl->getPinId() === null && (!$anyDelivered || $everPinned)) {
             return 1;
         }
 
