@@ -147,6 +147,14 @@ final class NatsConnection
      */
     private ?int $muxSid = null;
     /**
+     * Latched once the mux inbox subscription "<muxBase>.*" is rejected by server permissions (#167).
+     * The -ERR is async, so it lands after ensureMuxInbox() cached the (now dead) muxSid/muxBase. On
+     * detection the mux state is dropped (so a reconnect does not replay the rejected SUB) and every
+     * request()/requestMany() then fails fast with a clear, catchable error instead of a silent
+     * permanent timeout. Reset by releaseRuntimeState() so a fresh connect() re-attempts the mux inbox.
+     */
+    private bool $muxRejected = false;
+    /**
      * In-flight request waiters keyed by per-request suffix token. Each value routes one reply: a single
      * request completes its DeferredFuture; requestMany appends to its collector. Removed on EVERY request
      * exit - the no-late-leak mechanism that replaces per-request sid removal (#118).
@@ -690,6 +698,9 @@ final class NatsConnection
         $this->muxBase = null;
         $this->muxSid = null;
         $this->muxWaiters = [];
+        // A fresh connect() may target an account/server that permits the reply-inbox wildcard, so a
+        // terminal close clears the rejection latch and lets ensureMuxInbox() re-attempt the mux (#167).
+        $this->muxRejected = false;
         $this->unboundedSids = [];
         $this->reconnectBuffer = '';
         $this->parser = new ProtocolParser();
@@ -1762,6 +1773,23 @@ final class NatsConnection
     }
 
     /**
+     * The clear, catchable error raised by request()/requestMany() once the mux reply-inbox
+     * subscription has been permission-rejected (#167), replacing the pre-fix silent timeout. Names the
+     * reply-inbox wildcard the account must be allowed to subscribe to.
+     */
+    private function muxRejectedException(): ConnectionException
+    {
+        $wildcard = $this->options->inboxPrefix . '.>';
+
+        return new ConnectionException(
+            'request/reply is unavailable on this connection: the shared reply-inbox subscription "'
+            . $this->options->inboxPrefix . '.<inbox>.*" was rejected by the server (permissions violation). '
+            . 'Grant the account subscribe permission for the reply-inbox wildcard "' . $wildcard
+            . '" to use request()/requestMany().',
+        );
+    }
+
+    /**
      * Executes request/reply flow using plain publish or header publish variants.
      *
      * @param array<string,string>|null $headers
@@ -1775,6 +1803,10 @@ final class NatsConnection
     ): NatsMessage {
         if ($this->state !== ConnectionState::Open) {
             throw new ConnectionException('Connection is not open');
+        }
+
+        if ($this->muxRejected) {
+            throw $this->muxRejectedException();
         }
 
         $this->ensureMuxInbox();
@@ -1821,6 +1853,13 @@ final class NatsConnection
                 // rather than discarded as a spurious timeout.
                 if ($replyReceived) {
                     break;
+                }
+
+                // The mux reply inbox was permission-rejected mid-flight (the async -ERR was just read);
+                // no reply can arrive on it, so fail fast with the clear error rather than waiting out
+                // the deadline (#167).
+                if ($this->muxRejected) {
+                    throw $this->muxRejectedException();
                 }
 
                 if ($waitCancellation->isRequested()) {
@@ -1941,6 +1980,10 @@ final class NatsConnection
             throw new TimeoutException('Request timeout must be greater than zero');
         }
 
+        if ($this->muxRejected) {
+            throw $this->muxRejectedException();
+        }
+
         $this->ensureMuxInbox();
         $token = $this->newMuxToken();
         $replyTo = $this->muxBase . '.' . $token;
@@ -1992,6 +2035,12 @@ final class NatsConnection
                 : new CompositeCancellation($cancellation, $totalCancellation);
 
             while (true) {
+                // The mux reply inbox was permission-rejected (the async -ERR was just read); no reply
+                // can arrive, so fail fast with the clear error rather than waiting out the deadline (#167).
+                if ($this->muxRejected) {
+                    throw $this->muxRejectedException();
+                }
+
                 if ($noResponders) {
                     break;
                 }
@@ -2991,6 +3040,21 @@ final class NatsConnection
         if ($frame->type === ProtocolFrameType::Err) {
             $error = $frame->error ?? 'unknown';
             if ($this->isRecoverableServerError($error)) {
+                // A permissions violation naming the mux inbox subscription "<muxBase>.*" means this
+                // account cannot subscribe to the reply-inbox wildcard, so no request reply can ever be
+                // delivered (#167). Drop the dead mux state (so a reconnect does not replay the rejected
+                // SUB) and latch $muxRejected: request()/requestMany() then fail fast with a clear,
+                // catchable error instead of a silent permanent timeout. The random muxBase makes the
+                // substring match unambiguous.
+                if ($this->muxSid !== null && $this->muxBase !== null && str_contains($error, $this->muxBase)) {
+                    // dropSubscriptionState() also clears the sid's slow-consumer exemption flag.
+                    $this->dropSubscriptionState($this->muxSid);
+                    $this->muxSid = null;
+                    $this->muxBase = null;
+                    $this->muxInboxSetup = null;
+                    $this->muxRejected = true;
+                }
+
                 // Non-fatal server error (e.g. a per-subscription permissions violation): surface it
                 // to the async error listener instead of tearing down the connection.
                 $this->emitError(new NatsException('Server sent recoverable error frame: ' . $error));

@@ -15,6 +15,19 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` `request()`/`requestMany()` now surface a clear, catchable `ConnectionException` when the
+  shared mux reply-inbox subscription `_INBOX.<inbox>.*` is rejected by server permissions, instead of
+  hanging every request to a silent timeout (#167, a follow-up to #118's muxed request inbox). An account
+  without subscribe permission for the reply-inbox wildcard (e.g. `_INBOX.>`) previously saw all
+  request/reply calls time out with no explanation; the connection now detects the async permission
+  `-ERR`, drops the dead mux state (so a reconnect does not replay the rejected wildcard SUB), and fails
+  requests fast with a message naming the wildcard permission required. The in-flight request that
+  triggers the rejection also fails fast rather than waiting out its full timeout.
+
 ## [2.7.0] - 2026-07-15
 
 ### Changed
