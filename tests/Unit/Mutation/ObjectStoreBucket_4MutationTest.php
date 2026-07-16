@@ -48,7 +48,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
 
     private function connectedClient(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return $client;

@@ -252,7 +252,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($accountPayload), $accountPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $account = $client->jetStream()->accountInfo()->await();
@@ -277,7 +277,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $config = \IDCT\NATS\JetStream\Configuration\StreamConfiguration::create('ORDERS')
@@ -316,7 +316,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $config = \IDCT\NATS\JetStream\Configuration\ConsumerConfiguration::create()
@@ -353,7 +353,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         self::assertSame(['cfg', 'sessions'], $client->jetStream()->keyValueBucketNames()->await());
@@ -374,7 +374,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         self::assertSame(['assets', 'media'], $client->jetStream()->objectStoreBucketNames()->await());
@@ -395,7 +395,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $names = $client->jetStream()->streamNames()->await();
@@ -419,7 +419,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $names = $client->jetStream()->consumerNames('ORDERS')->await();
@@ -443,7 +443,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->getLastMessageForSubject('ORDERS', 'orders.new')->await();
@@ -483,7 +483,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*', 'orders.archive'])->await();
@@ -510,7 +510,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($err), $err),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -540,7 +540,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($withoutErrCode), $withoutErrCode),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -578,7 +578,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
@@ -607,7 +607,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -634,7 +634,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updateOk), $updateOk),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $info = $client->jetStream()->createOrUpdateStream('ORDERS', ['orders.*'])->await();
@@ -659,7 +659,7 @@ final class JetStreamContextTest extends TestCase
             "MSG _INBOX.c 3 16\r\n{\"success\":true}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $js = $client->jetStream();
@@ -690,7 +690,7 @@ final class JetStreamContextTest extends TestCase
             "MSG _INBOX.a 1 48\r\n{\"error\":{\"code\":404,\"description\":\"not found\"}}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -790,7 +790,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($deletePayload), $deletePayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $js = $client->jetStream();
@@ -824,7 +824,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->createConsumer('ORDERS', 'PROC', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']])->await();
@@ -843,7 +843,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -866,7 +866,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -890,7 +890,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -916,7 +916,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -944,7 +944,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->createPushConsumer('ORDERS', 'PROC', '_INBOX.deliver', null, [
@@ -970,7 +970,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->createConsumer('ORDERS', 'PROC', null, [
@@ -992,7 +992,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1018,7 +1018,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500, [
@@ -1045,7 +1045,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1069,7 +1069,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1095,7 +1095,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500, [
@@ -1117,7 +1117,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -1142,7 +1142,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -1169,7 +1169,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg), $msg),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // 1250ms heartbeat against a 2500ms expiry: exactly the 50% ceiling - allowed.
@@ -1197,7 +1197,7 @@ final class JetStreamContextTest extends TestCase
             blockWhenEmpty: true,
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $startNs = hrtime(true);
@@ -1227,7 +1227,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen('{}'), '{}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ok = $client->jetStream()->unpinConsumer('ORDERS', 'PROC', 'g1')->await();
@@ -1282,7 +1282,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($h3), strlen($h3) + strlen($b3), $h3, $b3),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10])->await();
@@ -1317,7 +1317,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($h3), strlen($h3) + strlen($b3), $h3, $b3),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', ['orders.a', 'orders.b'])->await();
@@ -1358,7 +1358,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.DGET.y 2 %d %d\r\n%s%s\r\n", strlen($h2), strlen($h2) + strlen($b2), $h2, $b2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
@@ -1421,7 +1421,7 @@ final class JetStreamContextTest extends TestCase
 
         $transport = new FakeTransport($reads);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         self::assertSame($maxPayload, $client->maxPayload());
 
@@ -1492,7 +1492,7 @@ final class JetStreamContextTest extends TestCase
 
         $transport = new FakeTransport($reads);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // With the escaping-aware budget this completes; with strlen + 3 the oversized chunk's PUB throws.
@@ -1543,7 +1543,7 @@ final class JetStreamContextTest extends TestCase
         }
 
         $transport = new FakeTransport($reads);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         self::assertSame(0, $client->maxPayload());
 
@@ -1583,7 +1583,7 @@ final class JetStreamContextTest extends TestCase
         }
 
         $transport = new FakeTransport($reads);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
@@ -1624,7 +1624,7 @@ final class JetStreamContextTest extends TestCase
         }
 
         $transport = new FakeTransport($reads);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', $subjects)->await();
@@ -1656,7 +1656,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s\r\n", strlen($err), strlen($err), $err),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1713,7 +1713,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->publish('orders.created', '{"id":1}')->await();
@@ -1734,7 +1734,7 @@ final class JetStreamContextTest extends TestCase
             "MSG _INBOX.a 1 7\r\nnotjson\r\n", // a non-JSON publish ack
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1757,7 +1757,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1781,7 +1781,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->createStream(
@@ -1810,7 +1810,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -1841,7 +1841,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $when = new DateTimeImmutable('2030-01-01 00:00:00', new DateTimeZone('UTC'));
@@ -1872,7 +1872,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1906,7 +1906,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publishScheduled(
@@ -1940,7 +1940,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publishScheduled(
@@ -1970,7 +1970,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publishScheduled(
@@ -2000,7 +2000,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publishScheduled(
@@ -2023,7 +2023,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2057,7 +2057,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $ack = $client->jetStream()->publish('orders.created', '{"id":1}', msgId: 'order-1')->await();
@@ -2082,7 +2082,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publish(
@@ -2117,7 +2117,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorAck), $errorAck),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2145,7 +2145,7 @@ final class JetStreamContextTest extends TestCase
         ]);
 
         // Tight retry wait so the test is fast.
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $js = new JetStreamContext($client, publishRetryAttempts: 3, publishRetryWaitMs: 1);
 
@@ -2168,7 +2168,7 @@ final class JetStreamContextTest extends TestCase
             "MSG _INBOX.any 1 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $delivered = new NatsMessage('events.x', 9, '$JS.ACK.ORDERS.c1.1.5.5.0.0', 'body');
@@ -2196,7 +2196,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ok), $ok),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $js = $client->jetStream();
 
@@ -2266,7 +2266,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publish('orders.created', '{"id":1}', ttl: 30)->await();
@@ -2290,7 +2290,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->publish('orders.created', '{"id":1}', ttl: 'never')->await();
@@ -2308,7 +2308,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2331,7 +2331,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2359,7 +2359,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $value = $client->jetStream()->incrementCounter('counters.visits', '+5')->await();
@@ -2386,7 +2386,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $value = $client->jetStream()->incrementCounter('counters.visits', '+1')->await();
@@ -2404,7 +2404,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2434,7 +2434,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s%s\r\n", $h, $h + strlen($body), $hdrs, $body),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $value = $client->jetStream()->counterValue('COUNTERS', 'counters.visits')->await();
@@ -2459,7 +2459,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s\r\n", $h, $h, $hdrs),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $value = $client->jetStream()->counterValue('COUNTERS', 'counters.visits')->await();
@@ -2482,7 +2482,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $when = new DateTimeImmutable('2030-01-01 00:00:00', new DateTimeZone('UTC'));
@@ -2513,7 +2513,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $when = new DateTimeImmutable('2030-01-01 00:00:00', new DateTimeZone('UTC'));
@@ -2542,7 +2542,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($deliveryPayload), $deliveryPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->fetchNext('ORDERS', 'PROC', 2500)->await();
@@ -2562,7 +2562,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2586,7 +2586,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 reply.ack %d\r\n%s\r\n", strlen($deliveryPayload), $deliveryPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->request('$JS.API.CONSUMER.MSG.NEXT.ORDERS.PROC', '{}')->await();
@@ -2623,7 +2623,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2643,7 +2643,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2668,7 +2668,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $created = $client->jetStream()->createPushConsumer('ORDERS', 'PROC', 'deliver.proc', 'orders.*')->await();
@@ -2695,7 +2695,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $consumer = $client->jetStream()->createEphemeralPushConsumer('ORDERS', 'deliver.ep', 'orders.*')->await();
@@ -2737,7 +2737,7 @@ final class JetStreamContextTest extends TestCase
             "MSG deliver.proc 2 5\r\nhello\r\n",
         ];
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = null;
@@ -2790,7 +2790,7 @@ final class JetStreamContextTest extends TestCase
             ),
         ];
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $handled = false;
@@ -2838,7 +2838,7 @@ final class JetStreamContextTest extends TestCase
             ),
         ];
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $handled = false;
@@ -2873,7 +2873,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $consumer = $client->jetStream()->createEphemeralConsumer('ORDERS', 'orders.*')->await();
@@ -2905,7 +2905,7 @@ final class JetStreamContextTest extends TestCase
             "MSG deliver.ephemeral 2 5\r\nhello\r\n",
         ];
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = null;
@@ -2935,7 +2935,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2957,7 +2957,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $created = $client->jetStream()->createStream('AGG', [], [
@@ -2985,7 +2985,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $created = $client->jetStream()->createStream('MIRROR', [], [
@@ -3005,7 +3005,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -3025,7 +3025,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($malformedPayload), $malformedPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -3047,7 +3047,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($responsePayload), $responsePayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $updated = $client->jetStream()->updateStream('ORDERS', [
@@ -3071,7 +3071,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $consumer = $client->jetStream()->createConsumer('ORDERS', 'PROC', 'orders.*', [
@@ -3102,7 +3102,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // No ack_policy passed: the durable createConsumer() path must default it to explicit.
@@ -3123,7 +3123,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->createPushConsumer('ORDERS', 'PROC', 'deliver.proc', 'orders.*', [
@@ -3145,7 +3145,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg2), $msg2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 2, 2500)->await();
@@ -3166,7 +3166,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -3187,7 +3187,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 2, 2500)->await();
@@ -3214,7 +3214,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $observed = null;
@@ -3249,7 +3249,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($msg1), $msg1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2500)->await();
@@ -3269,7 +3269,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -3289,7 +3289,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.FETCH.a 1 %d %d\r\n%s\r\n", $headerBytes, $headerBytes, $statusHeaders),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         try {
@@ -3313,7 +3313,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse('{"paused":true,"pause_until":"2026-12-01T00:00:00Z"}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $result = $client->jetStream()->pauseConsumer('ORDERS', 'PROC', '2026-12-01T00:00:00Z')->await();
@@ -3335,7 +3335,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse('{"paused":false}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $result = $client->jetStream()->resumeConsumer('ORDERS', 'PROC')->await();
@@ -3370,7 +3370,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse($consumerCreateResponse),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->subscribeOrderedConsumer('ORDERS', function (NatsMessage $msg): void {})->await();
@@ -3397,7 +3397,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse('{"purged":42}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $result = $client->jetStream()->purgeStream('ORDERS')->await();
@@ -3416,7 +3416,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse('{"purged":10}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $result = $client->jetStream()->purgeStream('ORDERS', ['filter' => 'orders.old'])->await();
@@ -3442,7 +3442,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse($listPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $streams = $client->jetStream()->listStreams()->await();
@@ -3469,7 +3469,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse($listPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $streams = $client->jetStream()->listStreams(['subject' => 'orders.>'])->await();
@@ -3496,7 +3496,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse($listPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $consumers = $client->jetStream()->listConsumers('ORDERS')->await();
@@ -3536,7 +3536,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen((string) $page2), (string) $page2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $streams = $client->jetStream()->listStreams()->await();
@@ -3566,7 +3566,7 @@ final class JetStreamContextTest extends TestCase
             $this->jsOkResponse($msgPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->getStreamMessage('ORDERS', 1)->await();
@@ -3723,7 +3723,7 @@ final class JetStreamContextTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $js = $client->jetStream();
 
@@ -3753,7 +3753,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($apiResponse), $apiResponse),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->getStreamMessage('EVENTS', 1)->await();
@@ -3786,7 +3786,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($apiResponse), $apiResponse),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->getStreamMessage('EVENTS', 2)->await();
@@ -3813,7 +3813,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($apiResponse), $apiResponse),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->getStreamMessage('EVENTS', 3)->await();
@@ -3837,7 +3837,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.any 1 %d %d\r\n%s%s\r\n", $hdrLen, $totalLen, $headerBlock, $body),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->directGetStreamMessage('EVENTS', 2)->await();
@@ -3867,7 +3867,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.any 1 %d %d\r\n%s%s\r\n", $hdrLen, $totalLen, $headerBlock, $body),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = $client->jetStream()->directGetLastMessageForSubject('EVENTS', 'events.order')->await();
@@ -3893,7 +3893,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.any 1 %d %d\r\n%s\r\n", $len, $len, $statusBlock),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -3938,7 +3938,7 @@ final class JetStreamContextTest extends TestCase
             ],
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -4034,7 +4034,7 @@ final class JetStreamContextTest extends TestCase
             ];
         };
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -4090,7 +4090,7 @@ final class JetStreamContextTest extends TestCase
             ],
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -4154,7 +4154,7 @@ final class JetStreamContextTest extends TestCase
             ],
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -4483,7 +4483,7 @@ final class JetStreamContextTest extends TestCase
             ],
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -4521,7 +4521,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createErr), $createErr),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -4547,7 +4547,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $names = $client->jetStream()->streamNames()->await();
@@ -4574,7 +4574,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s%s\r\n", $h, $h + strlen($body), $hdrs, $body),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -4651,7 +4651,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createPayload), $createPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $info = $client->jetStream()->addOrUpdateConsumer('ORDERS', 'PROC', 'orders.*')->await();
@@ -4676,7 +4676,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $names = $client->jetStream()->consumerNames('ORDERS')->await();
@@ -4711,7 +4711,7 @@ final class JetStreamContextTest extends TestCase
             "MSG deliver.eph 2 5\r\nhello\r\n",
         ];
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -4762,7 +4762,7 @@ final class JetStreamContextTest extends TestCase
             ),
         ];
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -5059,7 +5059,7 @@ final class JetStreamContextTest extends TestCase
             ],
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -5484,7 +5484,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5513,7 +5513,7 @@ final class JetStreamContextTest extends TestCase
         ]);
 
         // Use retryAttempts=3 so that a retry would produce a second request (proving we don't retry).
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $js = new JetStreamContext($client, publishRetryAttempts: 3, publishRetryWaitMs: 1);
 
@@ -5544,7 +5544,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.a 1 %d %d\r\n%s\r\n", $h, $h, $hdrs),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5570,7 +5570,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($badPayload), $badPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5595,7 +5595,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($errorPayload), $errorPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5621,7 +5621,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($payload), $payload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $value = $client->jetStream()->incrementCounter('counters.visits', '+1')->await();
@@ -5645,7 +5645,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($payload), $payload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5668,7 +5668,7 @@ final class JetStreamContextTest extends TestCase
             blockWhenEmpty: true,
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5704,7 +5704,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5729,7 +5729,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5753,7 +5753,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5778,7 +5778,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5802,7 +5802,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5834,7 +5834,7 @@ final class JetStreamContextTest extends TestCase
             blockWhenEmpty: true,
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // expiresMs=1 makes the TimeoutCancellation fire after ~1001 ms; the blocking transport
@@ -5899,7 +5899,7 @@ final class JetStreamContextTest extends TestCase
             'HMSG _INBOX.b 2 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         // publishRetryAttempts=2, publishRetryWaitMs=1 (tight loop so the test is fast).
@@ -5923,7 +5923,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5948,7 +5948,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5972,7 +5972,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -5995,7 +5995,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -6020,7 +6020,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -6043,7 +6043,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -6066,7 +6066,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -6095,7 +6095,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamPayload), $streamPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $created = $client->jetStream()->createStream('ORDERS-2_prod', ['orders.*'])->await();
@@ -6301,7 +6301,7 @@ final class JetStreamContextTest extends TestCase
             ],
         );
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, 'events.>')->await();
@@ -6419,7 +6419,7 @@ final class JetStreamContextTest extends TestCase
         }
         $transport->enqueueOnWriteContaining['SUB deliver.eph '] = $statusFrames;
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -6515,7 +6515,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -6542,7 +6542,7 @@ final class JetStreamContextTest extends TestCase
             sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($h1), strlen($h1) + strlen($b1), $h1, $b1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -6565,7 +6565,7 @@ final class JetStreamContextTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return [$client, $transport];

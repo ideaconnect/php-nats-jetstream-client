@@ -47,7 +47,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         // frames DYNAMICALLY on the captured mux reply-to instead of pre-seeding them (see muxReplies()).
         $transport = new FakeTransport([self::INFO_LINE, "PONG\r\n"]);
         $this->muxReplies($transport, $reads);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $this->lastTransport = $transport;
 

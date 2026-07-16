@@ -51,7 +51,7 @@ final class NatsClientTest extends TestCase
             "MSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $message = null;
@@ -88,7 +88,7 @@ final class NatsClientTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
         };
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $reply = $client->request('svc.echo', '{"x":1}', 50)->await();
@@ -106,7 +106,7 @@ final class NatsClientTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $deferredCancellation = new DeferredCancellation();
@@ -141,7 +141,7 @@ final class NatsClientTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 %d\r\n%s\r\n", $replyTo, strlen($replyPayload), $replyPayload)];
         };
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         $client->publishWithHeaders('orders.created', '{"id":1}', ['X-Test' => '1'])->await();
@@ -164,7 +164,7 @@ final class NatsClientTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         self::assertSame(['nats://10.0.0.2:4222', 'nats://10.0.0.3:4222'], $client->discoveredServers());

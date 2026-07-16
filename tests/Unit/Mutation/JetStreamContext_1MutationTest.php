@@ -38,7 +38,7 @@ final class JetStreamContext_1MutationTest extends \PHPUnit\Framework\TestCase
     private function connect(array $muxFrames): array
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
         $this->muxReplies($transport, $muxFrames);
 

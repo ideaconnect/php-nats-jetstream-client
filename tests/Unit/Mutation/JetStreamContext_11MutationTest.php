@@ -85,7 +85,7 @@ final class JetStreamContext_11MutationTest extends TestCase
 
     private function context(FakeTransport $transport): JetStreamContext
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
         return $client->jetStream();
