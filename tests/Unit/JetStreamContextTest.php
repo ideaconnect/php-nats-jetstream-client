@@ -6498,6 +6498,63 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * #121 (mutation-hardening): the DURABLE caller-owned push path (subscribePushConsumer) must surface a
+     * terminal status through the error listener exactly like the ephemeral path above. This pins the
+     * still-uncovered corners of that path/helper: the durable subscribe callback surfacing at all
+     * (surfaceCallerOwnedPushStatus reached with the REAL control headers, not [] - kills the durable
+     * Coalesce/MethodCallRemoval), and the `status < 400` boundary at EXACTLY 400 (a 409 does not
+     * distinguish `<` from `<=`). The ephemeral test above uses 409 on the ephemeral path, so neither is
+     * exercised. (The Description's own trim() in surfaceCallerOwnedPushStatus is a no-op - NatsHeaders
+     * already trims every parsed header value - so it is an equivalent mutant, not pinned here.)
+     */
+    public function testDurableCallerOwnedPushConsumerSurfacesStatus400(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"DUR","config":{"deliver_subject":"deliver.dur","ack_policy":"none"}}';
+        // Status EXACTLY 400 - the `< 400` boundary that a 409 (used by the ephemeral test) cannot pin.
+        $terminal = NatsHeaders::toWireBlock(['Status' => '400', 'Description' => 'Bad Request']);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.dur '] = [
+            sprintf("HMSG deliver.dur 2 %d %d\r\n%s\r\n", strlen($terminal), strlen($terminal), $terminal),
+        ];
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'DUR',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+            'deliver.dur',
+        )->await();
+
+        for ($i = 0; $i < 5; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // The status frame was intercepted (not delivered as data) and surfaced via the error listener.
+        self::assertSame([], $received);
+        self::assertCount(1, $errors);
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertSame(400, $errors[0]->getCode());
+        self::assertStringContainsString('terminal status 400', $errors[0]->getMessage());
+        self::assertStringContainsString('(Bad Request)', $errors[0]->getMessage());
+    }
+
+    /**
      * #121: a JetStream publish ack that carries neither an `error` nor a `stream` is invalid
      * (nats.go rejects an empty-stream ack). It must throw rather than be accepted as a bogus
      * PubAck('', 0) success.
