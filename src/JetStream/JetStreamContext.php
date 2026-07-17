@@ -2223,6 +2223,12 @@ final class JetStreamContext
             $issued = 0;
             $tokenSeq = 0;
             $consecutiveEmptyPulls = 0;
+            // #169 rolling streak of consecutive EMPTY RETIRES across pulls (distinct from
+            // $consecutiveEmptyPulls, the boundary backoff-step counter). Reset by any delivery; NOT
+            // reset at generation boundaries, so it survives the engine's continuous refill. Only a
+            // streak spanning one full pipeline width (>= the configured depth) latches the idle drain -
+            // a single tail empty behind a delivering head is not proof of idleness.
+            $emptyRetireStreak = 0;
             // FIX1 latch: an empty pull stops refilling the generation; it drains, backs off, relaunches.
             $idleDraining = false;
             // Whether the generation's empties were immediate (no_wait, or a 409) and so need pacing.
@@ -2260,6 +2266,7 @@ final class JetStreamContext
                             $issueOrder = [];
                             $lastActivityNs = hrtime(true);
                             $consecutiveEmptyPulls = 0;
+                            $emptyRetireStreak = 0;
                             $idleDraining = false;
                             $backoffWarranted = false;
                             // $anyDelivered persists across reconnect (a group already bootstrapped its
@@ -2315,6 +2322,7 @@ final class JetStreamContext
                         if ($delivered > 0) {
                             // A delivery ends the idle streak and clears any latched drain (#153, FIX1).
                             $consecutiveEmptyPulls = 0;
+                            $emptyRetireStreak = 0;
                             $idleDraining = false;
                             $backoffWarranted = false;
                             $anyDelivered = true;
@@ -2351,12 +2359,22 @@ final class JetStreamContext
                             || $code === 408
                             || ($code === 409 && PullConsumerIterator::isNonTerminalPullStatus($description));
                         if ($routine) {
-                            // FIX1: latch idleDraining so the generation stops refilling and drains out.
-                            $idleDraining = true;
+                            ++$emptyRetireStreak;
                             if ($cfg->noWait || $code === 409) {
                                 // Immediately answered empties (no_wait, or any 409) need pacing (#153); a
                                 // plain waiting 404/408/deadline already spent its expires window server-side.
                                 $backoffWarranted = true;
+                            }
+                            // FIX1: latch idleDraining so the generation stops refilling and drains out -
+                            // but only once a ROLLING streak of empty retires spans one full pipeline
+                            // width (#169). A lone tail empty right after a delivering head is a racing
+                            // pull against a just-drained stream, not idleness; latching on it clamped a
+                            // steadily-delivering no_wait pipeline to depth 1 with periodic backoff
+                            // stalls. The streak (not a per-generation flag) survives the continuous
+                            // refill, so a productive-then-idle stream still accumulates to the latch and
+                            // backs off. Depth 1 keeps the original latch-on-first-empty behavior.
+                            if ($emptyRetireStreak >= max(1, $cfg->depth)) {
+                                $idleDraining = true;
                             }
 
                             continue;

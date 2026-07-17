@@ -97,11 +97,14 @@ final class JetStreamContext_9MutationTest extends TestCase
     public function testRoutine409EmptyWarrantsBackoffSoNextGenerationIsSerial(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        // #169 streak semantics (depth 2): 409#0 (streak 1, refills #2), 409#1 (streak 2 -> latch),
+        // 409#2 (drain-out) -> warranted boundary -> gen2 serial.
         $this->pullServer($transport, 'S', 'C', [
-            [['status' => 409, 'desc' => 'Leadership Change']], // pull#0 (gen1, depth 2)
-            [['status' => 409, 'desc' => 'Leadership Change']], // pull#1 (gen1)
-            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#2 (gen2, serial) - terminal
-            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#3 - only a mutant that skipped backoff reaches it
+            [['status' => 409, 'desc' => 'Leadership Change']], // pull#0: streak 1 (refills #2)
+            [['status' => 409, 'desc' => 'Leadership Change']], // pull#1: streak 2 -> latch
+            [['status' => 409, 'desc' => 'Leadership Change']], // pull#2: drains out
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#3 (gen2, serial) - terminal
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#4 - only a mutant that skipped backoff reaches it
         ]);
         $js = $this->context($transport);
 
@@ -112,9 +115,10 @@ final class JetStreamContext_9MutationTest extends TestCase
             ->handle(static function (): void {})->await();
 
         self::assertSame(0, $processed);
-        // kills LessThan(409->408) @ 2351, IncrementInteger(409->410) @ 2351, Identical(===->!==) @ 2351:
-        // each stops a routine 409 from warranting a backoff, leaving generation 2 at depth 2 -> 4 PUBs.
-        self::assertCount(3, $this->pullWrites($transport));
+        // kills LessThan(409->408), IncrementInteger(409->410) and Identical(===->!==) on the
+        // warranted-empty check: each stops a routine 409 from warranting a backoff, leaving generation 2
+        // at depth 2 -> 5 PUBs, not the real serial 4.
+        self::assertCount(4, $this->pullWrites($transport));
     }
 
     /**
@@ -125,11 +129,14 @@ final class JetStreamContext_9MutationTest extends TestCase
     public function testWaiting404EmptyDoesNotWarrantBackoffSoNextGenerationStaysParallel(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        // #169 streak semantics (depth 2): pull#0's empty (streak 1 < 2) refills pull#2 before pull#1's
+        // empty (streak 2) latches the drain; pull#2's empty drains out, then the boundary runs.
         $this->pullServer($transport, 'S', 'C', [
-            [['status' => 404, 'desc' => 'No Messages']],       // pull#0 (gen1, depth 2)
-            [['status' => 404, 'desc' => 'No Messages']],       // pull#1 (gen1)
-            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#2 (gen2) - terminal (head)
-            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#3 (gen2) - issued only when gen2 stays depth 2
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#0: streak 1 (refills #2)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#1: streak 2 -> latch
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#2: drains out
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#3 (gen2) - terminal (head)
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#4 (gen2) - issued only when gen2 stays depth 2
         ]);
         $js = $this->context($transport);
 
@@ -140,9 +147,10 @@ final class JetStreamContext_9MutationTest extends TestCase
             ->handle(static function (): void {})->await();
 
         self::assertSame(0, $processed);
-        // kills LogicalOrAllSubExprNegation(!noWait || !(code===409)) @ 2351 (and the Identical mutant):
-        // a mutant that DOES warrant a backoff for a waiting 404 forces generation 2 serial -> 3 PUBs.
-        self::assertCount(4, $this->pullWrites($transport));
+        // kills LogicalOrAllSubExprNegation(!noWait || !(code===409)) on the warranted-empty check (and
+        // the Identical mutant): a mutant that DOES warrant a backoff for a waiting 404 increments the
+        // idle streak at the boundary and forces generation 2 serial -> 4 PUBs, not 5.
+        self::assertCount(5, $this->pullWrites($transport));
     }
 
     /**
@@ -246,19 +254,22 @@ final class JetStreamContext_9MutationTest extends TestCase
     }
 
     /**
-     * A delivery resets the idle streak to exactly 0 (not -1) @ 2313. After the reset, one warranted
-     * (routine 409) empty generation increments it to 1, forcing the following generation serial. A
-     * mutant that reset to -1 would need TWO increments to go serial, leaving one extra parallel
-     * generation -> one extra pull PUB.
+     * A delivery resets the idle backoff counter to exactly 0 (not -1). After the reset, one warranted
+     * (routine 409) empty streak's boundary increments it to 1, forcing the following generation
+     * serial. A mutant that reset to -1 would need TWO increments to go serial, leaving one extra
+     * parallel generation -> one extra pull PUB.
      */
     public function testDeliveryResetsIdleStreakToZeroNotNegative(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        // #169 streak semantics (depth 2): the delivery resets the counters; the three warranted (409
+        // Leadership Change) empties then build streak 1 (refill #3), 2 (latch), 3 (drain-out); the
+        // boundary backs off (++ from the delivery's reset value) and sizes the next generation.
         $this->pullServer($transport, 'S', 'C', [
             [['msg' => 'a']],                                   // pull#0: delivers -> resets the streak
-            [['msg' => 'b']],                                   // pull#1: delivers (refill during delivery)
-            [['status' => 409, 'desc' => 'Leadership Change']], // pull#2: routine empty (refill)
-            [['status' => 409, 'desc' => 'Leadership Change']], // pull#3: routine empty -> backoff, streak=1
+            [['status' => 409, 'desc' => 'Leadership Change']], // pull#1: streak 1 (refills #3)
+            [['status' => 409, 'desc' => 'Leadership Change']], // pull#2: streak 2 -> latch
+            [['status' => 409, 'desc' => 'Leadership Change']], // pull#3: drains out
             [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#4: serial terminal (real)
             [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#5: only a -1-resetting mutant reaches it
         ]);
@@ -270,26 +281,29 @@ final class JetStreamContext_9MutationTest extends TestCase
             ->setExpiresMs(200)
             ->handle(static function (): void {})->await();
 
-        self::assertSame(2, $processed);
-        // kills DecrementInteger(0->-1) @ 2313: resetting to -1 needs an extra empty generation to reach
-        // the serial threshold, so generation after the idle wave stays depth 2 -> 6 PUBs, not 5.
+        self::assertSame(1, $processed);
+        // kills DecrementInteger(0->-1) on the delivery-branch consecutiveEmptyPulls reset: the warranted
+        // boundary after the delivery increments -1 back to only 0, so the following generation would
+        // wrongly stay depth 2 -> 6 PUBs, not the real serial 5.
         self::assertCount(5, $this->pullWrites($transport));
     }
 
     /**
-     * A delivery clears the backoff-warranted latch to false @ 2315, so a subsequent NON-warranted
-     * (waiting 404) empty generation does not spuriously back off: the streak stays 0 and the next
-     * generation stays depth 2. A mutant that latched true would back off, go serial, and issue one
-     * FEWER terminal pull.
+     * A delivery clears the backoff-warranted latch to false, so a subsequent NON-warranted (waiting
+     * 404) empty streak does not spuriously back off at its boundary: the idle counter stays 0 and the
+     * next generation stays depth 2. A mutant that latched true would back off, go serial, and issue
+     * one FEWER terminal pull.
      */
     public function testDeliveryClearsBackoffWarrantedLatch(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        // #169 streak semantics (depth 2): the delivery resets the streak; the three waiting 404s then
+        // build streak 1 (refill #3), 2 (latch), 3 (drain-out) and reach the boundary un-warranted.
         $this->pullServer($transport, 'S', 'C', [
             [['msg' => 'a']],                                   // pull#0: delivers -> clears the latch
-            [['msg' => 'b']],                                   // pull#1: delivers (refill)
-            [['status' => 404, 'desc' => 'No Messages']],       // pull#2: waiting empty (no backoff warranted)
-            [['status' => 404, 'desc' => 'No Messages']],       // pull#3: waiting empty
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#1: streak 1 (refills #3)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#2: streak 2 -> latch
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#3: drains out
             [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#4: terminal (head of depth-2 gen)
             [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#5: issued only while the gen stays depth 2
         ]);
@@ -301,9 +315,10 @@ final class JetStreamContext_9MutationTest extends TestCase
             ->setExpiresMs(200)
             ->handle(static function (): void {})->await();
 
-        self::assertSame(2, $processed);
-        // kills FalseValue(false->true) @ 2315: a latched-true backoffWarranted makes the waiting-404
-        // generation back off and go serial, so only 5 pull PUBs would reach the wire, not 6.
+        self::assertSame(1, $processed);
+        // kills FalseValue(false->true) on the delivery-branch backoffWarranted reset: a latched-true
+        // backoffWarranted makes the waiting-404 boundary back off and go serial, so only 5 pull PUBs
+        // would reach the wire, not 6.
         self::assertCount(6, $this->pullWrites($transport));
     }
 }

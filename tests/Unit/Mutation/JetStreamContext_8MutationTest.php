@@ -346,11 +346,15 @@ final class JetStreamContext_8MutationTest extends TestCase
     public function testWaitingEmptyGenerationDoesNotArmBackoff(): void
     {
         $transport = new FakeTransport($this->infoPong());
-        // gen1: two depth-2 pulls both 404 (waiting empties). gen2: pull #2 delivers 'a'.
+        // #169 streak semantics (depth 2): a full WAITING streak - 404#0 (streak 1, refills #2),
+        // 404#1 (streak 2 -> latch), 404#2 (drain-out) - reaches the boundary un-warranted, so the
+        // next generation fans out to depth 2 and pull #3 delivers 'a'.
         $this->pullServer($transport, 'S', 'C', [
             [['status' => 404, 'desc' => 'No Messages']],
             [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 404, 'desc' => 'No Messages']],
             [['msg' => 'a']],
+            [['status' => 404, 'desc' => 'No Messages']], // gen2 tail: issued only at depth 2, abandoned by stop()
         ]);
         $js = $this->context($transport);
 
@@ -358,13 +362,13 @@ final class JetStreamContext_8MutationTest extends TestCase
         $pubsAtFirstDelivery = null;
         $iter->handle(function () use (&$pubsAtFirstDelivery, $transport, $iter): void {
             // The issue phase runs to full effective depth BEFORE this handler is reached, so the pull
-            // PUB count already reflects gen2's fan-out here: 2 (gen1) + 2 (gen2) = 4 on real code, but
-            // 2 + 1 = 3 if the empty generation wrongly armed the backoff and clamped depth to 1.
+            // PUB count already reflects gen2's fan-out here: 3 (streak) + 2 (gen2) = 5 on real code, but
+            // 3 + 1 = 4 if the waiting streak wrongly armed the backoff and clamped depth to 1.
             $pubsAtFirstDelivery ??= $this->pullPubCount($transport);
             $iter->stop();
         })->await();
 
-        self::assertSame(4, $pubsAtFirstDelivery);
+        self::assertSame(5, $pubsAtFirstDelivery);
     }
 
     // kills LogicalNot @ 2259 (if (!$finite)  ->  if ($finite))
