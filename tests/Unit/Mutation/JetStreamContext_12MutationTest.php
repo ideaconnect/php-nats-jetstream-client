@@ -121,9 +121,9 @@ final class JetStreamContext_12MutationTest extends TestCase
     }
 
     // kills DecrementInteger @ reconnect reset ($consecutiveEmptyPulls = 0 -> = -1)
-    // Real seeds 0: the post-reconnect no_wait-404 generation's boundary ++ makes it 1, clamping the
-    // next generation to depth 1 -> 5 total pull PUBs. The mutant seeds -1: the ++ makes it 0, so the
-    // next generation stays depth 2 -> 6 total pull PUBs.
+    // Real seeds 0: the post-reconnect no_wait-404 streak's boundary ++ makes it 1, clamping the
+    // next generation to depth 1 -> 6 total pull PUBs. The mutant seeds -1: the ++ makes it 0, so the
+    // next generation stays depth 2 -> 7 total pull PUBs.
     public function testReconnectResetsConsecutiveEmptyPullsToZero(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
@@ -157,7 +157,9 @@ final class JetStreamContext_12MutationTest extends TestCase
             if ($pubSeen === 2) {
                 return [];
             }
-            if ($pubSeen === 3 || $pubSeen === 4) {
+            if ($pubSeen === 3 || $pubSeen === 4 || $pubSeen === 5) {
+                // #169 streak semantics (depth 2): empty#1 (refill), empty#2 (latch), empty#3
+                // (drain-out) -> warranted boundary, THEN the terminal generation.
                 $hdr = "NATS/1.0 404 No Messages\r\n\r\n";
 
                 return [sprintf("HMSG %s %d %d %d\r\n%s\r\n", $replyTo, $pullSid, strlen($hdr), strlen($hdr), $hdr)];
@@ -180,13 +182,13 @@ final class JetStreamContext_12MutationTest extends TestCase
             ->handle(static function (): void {})->await();
 
         self::assertGreaterThanOrEqual(2, count($transport->connectCalls));
-        self::assertSame(5, $this->pullPubCount($transport));
+        self::assertSame(6, $this->pullPubCount($transport));
     }
 
     // kills FalseValue @ reconnect reset ($backoffWarranted = false -> = true)
-    // Real resets false: the post-reconnect waiting-404 generation's boundary does NOT ++, so the next
-    // generation fans out to depth 2 -> 6 total pull PUBs. The mutant resets true: the boundary ++
-    // clamps the next generation to depth 1 -> 5 total pull PUBs.
+    // Real resets false: the post-reconnect waiting-404 streak's boundary does NOT ++, so the next
+    // generation fans out to depth 2 -> 7 total pull PUBs. The mutant resets true: the boundary ++
+    // clamps the next generation to depth 1 -> 6 total pull PUBs.
     public function testReconnectClearsBackoffWarranted(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
@@ -220,7 +222,9 @@ final class JetStreamContext_12MutationTest extends TestCase
             if ($pubSeen === 2) {
                 return [];
             }
-            if ($pubSeen === 3 || $pubSeen === 4) {
+            if ($pubSeen === 3 || $pubSeen === 4 || $pubSeen === 5) {
+                // #169 streak semantics (depth 2): the post-reconnect waiting streak is empty#1
+                // (refill), empty#2 (latch), empty#3 (drain-out) -> boundary, THEN the terminal gen.
                 $hdr = "NATS/1.0 404 No Messages\r\n\r\n";
 
                 return [sprintf("HMSG %s %d %d %d\r\n%s\r\n", $replyTo, $pullSid, strlen($hdr), strlen($hdr), $hdr)];
@@ -242,7 +246,7 @@ final class JetStreamContext_12MutationTest extends TestCase
             ->handle(static function (): void {})->await();
 
         self::assertGreaterThanOrEqual(2, count($transport->connectCalls));
-        self::assertSame(6, $this->pullPubCount($transport));
+        self::assertSame(7, $this->pullPubCount($transport));
     }
 
     // kills Continue_ @ 423 stale-pin retire (continue -> break)
@@ -311,17 +315,22 @@ final class JetStreamContext_12MutationTest extends TestCase
 
     // kills LogicalAnd @ generation-boundary backoff guard
     // (!finite && !drain && inflight===[] && idleDraining -> ((!finite && !drain) || inflight===[]) && idleDraining)
-    // Pull #1 is a plain WAITING 404 (latches idleDraining, does NOT arm backoff) while pull #2 is still
-    // in flight; at the boundary inflight !== [] and idleDraining is true. The real guard needs
-    // inflight === [], so it does NOT enter the backoff block, keeps idleDraining latched, and issues NO
-    // third pull before pull #2's terminal 409: 2 pull PUBs. The mutant enters via its extra disjunct,
-    // un-latches idleDraining, and the issue phase fans out a THIRD pull: 3 pull PUBs.
+    // Pulls #0+#1 are plain WAITING 404s whose rolling streak (2 >= depth) latches idleDraining while the
+    // refilled pull #2 is still in flight; at the boundary inflight !== [] and idleDraining is true. The
+    // real guard needs inflight === [], so it does NOT enter the backoff block, keeps idleDraining
+    // latched, and issues NO fourth pull before pull #2's terminal 409: 3 pull PUBs. The mutant enters
+    // via its extra disjunct, un-latches idleDraining, and the issue phase fans out a FOURTH pull: 4 PUBs.
     public function testInflightNonEmptyIdleDrainingDoesNotUnlatchAndOverIssue(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        // #169 streak semantics (depth 2): pull#0's empty (streak 1) refills pull#2; pull#1's empty
+        // (streak 2) latches idleDraining WHILE pull#2 is still in flight - exactly the
+        // latched-with-inflight state the boundary guard must not enter.
         $this->pullServer($transport, 'S', 'C', [
-            [['status' => 404, 'desc' => 'No Messages']],
-            [['status' => 409, 'desc' => 'Consumer Deleted']],
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#0: streak 1 (refills #2)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#1: streak 2 -> latch (inflight: #2)
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#2: terminal while latched
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#3: only an over-issuing mutant reaches it
         ]);
         $js = $this->context($transport);
 
@@ -336,7 +345,7 @@ final class JetStreamContext_12MutationTest extends TestCase
 
         self::assertSame(0, $processed);
         self::assertCount(1, $errors);
-        self::assertSame(2, $this->pullPubCount($transport));
+        self::assertSame(3, $this->pullPubCount($transport));
     }
 
     // kills FalseValue @ generation-boundary backoff reset ($backoffWarranted = false -> = true)
@@ -347,13 +356,16 @@ final class JetStreamContext_12MutationTest extends TestCase
     public function testBackoffWarrantedResetSoWaitingEmptiesNeverArmBackoffAcrossGenerations(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        // #169 streak semantics (depth 2): each streak is empty#1 (refill), empty#2 (latch), empty#3
+        // (drain-out), then the boundary; two full waiting streaks, then the terminal generation.
         $this->pullServer($transport, 'S', 'C', [
-            [['status' => 404, 'desc' => 'No Messages']],
-            [['status' => 404, 'desc' => 'No Messages']],
-            [['status' => 404, 'desc' => 'No Messages']],
-            [['status' => 404, 'desc' => 'No Messages']],
-            [['status' => 409, 'desc' => 'Consumer Deleted']],
-            [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 404, 'desc' => 'No Messages']],       // streak1: 1 (refills #2)
+            [['status' => 404, 'desc' => 'No Messages']],       // streak1: 2 -> latch
+            [['status' => 404, 'desc' => 'No Messages']],       // streak1: drains out -> boundary
+            [['status' => 404, 'desc' => 'No Messages']],       // streak2: latches immediately (rolling >= 2)
+            [['status' => 404, 'desc' => 'No Messages']],       // streak2: drains out -> boundary
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // gen3 head: terminal
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // gen3 tail: issued only at depth 2
         ]);
         $js = $this->context($transport);
 
@@ -368,6 +380,6 @@ final class JetStreamContext_12MutationTest extends TestCase
 
         self::assertSame(0, $processed);
         self::assertCount(1, $errors);
-        self::assertSame(6, $this->pullPubCount($transport));
+        self::assertSame(7, $this->pullPubCount($transport));
     }
 }

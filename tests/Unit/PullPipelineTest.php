@@ -213,6 +213,75 @@ final class PullPipelineTest extends TestCase
         self::assertSame(4, $pubsAtB, 'after a 423 pin loss, a pinned group must re-serialize its pin re-capture, not fan out');
     }
 
+    public function testDeliveringPipelineIsNotClampedByInterleavedNoWaitEmpties(): void
+    {
+        // #169 repro: no_wait + depth 2 with steady traffic below depth*batch, so tail pulls race an
+        // already-drained stream and 404 immediately while head pulls keep delivering. A single tail
+        // empty must NOT latch the idle drain (streak 1 < depth 2): the pipeline keeps refilling at
+        // full depth with no backoff pause and no serial clamp. Pre-#169, each interleaved 404 latched
+        // the drain and forced a backoff + serial generation: only 5 pulls would reach the wire.
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a']],                                   // pull#0: delivers (streak 0, refills #2)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#1: streak 1 < 2 -> NO latch, refills #3
+            [['msg' => 'b']],                                   // pull#2: delivers (streak 0, refills #4)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#3: streak 1 -> NO latch, refills #5
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#4: terminal stops the run
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#5: already on the wire at full depth
+        ]);
+        $js = $this->context($transport);
+
+        $received = [];
+        $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setNoWait(true)
+            ->setOnError(static function (): void {})
+            ->handle(function (NatsMessage $m) use (&$received): void {
+                $received[] = $m->payload;
+            })->await();
+
+        self::assertSame(['a', 'b'], $received);
+        self::assertSame(6, $this->pullPubCount($transport), 'interleaved no_wait empties must not clamp a delivering pipeline to serial');
+    }
+
+    public function testProductiveThenIdleStreamStillBacksOff(): void
+    {
+        // #169 soundness (the trap that sank the first fix attempt): the streak must survive the
+        // engine's CONTINUOUS REFILL, so a stream that delivers and then goes idle still accumulates
+        // consecutive empty retires to the latch and backs off - a per-generation "delivered" flag
+        // would never reset (inflight rarely drains) and would disable the idle backoff forever.
+        // Here: one delivery, then three no_wait 404s (streak 1 refill, 2 latch, 3 drain-out) ->
+        // warranted boundary (>=10ms pacing) -> serial terminal generation: exactly 5 pulls.
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a']],                                   // pull#0: delivers (streak resets)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#1: streak 1 (refills #3)
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#2: streak 2 -> latch
+            [['status' => 404, 'desc' => 'No Messages']],       // pull#3: drains out -> backoff boundary
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#4: serial terminal
+        ]);
+        $js = $this->context($transport);
+
+        $startNs = hrtime(true);
+        $received = [];
+        $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setNoWait(true)
+            ->setOnError(static function (): void {})
+            ->handle(function (NatsMessage $m) use (&$received): void {
+                $received[] = $m->payload;
+            })->await();
+        $elapsedNs = hrtime(true) - $startNs;
+
+        self::assertSame(['a'], $received);
+        self::assertSame(5, $this->pullPubCount($transport), 'the post-delivery idle streak must clamp the next generation serial');
+        // The warranted boundary paced the relaunch (first backoff step is 10ms); a fix that disabled
+        // the idle backoff after any delivery would relaunch instantly at full depth.
+        self::assertGreaterThanOrEqual(9_000_000, $elapsedNs, 'a productive-then-idle no_wait stream must still be paced');
+    }
+
     public function testDrainFinishesInFlightBatchThenStops(): void
     {
         // One pull of batch 3; the handler drains after the first message -> the whole in-flight batch

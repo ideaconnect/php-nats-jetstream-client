@@ -15,6 +15,22 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` The pipelined pull engine no longer treats a single immediately-answered empty pull as proof
+  of idleness when `setDepth()` > 1 (#169). Retires run in issue order, so under `no_wait` with steady
+  traffic below `depth*batch` a tail pull that raced an already-drained stream would 404 right after a
+  delivering head pull - and that lone empty latched the idle drain, injecting a periodic backoff pause
+  and clamping the next generation to depth 1 (the effective pipeline oscillated depth->1->depth with
+  ~10 ms stalls despite continuously delivering). The engine now counts a ROLLING streak of consecutive
+  empty retires across pulls (reset by any delivery, surviving the engine's continuous refill) and only
+  latches the idle drain once the streak spans one full pipeline width (>= `setDepth()`), so a
+  delivering pipeline keeps its full depth while a genuinely idle stream still accumulates to the latch
+  and backs off exactly as before. `setDepth(1)` (and finite `setIterations()` mode) keep the original
+  latch-on-first-empty behavior unchanged.
+
 ## [2.7.1] - 2026-07-16
 
 ### Fixed
