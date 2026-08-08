@@ -1,6 +1,9 @@
 # CHANGELOG and inline comments say the one-shot 503 signal is "re-armed by the next delivery" — the code (intentionally) also re-arms on any routine non-503 retire
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — docs-only: the CHANGELOG bullet and both inline comments now state the one-
+  shot signal re-arms on the next delivery OR any routine non-503 retire (one onError per no-
+  responders episode), matching the implementation pinned by
+  testNoRespondersSignalReArmsAfterRoutineNonEmptyGap.
 - **Severity:** minor
 - **Type:** documentation / disclosed-contract mismatch (code is correct, text is wrong)
 - **Area:** JetStream pull pipelining engine (round-1 fix follow-up)

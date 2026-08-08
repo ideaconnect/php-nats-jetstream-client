@@ -362,13 +362,20 @@ final class Service
                                 // callback into the shared dispatch loop, aborting delivery for every
                                 // subscription on the connection (#97). The publish path itself is
                                 // broken, so no controlled reply can be attempted either: record the
-                                // fault and move on.
-                                $endpoint->errors++;
+                                // fault and move on. A request whose HANDLER already errored counted
+                                // its one error (and emitted its request_error, with the handler's
+                                // own code) above - counting the failed error-reply write again would
+                                // let $SRV.STATS report num_errors > num_requests. Only count/emit
+                                // here when the handler succeeded ($errorHeaders === null) and the
+                                // reply write is the sole fault of the request.
                                 $endpoint->lastError = $e->getMessage();
-                                $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
-                                    'code' => 'HANDLER_ERROR',
-                                    'error' => $e->getMessage(),
-                                ]);
+                                if ($errorHeaders === null) {
+                                    $endpoint->errors++;
+                                    $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
+                                        'code' => 'HANDLER_ERROR',
+                                        'error' => $e->getMessage(),
+                                    ]);
+                                }
                             }
                         },
                         $endpoint->queueGroup,

@@ -307,9 +307,12 @@ final class WebSocketFrameCodec
     }
 
     /**
-     * Removes a client mask from a payload (masking is its own XOR inverse). Companion to
-     * {@see parseFrameHeader()} for callers that extract a spanning frame's payload themselves;
-     * {@see decode()} keeps unmasking inline.
+     * Removes a client mask from a payload (masking is its own XOR inverse).
+     *
+     * @deprecated Production-dead since masked server-to-client frames became a terminal RFC 6455
+     *             5.1 violation; harnesses decoding client-written frames should use
+     *             {@see decode()} with `allowMasked: true` instead. Kept only for backward
+     *             compatibility - removal would be a bc-break for a helper public since 2.7.x.
      */
     public static function unmask(string $payload, string $key): string
     {

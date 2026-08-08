@@ -257,4 +257,64 @@ final class KeyValueBucket_5MutationTest extends TestCase
 
         self::assertSame(12, $status['last_sequence']);
     }
+
+    // ─── watch() onConsumerCreated caught-up latch (immediate path) ──────────
+
+    /**
+     * kills TrueValue @ the onConsumerCreated latch (`$caughtUpFired = true;` -> `= false;`) - the
+     * IMMEDIATE end-of-initial-data path on an empty/no-match bucket (#99).
+     *
+     * The consumer is created with num_pending=0, so onCaughtUp fires IMMEDIATELY from
+     * onConsumerCreated and must LATCH. A live update then arrives whose $JS.ACK also reports
+     * pending=0 (the stream end - normal for any live tail delivery).
+     *
+     * REAL: the immediate fire latches $caughtUpFired=true, so the delivery's own caught-up check is
+     * suppressed -> onCaughtUp fires exactly ONCE.
+     *
+     * MUTANT (`$caughtUpFired = false;` in onConsumerCreated): the immediate path fires but leaves
+     * the latch open, so the first pending=0 delivery re-fires the one-shot signal -> TWICE.
+     * (The 5-chunk sibling test above pins the IN-HANDLER latch; this pins the immediate one.)
+     */
+    public function testWatchImmediateCaughtUpLatchSuppressesLaterDeliverySignal(): void
+    {
+        $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","num_pending":0,'
+            . '"config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $this->watchServer(
+            $transport,
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            [
+                // A live PUT delivery whose $JS.ACK last token (num_pending) is 0.
+                "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
+            ],
+        );
+
+        $client = $this->connect($transport);
+
+        $caughtUpCount = 0;
+        $handled = 0;
+        $client->jetStream()->keyValue('cfg')->watch(
+            static function (KeyValueEntry $entry) use (&$handled): void {
+                $handled++;
+            },
+            '>',
+            new KeyWatchOptions(onCaughtUp: static function () use (&$caughtUpCount): void {
+                $caughtUpCount++;
+            }),
+        )->await();
+
+        // The empty-bucket immediate path fired the signal once, before any delivery.
+        self::assertSame(1, $caughtUpCount);
+
+        for ($i = 0; $i < 4; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // The live delivery was handled, but the one-shot signal did NOT re-fire.
+        self::assertSame(1, $handled);
+        self::assertSame(1, $caughtUpCount, 'onCaughtUp is one-shot: the immediate latch must suppress the delivery-path re-fire');
+
+        $client->disconnect()->await();
+    }
 }

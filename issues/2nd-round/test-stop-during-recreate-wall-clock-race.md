@@ -1,6 +1,9 @@
 # testStopOrderedConsumerDuringInFlightRecreateDoesNotResurrect sequences the stop with a 50 ms wall-clock delay — can flake red under CI load
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — the stop is now triggered from the transport onWrite hook when attempt #1's
+  CONSUMER.CREATE is observed (EventLoop::queue), replacing the 50ms wall-clock delay; the 5s
+  outer deadline remains. The rework was itself validated by an intermediate red (an off-by-one
+  landed the stop in attempt #2) and is stable across repeat runs.
 - **Severity:** minor
 - **Type:** test quality (flaky-by-construction; violates repo timing convention)
 - **Area:** tests — ordered-consumer stop race

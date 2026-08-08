@@ -18,11 +18,13 @@ use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FixedNonceSigner;
 use IDCT\NATS\Tests\Support\FlakyTransport;
@@ -9384,7 +9386,16 @@ final class NatsConnectionTest extends TestCase
 
         self::assertCount(1, $captured);
         self::assertInstanceOf(ConnectionException::class, $captured[0]);
-        self::assertStringContainsString('cannot join the in-flight recovery', $captured[0]->getMessage());
+        // The full text is operator guidance (how to break the supervision deadlock, #145): pin it
+        // verbatim so no fragment of the diagnosis/remedy can silently drop or reorder.
+        self::assertSame(
+            'connect() cannot join the in-flight recovery from a connection/error listener: '
+            . 'the listener runs inside the recovery fiber, and awaiting the join there '
+            . 'deadlocks. Schedule supervision reconnects with Revolt\EventLoop::queue() and '
+            . 'do not await the scheduled connect from inside the listener (that only moves '
+            . 'the same dependency cycle one fiber away).',
+            $captured[0]->getMessage(),
+        );
     }
 
     /**
@@ -11278,6 +11289,57 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * The heartbeat protocol-violation branch reports through emitErrorSafely, not emitError:
+     * emitError() logs BEFORE its listener-throw guard, so a throwing user-supplied PSR-3 logger
+     * would otherwise skip the recovery below it and escape into the EventLoop::repeat timer (no
+     * loop error handler exists - the throw would kill EventLoop::run()). The violation is ONE-SHOT
+     * (the WS transport nulls it before throwing), so the skipped recovery would never be retried:
+     * the corrupt stream would keep running as Open. Recovery must run despite the logger (#150).
+     */
+    public function testHeartbeatProtocolViolationRecoveryRunsEvenWhenLoggerThrows(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+
+        // Throws only while the violation is reported - a logger throwing on every call would
+        // already fail the connect() handshake logging and miss the point of the test.
+        $throwingLogger = new class extends \Psr\Log\AbstractLogger {
+            public function log($level, \Stringable|string $message, array $context = []): void
+            {
+                if (str_contains((string) $message, 'inflate failure')) {
+                    throw new \RuntimeException('logger failed');
+                }
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                logger: $throwingLogger,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // Reconnect handshake material for the recovery the violation must trigger.
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        $transport->throwOnNextRead = new ProtocolException('WebSocket inflate failure surfaced on the heartbeat read');
+
+        // On regression the logger's RuntimeException escapes this call - the timer-callback path.
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertCount(2, $transport->connectCalls, 'recovery must run even though the logger threw during emitError');
+        $connects = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'CONNECT '));
+        self::assertCount(2, $connects, 'the recovery must complete a second CONNECT handshake');
+        self::assertSame(ConnectionState::Open, $connection->state(), 'the recovered connection must be Open');
+    }
+
+    /**
      * A heartbeat-read chunk whose parsed head is a fatal -ERR plus a MSG and whose tail is corrupt
      * exercises BOTH containments at once (#147/#128): the recovered MSG is still delivered, and
      * both failures - the parse error AND the fatal frame error raised while dispatching the
@@ -11414,5 +11476,1381 @@ final class NatsConnectionTest extends TestCase
         } catch (ProtocolException $e) {
             self::assertStringContainsString('empty tokens', $e->getMessage());
         }
+    }
+
+    /**
+     * connect() re-entered from a Closed listener that fires on the connecting fiber's own terminal
+     * path must be refused with the FULL operator guidance (#145): the message diagnoses the
+     * deadlock and names the remedy, so it is pinned verbatim.
+     */
+    public function testConnectReenteredFromClosedListenerThrowsFullOperatorGuidance(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "-ERR Maximum Connections Exceeded\r\n"]);
+
+        /** @var list<\Throwable> $captured */
+        $captured = [];
+        /** @var NatsConnection|null $connection */
+        $connection = null;
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event) use (&$connection, &$captured): void {
+                    if ($event !== ConnectionEvent::Closed || $connection === null) {
+                        return;
+                    }
+
+                    try {
+                        $connection->connect()->await();
+                    } catch (\Throwable $e) {
+                        $captured[] = $e;
+                    }
+                },
+            ),
+            $transport,
+        );
+
+        try {
+            $connection->connect()->await();
+            self::fail('the terminal connect failure must reach the caller');
+        } catch (ConnectionException $e) {
+            self::assertSame('Server error during connect: Maximum Connections Exceeded', $e->getMessage());
+        }
+
+        self::assertCount(1, $captured);
+        self::assertInstanceOf(ConnectionException::class, $captured[0]);
+        self::assertSame(
+            'connect() cannot be re-entered from a connection/error listener: the listener runs '
+            . 'inside the connecting fiber, and awaiting the re-entrant connect there deadlocks. '
+            . 'Schedule supervision reconnects with Revolt\EventLoop::queue() and do not await '
+            . 'the scheduled connect from inside the listener (that only moves the same '
+            . 'dependency cycle one fiber away).',
+            $captured[0]->getMessage(),
+        );
+    }
+
+    /**
+     * randomizeServers must actually SHUFFLE the configured pool, not merely dial a member of it:
+     * with the RNG seeded, the first dialed server must match the seed's shuffle permutation
+     * (computed here with the same RNG), which for the chosen seed moves index 0 (#55).
+     */
+    public function testRandomizeServersShufflesDialOrderDeterministically(): void
+    {
+        $servers = [];
+        for ($i = 0; $i < 8; $i++) {
+            $servers[] = 'nats://127.0.0.1:' . (5100 + $i);
+        }
+
+        // Pick a seed whose shuffle demonstrably moves index 0, using the same RNG stream the
+        // constructor consumes; re-seeding below replays the identical permutation there.
+        $seed = null;
+        for ($candidate = 1; $candidate <= 100; $candidate++) {
+            mt_srand($candidate);
+            $copy = $servers;
+            shuffle($copy);
+            if ($copy[0] !== $servers[0]) {
+                $seed = $candidate;
+                break;
+            }
+        }
+        self::assertNotNull($seed, 'no candidate seed moved index 0 - statistically impossible');
+
+        // Replay the chosen seed to recompute the expected permutation's first server.
+        mt_srand($seed);
+        $expected = $servers;
+        shuffle($expected);
+        $expectedFirst = $expected[0];
+        self::assertNotSame($servers[0], $expectedFirst, 'sanity: the chosen seed moves index 0');
+
+        mt_srand($seed);
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(servers: $servers, randomizeServers: true, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+        mt_srand();
+
+        self::assertSame(
+            'tcp://' . substr($expectedFirst, strlen('nats://')) . '|5000',
+            $transport->connectCalls[0],
+            'randomizeServers must dial the seeded shuffle\'s first server, not the configured order',
+        );
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * Destroying a connection that never opened must not touch the transport: __destruct's teardown
+     * (queued transport close) is reserved for abandoned OPEN connections (#126).
+     */
+    public function testDestructOnNeverOpenedConnectionLeavesTransportUntouched(): void
+    {
+        $transport = new FakeTransport();
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+
+        unset($connection);
+        // The responder closure cycle keeps the object alive past unset(); collect it now.
+        gc_collect_cycles();
+        delay(0.02); // any (incorrectly) queued teardown closure would run here
+
+        self::assertFalse($transport->closed, 'destructing a never-opened connection must not close its transport');
+    }
+
+    /**
+     * An async -ERR permissions violation naming one subscription's subject must notify ONLY that
+     * subject's registered rejection handler, never handlers registered for other sids (#167 family).
+     */
+    public function testAsyncSubscriptionRejectionOnlyNotifiesTheNamedSubjectsHandler(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $alphaSid = $connection->subscribe('svc.alpha', static function (NatsMessage $m): void {})->await();
+        $betaSid = $connection->subscribe('svc.beta', static function (NatsMessage $m): void {})->await();
+
+        /** @var list<string> $alphaRejections */
+        $alphaRejections = [];
+        /** @var list<string> $betaRejections */
+        $betaRejections = [];
+        $connection->markSubscriptionRejectionHandler($alphaSid, static function (string $error) use (&$alphaRejections): void {
+            $alphaRejections[] = $error;
+        });
+        $connection->markSubscriptionRejectionHandler($betaSid, static function (string $error) use (&$betaRejections): void {
+            $betaRejections[] = $error;
+        });
+
+        $transport->pushReadChunk("-ERR 'Permissions Violation for Subscription to \"svc.alpha\"'\r\n");
+        $connection->processIncoming()->await();
+
+        self::assertCount(1, $alphaRejections, 'the named subject\'s rejection handler must fire');
+        self::assertStringContainsString('svc.alpha', $alphaRejections[0]);
+        self::assertSame([], $betaRejections, 'a rejection naming svc.alpha must not notify svc.beta\'s handler');
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a recoverable -ERR must not tear the connection down');
+    }
+
+    /**
+     * A request whose deadline fires while an external cancellation token is SUPPLIED BUT NOT
+     * REQUESTED must surface the documented TimeoutException - not the internal CancelledException
+     * of the timed-out wait (#135 family).
+     */
+    public function testRequestWithPendingExternalCancellationTimesOutWithTimeoutException(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $cancelSource = new DeferredCancellation();
+
+        try {
+            $connection->request('svc.probe', 'ping', 150, $cancelSource->getCancellation())->await(new TimeoutCancellation(5));
+            self::fail('a request with no reply must time out');
+        } catch (TimeoutException $e) {
+            self::assertSame('Request timed out for subject svc.probe', $e->getMessage());
+        }
+    }
+
+    /**
+     * A second connect() joining an in-flight dial must FAIL when that dial resolves without the
+     * connection opening (here: the owner's hand-off recovery is aborted by a concurrent
+     * disconnect()): supervision code treats a resolved connect() as "connected" (#145).
+     */
+    public function testJoinerOfInFlightConnectFailsWhenDialIsAbortedByDisconnect(): void
+    {
+        /** @var DeferredFuture<void> $dialGate */
+        $dialGate = new DeferredFuture();
+
+        $transport = new class ($dialGate) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+
+            /** @param DeferredFuture<void> $dialGate */
+            public function __construct(private DeferredFuture $dialGate) {}
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+
+                    // Hold the first dial open so the joiner parks and the user close lands mid-dial.
+                    if (count($this->connectCalls) === 1) {
+                        $this->dialGate->getFuture()->await();
+                    }
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(static fn(): string => "-ERR Maximum Connections Exceeded\r\n");
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            $transport,
+        );
+
+        $owner = $connection->connect();
+        $joiner = $connection->connect();
+        delay(0.01); // owner parked inside the dial; joiner parked on the in-flight deferred
+
+        // The user closes while the dial is in flight: close-intent must win over the connect.
+        $connection->disconnect()->await();
+        $dialGate->complete();
+
+        try {
+            $owner->await(new TimeoutCancellation(3));
+            self::fail('the aborted owner connect must not resolve as success');
+        } catch (ConnectionException $e) {
+            self::assertSame('Connect was aborted before the connection opened', $e->getMessage());
+        }
+
+        try {
+            $joiner->await(new TimeoutCancellation(3));
+            self::fail('the joiner of an aborted dial must not resolve as success');
+        } catch (ConnectionException $e) {
+            self::assertSame('Connect was aborted before the connection opened', $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * The owned-recovery hand-off can fail AFTER performConnect() returns control flow to the
+     * catch (recovery exhausted): the still-pending connecting deferred must be settled with that
+     * failure so a parked joiner shares it instead of hanging forever (#145).
+     */
+    public function testJoinerSharesExhaustionFailureOfOwnedRecovery(): void
+    {
+        $transport = new FakeTransport([
+            "-ERR Maximum Connections Exceeded\r\n",
+            "-ERR Maximum Connections Exceeded\r\n",
+        ]);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 1, pingIntervalSeconds: 0),
+            $transport,
+        );
+
+        $owner = $connection->connect();
+        $joiner = $connection->connect();
+
+        try {
+            $owner->await(new TimeoutCancellation(5));
+            self::fail('the exhausted connect must fail');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect attempts exhausted', $e->getMessage());
+        }
+
+        try {
+            $joiner->await(new TimeoutCancellation(5));
+            self::fail('the joiner must share the exhaustion failure, not hang');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect attempts exhausted', $e->getMessage());
+        }
+    }
+
+    /**
+     * A joiner parked on an in-flight connect whose handshake fails with an auth error must receive
+     * that same AuthenticationException - the fail-fast path settles the shared deferred (#145/#46).
+     */
+    public function testJoinerSharesAuthenticationFailureOfInFlightConnect(): void
+    {
+        $transport = new FakeTransport(["-ERR Authorization Violation\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 5, pingIntervalSeconds: 0),
+            $transport,
+        );
+
+        $owner = $connection->connect();
+        $joiner = $connection->connect();
+
+        try {
+            $owner->await(new TimeoutCancellation(5));
+            self::fail('the auth-rejected connect must fail');
+        } catch (\IDCT\NATS\Exception\AuthenticationException) {
+            // expected
+        }
+
+        try {
+            $joiner->await(new TimeoutCancellation(5));
+            self::fail('the joiner must share the auth failure, not hang');
+        } catch (\IDCT\NATS\Exception\AuthenticationException $e) {
+            self::assertStringContainsString('authentication', strtolower($e->getMessage()));
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * A joiner parked on an in-flight connect that fails terminally (reconnect disabled) must
+     * receive the SAME wrapped ConnectionException the owner throws - one error type for all
+     * callers of the dial (#145).
+     */
+    public function testJoinerSharesTerminalWrappedFailureOfInFlightConnect(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "-ERR Maximum Connections Exceeded\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
+            $transport,
+        );
+
+        $owner = $connection->connect();
+        $joiner = $connection->connect();
+
+        try {
+            $owner->await(new TimeoutCancellation(5));
+            self::fail('the terminal connect must fail');
+        } catch (ConnectionException $e) {
+            self::assertSame('Server error during connect: Maximum Connections Exceeded', $e->getMessage());
+        }
+
+        try {
+            $joiner->await(new TimeoutCancellation(5));
+            self::fail('the joiner must share the terminal failure, not hang');
+        } catch (ConnectionException $e) {
+            self::assertSame('Server error during connect: Maximum Connections Exceeded', $e->getMessage());
+        }
+    }
+
+    /**
+     * connect() issued from a NON-recovery fiber while a recovery is in flight must JOIN that
+     * recovery and share its (successful) outcome - only a call from inside the recovery fiber
+     * itself is refused (#145). The join must not dial again.
+     */
+    public function testConnectFromAnotherFiberJoinsInFlightRecoveryAndSharesSuccess(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        /** @var DeferredFuture<void> $release */
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            /** @var list<string> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [$info, "PONG\r\n", '__EOF__', $info, "PONG\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+
+                    // Hold the recovery's dial open so the join happens while recovery is in flight.
+                    if (count($this->connectCalls) === 2) {
+                        $this->release->getFuture()->await();
+                    }
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // EOF -> recovery; its dial (2nd connect call) is parked on the gate
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
+
+        // Joining from a non-recovery fiber (caller fiber non-null) must await the recovery.
+        $join = async(static function () use ($connection): void {
+            $connection->connect()->await();
+        });
+        delay(0.01); // the join body runs while the recovery is still in flight
+
+        $release->complete();
+        $join->await(new TimeoutCancellation(5)); // shares the recovery's success - no exception
+        $pump->await(new TimeoutCancellation(5));
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls, 'the join must not start a third dial');
+    }
+
+    /**
+     * A MSG the server coalesced behind the reconnect-handshake PONG must reach its handler even
+     * when a fatal -ERR in the same batch fails the attempt and the recovery then exhausts: its
+     * bytes are consumed, so skipping the delivery would lose it permanently (#157/#147).
+     */
+    public function testTrailingHandshakeFramesAreDeliveredEvenWhenTheAttemptFails(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $transport = new FakeTransport([
+            $info, "PONG\r\n",
+            FakeTransport::EOF,
+            $info,
+            "PONG\r\nMSG updates 1 2\r\nhi\r\n-ERR Some Fatal Failure\r\n",
+        ]);
+
+        /** @var list<string> $errors */
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 1,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        /** @var list<string> $received */
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $m) use (&$received): void {
+            $received[] = $m->payload;
+        })->await();
+
+        try {
+            $connection->processIncoming()->await(new TimeoutCancellation(5));
+            self::fail('the exhausted recovery must surface');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect attempts exhausted', $e->getMessage());
+        }
+
+        self::assertSame(['hi'], $received, 'the MSG coalesced behind the handshake PONG must reach its handler despite the failed attempt');
+        self::assertSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, 'discarded undelivered')),
+            'nothing may be reported as discarded - the trailing backlog was delivered before the terminal close',
+        );
+    }
+
+    /**
+     * Frames recovered from a mid-chunk parse failure (#147) must be delivered BEFORE the recovery
+     * dials, even when one recovered frame is a fatal -ERR: their bytes are consumed, and the
+     * post-recovery drain would deliver them out of the failure's wire order.
+     */
+    public function testFramesRecoveredFromAParseFailureAreDeliveredBeforeRecoveryRuns(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $transport = new FakeTransport([
+            $info, "PONG\r\n",
+            "MSG updates 1 2\r\nhi\r\n-ERR Some Fatal Failure\r\nBOGUS LINE\r\n",
+            $info, "PONG\r\n",
+        ]);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        /** @var list<array{string, int}> $received */
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $m) use (&$received, $transport): void {
+            $received[] = [$m->payload, count($transport->connectCalls)];
+        })->await();
+
+        try {
+            $connection->processIncoming()->await(new TimeoutCancellation(5));
+            self::fail('the fatal -ERR recovered alongside the MSG must propagate');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('Server sent error frame', $e->getMessage());
+        }
+
+        self::assertSame(
+            [['hi', 1]],
+            $received,
+            'the recovered MSG must be delivered BEFORE the recovery dials (still on the failing epoch)',
+        );
+        self::assertSame(ConnectionState::Open, $connection->state(), 'the recovery itself succeeds');
+    }
+
+    /**
+     * A recovery attempt whose dial succeeded but whose epoch was aborted by a concurrent
+     * disconnect() must CLOSE the fresh socket it just opened (#84/#133) and must not count the
+     * aborted attempt as a reconnect.
+     */
+    public function testRecoveryAbortedByDisconnectAfterAFreshDialClosesTheNewSocket(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        /** @var DeferredFuture<void> $release */
+        $release = new DeferredFuture();
+
+        $transport = new class ($info, $release) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            public int $closeCalls = 0;
+            /** @var list<string> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $release */
+            public function __construct(string $info, private DeferredFuture $release)
+            {
+                $this->reads = [$info, "PONG\r\n", '__EOF__', $info, "PONG\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+
+                    // Hold the recovery's dial open so disconnect() lands mid-attempt.
+                    if (count($this->connectCalls) === 2) {
+                        $this->release->getFuture()->await();
+                    }
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(function (): void {
+                    $this->closeCalls++;
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // EOF -> recovery; attempt 1 parked inside its dial (2nd connect call)
+        self::assertCount(2, $transport->connectCalls);
+
+        $connection->disconnect()->await();
+        $release->complete(); // the dial completes; the attempt must then observe close-intent
+
+        $pump->await(new TimeoutCancellation(5));
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(0, $connection->statistics()->reconnects, 'an aborted recovery must not count as a reconnect');
+        self::assertSame(
+            3,
+            $transport->closeCalls,
+            'attempt-start close + user disconnect close + the abort must release the freshly dialed socket',
+        );
+    }
+
+    /**
+     * Close-intent set DURING the subscription replay (after the fresh handshake) must also tear
+     * the new socket down instead of flipping Open (#84): the second closing re-check after the
+     * replay's suspension points.
+     */
+    public function testRecoveryAbortedByDisconnectDuringReplayClosesTheNewSocket(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        /** @var DeferredFuture<void> $writeGate */
+        $writeGate = new DeferredFuture();
+
+        $transport = new class ($info, $writeGate) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            public int $closeCalls = 0;
+            /** @var list<string> */
+            public array $writes = [];
+            /** @var list<string> */
+            private array $reads;
+
+            /** @param DeferredFuture<void> $writeGate */
+            public function __construct(string $info, private DeferredFuture $writeGate)
+            {
+                $this->reads = [$info, "PONG\r\n", '__EOF__', $info, "PONG\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    $this->writes[] = $bytes;
+
+                    // Hold the replayed SUB write open so disconnect() lands mid-replay.
+                    if (count($this->connectCalls) === 2 && str_starts_with($bytes, 'SUB ')) {
+                        $this->writeGate->getFuture()->await();
+                    }
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(function (): void {
+                    $this->closeCalls++;
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.05); // EOF -> recovery: fresh handshake done, replayed SUB write parked on the gate
+        self::assertCount(2, $transport->connectCalls);
+
+        $connection->disconnect()->await();
+        $writeGate->complete(); // the replay resumes; the post-replay closing re-check must abort
+
+        $pump->await(new TimeoutCancellation(5));
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(
+            3,
+            $transport->closeCalls,
+            'attempt-start close + user disconnect close + the post-replay abort must release the new socket',
+        );
+    }
+
+    /**
+     * An auth failure during recovery is terminal (#46): the freshly dialed socket must be released
+     * (#133), a parsed-but-undelivered inbound backlog must be reported loudly (#158), and the
+     * runtime state must be released so a dispatch loop suspended mid-delivery cannot deliver into
+     * the dead epoch afterwards (#127).
+     */
+    public function testAuthFailureDuringRecoveryReportsAndDiscardsSuspendedBacklogAndClosesSocket(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        /** @var DeferredFuture<void> $gate */
+        $gate = new DeferredFuture();
+
+        $transport = new class ($info) implements TransportInterface {
+            public int $closeCalls = 0;
+            /** @var list<string> */
+            private array $reads;
+
+            public function __construct(string $info)
+            {
+                $this->reads = [
+                    $info, "PONG\r\n",
+                    "MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\n",
+                    '__EOF__',
+                    "-ERR Authorization Violation\r\n",
+                ];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(function (): void {
+                    $this->closeCalls++;
+                });
+            }
+        };
+
+        /** @var list<string> $errors */
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                maxReconnectAttempts: 3,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        /** @var list<string> $received */
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $m) use (&$received, $gate): void {
+            $received[] = $m->payload;
+            if ($m->payload === 'm1') {
+                $gate->getFuture()->await(); // suspend mid-delivery, m2 stays queued
+            }
+        })->await();
+
+        $pump1 = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.02);
+        self::assertSame(['m1'], $received, 'the handler must be suspended on m1 with m2 still queued');
+
+        $pump2 = async(static fn(): int => $connection->processIncoming()->await());
+        try {
+            $pump2->await(new TimeoutCancellation(5));
+            self::fail('the auth failure must surface from the recovery');
+        } catch (\IDCT\NATS\Exception\AuthenticationException) {
+            // expected
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(2, $transport->closeCalls, 'attempt-start close + the auth path must release the dialed socket (#133)');
+        self::assertNotSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, '1 parsed inbound message(s) were discarded undelivered')),
+            'the undelivered backlog must be reported loudly before it is cleared (#158)',
+        );
+
+        // The suspended dispatch resumes into a RELEASED registry: m2 must NOT be delivered.
+        $gate->complete();
+        delay(0.02);
+        self::assertSame(['m1'], $received, 'the discarded backlog must not be delivered after the terminal close');
+        $pump1->await(new TimeoutCancellation(5));
+    }
+
+    /**
+     * The initial-connect retry loop's auth fail-fast (#46) must release the dialed socket (#133)
+     * and settle a parked joiner with the same AuthenticationException (#145).
+     */
+    public function testRetryInitialConnectAuthFailureClosesSocketAndSettlesJoiner(): void
+    {
+        $transport = new class implements TransportInterface {
+            public int $closeCalls = 0;
+            /** @var list<string> */
+            private array $reads = [
+                "-ERR Maximum Connections Exceeded\r\n",
+                "-ERR Authorization Violation\r\n",
+            ];
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(fn(): string => array_shift($this->reads) ?? '');
+            }
+
+            public function close(): Future
+            {
+                return async(function (): void {
+                    $this->closeCalls++;
+                });
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                maxReconnectAttempts: 2,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                retryOnFailedInitialConnect: true,
+            ),
+            $transport,
+        );
+
+        $owner = $connection->connect();
+        $joiner = $connection->connect();
+
+        try {
+            $owner->await(new TimeoutCancellation(5));
+            self::fail('the auth-rejected retry must fail');
+        } catch (\IDCT\NATS\Exception\AuthenticationException) {
+            // expected
+        }
+
+        try {
+            $joiner->await(new TimeoutCancellation(5));
+            self::fail('the joiner must share the retry-path auth failure, not hang');
+        } catch (\IDCT\NATS\Exception\AuthenticationException) {
+            // expected
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(2, $transport->closeCalls, 'attempt-start close + the auth fail-fast release (#133)');
+    }
+
+    /**
+     * The initial-connect retry loop (#56) must wait its configured backoff before redialing -
+     * removing the delay would hammer the server with immediate retries.
+     */
+    public function testRetryInitialConnectWaitsTheBackoffBeforeRedialing(): void
+    {
+        $transport = new FakeTransport([
+            "-ERR Maximum Connections Exceeded\r\n",
+            "-ERR Maximum Connections Exceeded\r\n",
+        ]);
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                maxReconnectAttempts: 1,
+                reconnectDelayMs: 300,
+                reconnectMaxDelayMs: 300,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                retryOnFailedInitialConnect: true,
+            ),
+            $transport,
+        );
+
+        $startedNs = hrtime(true);
+        try {
+            $connection->connect()->await(new TimeoutCancellation(5));
+            self::fail('the exhausted retry must fail');
+        } catch (ConnectionException $e) {
+            self::assertSame('Server error during connect: Maximum Connections Exceeded', $e->getMessage());
+        }
+        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+
+        self::assertGreaterThan(0.25, $elapsedSeconds, 'the retry must wait its configured backoff before redialing');
+    }
+
+    /**
+     * A publish whose write fails while ANOTHER fiber's recovery is already in flight must AWAIT
+     * that recovery and retry on the fresh socket - returning early would retry on the dead socket
+     * and surface a spurious failure for a frame the recovery was about to make deliverable.
+     */
+    public function testSecondFailingPublisherAwaitsInFlightRecoveryAndRetriesOnTheFreshSocket(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
+        $transport = new class ($info) implements TransportInterface {
+            /** @var list<string> */
+            public array $connectCalls = [];
+            /** @var list<string> */
+            public array $writes = [];
+            public int $epoch = 1;
+            /** @var list<string> */
+            private array $reads;
+
+            public function __construct(string $info)
+            {
+                $this->reads = [$info, "PONG\r\n", $info, "PONG\r\n"];
+            }
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(function () use ($dsn, $timeoutMs): void {
+                    $this->connectCalls[] = $dsn . '|' . $timeoutMs;
+                    if (count($this->connectCalls) >= 2) {
+                        $this->epoch = 2;
+                    }
+                });
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(function () use ($bytes): void {
+                    // Every publish write on the FIRST epoch's socket fails (broken pipe).
+                    if ($this->epoch === 1 && str_starts_with($bytes, 'PUB ')) {
+                        throw new TransportClosedException('broken pipe');
+                    }
+
+                    $this->writes[] = $bytes;
+                });
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(fn(): string => array_shift($this->reads) ?? '');
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $first = $connection->publish('orders.a', 'a1');
+        $second = $connection->publish('orders.b', 'b1');
+
+        $first->await(new TimeoutCancellation(5));
+        $second->await(new TimeoutCancellation(5));
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $pubs = array_values(array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'PUB ')));
+        self::assertCount(2, $pubs, 'both publishes must land on the fresh socket after the shared recovery');
+    }
+
+    /**
+     * A heartbeat tick on a connection that is not Open must stop the timer and touch NOTHING:
+     * writing its PING would inject bytes into a handshake/teardown the tick does not own.
+     */
+    public function testPingTimerTickOnNotOpenConnectionWritesNothing(): void
+    {
+        $transport = new FakeTransport();
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+
+        $tick = new \ReflectionMethod($connection, 'pingTimerTick');
+        $tick->invoke($connection);
+
+        self::assertSame([], $transport->writes, 'a heartbeat tick on a not-open connection must not write a PING');
+    }
+
+    /**
+     * publishHeaderBlock() coalesces frames into segments of at most PUBLISH_BLOCK_SEGMENT_BYTES
+     * (512 KiB): two frames summing EXACTLY to the cap share one segment (one transport write);
+     * one byte past the cap forces a flush (two writes). Pins the > boundary of the cap check.
+     */
+    public function testPublishHeaderBlockSegmentCapBoundary(): void
+    {
+        $codec = new ProtocolCodec();
+        $headerBlock = NatsHeaders::toWireBlock([]);
+        $frameLen = static fn(int $n): int => strlen($codec->encodeHeaderPublishBlock('seg.x', str_repeat('x', $n), $headerBlock));
+
+        $cap = 512 * 1024;
+        $firstPayload = 200_000;
+        $target = $cap - $frameLen($firstPayload);
+        $secondPayload = null;
+        for ($n = $target - 60; $n <= $target; $n++) {
+            if ($frameLen($n) === $target) {
+                $secondPayload = $n;
+                break;
+            }
+        }
+        self::assertNotNull($secondPayload, 'a payload length hitting the cap exactly must exist');
+
+        $messages = static fn(int $second): array => [
+            ['subject' => 'seg.x', 'payload' => str_repeat('x', $firstPayload), 'headers' => []],
+            ['subject' => 'seg.x', 'payload' => str_repeat('x', $second), 'headers' => []],
+        ];
+
+        // Exactly at the cap: both frames share ONE segment write (handshake wrote CONNECT + PING).
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+        $connection->publishHeaderBlock($messages($secondPayload))->await();
+        self::assertCount(3, $transport->writes, 'frames summing exactly to the segment cap must share one write');
+        self::assertSame($cap, strlen($transport->writes[2]), 'the coalesced segment must be exactly the cap');
+
+        // One byte past the cap: the first frame is flushed before appending - two segment writes.
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+        $connection->publishHeaderBlock($messages($secondPayload + 1))->await();
+        self::assertCount(4, $transport->writes, 'frames one byte past the segment cap must split into two writes');
+    }
+
+    /**
+     * The reconnect replay's immediate-frame poll is bounded to exactly 16 polls: with a server
+     * that keeps emitting prompt frames, the replay consumes 16 chunks and moves on. Pins the loop
+     * bound so the replay window cannot silently widen or shrink.
+     */
+    public function testReplayImmediateFramePollStopsAfterExactlySixteenChunks(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $reads = [$info, "PONG\r\n", '__EOF__', $info, "PONG\r\n"];
+        for ($i = 0; $i < 20; $i++) {
+            $reads[] = "+OK\r\n";
+        }
+
+        $transport = new class ($reads) implements TransportInterface {
+            /** @param list<string> $reads */
+            public function __construct(public array $reads) {}
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function (): string {
+                    $next = array_shift($this->reads) ?? '';
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
+
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        $pump->await(new TimeoutCancellation(5)); // EOF -> recovery -> replay poll -> Open
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(
+            4,
+            $transport->reads,
+            'the replay poll must consume exactly 16 of the 20 prompt chunks (its documented bound)',
+        );
+    }
+
+    /**
+     * Each replay poll is bounded to ~5ms: an idle socket ends the poll almost immediately, so the
+     * whole recovery stays fast. A mis-scaled poll timeout (seconds instead of ms) would stall the
+     * recovery for minutes inside the replay window.
+     */
+    public function testReplayImmediateFramePollTimesOutPromptlyOnAnIdleSocket(): void
+    {
+        $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+        $reads = [$info, "PONG\r\n", '__EOF__', $info, "PONG\r\n", "+OK\r\n"];
+
+        $transport = new class ($reads) implements TransportInterface {
+            /** @param list<string> $reads */
+            public function __construct(public array $reads) {}
+
+            public function connect(string $dsn, int $timeoutMs): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function upgradeTls(): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function write(string $bytes): Future
+            {
+                return async(static fn(): null => null);
+            }
+
+            public function readLine(?Cancellation $cancellation = null): Future
+            {
+                return async(function () use ($cancellation): string {
+                    $next = array_shift($this->reads);
+                    if ($next === null) {
+                        // Idle socket: block until the caller's own poll bound cancels the read.
+                        delay(10.0, cancellation: $cancellation);
+
+                        return '';
+                    }
+                    if ($next === '__EOF__') {
+                        throw new TransportClosedException('eof');
+                    }
+
+                    return $next;
+                });
+            }
+
+            public function close(): Future
+            {
+                return async(static fn(): null => null);
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
+
+        $startedNs = hrtime(true);
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        $pump->await(new TimeoutCancellation(5));
+        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertLessThan(3.0, $elapsedSeconds, 'the idle replay poll must end within its ~5ms bound, not stall the recovery');
+    }
+
+    /**
+     * An auto-unsubscribe whose server-side max is already received must WAIT for the queued
+     * backlog before dropping the sid: a message the server counted toward the max but a throwing
+     * handler left queued must still be delivered on the next drain pass (#112/#162).
+     */
+    public function testAutoUnsubBacklogSurvivesAHandlerThrowAndIsDeliveredBeforeTheDrop(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        /** @var list<string> $received */
+        $received = [];
+        $sid = $connection->subscribe('updates', static function (NatsMessage $m) use (&$received): void {
+            $received[] = $m->payload;
+            if ($m->payload === 'm1') {
+                throw new \RuntimeException('handler boom');
+            }
+        })->await();
+        $connection->unsubscribe($sid, 2)->await();
+
+        $transport->pushReadChunk("MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\n");
+        try {
+            $connection->processIncoming()->await(); // m1 delivered; its handler throw propagates (#128)
+            self::fail('the handler throw must propagate to the read caller');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler boom', $e->getMessage());
+        }
+        self::assertSame(['m1'], $received);
+
+        $transport->pushReadChunk("PING\r\n"); // any inbound cycle drains the retained backlog
+        $connection->processIncoming()->await();
+
+        self::assertSame(
+            ['m1', 'm2'],
+            $received,
+            'the queued m2 - already counted toward the max by the server - must reach the handler before the sid drops',
+        );
+    }
+
+    /**
+     * A heartbeat tick that trips maxPingsOut escalates into recovery and must then STOP: writing
+     * the tick's own PING after the recovery would inject a stray heartbeat into the fresh epoch.
+     */
+    public function testMissedPongEscalationDoesNotAlsoSendTheTickPing(): void
+    {
+        $transport = new FakeTransport([
+            self::HANDSHAKE_INFO, "PONG\r\n",
+            self::HANDSHAKE_INFO, "PONG\r\n",
+        ]);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0, maxPingsOut: 1),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // One liveness budget already consumed without a PONG; the next tick trips maxPingsOut.
+        $outstanding = new \ReflectionProperty($connection, 'outstandingPings');
+        $outstanding->setValue($connection, 1);
+
+        $tick = new \ReflectionMethod($connection, 'pingTimerTick');
+        $tick->invoke($connection);
+
+        self::assertSame(ConnectionState::Open, $connection->state(), 'the escalation must recover the connection');
+        self::assertCount(2, $transport->connectCalls);
+        self::assertCount(
+            4,
+            $transport->writes,
+            'CONNECT+PING per epoch and nothing else: the escalated tick must not also write its own PING',
+        );
+    }
+
+    /**
+     * A heartbeat tick firing while a user read owns the socket must NOT start a second
+     * overlapping transport read - the transport would reject it, and the user read already
+     * consumes the PONG (#148 read-slot discipline).
+     */
+    public function testHeartbeatTickDoesNotStartASecondReadWhileAUserReadIsInFlight(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0.08, maxPingsOut: 5), $transport);
+        $connection->connect()->await();
+
+        $readCancel = new DeferredCancellation();
+        $userRead = $connection->readIncoming($readCancel->getCancellation());
+        delay(0.12); // one tick fires while the user read owns the socket
+
+        self::assertContains("PING\r\n", array_slice($transport->writes, 2), 'sanity: a heartbeat tick did fire');
+        self::assertSame(1, $transport->startedReads, 'the heartbeat must not overlap the in-flight user read');
+
+        $readCancel->cancel();
+        try {
+            $userRead->await();
+        } catch (CancelledException) {
+            // expected: the user read was cancelled by the test teardown
+        }
+        $connection->disconnect()->await();
+    }
+
+    /**
+     * A publisher parked on the sealed reconnect-flush gate (#165) must complete its write once the
+     * gate opens with the connection Open - it must not fall through into the buffering path and
+     * fail a publish whose frame was just written.
+     */
+    public function testPublisherParkedOnTheFlushGateWritesOnceTheGateOpensOnAnOpenConnection(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        // Model the #165 seal window: state Connecting with a sealed flush gate armed.
+        /** @var DeferredFuture<null> $gate */
+        $gate = new DeferredFuture();
+        $stateProp = new \ReflectionProperty($connection, 'state');
+        $stateProp->setValue($connection, ConnectionState::Connecting);
+        $gateProp = new \ReflectionProperty($connection, 'reconnectFlushGate');
+        $gateProp->setValue($connection, $gate);
+
+        $publish = $connection->publish('orders.sealed', 'p1');
+        delay(0.01); // the publisher parks on the gate
+
+        // Recovery finishes: state flips Open, the gate is cleared and completed (its finally).
+        $stateProp->setValue($connection, ConnectionState::Open);
+        $gateProp->setValue($connection, null);
+        $gate->complete();
+
+        $publish->await(new TimeoutCancellation(3)); // must resolve cleanly
+
+        self::assertCount(
+            1,
+            array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'PUB orders.sealed')),
+            'the parked frame must be written exactly once after the gate opens',
+        );
+    }
+
+    /**
+     * An external cancellation of requestMany() must surface PROMPTLY - not only once the total
+     * deadline eventually expires (#135 family).
+     */
+    public function testRequestManyExternalCancellationSurfacesPromptly(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $cancelSource = new DeferredCancellation();
+        $canceller = async(static function () use ($cancelSource): void {
+            delay(0.05);
+            $cancelSource->cancel();
+        });
+
+        $startedNs = hrtime(true);
+        try {
+            $connection->requestMany('svc.scatter', 'q', null, null, 3000, null, $cancelSource->getCancellation())
+                ->await(new TimeoutCancellation(10));
+            self::fail('the external cancellation must surface');
+        } catch (CancelledException) {
+            // expected
+        }
+        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+        $canceller->await();
+
+        self::assertLessThan(1.5, $elapsedSeconds, 'the cancellation must surface promptly, not at the total deadline');
     }
 }

@@ -1,6 +1,11 @@
 # ADR-9 gap check only fires on Nats-Last-Consumer GREATER than tracked max — a server-side consumer replacement resets cseq and masks real gaps until the old high-water mark is passed
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — two arms (nats.go any-inequality parity): a heartbeat reporting Nats-Last-
+  Consumer BELOW the tracked max surfaces one 'consumer appears to have been replaced (sequence
+  regressed)' error, rebases the tracker, and re-arms the gap signal; a delivered cseq regression
+  rebases silently. Pinned by
+  `testPushConsumerHeartbeatRegressionSignalsReplacementAndRebasesTracker` and
+  `testPushConsumerDeliveryRegressionRebasesTrackerSilently` (both pre-fix red).
 - **Severity:** minor
 - **Type:** lost-message detection gap / nats.go parity deviation
 - **Area:** JetStream push-consumer dispatch (round-1 ADR-9 fix follow-up)

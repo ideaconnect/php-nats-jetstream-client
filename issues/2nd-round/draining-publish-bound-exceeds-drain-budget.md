@@ -1,6 +1,13 @@
 # Draining-branch publish writes get a fresh full requestTimeoutMs each — drain() can overshoot its documented budget by K × 10 s
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — drain() records its deadline on the instance; the Draining branch of
+  writePublishFrame() bounds handler publishes by the drain's REMAINING budget, and
+  drainPendingForSid() checks the deadline between deliveries (each pass's head delivery stays
+  exempt to preserve the pinned post-deadline head-delivery contract in
+  NatsConnection_1MutationTest — the bound stays hard: at most one head per pass, its publishes
+  clamped to the expired remainder). Pinned by
+  `DrainFlushBoundedWriteTest::testDrainBudgetBoundsSerialHandlerPublishesAcrossBacklog`, verified
+  red pre-fix both fully disabled (9.62s vs the 1.4s bound) and with only the loop check disabled.
 - **Severity:** minor
 - **Type:** blocked flow (bounded, but far beyond the documented bound) / contract mismatch
 - **Area:** connection drain

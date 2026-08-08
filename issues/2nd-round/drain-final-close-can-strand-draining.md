@@ -1,6 +1,9 @@
 # drain()'s final teardown awaits transport->close() unguarded — a throwing close() strands the connection in Draining, contradicting the new "always reaches Closed" contract
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — drain()'s teardown uses closeTransportBestEffort() like every other
+  terminal path. Pinned by
+  `DrainFlushBoundedWriteTest::testDrainStillClosesWhenTransportCloseThrows` (pre-fix red: the
+  close() throw escaped drain()->await() with state stranded in Draining).
 - **Severity:** minor
 - **Type:** contract violation (custom-transport edge) / blocked flow
 - **Area:** connection drain (round-1 fix follow-up)

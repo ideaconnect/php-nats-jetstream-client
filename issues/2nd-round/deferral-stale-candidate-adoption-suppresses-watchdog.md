@@ -1,7 +1,12 @@
 # Deferral leaves the failed candidate's adoption state — a surviving old consumer can suppress the watchdog via touch()-before-name-filter until the next idle heartbeat
 
-- **Status:** OPEN (filed 2026-08-08 during adversarial verification of the deferral-latch fix;
-  nit — self-healing, no message loss)
+- **Status:** FIXED (2026-08-08) — the recreate captures the pre-episode adoption state (deliver inbox,
+  expected sequence, ack-parse flag; the old consumer name was already captured) and the deferral
+  restores all of it alongside the latch reset, so a surviving old consumer's frames pass the name
+  filter immediately after reconnect. Pinned by
+  `testDeferralRewindsAdoptionSoSurvivorFramesDeliverAfterReconnect` (pre-fix red: the survivor
+  frame was silently filtered); the sibling adopted-inbox deferral test was rewritten to the new
+  rewind contract.
 - **Severity:** nit
 - **Type:** delayed recovery in a narrow multi-failure edge
 - **Area:** JetStream ordered consumers — disconnect-collision deferral

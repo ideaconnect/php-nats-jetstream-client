@@ -119,15 +119,54 @@ final class WebSocketFrameCodecMutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testMaxFramePayloadBoundaryIsAccepted(): void
     {
-        // kills GreaterThan @ line 115
+        // kills GreaterThan @ line 146 (> -> >= would flag exactly-MAX as a terminal violation)
         $max = 64 * 1024 * 1024; // MAX_FRAME_PAYLOAD
         $buffer = pack('CC', 0x82, 127) . pack('J', $max); // declares length == MAX, no payload yet
         $original = $buffer;
 
-        $frames = WebSocketFrameCodec::decode($buffer); // must NOT throw at exactly MAX
+        $frames = WebSocketFrameCodec::decode($buffer, $terminal); // must NOT flag at exactly MAX
 
         self::assertSame([], $frames, 'a frame at exactly MAX length is valid and just waits for payload');
         self::assertSame($original, $buffer);
+        self::assertNull($terminal, 'exactly MAX is within bounds - no terminal violation may be reported');
+    }
+
+    /**
+     * RFC 6455 5.5 applies to EVERY control opcode, including OP_CLOSE (0x8, the lowest): a Close
+     * frame with FIN cleared is a fragmented control frame and must be reported terminal. The
+     * ">= 0x8" -> "> 0x8" mutant would exempt exactly the Close opcode from the control-frame rules.
+     */
+    public function testFragmentedCloseFrameIsATerminalControlViolation(): void
+    {
+        // kills GreaterThanOrEqualTo @ line 161 (opcode >= 0x8 -> > 0x8 skips OP_CLOSE)
+        $close = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, pack('n', 1000), false);
+        $close[0] = chr(ord($close[0]) & 0x7F); // clear FIN on the control frame
+        $buffer = $close;
+
+        $frames = WebSocketFrameCodec::decode($buffer, $terminal);
+
+        self::assertSame([], $frames, 'a fragmented Close must not be decoded as a data-like frame');
+        self::assertInstanceOf(ProtocolException::class, $terminal);
+        self::assertStringContainsString('control frame', $terminal->getMessage());
+    }
+
+    /**
+     * RFC 6455 5.5's control-frame payload cap is INCLUSIVE at 125 bytes: a ping carrying exactly
+     * 125 bytes is legal and must decode, not be flagged as oversized. The "> 125" -> ">= 125"
+     * mutant would reject the boundary payload.
+     */
+    public function testControlFrameWithExactly125BytePayloadIsAccepted(): void
+    {
+        // kills GreaterThan @ line 161 (length > 125 -> >= 125 rejects the inclusive boundary)
+        $payload = str_repeat('p', 125);
+        $buffer = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, $payload, false);
+
+        $frames = WebSocketFrameCodec::decode($buffer, $terminal);
+
+        self::assertNull($terminal, 'a 125-byte control payload is exactly at the inclusive cap');
+        self::assertCount(1, $frames);
+        self::assertSame(WebSocketFrameCodec::OP_PING, $frames[0]['opcode']);
+        self::assertSame($payload, $frames[0]['payload']);
     }
 
     /**

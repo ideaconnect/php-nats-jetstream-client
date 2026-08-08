@@ -1,7 +1,10 @@
 # create() applies mirror read/write prefixes BEFORE createStream() succeeds, and they are never reset — a failed mirror create permanently poisons the handle
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified — found
-  independently by two lenses)
+- **Status:** FIXED (2026-08-08) — create() awaits createStream() first and applies mirror prefixes only on
+  success; create() and bind() reset readPrefix/writePrefix before conditionally re-applying.
+  Pinned by `testFailedMirrorCreateLeavesHandleOnPlainBucketSubjects` and
+  `testRebindToNonMirrorStreamClearsStalePrefixes` (both pre-fix red on the misdirected wire
+  subjects).
 - **Severity:** minor
 - **Type:** silent write misdirection / read blindness (lost messages from the caller's view)
 - **Area:** KV mirror support (round-1 ADR-57 fix follow-up)

@@ -862,7 +862,8 @@ use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
 
-$kv = $client->jetStream()->keyValue('cfg');
+$js = $client->jetStream();
+$kv = $js->keyValue('cfg');
 $kv->create()->await();
 
 // Register the watcher BEFORE the writes it should observe: watch() delivers live updates only

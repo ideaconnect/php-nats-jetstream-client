@@ -771,11 +771,16 @@ final class WebSocketTransportTest extends TestCase
         (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
         $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
         self::assertTrue($socket->isClosed());
+        self::assertSame(1, $socket->writeAttempts(), 'the first close writes the Close frame once');
 
         // Second close on the already-released socket: a no-op, not a second frame write or error.
+        // The ATTEMPT count is what pins this - the closed double throws before recording bytes and
+        // close() swallows frame-write failures, so writtenBytes() alone would stay equal even if
+        // close() regressed into re-attempting the write on a retained socket.
         $written = $socket->writtenBytes();
         $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
         self::assertSame($written, $socket->writtenBytes());
+        self::assertSame(1, $socket->writeAttempts(), 'a repeated close must not re-attempt the Close-frame write');
     }
 
     /**
@@ -1050,13 +1055,14 @@ final class WebSocketTransportTest extends TestCase
     }
 
     /**
-     * A hostile peer flooding PINGs in a single read must not spawn unbounded answer fibers: the
-     * cap admits at most 16 outstanding control answers per batch (RFC 6455 5.5.3 permits answering
-     * only the most recent ping, so dropping the excess is conformant). 18 pings coalesced with a
-     * data frame into one read yield EXACTLY 16 pongs - answering the FIRST 16 pings in arrival
-     * order - while the data frame is still delivered.
+     * A peer coalescing a PING flood into a single read costs ONE answer, not one per ping: a
+     * queued-but-unsent pong payload is REPLACED by each newer ping's (RFC 6455 5.5.3 permits
+     * answering only the most recent ping - eliding the OLDER answers, never the newest). 18 pings
+     * coalesced with a data frame into one read yield EXACTLY one pong, carrying the NEWEST ping's
+     * payload, while the data frame is still delivered. Pre-fix a counted-fiber cap kept the 16
+     * OLDEST answers and dropped the newest - the 5.5.3 inversion.
      */
-    public function testReadLineCapsControlFrameAnswersPerReadBatch(): void
+    public function testReadLineCoalescesPingFloodIntoSinglePongForNewestPing(): void
     {
         $pings = '';
         for ($i = 0; $i < 18; $i++) {
@@ -1070,31 +1076,110 @@ final class WebSocketTransportTest extends TestCase
 
         self::assertSame('DATA', $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
 
-        // The answer fibers were spawned before readLine() resolved and each write completes
+        // The writer fiber was spawned before readLine() resolved and its write completes
         // synchronously on the scripted socket; wait state-driven (bounded by an hrtime deadline,
-        // never a bare sleep) until the 16 admitted answers have hit the wire.
+        // never a bare sleep) until the answer has hit the wire.
         $deadlineNs = hrtime(true) + 2_000_000_000;
         do {
             $buffer = $socket->writtenBytes();
             $pongs = WebSocketFrameCodec::decode($buffer, allowMasked: true);
-            if (count($pongs) >= 16) {
+            if ($pongs !== []) {
                 break;
             }
             delay(0.001);
         } while (hrtime(true) < $deadlineNs);
 
-        // Two extra event-loop ticks: any (erroneously admitted) 17th/18th answer fiber would have
-        // run and written by now, so the exact count below pins the drop, not a race.
+        // Two extra event-loop ticks: any erroneously queued additional answer would have been
+        // written by now, so the exact count below pins the coalescing, not a race.
         delay(0);
         delay(0);
 
         $buffer = $socket->writtenBytes();
         $pongs = WebSocketFrameCodec::decode($buffer, allowMasked: true);
-        self::assertCount(16, $pongs, 'exactly the cap of 16 pongs; the 17th and 18th pings are dropped (RFC 6455 5.5.3)');
-        foreach ($pongs as $i => $pong) {
-            self::assertSame(WebSocketFrameCodec::OP_PONG, $pong['opcode']);
-            self::assertSame(sprintf('p%02d', $i), $pong['payload'], 'pongs answer the first 16 pings in arrival order');
+        self::assertCount(1, $pongs, 'coalesced pings collapse to exactly ONE pong (RFC 6455 5.5.3)');
+        self::assertSame(WebSocketFrameCodec::OP_PONG, $pongs[0]['opcode']);
+        self::assertSame('p17', $pongs[0]['payload'], 'the single pong answers the NEWEST ping, never an older one');
+    }
+
+    /**
+     * The RFC 6455 5.5.1 Close echo is a MUST and lives in its OWN answer slot that a ping flood
+     * can never displace: 17 pings + a Close coalesced into ONE read on a healthy socket yield
+     * exactly one pong - for the NEWEST ping - followed by exactly one Close echo mirroring the
+     * received status code. Pre-fix the counted-fiber cap (16) never decremented within a batch
+     * (fibers only start once the read fiber suspends), so it admitted the 16 OLDEST pongs and
+     * dropped the Close echo entirely despite zero actual backpressure.
+     */
+    public function testReadLineFlushesCloseEchoAfterCoalescedPingFlood(): void
+    {
+        $pings = '';
+        for ($i = 0; $i < 17; $i++) {
+            $pings .= WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, sprintf('p%02d', $i), false);
         }
+        $status = pack('n', 1000);
+        $close = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, $status, false);
+        $socket = new ScriptedChunkSocket([$pings . $close]);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        try {
+            $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+            self::fail('expected TransportClosedException on the server close frame');
+        } catch (TransportClosedException) {
+            // The closure still surfaces; the answers are asserted below.
+        }
+
+        // State-driven bounded wait until both answers hit the wire, then two extra ticks so any
+        // erroneously admitted additional answer would also have been written - the exact frame
+        // list below pins the slot semantics, not a race.
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        do {
+            $buffer = $socket->writtenBytes();
+            $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+            if (count($frames) >= 2) {
+                break;
+            }
+            delay(0.001);
+        } while (hrtime(true) < $deadlineNs);
+        delay(0);
+        delay(0);
+
+        $buffer = $socket->writtenBytes();
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+        self::assertCount(2, $frames, 'exactly one pong plus the mandatory Close echo (RFC 6455 5.5.1)');
+        self::assertSame(WebSocketFrameCodec::OP_PONG, $frames[0]['opcode']);
+        self::assertSame('p16', $frames[0]['payload'], 'the pong answers the NEWEST of the 17 coalesced pings');
+        self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[1]['opcode']);
+        self::assertSame($status, $frames[1]['payload'], 'the Close echo mirrors the received status code');
+    }
+
+    /**
+     * An answer queued while the transport still had its socket must not resurrect after the
+     * socket is released: the writer fiber reads the CURRENT socket, so a release (close() nulls
+     * the property first) between queueing and flushing drops the answer silently and clears its
+     * slot - the answer path on a closing transport stays silent.
+     */
+    public function testQueuedControlAnswerIsDroppedSilentlyOnceSocketReleased(): void
+    {
+        $socket = new ScriptedChunkSocket([]);
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        // Queue a pong answer (the spawned writer fiber cannot start until this fiber yields),
+        // then release the socket the way close() does before the writer ever runs.
+        (new \ReflectionMethod(WebSocketTransport::class, 'answerControlFrame'))
+            ->invoke($transport, WebSocketFrameCodec::OP_PONG, 'late');
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, null);
+
+        // Two event-loop ticks let the writer fiber drain the slot against the released socket.
+        delay(0);
+        delay(0);
+
+        self::assertSame(0, $socket->writeAttempts(), 'no write may be attempted once the socket is released');
+        self::assertNull(
+            (new \ReflectionProperty(WebSocketTransport::class, 'pendingPongPayload'))->getValue($transport),
+            'the dropped answer must not linger in its slot',
+        );
     }
 
     /**
@@ -1320,6 +1405,35 @@ final class WebSocketTransportTest extends TestCase
             . "Sec-WebSocket-Accept: {$accept}\r\n\r\n");
 
         self::assertInstanceOf(ConnectionException::class, $error);
+        // The full message is the operator's only signal WHY the 101 was not a WebSocket upgrade.
+        self::assertSame(
+            'WebSocket handshake failed: the 101 response is missing the required '
+            . '"Upgrade: websocket" / "Connection: Upgrade" headers (RFC 6455 4.1)',
+            $error->getMessage(),
+        );
+    }
+
+    /**
+     * RFC 6455 4.1 requires BOTH headers: a 101 carrying only "Connection: Upgrade" (no Upgrade
+     * header) and one carrying only "Upgrade: websocket" (no Connection header) must EACH fail -
+     * either flag alone is insufficient, and neither flag may default to accepted.
+     */
+    public function testHandshakeRejectsWhenEitherUpgradeOrConnectionHeaderIsMissingAlone(): void
+    {
+        // Upgrade header missing, Connection present: $upgradeOk must default to (and stay) false.
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Connection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n\r\n");
+
+        self::assertInstanceOf(ConnectionException::class, $error, 'a 101 without Upgrade: websocket must fail');
+        self::assertStringContainsString('RFC 6455 4.1', $error->getMessage());
+
+        // Connection header missing, Upgrade present: $connectionOk must default to (and stay) false.
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n\r\n");
+
+        self::assertInstanceOf(ConnectionException::class, $error, 'a 101 without Connection: Upgrade must fail');
         self::assertStringContainsString('RFC 6455 4.1', $error->getMessage());
     }
 
@@ -1336,23 +1450,33 @@ final class WebSocketTransportTest extends TestCase
             . "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n", compression: false);
 
         self::assertInstanceOf(ConnectionException::class, $error);
-        self::assertStringContainsString('never offered', $error->getMessage());
+        // Full-message pin: the named extension and the RFC citation are the operator's diagnostics.
+        self::assertSame(
+            'WebSocket handshake failed: the server negotiated extension "permessage-deflate"'
+            . ' that this client never offered (RFC 6455 4.1)',
+            $error->getMessage(),
+        );
     }
 
     /**
      * RFC 7692: this codec inflates per message (no context takeover), so a server negotiating
-     * parameters beyond the offered client/server_no_context_takeover would garble every message
-     * after the first - the handshake must reject them. A conformant response negotiates cleanly.
+     * unknown parameters beyond the acceptable set would garble decoding in ways the client cannot
+     * detect up front - the handshake must reject them. A conformant response negotiates cleanly.
      */
     public function testHandshakeValidatesCompressionParameters(): void
     {
         [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
             . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
             . "Sec-WebSocket-Accept: {$accept}\r\n"
-            . "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=10\r\n\r\n", compression: true);
+            . "Sec-WebSocket-Extensions: permessage-deflate; mystery_param=1\r\n\r\n", compression: true);
 
         self::assertInstanceOf(ConnectionException::class, $error);
-        self::assertStringContainsString('unacceptable permessage-deflate parameter', $error->getMessage());
+        // Full-message pin: the offending parameter AND the accepted set are the operator's signal.
+        self::assertSame(
+            'WebSocket handshake failed: unacceptable permessage-deflate parameter "mystery_param=1"'
+            . ' (accepted: client_no_context_takeover, server_no_context_takeover, server_max_window_bits=8..15)',
+            $error->getMessage(),
+        );
 
         // RFC 7692 7.1.1.1: server_no_context_takeover was offered, so the server must ECHO it or
         // decline - accepting without it means the server may retain deflate context across
@@ -1363,7 +1487,12 @@ final class WebSocketTransportTest extends TestCase
             . "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n", compression: true);
 
         self::assertInstanceOf(ConnectionException::class, $error);
-        self::assertStringContainsString('server_no_context_takeover', $error->getMessage());
+        self::assertSame(
+            'WebSocket handshake failed: the server accepted permessage-deflate without echoing '
+            . 'server_no_context_takeover (RFC 7692 7.1.1.1) - it may use context takeover, which '
+            . 'this client cannot decode',
+            $error->getMessage(),
+        );
 
         [$error, $transport] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
             . "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n"
@@ -1379,6 +1508,96 @@ final class WebSocketTransportTest extends TestCase
     }
 
     /**
+     * RFC 7692 7.1.2.1: the server may volunteer server_max_window_bits - even though it was not
+     * offered - to limit its OWN LZ77 window; the raw 15-bit inflater decodes any smaller-window
+     * stream, so 8..15 must be ACCEPTED, not fail the handshake. The quoted-string spelling ="12"
+     * is a legal equivalent encoding per RFC 6455 9.1's extension-param ABNF (token |
+     * quoted-string) and must be accepted too. Pre-fix the parameter loop rejected everything but
+     * the two no_context_takeover tokens.
+     */
+    public function testHandshakeAcceptsServerMaxWindowBitsWithinRange(): void
+    {
+        // 8 and 15 are the INCLUSIVE range ends of RFC 7692's window-bits and must be accepted in
+        // both spellings; the upper-cased parameter name pins the case-insensitive (/i) matching -
+        // extension parameter names are tokens, and tokens compare case-insensitively.
+        foreach ([
+            'server_max_window_bits=12',
+            'server_max_window_bits="12"',
+            'server_max_window_bits=8',
+            'server_max_window_bits=15',
+            'server_max_window_bits="8"',
+            'server_max_window_bits="15"',
+            'SERVER_MAX_WINDOW_BITS=12',
+        ] as $param) {
+            [$error, $transport] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+                . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                . "Sec-WebSocket-Accept: {$accept}\r\n"
+                . "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover; {$param}\r\n\r\n", compression: true);
+
+            self::assertNull($error, "{$param} is RFC-legal and decodable - the handshake must succeed");
+            self::assertTrue(
+                (new \ReflectionProperty(WebSocketTransport::class, 'compressionActive'))->getValue($transport),
+                'compression must be active after the negotiation',
+            );
+            $transport->close()->await();
+        }
+    }
+
+    /**
+     * Parameter order must not matter: an accepted server_max_window_bits parameter CONTINUES the
+     * parameter loop, so a server_no_context_takeover echoed AFTER it is still seen and the
+     * negotiation completes. A loop that stopped at the accepted parameter would miss the echo and
+     * wrongly fail the handshake with the RFC 7692 7.1.1.1 error.
+     */
+    public function testHandshakeAcceptsWindowBitsListedBeforeContextTakeoverEcho(): void
+    {
+        [$error, $transport] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n"
+            . "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=12; server_no_context_takeover\r\n\r\n", compression: true);
+
+        self::assertNull($error, 'parameters after an accepted server_max_window_bits must still be processed');
+        self::assertTrue(
+            (new \ReflectionProperty(WebSocketTransport::class, 'compressionActive'))->getValue($transport),
+            'compression must be active after the negotiation',
+        );
+        $transport->close()->await();
+    }
+
+    /**
+     * The server_max_window_bits acceptance stays bounded to the exact RFC 7692 section 7 grammar:
+     * the value is MANDATORY for this parameter (only client_max_window_bits has an optional-value
+     * form), decimal without leading zeroes, 8..15 - so the bare value-less spelling, out-of-range
+     * values, and the leading-zero spelling all fail the handshake as invalid response parameters
+     * (RFC 7692 section 5). client_max_window_bits stays rejected outright - it was never offered
+     * (RFC 7692 7.1.2.2 forbids the server volunteering it) and would change what this client must
+     * deflate.
+     */
+    public function testHandshakeRejectsOutOfRangeWindowBitsAndClientMaxWindowBits(): void
+    {
+        // 'xserver_max_window_bits=12' pins the ^ anchor (a suffix match is not the parameter);
+        // 'server_max_window_bits=12x' pins the $ anchor (trailing junk is not a valid value).
+        foreach ([
+            'server_max_window_bits',
+            'server_max_window_bits=7',
+            'server_max_window_bits=16',
+            'server_max_window_bits=08',
+            'client_max_window_bits=12',
+            'xserver_max_window_bits=12',
+            'server_max_window_bits=12x',
+        ] as $param) {
+            [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+                . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                . "Sec-WebSocket-Accept: {$accept}\r\n"
+                . "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover; {$param}\r\n\r\n", compression: true);
+
+            self::assertInstanceOf(ConnectionException::class, $error, "{$param} must fail the handshake");
+            self::assertStringContainsString('unacceptable permessage-deflate parameter', $error->getMessage());
+            self::assertStringContainsString($param, $error->getMessage());
+        }
+    }
+
+    /**
      * A non-101 status line (e.g. an auth proxy answering 403) must fail the handshake naming the
      * server's status line, so operators see WHY the upgrade was refused instead of a frame-decode
      * error on an HTML error page.
@@ -1389,8 +1608,26 @@ final class WebSocketTransportTest extends TestCase
             . "Content-Length: 0\r\n\r\n");
 
         self::assertInstanceOf(ConnectionException::class, $error);
-        self::assertStringContainsString('rejected by server', $error->getMessage());
-        self::assertStringContainsString('403 Forbidden', $error->getMessage());
+        // Full-message pin: the verbatim status line is the operator's only clue WHY the upgrade failed.
+        self::assertSame('WebSocket upgrade rejected by server: HTTP/1.1 403 Forbidden', $error->getMessage());
+    }
+
+    /**
+     * The 101 status check is anchored at the START of the status line: a response whose first line
+     * merely CONTAINS "HTTP/1.1 101" further in (e.g. a mangled proxy banner) is not a valid HTTP
+     * status line and must be rejected, not treated as a completed upgrade.
+     */
+    public function testHandshakeRejectsStatusLineWithLeadingGarbage(): void
+    {
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "banner HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n\r\n");
+
+        self::assertInstanceOf(ConnectionException::class, $error, 'a status line not STARTING with HTTP/1.x 101 must fail');
+        self::assertSame(
+            'WebSocket upgrade rejected by server: banner HTTP/1.1 101 Switching Protocols',
+            $error->getMessage(),
+        );
     }
 
     /**
@@ -1405,6 +1642,115 @@ final class WebSocketTransportTest extends TestCase
 
         self::assertInstanceOf(ConnectionException::class, $error);
         self::assertStringContainsString('exceeded the maximum header size', $error->getMessage());
+    }
+
+    /**
+     * The 16 KiB header bound is EXCLUSIVE: a terminator-less response of exactly 16384 bytes does
+     * not trip the size guard - the failure that surfaces is the peer's close (EOF), not the size
+     * bound. One byte of slack must not reclassify a legal-sized response as oversized.
+     */
+    public function testHandshakeHeaderSizeBoundIsExclusiveAtExactly16384Bytes(): void
+    {
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => str_repeat('X', 16384));
+
+        self::assertInstanceOf(ConnectionException::class, $error);
+        self::assertSame(
+            'WebSocket handshake failed: connection closed before response',
+            $error->getMessage(),
+            'exactly 16384 headers bytes must NOT trip the (exclusive) size bound',
+        );
+    }
+
+    /**
+     * Header parsing tolerates real-world whitespace sloppiness: a name padded before the colon
+     * ("Upgrade : websocket") must still match via trimming, and a value glued to the colon
+     * ("Connection:Upgrade") must be read from the byte right after the colon - the handshake
+     * completes on such a response.
+     */
+    public function testHandshakeParsesPaddedHeaderNamesAndUnpaddedValues(): void
+    {
+        [$error, $transport] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade : websocket\r\n"
+            . "Connection:Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n\r\n");
+
+        self::assertNull($error, 'padded names and unpadded values are valid header spellings');
+        $transport->close()->await();
+    }
+
+    /**
+     * Bytes after the header terminator (e.g. the NATS INFO frame the server pipelines behind the
+     * 101) belong to the WEBSOCKET STREAM: they are retained verbatim as the initial read buffer and
+     * are never parsed as handshake headers - a header-shaped surplus (here an extension header that
+     * would FAIL the handshake if it were parsed) must not affect the negotiation. Driven through a
+     * scripted socket that computes the accept key from the emitted request, so the whole response
+     * (terminator and surplus included) deterministically arrives in one read.
+     */
+    public function testHandshakeRetainsSurplusBytesVerbatimWithoutParsingThemAsHeaders(): void
+    {
+        $surplus = "Sec-WebSocket-Extensions: permessage-deflate\r\nX-After: 1\r\n\r\n";
+        $socket = new ScriptedChunkSocket([], responseFromWritten: static function (string $request) use ($surplus): string {
+            preg_match('/Sec-WebSocket-Key:\s*(\S+)/i', $request, $m);
+
+            return "HTTP/1.1 101 Switching Protocols\r\n"
+                . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                . 'Sec-WebSocket-Accept: ' . WebSocketFrameCodec::acceptKey($m[1] ?? '') . "\r\n\r\n"
+                . $surplus;
+        });
+
+        // Compression NOT offered: if the surplus "Sec-WebSocket-Extensions" line leaked into header
+        // parsing, the handshake would fail with the unsolicited-extension error.
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+        (new \ReflectionMethod(WebSocketTransport::class, 'performHandshake'))->invoke($transport, 'h', 80, '/');
+
+        // The surplus is retained BYTE-IDENTICALLY (nothing dropped, no terminator bytes leaked in).
+        self::assertSame(
+            $surplus,
+            (new \ReflectionProperty(WebSocketTransport::class, 'readBuffer'))->getValue($transport),
+        );
+        self::assertFalse(
+            (new \ReflectionProperty(WebSocketTransport::class, 'compressionActive'))->getValue($transport),
+            'the surplus extension header must not have been parsed as a handshake header',
+        );
+    }
+
+    /**
+     * write() deflates the payload EXACTLY when permessage-deflate was negotiated: with compression
+     * active the emitted binary frame carries RSV1 and a deflated payload that inflates back to the
+     * original bytes; without negotiation the frame carries the raw bytes and no RSV1. A swapped
+     * condition would deflate for the peer that cannot inflate and vice versa (#61).
+     */
+    public function testWriteDeflatesPayloadOnlyWhenCompressionActive(): void
+    {
+        $bytes = "PUB orders 5\r\nhello\r\n";
+
+        // Compression negotiated: deflated RSV1 frame that round-trips through inflate().
+        $compressedSocket = new ScriptedChunkSocket([]);
+        $compressed = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($compressed, $compressedSocket);
+        (new \ReflectionProperty(WebSocketTransport::class, 'compressionActive'))->setValue($compressed, true);
+        $compressed->write($bytes)->await();
+
+        $buffer = $compressedSocket->writtenBytes();
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+        self::assertCount(1, $frames);
+        self::assertSame(WebSocketFrameCodec::OP_BINARY, $frames[0]['opcode']);
+        self::assertTrue($frames[0]['rsv1'], 'a compressed frame must be RSV1-marked');
+        self::assertNotSame($bytes, $frames[0]['payload'], 'the payload must actually be deflated');
+        self::assertSame($bytes, WebSocketFrameCodec::inflate($frames[0]['payload']));
+
+        // No negotiation: the raw bytes go out unmarked and untouched.
+        $plainSocket = new ScriptedChunkSocket([]);
+        $plain = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($plain, $plainSocket);
+        $plain->write($bytes)->await();
+
+        $buffer = $plainSocket->writtenBytes();
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+        self::assertCount(1, $frames);
+        self::assertFalse($frames[0]['rsv1']);
+        self::assertSame($bytes, $frames[0]['payload'], 'without negotiation the payload must pass through verbatim');
     }
 
     /**
@@ -1452,8 +1798,11 @@ final class WebSocketTransportTest extends TestCase
             . "Sec-WebSocket-Extensions: x-webkit-deflate-frame\r\n\r\n", compression: true);
 
         self::assertInstanceOf(ConnectionException::class, $error);
-        self::assertStringContainsString('unsupported extension response', $error->getMessage());
-        self::assertStringContainsString('x-webkit-deflate-frame', $error->getMessage());
+        // Full-message pin: the quoted server response is what the operator needs to see.
+        self::assertSame(
+            'WebSocket handshake failed: unsupported extension response "x-webkit-deflate-frame"',
+            $error->getMessage(),
+        );
 
         // A comma-separated list (a second extension) is equally unsupported.
         [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
@@ -1462,7 +1811,10 @@ final class WebSocketTransportTest extends TestCase
             . "Sec-WebSocket-Extensions: permessage-deflate; server_no_context_takeover, x-foo\r\n\r\n", compression: true);
 
         self::assertInstanceOf(ConnectionException::class, $error);
-        self::assertStringContainsString('unsupported extension response', $error->getMessage());
+        self::assertSame(
+            'WebSocket handshake failed: unsupported extension response "permessage-deflate; server_no_context_takeover, x-foo"',
+            $error->getMessage(),
+        );
     }
 
     /**

@@ -28,8 +28,18 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
     private int $index = 0;
     private bool $closed = false;
 
+    /** Whether the responseFromWritten hook already produced its (single) synthesized first read. */
+    private bool $responded = false;
+
     /** Bytes the transport wrote back (e.g. a PONG); retained only so writes do not throw. */
     private string $written = '';
+
+    /**
+     * Counted BEFORE the closed/failWrites checks, so a caller can pin "no write was even attempted"
+     * - writtenBytes() alone cannot: a post-close write throws before recording, so its bytes never
+     * change whether or not the caller regressed into re-attempting the write.
+     */
+    private int $writeAttempts = 0;
 
     /** @var list<\Closure(): void> */
     private array $onClose = [];
@@ -39,10 +49,16 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
      *                             once they are exhausted.
      * @param bool $failWrites When true every write() throws ClosedException, emulating a peer that
      *                         died between delivering its last chunk and the client's answer write.
+     * @param null|\Closure(string): string $responseFromWritten Optional request->response probe: when
+     *        set, the FIRST read() returns this closure's value computed from the bytes written so far
+     *        (then the scripted $chunks follow). Lets a handshake test answer deterministically to a
+     *        request containing a randomly generated Sec-WebSocket-Key, with exact read boundaries a
+     *        loopback TCP socket cannot guarantee.
      */
     public function __construct(
         private readonly array $chunks,
         private readonly bool $failWrites = false,
+        private readonly ?\Closure $responseFromWritten = null,
     ) {}
 
     #[\Override]
@@ -50,7 +66,17 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
     {
         $cancellation?->throwIfRequested();
 
-        if ($this->closed || $this->index >= count($this->chunks)) {
+        if ($this->closed) {
+            return null;
+        }
+
+        if ($this->responseFromWritten !== null && !$this->responded) {
+            $this->responded = true;
+
+            return ($this->responseFromWritten)($this->written);
+        }
+
+        if ($this->index >= count($this->chunks)) {
             return null;
         }
 
@@ -60,6 +86,8 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
     #[\Override]
     public function write(string $bytes): void
     {
+        $this->writeAttempts++;
+
         if ($this->closed) {
             throw new ClosedException('The scripted socket is closed');
         }
@@ -75,6 +103,12 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
     public function writtenBytes(): string
     {
         return $this->written;
+    }
+
+    /** How many write() calls were attempted, including those rejected as closed/failing. */
+    public function writeAttempts(): int
+    {
+        return $this->writeAttempts;
     }
 
     #[\Override]

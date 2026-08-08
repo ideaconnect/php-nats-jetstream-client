@@ -171,13 +171,16 @@ final class ObjectStoreBucket
     }
 
     /**
-     * Rejects creating a link under a name currently held by a LIVE stored OBJECT (nats.go
-     * ErrObjectAlreadyExists parity): the rollup meta publish would silently replace the object's
-     * metadata, stranding its chunks forever. An existing LINK is deliberately allowed - nats.go
-     * permits re-pointing an alias (a link stores no chunks, so nothing is orphaned) - as is a
-     * deleted tombstone or no record at all. The lookup does NOT swallow errors: a transient
-     * lookup failure read as "name free" would let the publish overwrite a live object anyway -
-     * the exact loss this guard exists to prevent - so only a definitive 404 means free.
+     * Rejects creating a link under a name currently held by any NON-LINK object record, exactly as
+     * nats.go's AddLink guard does (GetInfo with ShowDeleted + ErrObjectAlreadyExists): a LIVE
+     * stored object blocks because the rollup meta publish would silently replace its metadata,
+     * stranding its chunks forever, and a DELETED tombstone blocks too - nats.go's Delete keeps the
+     * meta record (only marks it deleted), so put -> delete -> addLink fails there as well, and
+     * diverging would fork cross-client behavior on shared buckets. Only an existing LINK is
+     * allowed - nats.go permits re-pointing an alias (a link stores no chunks, nothing is
+     * orphaned) - or no record at all. The lookup does NOT swallow errors: a transient lookup
+     * failure read as "name free" would let the publish overwrite a live object anyway - the exact
+     * loss this guard exists to prevent - so only a definitive 404 means free.
      */
     private function assertNameFreeForLink(string $name): void
     {
@@ -185,9 +188,9 @@ final class ObjectStoreBucket
         // else (a transient 503 must fail the addLink, not read as "name free").
         $existing = $this->fetchInfo($name, false);
 
-        if ($existing !== null && !$existing->deleted && !$existing->isLink()) {
+        if ($existing !== null && !$existing->isLink()) {
             throw new JetStreamException(sprintf(
-                'Cannot create link "%s": a stored object with that name already exists (delete it first)',
+                'Cannot create link "%s": an object record with that name already exists',
                 $name,
             ));
         }
@@ -805,9 +808,31 @@ final class ObjectStoreBucket
         $this->assertValidName($name);
 
         try {
-            $response = $this->requestStreamMessage($this->metaSubject($name));
+            return $this->fetchInfoBySubject($this->metaSubject($name));
         } catch (JetStreamException $e) {
-            if ($swallowErrors || $e->getCode() === 404) {
+            if ($swallowErrors) {
+                return null;
+            }
+
+            throw $e;
+        }
+    }
+
+    /**
+     * Leader STREAM.MSG.GET read of the latest meta record under an exact meta SUBJECT, with the
+     * same metadata/seq hydration as {@see fetchInfo()} (which delegates here); a definitive 404
+     * maps to null, every other error propagates. list()'s per-subject 503 fallback must query the
+     * subject the stream enumeration reported VERBATIM: decoding its token to a name and letting
+     * the padded re-encode rebuild the subject is lossy for non-canonical (unpadded base64url)
+     * tokens written by other clients - the rebuilt subject 404s and the record silently vanishes
+     * from the listing, while the Direct Get paths (which never rebuild the subject) return it.
+     */
+    private function fetchInfoBySubject(string $subject): ?ObjectInfo
+    {
+        try {
+            $response = $this->requestStreamMessage($subject);
+        } catch (JetStreamException $e) {
+            if ($e->getCode() === 404) {
                 return null;
             }
 
@@ -913,24 +938,32 @@ final class ObjectStoreBucket
      * updates-only (#98).
      *
      * @param callable(ObjectInfo):void $handler
+     * @param bool $exactName When true, $pattern is ALWAYS treated as an exact object name and
+     *        base64url-encoded into the meta filter - the escape hatch for names that themselves
+     *        contain "*" or ">" (legal per {@see assertValidName()}, stored as safe encoded
+     *        tokens), which the default wildcard guard would otherwise reject.
      * @return Future<int> The watch handle sid. The watch rides an ordered consumer whose automatic
      *         recreates rotate the internal sid, so stop it with
      *         {@see \IDCT\NATS\JetStream\JetStreamContext::stopOrderedConsumer()} - a plain
      *         `unsubscribe($sid)` only works until the first recreate.
      */
-    public function watch(callable $handler, string $pattern = '>', ?ObjectStoreWatchOptions $options = null): Future
+    public function watch(callable $handler, string $pattern = '>', ?ObjectStoreWatchOptions $options = null, bool $exactName = false): Future
     {
-        return async(function () use ($handler, $pattern, $options): int {
+        return async(function () use ($handler, $pattern, $options, $exactName): int {
             // Meta subjects carry base64url-ENCODED object names (ADR-20), so a raw subject
             // wildcard like "logs-*" can never match an encoded token - it would subscribe
             // successfully and silently observe nothing. Only ">" (all objects) or an EXACT object
-            // name (encoded here) is meaningful.
-            if ($pattern !== '>') {
+            // name (encoded here) is meaningful. With $exactName the pattern is a NAME by
+            // declaration - encode unconditionally, so names containing "*"/">" stay watchable.
+            if ($exactName) {
+                $pattern = $this->encodeName($pattern);
+            } elseif ($pattern !== '>') {
                 if (str_contains($pattern, '*') || str_contains($pattern, '>')) {
                     throw new JetStreamException(
                         'Object Store watch patterns cannot use subject wildcards: meta subjects encode '
                         . 'object names (base64url), so a wildcard never matches. Use ">" for all objects '
-                        . 'or an exact object name, and filter client-side for anything else.',
+                        . 'or an exact object name (pass exactName: true for a name that itself contains '
+                        . '"*" or ">"), and filter client-side for anything else.',
                     );
                 }
 
@@ -1035,10 +1068,10 @@ final class ObjectStoreBucket
                                 // Direct Get unavailable (allow_direct disabled / legacy stream):
                                 // fall back to the leader read like info() does, instead of failing
                                 // the whole enumeration on a bucket whose single-object reads work.
-                                $encoded = substr($subject, strlen($this->metaPrefix()));
-                                $name = base64_decode(strtr($encoded, '-_', '+/'), true);
-
-                                return is_string($name) ? $this->fetchInfo($name, false) : null;
+                                // Queried by the ENUMERATED subject itself - a name round-trip
+                                // re-encodes with padding and silently drops records stored under
+                                // non-canonical (unpadded) tokens (see fetchInfoBySubject()).
+                                return $this->fetchInfoBySubject($subject);
                             }
 
                             throw $e;
@@ -1236,7 +1269,9 @@ final class ObjectStoreBucket
      * be permanently corrupted while put()/putStream() reported success (the digest check would
      * only catch it at read time, when the data is already unrecoverable). A violation aborts the
      * upload; the caller purges the partial NUID and surfaces the error so the writer can retry.
-     * Sequences the server did not report (<= 0) skip the check rather than false-positive.
+     * A sequence the server did not report (<= 0) skips only ITS OWN pairs rather than
+     * false-positive - later verifiable pairs are still checked against the last reported
+     * sequence, so one seq-less ack cannot disable the guard for the rest of the upload.
      *
      * @param list<int> $ackSequences Acked stream sequences in chunk-publish order.
      */
@@ -1245,8 +1280,9 @@ final class ObjectStoreBucket
         $previous = null;
         foreach ($ackSequences as $sequence) {
             if ($sequence <= 0) {
-                // The server did not report a sequence (defensive): order cannot be verified.
-                return;
+                // The server did not report a sequence for this chunk (defensive): this pair
+                // cannot be verified; $previous stays so the next reported one still is.
+                continue;
             }
 
             if ($previous !== null && $sequence <= $previous) {

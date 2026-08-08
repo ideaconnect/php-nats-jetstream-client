@@ -8,6 +8,7 @@ use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Tests\Support\ScriptedChunkSocket;
+use IDCT\NATS\Tests\Support\WedgedWriteSocket;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\WebSocketFrameCodec;
 use IDCT\NATS\Transport\WebSocketTransport;
@@ -314,5 +315,454 @@ final class WebSocketTransport_5MutationTest extends TestCase
         } finally {
             $server->close();
         }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // consumeSpanningFrame() - header top-up accounting and the surplus-chunk fold (lines 338, 368)
+    // -------------------------------------------------------------------------------------------
+
+    /**
+     * When the header top-up loop exhausts the queued chunks without completing the header, the
+     * chunk-length accounting must have been DECREMENTED for every chunk folded into the buffer
+     * before the "header incomplete" violation is deferred - a replacing (=) or incrementing (+=)
+     * accounting would leave a phantom byte count behind the deferred failure.
+     *
+     * kills Assignment (-= -> =) and MinusEqual (-= -> +=) @ line 338.
+     */
+    public function testHeaderTopUpDecrementsChunkAccountingBeforeDeferringIncompleteHeader(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions());
+        // 1 buffered byte + a 1-byte chunk announcing a 16-bit length (126): after the top-up the
+        // buffer holds 2 of the 4 needed header bytes and no chunks remain -> the sized-frame
+        // invariant is violated and consumeSpanningFrame() defers the ProtocolException.
+        self::prop('readBuffer')->setValue($transport, "\x82");
+        self::prop('readChunks')->setValue($transport, [chr(126)]);
+        self::prop('readChunksLength')->setValue($transport, 1);
+        self::prop('readFrameRequired')->setValue($transport, 2);
+
+        try {
+            self::drain($transport);
+            self::fail('expected the incomplete-header violation to surface');
+        } catch (ProtocolException $e) {
+            self::assertSame('WebSocket frame header incomplete despite sized frame', $e->getMessage());
+        }
+
+        // The shifted chunk's length was subtracted (1 - 1 = 0); '=' would leave 1, '+=' would leave 2.
+        self::assertSame(0, self::prop('readChunksLength')->getValue($transport));
+        self::assertSame([], self::prop('readChunks')->getValue($transport));
+    }
+
+    /**
+     * The beyond-the-frame fold must re-inject ONLY the chunks past the consumed payload: the frame's
+     * payload arrives as one fully consumed chunk (so the fold starts at index 1), and the trailing
+     * frame is split across TWO further chunks. Folding the full chunk list would duplicate the
+     * 70000 consumed payload bytes into the buffer; folding only one surplus chunk would lose the
+     * trailing frame's tail. Byte-exact delivery of both messages pins it.
+     *
+     * kills UnwrapArraySlice @ line 368 (fold restarts at chunk 0, duplicating the consumed payload)
+     * and SpreadOneItem @ line 368 (only the first surplus chunk is folded, dropping the tail).
+     */
+    public function testSpanningFrameFoldsOnlyChunksBeyondTheConsumedPayload(): void
+    {
+        $payload = str_repeat('Z', 70000);
+        $header = pack('CC', 0x82, 127) . pack('J', 70000); // FIN+binary, 64-bit length form
+        $tail = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'TAIL', false);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('readBuffer')->setValue($transport, $header);
+        self::prop('readChunks')->setValue($transport, [$payload, substr($tail, 0, 3), substr($tail, 3)]);
+        self::prop('readChunksLength')->setValue($transport, 70000 + strlen($tail));
+        self::prop('readFrameRequired')->setValue($transport, 10 + 70000);
+
+        self::assertSame($payload . 'TAIL', self::drain($transport));
+
+        // The spill state is fully retired: nothing duplicated, nothing left behind.
+        self::assertSame('', self::prop('readBuffer')->getValue($transport));
+        self::assertSame([], self::prop('readChunks')->getValue($transport));
+        self::assertSame(0, self::prop('readChunksLength')->getValue($transport));
+        self::assertNull(self::prop('readFrameRequired')->getValue($transport));
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // drainDataFrames() - terminal precedence (lines 481, 498)
+    // -------------------------------------------------------------------------------------------
+
+    /**
+     * When one read carries a Close frame AND a trailing codec strictness violation (here a masked
+     * frame), the FIRST terminal condition wins: the surfaced failure must be the graceful
+     * TransportClosedException, not the later ProtocolException - the connection layer reconnects on
+     * the former and fails loudly on the latter.
+     *
+     * kills AssignCoalesce (??= -> =) @ line 481 (the codec terminal would overwrite the Close).
+     */
+    public function testCloseTerminalIsNotOverwrittenByTrailingCodecViolation(): void
+    {
+        $close = self::serverFrame(WebSocketFrameCodec::OP_CLOSE, pack('n', 1000), true);
+        $masked = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'x', true, 'MKEY');
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('readBuffer')->setValue($transport, $close . $masked);
+
+        $this->expectException(TransportClosedException::class);
+        $this->expectExceptionMessage('WebSocket close frame received');
+        self::drain($transport);
+    }
+
+    /**
+     * A read carrying [data][Close][incomplete frame declaring an out-of-bounds 64-bit length] must
+     * return the data, then surface the CLOSE - the deferred Close must not be overwritten by the
+     * head-frame sizing pass rediscovering the hostile length (its plain `=` assignment is only safe
+     * because the terminal branch returns before the sizing block runs).
+     *
+     * kills ReturnRemoval @ line 498 (falling through to the sizing block replaces the deferred
+     * TransportClosedException with the oversize ProtocolException).
+     */
+    public function testDeferredCloseSurvivesTrailingOversizedLengthDeclaration(): void
+    {
+        $payload = "MSG orders 1 5\r\nhello\r\n";
+        $data = self::serverFrame(WebSocketFrameCodec::OP_BINARY, $payload, true);
+        $close = self::serverFrame(WebSocketFrameCodec::OP_CLOSE, '', true);
+        $poison = pack('CC', 0x82, 127) . pack('J', 64 * 1024 * 1024 + 1); // incomplete oversized head
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('readBuffer')->setValue($transport, $data . $close . $poison);
+
+        self::assertSame($payload, self::drain($transport), 'same-read data is returned before the close');
+
+        try {
+            self::drain($transport);
+            self::fail('expected the deferred close on the following drain');
+        } catch (TransportClosedException $e) {
+            self::assertSame('WebSocket close frame received', $e->getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // answerControlFrame() - slot and writer-fiber semantics (lines 540, 544, 550, 552, 555, 583)
+    // -------------------------------------------------------------------------------------------
+
+    private static function answer(WebSocketTransport $t, int $opcode, string $payload): void
+    {
+        (new \ReflectionMethod(WebSocketTransport::class, 'answerControlFrame'))
+            ->invoke($t, $opcode, $payload);
+    }
+
+    /**
+     * With no socket there is nothing to answer: the guard must return BEFORE touching the slots or
+     * spawning the writer fiber - a queued answer would otherwise chase the next connection's socket.
+     *
+     * kills ReturnRemoval @ line 540 (the slots would fill and the writer flag would flip).
+     */
+    public function testAnswerControlFrameWithoutSocketTouchesNeitherSlotsNorWriter(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions()); // socket stays null
+
+        self::answer($transport, WebSocketFrameCodec::OP_PONG, 'late-pong');
+        self::answer($transport, WebSocketFrameCodec::OP_CLOSE, 'late-echo');
+
+        // Asserted synchronously, before any event-loop tick: the real guard never sets these.
+        self::assertNull(self::prop('pendingPongPayload')->getValue($transport));
+        self::assertNull(self::prop('pendingCloseEcho')->getValue($transport));
+        self::assertFalse(self::prop('controlAnswerWriterActive')->getValue($transport));
+    }
+
+    /**
+     * At most ONE Close echo is ever sent per connection, and it answers the FIRST Close seen: a
+     * later Close's status must not replace a queued-but-unsent echo (RFC 6455 5.5.1 - the echo
+     * mirrors the Close that initiated the closing handshake).
+     *
+     * kills AssignCoalesce (??= -> =) @ line 544 (the second status would overwrite the first).
+     */
+    public function testFirstQueuedCloseEchoIsNeverReplacedByALaterClose(): void
+    {
+        $socket = new ScriptedChunkSocket([]);
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('socket')->setValue($transport, $socket);
+
+        // Two Close answers queued back-to-back before the writer fiber can run.
+        self::answer($transport, WebSocketFrameCodec::OP_CLOSE, pack('n', 1001));
+        self::answer($transport, WebSocketFrameCodec::OP_CLOSE, pack('n', 4000));
+
+        delay(0);
+        delay(0);
+
+        $buffer = $socket->writtenBytes();
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+        self::assertCount(1, $frames, 'exactly one Close echo may ever be written');
+        self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
+        self::assertSame(pack('n', 1001), $frames[0]['payload'], 'the FIRST Close status wins the echo slot');
+    }
+
+    /**
+     * The answer slots are drained by a SINGLE writer fiber: while one is wedged on a
+     * backpressure-suspended write, a newer answer only refills its slot - it must not spawn a
+     * second writer (which would issue concurrent writes on the same socket).
+     *
+     * kills ReturnRemoval @ line 550 (a second fiber starts despite the active writer) and
+     * TrueValue @ line 552 (the active flag is never armed, so every answer spawns a fiber).
+     */
+    public function testWedgedAnswerWriterIsNeverDuplicatedByNewerAnswers(): void
+    {
+        $socket = new WedgedWriteSocket();
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('socket')->setValue($transport, $socket);
+
+        self::answer($transport, WebSocketFrameCodec::OP_PONG, 'first');
+        delay(0);
+        delay(0);
+        self::assertSame(1, $socket->writeAttempts(), 'the single writer starts and wedges on its first write');
+
+        self::answer($transport, WebSocketFrameCodec::OP_PONG, 'second');
+        delay(0);
+        delay(0);
+
+        // Real: the newer answer waits in its slot for the wedged writer - no concurrent second write.
+        self::assertSame(1, $socket->writeAttempts(), 'no second writer fiber may start while one is active');
+        self::assertSame('second', self::prop('pendingPongPayload')->getValue($transport));
+
+        // Release the wedged writer; it drains the remaining slot against the closed socket silently.
+        $socket->close();
+        delay(0);
+        delay(0);
+        self::assertNull(self::prop('pendingPongPayload')->getValue($transport));
+        self::assertFalse(self::prop('controlAnswerWriterActive')->getValue($transport));
+    }
+
+    /**
+     * The writer fiber RETIRES once both slots are empty (its finally resets the active flag), so a
+     * ping arriving after a completed drain must be answered by a fresh writer: two pings delivered
+     * in two separate reads yield two pongs, each carrying its own ping's payload.
+     *
+     * kills UnwrapFinally @ line 555 and FalseValue @ line 583 (either leaves the active flag stuck,
+     * so the second ping's pong is queued but never flushed).
+     */
+    public function testWriterFiberRetiresSoLaterPingsAreStillAnswered(): void
+    {
+        $socket = new ScriptedChunkSocket([
+            WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'p1', false)
+            . WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'D1', false),
+            WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'p2', false)
+            . WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'D2', false),
+        ]);
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('socket')->setValue($transport, $socket);
+
+        self::assertSame('D1', $transport->readLine(new TimeoutCancellation(3.0))->await());
+        $this->waitForWrittenFrames($socket, 1);
+
+        self::assertSame('D2', $transport->readLine(new TimeoutCancellation(3.0))->await());
+        $this->waitForWrittenFrames($socket, 2);
+        delay(0);
+        delay(0);
+
+        $buffer = $socket->writtenBytes();
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+        self::assertCount(2, $frames, 'each ping must be answered - the writer must retire between reads');
+        self::assertSame(WebSocketFrameCodec::OP_PONG, $frames[0]['opcode']);
+        self::assertSame('p1', $frames[0]['payload']);
+        self::assertSame(WebSocketFrameCodec::OP_PONG, $frames[1]['opcode']);
+        self::assertSame('p2', $frames[1]['payload']);
+    }
+
+    /** Bounded state-driven wait (hrtime deadline, never a bare sleep) for N decoded answer frames. */
+    private function waitForWrittenFrames(ScriptedChunkSocket $socket, int $count): void
+    {
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        do {
+            $buffer = $socket->writtenBytes();
+            if (count(WebSocketFrameCodec::decode($buffer, allowMasked: true)) >= $count) {
+                return;
+            }
+            delay(0.001);
+        } while (hrtime(true) < $deadlineNs);
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // processFrames() - frames AFTER a deferred terminal are dropped (lines 664, 673, 677, 695,
+    // 725, 733, 735, 738)
+    // -------------------------------------------------------------------------------------------
+
+    /**
+     * RFC 6455 5.2: RSV1 without a negotiated extension fails the connection EVEN IF the payload
+     * happens to be a well-formed DEFLATE stream - the violation must surface, never the inflated
+     * bytes (delivering them would hand attacker-shaped data to the NATS parser).
+     *
+     * kills ReturnRemoval @ line 664 (falling through would inflate the valid stream and DELIVER it).
+     */
+    public function testRsv1WithoutNegotiationRejectsEvenAValidDeflatePayload(): void
+    {
+        $frame = WebSocketFrameCodec::encode(
+            WebSocketFrameCodec::OP_BINARY,
+            WebSocketFrameCodec::deflate('SNEAKED'),
+            false,
+            null,
+            true, // RSV1 set, but compression was never negotiated
+        );
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('readBuffer')->setValue($transport, $frame);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('permessage-deflate was not negotiated');
+        self::drain($transport);
+    }
+
+    /**
+     * A corrupt compressed frame is a terminal condition: the data frames AFTER it in the same batch
+     * are dropped (nothing meaningful follows a failed connection), so with no data BEFORE it the
+     * drain must throw - not deliver the later frame's payload.
+     *
+     * kills ReturnRemoval @ line 677 (processing would continue past the deferred inflate error and
+     * deliver the trailing frame first).
+     */
+    #[\PHPUnit\Framework\Attributes\WithoutErrorHandler]
+    public function testFramesAfterACorruptCompressedFrameAreDropped(): void
+    {
+        $corrupt = WebSocketFrameCodec::encode(
+            WebSocketFrameCodec::OP_BINARY,
+            'this is not compressed data at all !!!!!!',
+            false,
+            null,
+            true,
+        );
+        $trailing = self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'LEAK', true);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('compressionActive')->setValue($transport, true);
+        self::prop('readBuffer')->setValue($transport, $corrupt . $trailing);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('inflate compressed WebSocket frame');
+        self::drain($transport);
+    }
+
+    /**
+     * An over-cap FIRST fragment is a terminal condition: the frames after it in the same batch are
+     * dropped, so the drain throws the bound violation - it must not deliver the trailing frame.
+     *
+     * kills ReturnRemoval @ line 695 (the loop would continue and deliver 'LEAK').
+     */
+    public function testFramesAfterAnOversizedFirstFragmentAreDropped(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions(), maxMessageBytes: 4);
+        self::prop('readBuffer')->setValue(
+            $transport,
+            self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'AAAAAA', false) // 6 > 4, opens fragmentation
+            . self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'LEAK', true),
+        );
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/exceeded the maximum/');
+        self::drain($transport);
+    }
+
+    /**
+     * An over-cap CONTINUATION is a terminal condition: the frames after it in the same batch are
+     * dropped, so the drain throws the bound violation - it must not deliver the trailing frame.
+     *
+     * kills ReturnRemoval @ line 725 (the loop would continue and deliver 'LEAK').
+     */
+    public function testFramesAfterAnOversizedContinuationAreDropped(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions(), maxMessageBytes: 6);
+        self::prop('readBuffer')->setValue(
+            $transport,
+            self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'AA', false)
+            . self::serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'BBBBBB', false) // 2 + 6 > 6
+            . self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'LEAK', true),
+        );
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessageMatches('/exceeded the maximum/');
+        self::drain($transport);
+    }
+
+    /**
+     * A fragmented compressed message whose reassembled stream fails to inflate tears the fragment
+     * state down AND drops the frames after it in the same batch: the drain throws the typed inflate
+     * error, and the transport is back at the not-fragmenting baseline.
+     *
+     * kills ReturnRemoval @ line 738 (the trailing 'LEAK' frame would be delivered instead) and
+     * MethodCallRemoval @ line 735 (the stale fragment state would survive the failure).
+     */
+    #[\PHPUnit\Framework\Attributes\WithoutErrorHandler]
+    public function testCorruptCompressedFragmentDropsLaterFramesAndResetsState(): void
+    {
+        $garbage = 'this is not compressed data at all !!!!!!';
+        $first = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, substr($garbage, 0, 20), false, null, true);
+        $first[0] = chr(ord($first[0]) & 0x7F); // FIN=0, RSV1 kept: compressed fragment start
+        $final = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CONTINUATION, substr($garbage, 20), false);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('compressionActive')->setValue($transport, true);
+        self::prop('readBuffer')->setValue(
+            $transport,
+            $first . $final . self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'LEAK', true),
+        );
+
+        try {
+            self::drain($transport);
+            self::fail('expected the inflate failure to surface, not the trailing frame to be delivered');
+        } catch (ProtocolException $e) {
+            self::assertStringContainsString('inflate compressed WebSocket frame', $e->getMessage());
+        }
+
+        // The fragment state was reset before the deferral - nothing stale survives the failure.
+        self::assertFalse(self::prop('fragmenting')->getValue($transport));
+        self::assertSame('', self::prop('fragmentBuffer')->getValue($transport));
+        self::assertSame([], self::prop('fragmentChunks')->getValue($transport));
+        self::assertSame(0, self::prop('fragmentChunksLength')->getValue($transport));
+    }
+
+    /**
+     * An inflated (RSV1) frame's output is APPENDED to data already decoded from the same read: a
+     * plain frame followed by a compressed frame yields the concatenation, in order.
+     *
+     * kills Assignment (.= -> =) @ line 673 (only the inflated payload would be returned).
+     */
+    public function testInflatedFrameAppendsToSameReadPlainData(): void
+    {
+        $compressedPayload = 'COMPRESSED-TAIL';
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('compressionActive')->setValue($transport, true);
+        self::prop('readBuffer')->setValue(
+            $transport,
+            self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'PLAIN-', true)
+            . WebSocketFrameCodec::encode(
+                WebSocketFrameCodec::OP_BINARY,
+                WebSocketFrameCodec::deflate($compressedPayload),
+                false,
+                null,
+                true,
+            ),
+        );
+
+        self::assertSame('PLAIN-' . $compressedPayload, self::drain($transport));
+    }
+
+    /**
+     * A completed compressed FRAGMENTED message's output is APPENDED to data already decoded from
+     * the same read, exactly like the unfragmented case.
+     *
+     * kills Assignment (.= -> =) @ line 733 (only the inflated message would be returned).
+     */
+    public function testInflatedFragmentedMessageAppendsToSameReadPlainData(): void
+    {
+        $message = 'COMPRESSED-FRAGMENTED-MESSAGE';
+        $compressed = WebSocketFrameCodec::deflate($message);
+        $half = intdiv(strlen($compressed), 2);
+
+        $first = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, substr($compressed, 0, $half), false, null, true);
+        $first[0] = chr(ord($first[0]) & 0x7F); // FIN=0, RSV1 kept
+        $final = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CONTINUATION, substr($compressed, $half), false);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        self::prop('compressionActive')->setValue($transport, true);
+        self::prop('readBuffer')->setValue(
+            $transport,
+            self::serverFrame(WebSocketFrameCodec::OP_BINARY, 'PLAIN-', true) . $first . $final,
+        );
+
+        self::assertSame('PLAIN-' . $message, self::drain($transport));
     }
 }

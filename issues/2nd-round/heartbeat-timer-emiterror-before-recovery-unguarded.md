@@ -1,6 +1,9 @@
 # Heartbeat-tick protocol-violation path calls unguarded emitError() before recoverConnection() — a throwing logger skips the recovery and kills the event loop
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — the protocol-violation branch reports via emitErrorSafely() (the #150
+  containment), so a throwing PSR-3 logger can neither skip recoverConnection() nor escape into
+  the event-loop timer. Pinned by `testHeartbeatProtocolViolationRecoveryRunsEvenWhenLoggerThrows`
+  (pre-fix red: the logger's RuntimeException escaped the timer callback).
 - **Severity:** minor
 - **Type:** correctness / deviation from the repo's own #150 containment pattern
 - **Area:** connection heartbeat / WS one-shot terminal recovery (round-1 fix follow-up)

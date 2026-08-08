@@ -1,6 +1,9 @@
 # The ADR-9 gap signal's "once per gap episode" semantics (de-dup + delivery re-arm) are not pinned by any test
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; nit — not adversarially verified)
+- **Status:** FIXED (2026-08-08) — testPushConsumerHeartbeatSequenceMismatchIsSurfaced now sends a second gap
+  heartbeat (still exactly 1 report), a delivery advancing the sequence, then another gap
+  heartbeat (2nd report). Verified to kill both target mutants (removed de-dup latch => 3 reports;
+  removed delivery re-arm => 1 report).
 - **Severity:** nit
 - **Type:** test coverage gap
 - **Area:** tests — JetStream push-consumer ADR-9 gap detection (round-1 fix follow-up)

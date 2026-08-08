@@ -67,6 +67,19 @@ final class HeartbeatWatchdogState
      */
     public ?string $watchdogTimerId = null;
 
+    /**
+     * Cleanup hook the watchdog's self-cancel tick invokes when the subscription it guards is found
+     * dead (a plain unsubscribe($sid) - the baseline watch() stop path - or a Closed connection).
+     * The timer holds only WeakReferences, so without this hook it structurally cannot release the
+     * ordered-consumer stop-registry entry: every legacy-path stop stranded one entry (rooting the
+     * stop closure, this state, and the user handler) per watch, forever, and left the ephemeral to
+     * server-side interest-loss reaping. The tick guards the call to the CURRENT timer
+     * ({@see $watchdogTimerId}) - a rotated-out old timer's sid is dead by design while the consumer
+     * lives on under a new sid, so it must never release the registry or delete the live consumer.
+     * Null for caller-owned push consumers (no registry entry to release).
+     */
+    public ?\Closure $onDefunct = null;
+
     public function __construct(public int $lastActivityNs)
     {
         $this->onMiss = static function (): void {};

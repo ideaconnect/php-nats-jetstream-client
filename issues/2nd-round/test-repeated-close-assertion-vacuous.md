@@ -1,6 +1,9 @@
 # testCloseWithoutSocketAndRepeatedCloseAreNoOps' "no second frame write" assertion is vacuous — the double rejects post-close writes, so the assertion passes with or without the guard
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; nit — not adversarially verified)
+- **Status:** FIXED (2026-08-08) — ScriptedChunkSocket gained a `writeAttempts` counter incremented before its
+  closed check, and the test now asserts the attempt count does not grow across the repeated
+  close. Verified: with the `$this->socket = null` release removed, the new assertion fails (2 vs
+  1) while the old writtenBytes assertion stayed green — proving the prior vacuousness.
 - **Severity:** nit
 - **Type:** test quality (assertion cannot fail)
 - **Area:** tests — WebSocket transport close

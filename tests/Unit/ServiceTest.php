@@ -1014,7 +1014,9 @@ final class ServiceTest extends TestCase
     /**
      * A connection-level reply-publish failure (the connection closed between request delivery and
      * the reply) used to escape the subscription callback into the shared dispatch loop as a
-     * spurious connection error. It must be recorded on the endpoint and swallowed.
+     * spurious connection error. It must be recorded on the endpoint and swallowed. With a
+     * SUCCESSFUL handler the reply write is the sole fault of the request, so it IS the one counted
+     * error, with a request_error event carrying the publish failure.
      */
     public function testReplyPublishConnectionFailureIsRecordedNotEscaping(): void
     {
@@ -1027,7 +1029,11 @@ final class ServiceTest extends TestCase
         $client = new NatsClient(new NatsOptions(reconnectEnabled: false), $transport);
         $client->connect()->await();
 
+        $events = [];
         $service = $client->service('echo', '1.0.0')
+            ->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$events): void {
+                $events[] = ['event' => $event, 'context' => $context];
+            })
             ->addEndpoint('echo', 'svc.echo', static function () use ($client): string {
                 // The connection dies while the handler runs; the reply publish then fails at the
                 // connection level (not JsonException) - the previously unguarded escape path.
@@ -1041,9 +1047,69 @@ final class ServiceTest extends TestCase
         $client->processIncoming()->await();
 
         $stats = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $stats['num_requests'] ?? null);
         self::assertSame(1, $stats['num_errors'] ?? null, 'the reply failure must be recorded on the endpoint');
         self::assertIsString($stats['last_error'] ?? null);
         self::assertStringContainsString('not open', (string) $stats['last_error']);
+
+        // The reply write happens after the terminal request_end (the handler already completed), so
+        // this path's single request_error trails it, carrying the publish failure itself.
+        self::assertSame(['request_start', 'request_end', 'request_error'], array_column($events, 'event'));
+        $errorContext = $events[2]['context'];
+        self::assertSame('HANDLER_ERROR', $errorContext['code'] ?? null);
+        self::assertIsString($errorContext['error'] ?? null);
+        self::assertStringContainsString('not open', (string) $errorContext['error']);
+    }
+
+    /**
+     * A request whose handler already errored (ServiceError -> errors++, request_error) and whose
+     * error-reply publish THEN fails must still count exactly ONE error: the reply-failure catch
+     * double-counted it, making $SRV.STATS num_errors exceed num_requests (>100% error rate), and
+     * emitted a second request_error - after the terminal request_end, with the hardcoded
+     * HANDLER_ERROR code contradicting the handler's own. Only lastError may record the publish
+     * failure (issues/2nd-round/service-reply-failure-double-counts-errors.md).
+     */
+    public function testHandlerErrorWithFailedErrorReplyCountsSingleError(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(reconnectEnabled: false), $transport);
+        $client->connect()->await();
+
+        $events = [];
+        $service = $client->service('echo', '1.0.0')
+            ->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$events): void {
+                $events[] = ['event' => $event, 'context' => $context];
+            })
+            ->addEndpoint('echo', 'svc.echo', static function () use ($client): string {
+                // The connection dies while the handler runs AND the handler fails: the error-reply
+                // publish (HPUB with the micro error headers) then fails at the connection level.
+                $client->disconnect()->await();
+
+                throw new \IDCT\NATS\Services\ServiceError('418', 'teapot');
+            });
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $stats = $service->statsSnapshot()['endpoints'][0] ?? [];
+        // One request, ONE error: the invariant num_errors <= num_requests must hold.
+        self::assertSame(1, $stats['num_requests'] ?? null);
+        self::assertSame(1, $stats['num_errors'] ?? null, 'a handler error whose reply write also fails is a single error');
+        // lastError still records the (later) publish failure, replacing the handler description.
+        self::assertIsString($stats['last_error'] ?? null);
+        self::assertStringContainsString('not open', (string) $stats['last_error']);
+
+        // Exactly one request_error - the handler's own, with its chosen code, before the terminal
+        // request_end. No late second event with a contradictory HANDLER_ERROR code follows.
+        self::assertSame(['request_start', 'request_error', 'request_end'], array_column($events, 'event'));
+        $errorContext = $events[1]['context'];
+        self::assertSame('418', $errorContext['code'] ?? null);
+        self::assertSame('teapot', $errorContext['error'] ?? null);
     }
 
     /**

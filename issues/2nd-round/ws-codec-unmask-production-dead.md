@@ -1,7 +1,9 @@
 # WebSocketFrameCodec::unmask() is production-dead after the masked-frame rejection — kept alive only by its own unit test
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; nit — verified by grep: only caller is
-  `tests/Unit/WebSocketFrameCodecTest.php:515`)
+- **Status:** RESOLVED (2026-08-08) — kept as `@deprecated` rather than removed: `unmask()` has been public
+  since 2.7.x, so removal would be an undisclosed bc-break; the docblock now points harnesses at
+  `decode(..., allowMasked: true)`. Still behavior-pinned by
+  `testDeprecatedUnmaskStillInvertsEncodeMasking`.
 - **Severity:** nit
 - **Type:** dead code
 - **Area:** WebSocket frame codec (round-1 fix follow-up)

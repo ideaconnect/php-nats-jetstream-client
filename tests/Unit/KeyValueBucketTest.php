@@ -687,6 +687,223 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
+     * A FAILED mirror create must not poison the handle: mirror prefixes are applied only after
+     * createStream() succeeds (nats.go builds the KV handle only from a successful create). Pre-fix
+     * the prefixes were applied BEFORE the await and never reset, so after a rejected cross-domain
+     * mirror create every put published through the foreign API to the origin bucket and every get
+     * read the origin subject - silent write misdirection and read blindness on a bucket whose
+     * create failed.
+     */
+    public function testFailedMirrorCreateLeavesHandleOnPlainBucketSubjects(): void
+    {
+        $createError = '{"error":{"code":400,"err_code":10058,"description":"stream name already in use with a different configuration"}}';
+        $putAck = '{"stream":"KV_dst","seq":1}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createError), $createError),   // STREAM.CREATE -> rejected
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),             // put ack
+            $this->kvDirectReply('$KV.dst.theme', 'blue', 1, 1),                          // Direct Get
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        try {
+            $kv->create(['mirror' => ['bucket' => 'src', 'domain' => 'HUB']])->await();
+            self::fail('the rejected mirror create must surface as an error');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('already in use', $e->getMessage());
+        }
+
+        $kv->put('theme', 'blue')->await();
+        $entry = $kv->get('theme')->await();
+
+        self::assertNotNull($entry);
+        self::assertSame('blue', $entry->value);
+
+        $writes = implode('', $transport->writes);
+        // Writes stay on THIS bucket's own subject - not routed through the foreign API to the
+        // origin of the mirror that was never created. (The STREAM.CREATE payload legitimately
+        // carries the external api string, so only PUBLISH frames are pinned here.)
+        self::assertStringContainsString('PUB $KV.dst.theme ', $writes);
+        self::assertStringNotContainsString('PUB $JS.HUB.API.', $writes);
+        // Reads target this bucket's own subject too, not the origin's.
+        self::assertStringContainsString('"last_by_subj":"$KV.dst.theme"', $writes);
+        self::assertStringNotContainsString('$KV.src.theme', $writes);
+    }
+
+    /**
+     * Re-binding a handle to a stream that is NO LONGER a mirror must clear the stale mirror
+     * prefixes: bind() re-resolves from the confirmed server config. Pre-fix bind() only ever SET
+     * prefixes, so a handle that once fronted a mirror kept routing writes to the old origin after
+     * the bucket was re-created as a plain bucket.
+     */
+    public function testRebindToNonMirrorStreamClearsStalePrefixes(): void
+    {
+        $mirrorInfo = '{"config":{"name":"KV_dst","max_msgs_per_subject":1,"mirror":{"name":"KV_src"}}}';
+        $plainInfo = '{"config":{"name":"KV_dst","max_msgs_per_subject":1}}';
+        $putAck = '{"stream":"KV_dst","seq":4}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($mirrorInfo), $mirrorInfo),  // bind #1: mirror
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),          // put #1 ack
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($plainInfo), $plainInfo),    // bind #2: plain
+            sprintf("MSG _INBOX.d 1 %d\r\n%s\r\n", strlen($putAck), $putAck),          // put #2 ack
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+
+        // While bound to the mirror, writes go through to the origin.
+        $kv->bind()->await();
+        $kv->put('theme', 'blue')->await();
+        self::assertStringContainsString('PUB $KV.src.theme ', implode('', $transport->writes));
+
+        // Re-bound to a non-mirror stream: the stale origin prefixes are gone.
+        $kv->bind()->await();
+        $kv->put('theme', 'green')->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertSame(1, substr_count($writes, 'PUB $KV.src.theme '), 'only the pre-rebind put may target the origin');
+        self::assertStringContainsString('PUB $KV.dst.theme ', $writes, 'after re-bind writes must use the bucket\'s own subject');
+    }
+
+    /**
+     * The `bucket` source alias explicitly declares a KV BUCKET, so it is KV_-prefixed
+     * UNCONDITIONALLY: a bucket legitimately named "KV_x" is backed by stream KV_KV_x and its
+     * records live under $KV.KV_x.>. Pre-fix the name-key idempotence guard was also applied to
+     * the alias, silently resolving `['bucket' => 'KV_x']` to bucket x's stream and subjects -
+     * the aggregate then copied the WRONG bucket's records.
+     */
+    public function testCreateSourceBucketAliasIsKvPrefixedUnconditionally(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create(['sources' => [['bucket' => 'KV_x']]])->await();
+
+        $create = $transport->writes[3];
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_KV_x","subject_transforms":[{"src":"$KV.KV_x.>","dest":"$KV.agg.>"}]}]',
+            $create,
+            'the bucket alias must map bucket "KV_x" to ITS backing stream/subjects, not bucket "x"\'s',
+        );
+    }
+
+    /**
+     * The `name` source key keeps nats.go's stream-name semantics: "KV_x" already names the
+     * backing stream (of bucket x) and is used as-is - no double prefix, transform on bucket x's
+     * subjects. Complements the unconditional `bucket`-alias prefixing above.
+     */
+    public function testCreateSourceNameKeyKeepsKvStreamNameSemantics(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create(['sources' => [['name' => 'KV_x']]])->await();
+
+        $create = $transport->writes[3];
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_x","subject_transforms":[{"src":"$KV.x.>","dest":"$KV.agg.>"}]}]',
+            $create,
+            'a KV_-prefixed name key must resolve as the backing stream name itself (nats.go idempotence)',
+        );
+        self::assertStringNotContainsString('KV_KV_', $create);
+    }
+
+    /**
+     * The `bucket` MIRROR alias is KV_-prefixed unconditionally too: mirroring bucket "KV_x"
+     * targets stream KV_KV_x, and this handle's write-through prefix resolves to that bucket's
+     * live subjects ($KV.KV_x.). Pre-fix the alias resolved to bucket x's stream and
+     * applyMirrorPrefixes routed the mirror's writes into the wrong bucket.
+     */
+    public function testCreateMirrorBucketAliasIsKvPrefixedUnconditionally(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $putAck = '{"stream":"KV_KV_x","seq":2}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        $kv->create(['mirror' => ['bucket' => 'KV_x']])->await();
+        $kv->put('theme', 'blue')->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"mirror":{"name":"KV_KV_x"}', $writes);
+        // Write-through targets bucket "KV_x"'s live subjects, not bucket "x"'s.
+        self::assertStringContainsString('PUB $KV.KV_x.theme ', $writes);
+        self::assertStringNotContainsString('PUB $KV.x.theme', $writes);
+    }
+
+    /**
+     * A mirror NAME that is already the backing `KV_` stream name keeps nats.go's stream-name
+     * semantics: used as-is, never double-prefixed (the counterpart of the unconditional
+     * `bucket`-alias prefixing - only the alias escapes the ambiguity).
+     */
+    public function testCreateMirrorNameKeyKeepsKvStreamNameSemantics(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('dst')->create(['mirror' => ['name' => 'KV_src']])->await();
+
+        $create = $transport->writes[3];
+        self::assertStringContainsString('"mirror":{"name":"KV_src"}', $create);
+        self::assertStringNotContainsString('KV_KV_', $create, 'an already-prefixed mirror name must not be double-prefixed');
+    }
+
+    /**
      * Verifies getRevision returns the entry stored at a specific sequence (#33).
      */
     public function testGetRevisionReturnsEntryAtSequence(): void
@@ -3319,5 +3536,533 @@ final class KeyValueBucketTest extends TestCase
 
         $this->expectException(\InvalidArgumentException::class);
         new KeyWatchOptions(idleHeartbeat: -1);
+    }
+
+    /**
+     * A caller-provided `mirror_direct: false` must survive the mirror default (`??=` assigns only
+     * when the caller left it unset): a bucket admin may deliberately keep origin DIRECT.GET traffic
+     * off a mirror. Overwriting it with the default (plain `=`) would silently re-enable it.
+     */
+    public function testCreateMirrorRespectsExplicitMirrorDirectFalse(): void
+    {
+        $reply = '{"config":{"name":"KV_dst"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('dst')->create(['mirror' => 'src', 'mirror_direct' => false])->await();
+
+        $create = $transport->writes[3];
+        self::assertStringContainsString('"mirror_direct":false', $create, 'an explicit mirror_direct:false must not be overridden by the mirror default');
+        self::assertStringNotContainsString('"mirror_direct":true', $create);
+    }
+
+    /**
+     * The ADR-57 transform-skip rule is EXTERNAL-only: a same-domain (non-external) source of the
+     * SAME bucket name still gets the mandatory transform. Only an external source whose bucket name
+     * matches this bucket already has matching subjects (nats.go rule).
+     */
+    public function testCreateSameBucketSourceWithoutExternalStillGetsTransform(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create(['sources' => [['name' => 'KV_agg']]])->await();
+
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_agg","subject_transforms":[{"src":"$KV.agg.>","dest":"$KV.agg.>"}]}]',
+            $transport->writes[3],
+            'the transform is skipped ONLY for an external same-bucket source; a local one keeps it',
+        );
+    }
+
+    /**
+     * The two halves of the external-same-bucket skip rule, pinned on the wire in one create: an
+     * EXTERNAL source of the SAME bucket name carries NO transform (its subjects already match),
+     * while an external source of a DIFFERENT bucket keeps the mandatory transform.
+     */
+    public function testCreateExternalSourcesSkipTransformOnlyForSameBucketName(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create(['sources' => [
+            ['name' => 'KV_agg', 'external' => ['api' => '$JS.HUB.API']],
+            ['name' => 'KV_b1', 'external' => ['api' => '$JS.HUB.API']],
+        ]])->await();
+
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_agg","external":{"api":"$JS.HUB.API"}},'
+            . '{"name":"KV_b1","external":{"api":"$JS.HUB.API"},'
+            . '"subject_transforms":[{"src":"$KV.b1.>","dest":"$KV.agg.>"}]}]',
+            $transport->writes[3],
+            'external same-bucket: no transform; external different-bucket: mandatory transform',
+        );
+    }
+
+    /**
+     * A numeric `bucket` source alias (JSON/user data is loosely typed) must be stringified BEFORE
+     * the same-bucket comparison: on a bucket literally named "42", an external source aliasing
+     * bucket 42 IS the same bucket, so the transform-skip rule applies. Without the cast the strict
+     * int-vs-string comparison would silently attach a transform the rule forbids.
+     */
+    public function testCreateExternalSourceNumericBucketAliasComparesAsString(): void
+    {
+        $reply = '{"config":{"name":"KV_42"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('42')->create(['sources' => [
+            ['bucket' => 42, 'external' => ['api' => '$JS.HUB.API']],
+        ]])->await();
+
+        self::assertStringContainsString(
+            '"sources":[{"external":{"api":"$JS.HUB.API"},"name":"KV_42"}]',
+            $transport->writes[3],
+            'a numeric alias of THIS bucket is the same bucket: external same-bucket sources carry no transform',
+        );
+        self::assertStringNotContainsString('"subject_transforms"', $transport->writes[3]);
+    }
+
+    /**
+     * A numeric source `name` (loosely typed input) is stringified before the KV_ prefix check, so
+     * it resolves like the equivalent string name instead of crashing the prefix parse.
+     */
+    public function testCreateSourceNumericNameIsStringifiedBeforePrefixCheck(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create(['sources' => [['name' => 42]]])->await();
+
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_42","subject_transforms":[{"src":"$KV.42.>","dest":"$KV.agg.>"}]}]',
+            $transport->writes[3],
+            'a numeric source name must resolve exactly like its string form',
+        );
+    }
+
+    /**
+     * A numeric mirror `name` is stringified before the KV_ prefix check too (the mirror twin of the
+     * source-name rule above).
+     */
+    public function testCreateMirrorNumericNameIsStringifiedBeforePrefixCheck(): void
+    {
+        $reply = '{"config":{"name":"KV_dst"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('dst')->create(['mirror' => ['name' => 42]])->await();
+
+        self::assertStringContainsString('"mirror":{"name":"KV_42"}', $transport->writes[3]);
+    }
+
+    /**
+     * bind() against a STREAM.INFO whose mirror name arrives as a JSON number (a malformed but
+     * decodable reply) must still resolve the write-through prefix from its string form instead of
+     * crashing the prefix parse - streams may legally carry numeric names.
+     */
+    public function testBindResolvesPrefixesFromNumericMirrorName(): void
+    {
+        $info = '{"config":{"name":"KV_dst","max_msgs_per_subject":1,"mirror":{"name":314}}}';
+        $putAck = '{"stream":"KV_314","seq":1}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($info), $info),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst')->bind()->await();
+        $kv->put('theme', 'blue')->await();
+
+        self::assertStringContainsString('PUB $KV.314.theme ', implode('', $transport->writes));
+    }
+
+    /**
+     * An EMPTY external api string on a mirror is "no external at all": the handle keeps
+     * same-domain semantics - writes go through to the origin's own subject (no api prefix glued
+     * on) and reads stay on THIS bucket's prefix.
+     */
+    public function testCreateMirrorEmptyExternalApiTreatedAsSameDomain(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $putAck = '{"stream":"KV_src","seq":1}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+            $this->kvDirectReply('$KV.dst.theme', 'blue', 1, 1),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        $kv->create(['mirror' => ['name' => 'src', 'external' => ['api' => '']]])->await();
+        $kv->put('theme', 'blue')->await();
+        $kv->get('theme')->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('PUB $KV.src.theme ', $writes, 'writes go through to the origin WITHOUT an api prefix');
+        self::assertStringContainsString('"last_by_subj":"$KV.dst.theme"', $writes, 'reads stay on this bucket\'s own prefix (same-domain mirror)');
+    }
+
+    /**
+     * A trailing dot on the external api is trimmed before the write prefix is assembled - without
+     * the rtrim every write would target `<api>..$KV.<origin>.<key>`, an empty-token subject no
+     * server routes.
+     */
+    public function testCreateMirrorExternalApiTrailingDotIsTrimmed(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $putAck = '{"stream":"KV_src","seq":1}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        $kv->create(['mirror' => ['name' => 'src', 'external' => ['api' => '$JS.HUB.API.']]])->await();
+        $kv->put('theme', 'blue')->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('PUB $JS.HUB.API.$KV.src.theme ', $writes);
+        self::assertStringNotContainsString('API..$KV', $writes, 'the trailing dot must be trimmed, not doubled into an empty token');
+    }
+
+    /**
+     * The KV-shape gate boundary: max_msgs_per_subject EXACTLY 0 is rejected with the full
+     * diagnostic, while EXACTLY 1 (the smallest KV-shaped value) binds fine.
+     */
+    public function testBindKvShapeGateBoundaryZeroRejectedOneAccepted(): void
+    {
+        $zeroInfo = '{"config":{"name":"KV_cfg","max_msgs_per_subject":0}}';
+        $oneInfo = '{"config":{"name":"KV_cfg","max_msgs_per_subject":1}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($zeroInfo), $zeroInfo),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($oneInfo), $oneInfo),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('cfg');
+        try {
+            $kv->bind()->await();
+            self::fail('max_msgs_per_subject 0 must be rejected as not KV-shaped');
+        } catch (JetStreamException $e) {
+            self::assertSame('Stream "KV_cfg" is not a KV bucket (max_msgs_per_subject < 1)', $e->getMessage());
+        }
+
+        self::assertSame($kv, $kv->bind()->await(), 'max_msgs_per_subject 1 is the smallest KV-shaped value and must bind');
+    }
+
+    /**
+     * The leader STREAM.MSG.GET fallback tolerates loosely typed message fields: a numeric `data`
+     * (its digits are a decodable base64 alphabet string) and numeric `hdrs` (decodes to bytes that
+     * are not a NATS/1.0 block -> no headers) must produce the decoded value with the default PUT
+     * operation instead of crashing the decode.
+     */
+    public function testGetFallbackToleratesNumericDataAndHdrsFields(): void
+    {
+        $envelope = '{"message":{"subject":"$KV.cfg.theme","seq":7,"data":1234,"hdrs":1010}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            $this->kvDirectStatus(1, 503, 'No Responders'),                          // Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),    // STREAM.MSG.GET fallback
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $entry = $client->jetStream()->keyValue('cfg')->get('theme')->await();
+
+        self::assertNotNull($entry);
+        self::assertSame(base64_decode('1234', true), $entry->value, 'numeric data must decode via its string form');
+        self::assertSame('PUT', $entry->operation, 'non-header hdrs bytes decode to no headers -> default PUT');
+        self::assertSame(7, $entry->revision);
+    }
+
+    /**
+     * getAll() batched fast path: an error that is NOT 503 (stream-lacks-Direct-Get) must fail the
+     * enumeration verbatim - falling through to the fan-out would retry against a server that just
+     * reported a real failure and mask it.
+     */
+    public function testGetAllBatchedNonUnavailableErrorFailsEnumeration(): void
+    {
+        $subjectsReply = '{"state":{"subjects":{"$KV.cfg.theme":1}}}';
+        $emptyPage = '{"state":{"subjects":{}}}';
+        $errHdrs = "NATS/1.0 500 Internal Error\r\nStatus: 500\r\nDescription: direct get batch exploded\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.DGET' => [
+                sprintf("HMSG _INBOX.JS.DGET.x 2 %d %d\r\n%s\r\n", strlen($errHdrs), strlen($errHdrs), $errHdrs),
+            ],
+        ];
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($subjectsReply), $subjectsReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('cfg')->getAll()->await();
+            self::fail('a non-503 batched Direct Get error must fail getAll()');
+        } catch (JetStreamException $e) {
+            self::assertSame(500, $e->getCode());
+            self::assertSame('direct get batch exploded', $e->getMessage());
+        }
+
+        // No fallback was attempted after the hard failure.
+        self::assertStringNotContainsString('"last_by_subj"', implode('', $transport->writes));
+    }
+
+    /**
+     * getAll() per-subject fan-out: when the per-key Direct Get answers 503 and the leader
+     * STREAM.MSG.GET fallback reports 404 (no record), the key is simply OMITTED - a null fallback
+     * entry must be handled null-safely, not dereferenced.
+     */
+    public function testGetAllFanOutLeaderFallback404OmitsKey(): void
+    {
+        $subjectsReply = '{"state":{"subjects":{"$KV.cfg.gone":1}}}';
+        $emptyPage = '{"state":{"subjects":{}}}';
+        $missing = '{"error":{"code":404,"description":"no message found"}}';
+
+        $transport = new FakeTransport([
+            // 2.10 server: no batched Direct Get, the fan-out runs directly.
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($subjectsReply), $subjectsReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
+            $this->kvDirectStatus(1, 503, 'No Responders'),                          // per-key Direct Get -> 503
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($missing), $missing),      // leader fallback -> 404
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // The null fallback entry must be handled NULL-SAFELY: escalate any PHP warning (e.g.
+        // "Attempt to read property on null" from a non-null-safe dereference) to a failure -
+        // PHP 8 only warns on a null property read, so the result alone cannot pin the contract.
+        set_error_handler(static function (int $errno, string $errstr): bool {
+            throw new \ErrorException($errstr, 0, $errno);
+        }, E_WARNING);
+        try {
+            $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
+        } finally {
+            restore_error_handler();
+        }
+
+        self::assertSame([], $all, 'a key whose leader fallback 404s is omitted, not dereferenced');
+    }
+
+    /**
+     * history() with revisions arriving only DURING the bounded wait loop (not during the
+     * subscribe) still completes: the stall clock measures REAL elapsed nanoseconds against the
+     * caller's bound, so a healthy replay that keeps arriving is never failed.
+     */
+    public function testHistoryCompletesWhenRevisionsArriveDuringTheWaitLoop(): void
+    {
+        $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":1,"config":{"deliver_subject":"dlv","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // The lone revision lands only after ~50 ms, well inside the replay's wait loop.
+        EventLoop::delay(0.05, static function () use ($transport): void {
+            $transport->pushReadChunk("MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.HIST.1.5.1.0.0 4\r\nblue\r\n");
+        });
+
+        $entries = $client->jetStream()->keyValue('cfg')->history('theme')->await();
+
+        self::assertCount(1, $entries);
+        self::assertSame('blue', $entries[0]->value);
+        self::assertSame('PUT', $entries[0]->operation);
+        self::assertSame(5, $entries[0]->revision);
+    }
+
+    /**
+     * keys() twin of the mid-loop arrival test above: a headers-only record landing only during the
+     * wait loop is still enumerated and the replay completes within the (real-time) progress bound.
+     */
+    public function testKeysCompleteWhenRecordsArriveDuringTheWaitLoop(): void
+    {
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":1,'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        EventLoop::delay(0.05, static function () use ($transport): void {
+            $transport->pushReadChunk("MSG \$KV.cfg.alpha 2 \$JS.ACK.KV_cfg.KEYS.1.6.1.0.0 0\r\n\r\n");
+        });
+
+        self::assertSame(['alpha'], $client->jetStream()->keyValue('cfg')->keys()->await());
+        self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
+    }
+
+    /**
+     * The other half of the failed-create rule (issues/3rd-round): prefixes the server DID confirm
+     * (via an earlier successful mirror create) must SURVIVE a later failed create() - the reset is
+     * atomic with the re-apply AFTER the successful await, so a rejected re-create cannot blind a
+     * working mirror handle (reads at the wrong subjects, writes into a stream that ingests
+     * nothing). Complements testFailedMirrorCreateLeavesHandleOnPlainBucketSubjects, which pins the
+     * fresh-handle side.
+     */
+    public function testFailedRecreateKeepsConfirmedMirrorPrefixes(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $createError = '{"error":{"code":400,"err_code":10058,"description":"stream name already in use with a different configuration"}}';
+        $putAck = '{"stream":"KV_src","seq":3}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),    // create #1 -> confirmed
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($createError), $createError),    // create #2 -> rejected
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($putAck), $putAck),              // put ack
+            $this->kvDirectReply('$KV.src.cache', 'warm', 3, 1),                           // Direct Get
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+
+        // The mirror is confirmed server-side: the handle fronts it.
+        $kv->create(['mirror' => ['bucket' => 'src', 'domain' => 'HUB']])->await();
+
+        // A later ensure/reconcile re-create is rejected - the handle must keep the CONFIRMED routing.
+        try {
+            $kv->create(['mirror' => ['bucket' => 'src', 'domain' => 'HUB']])->await();
+            self::fail('the rejected re-create must surface as an error');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('already in use', $e->getMessage());
+        }
+
+        $kv->put('cache', 'warm')->await();
+        $entry = $kv->get('cache')->await();
+
+        self::assertNotNull($entry);
+        self::assertSame('warm', $entry->value);
+
+        $writes = implode('', $transport->writes);
+        // Writes still cross domains through the external API prefix to the origin subject.
+        self::assertStringContainsString('PUB $JS.HUB.API.$KV.src.cache ', $writes);
+        self::assertStringNotContainsString('PUB $KV.dst.cache', $writes, 'a failed re-create must not strand writes on the plain bucket subject');
+        // Reads still hit the LOCAL mirror stream under the ORIGIN's subject.
+        self::assertStringContainsString('"last_by_subj":"$KV.src.cache"', $writes);
+        self::assertStringNotContainsString('"last_by_subj":"$KV.dst.cache"', $writes);
     }
 }

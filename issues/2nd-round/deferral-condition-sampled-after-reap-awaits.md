@@ -1,7 +1,10 @@
 # Deferral condition is sampled after the orphan-reap awaits — a reconnect completing in that window turns a disconnect collision into a loud terminal teardown
 
-- **Status:** OPEN (filed 2026-08-08 during adversarial verification of the deferral-latch fix;
-  nit — window is a few event-loop turns, failure is loud, matches pre-deferral baseline)
+- **Status:** FIXED (2026-08-08) — a sawNotOpen flag latches in the per-attempt catch and at the outer catch
+  entry; the deferral condition is now (sawNotOpen || state() !== Open), so a reconnect completing
+  during the orphan-reap awaits can no longer flip a disconnect collision into a terminal
+  teardown. Pinned by `testWatchdogRecreateDeferralLatchesNotOpenObservationAcrossReapAwaits`
+  (pre-fix red: terminal 'recreate failed' emitted).
 - **Severity:** nit
 - **Type:** race window (loud, non-silent)
 - **Area:** JetStream ordered consumers — disconnect-collision deferral

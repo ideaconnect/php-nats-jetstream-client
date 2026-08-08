@@ -1,6 +1,9 @@
 # assertUploadOrderPreserved() returns (not continues) on a non-positive sequence — one unreported seq disables order verification for all remaining chunks
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; nit — not adversarially verified)
+- **Status:** FIXED (2026-08-08) — the non-positive-sequence arm now `continue`s (leaving $previous
+  untouched), so later verifiable pairs are still checked. Pinned by
+  `testPutOrderCheckStillDetectsInversionAfterSeqlessAck` (pre-fix red: [1,0,5,3] stored the
+  corrupted object as success; now aborts and purges).
 - **Severity:** nit
 - **Type:** defensive-check completeness
 - **Area:** ObjectStore upload ordering (round-1 fix follow-up)

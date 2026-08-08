@@ -118,15 +118,23 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     /** Whether permessage-deflate was negotiated with the server (#61). */
     private bool $compressionActive = false;
 
-    /** Outstanding fire-and-forget control-frame answer fibers (see answerControlFrame()). */
-    private int $pendingControlAnswers = 0;
+    /**
+     * Latest queued-but-unsent pong payload, or null when none is pending. A newer ping's payload
+     * REPLACES a queued pong - RFC 6455 5.5.3 permits eliding the answers to OLDER pings in favor
+     * of the most recent one - so a coalesced ping flood costs one <=125-byte slot, constant
+     * memory by construction (no counter, no cap that could drop the newest answer).
+     */
+    private ?string $pendingPongPayload = null;
 
     /**
-     * Cap on concurrently parked control-frame answers under write backpressure. RFC 6455 5.5.3
-     * permits answering only the most recent ping, so dropping the excess is conformant; the cap
-     * bounds hostile-peer memory the way #89 bounds fragment reassembly.
+     * The single RFC 6455 5.5.1 Close-echo payload awaiting write, or null. A dedicated slot a
+     * ping flood can never displace: the echo is a MUST, and at most one is ever sent per
+     * connection (the first Close seen wins; processFrames() drops frames after a Close anyway).
      */
-    private const MAX_PENDING_CONTROL_ANSWERS = 16;
+    private ?string $pendingCloseEcho = null;
+
+    /** Whether the single writer fiber draining the two answer slots is currently running. */
+    private bool $controlAnswerWriterActive = false;
 
     /**
      * @param NatsOptions $options Client options controlling TLS (used for `wss://`) and socket behavior.
@@ -156,6 +164,10 @@ final class WebSocketTransport implements TlsAwareTransportInterface
             $this->fragmenting = false;
             $this->pendingTerminal = null;
             $this->compressionActive = false;
+            // Stale answers must not leak onto a new connection's socket - a leftover Close echo
+            // in particular would tell the fresh server this side is closing.
+            $this->pendingPongPayload = null;
+            $this->pendingCloseEcho = null;
 
             $parts = parse_url($dsn);
             if ($parts === false || !isset($parts['host'])) {
@@ -510,36 +522,65 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     }
 
     /**
-     * Writes a control-frame answer (pong / Close echo) on its own fire-and-forget fiber, swallowing
-     * any failure. Inline control-frame writes in the read fiber were a loss/stall hazard: a throw
-     * discarded the data frames decoded from the same read, and a backpressure suspension parked the
-     * read path indefinitely (the same suspension class as the close() wedge). The spawned fiber
-     * enqueues its bytes in spawn order; if the socket dies (or the bounded close() abandons the
-     * queue), the write's failure is swallowed - the failure that matters surfaces via the read path.
+     * Queues a control-frame answer (pong / Close echo) in its slot and starts the single writer
+     * fiber that drains the slots, swallowing any write failure. Inline control-frame writes in
+     * the read fiber were a loss/stall hazard: a throw discarded the data frames decoded from the
+     * same read, and a backpressure suspension parked the read path indefinitely (the same
+     * suspension class as the close() wedge). Answers are held as DATA, not fibers: a newer ping's
+     * payload replaces a queued-but-unsent pong (RFC 6455 5.5.3), while the mandatory Close echo
+     * (RFC 6455 5.5.1) keeps its own slot so a ping flood can never displace it - constant memory
+     * with no cap whose overflow would drop the NEWEST answers (a counted-fiber cap did exactly
+     * that: within one read batch the fibers never start, so the count only ever grew). If the
+     * socket dies (or close() releases it) before a slot is flushed, the answer is dropped
+     * silently - the failure that matters surfaces via the read path.
      */
     private function answerControlFrame(int $opcode, string $payload): void
     {
-        $socket = $this->socket;
-        if ($socket === null) {
+        if ($this->socket === null) {
             return;
         }
 
-        // Cap outstanding answer fibers: a hostile peer flooding PINGs while zero-windowing its
-        // read side would otherwise turn every ~7 inbound bytes into a parked fiber plus queued
-        // pong bytes, unbounded until the heartbeat escalation closes the socket. RFC 6455 5.5.3
-        // explicitly permits answering only the most recent ping, so excess answers are dropped.
-        if ($this->pendingControlAnswers >= self::MAX_PENDING_CONTROL_ANSWERS) {
+        if ($opcode === WebSocketFrameCodec::OP_CLOSE) {
+            $this->pendingCloseEcho ??= $payload;
+        } else {
+            $this->pendingPongPayload = $payload;
+        }
+
+        if ($this->controlAnswerWriterActive) {
             return;
         }
-        $this->pendingControlAnswers++;
+        $this->controlAnswerWriterActive = true;
 
-        async(function () use ($socket, $opcode, $payload): void {
+        async(function (): void {
             try {
-                $socket->write(WebSocketFrameCodec::encode($opcode, $payload));
-            } catch (\Throwable) {
-                // Dead/closing socket: the read path surfaces the failure; the answer is moot.
+                // Drain until both slots are empty: a write may suspend on backpressure, during
+                // which newer answers can (re)fill a slot - the loop picks them up on resume. The
+                // pong goes first (its ping preceded the Close on the wire); the Close echo is
+                // flushed even if the pong write failed.
+                while (true) {
+                    $pong = $this->pendingPongPayload;
+                    $closeEcho = $this->pendingCloseEcho;
+
+                    if ($pong !== null) {
+                        $this->pendingPongPayload = null;
+                        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PONG, $pong);
+                    } elseif ($closeEcho !== null) {
+                        $this->pendingCloseEcho = null;
+                        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, $closeEcho);
+                    } else {
+                        break;
+                    }
+
+                    try {
+                        // Read at write time, not queue time: close() nulls the property before
+                        // closing, and an answer must never chase a socket the transport released.
+                        $this->socket?->write($frame);
+                    } catch (\Throwable) {
+                        // Dead/closing socket: the read path surfaces the failure; the answer is moot.
+                    }
+                }
             } finally {
-                $this->pendingControlAnswers--;
+                $this->controlAnswerWriterActive = false;
             }
         });
     }
@@ -560,15 +601,15 @@ final class WebSocketTransport implements TlsAwareTransportInterface
         foreach ($frames as $frame) {
             switch ($frame['opcode']) {
                 case WebSocketFrameCodec::OP_PING:
-                    // Answer with a pong carrying the same application data - on its OWN fiber,
-                    // never inline: this runs inside the READ fiber, and an inline write could
-                    // (a) THROW on a just-died socket, discarding the data frames already decoded
-                    // into $out from the same read (their bytes are consumed - core NATS never
-                    // resends), or (b) SUSPEND on a backpressure-stalled peer, parking the whole
-                    // read path behind an outbound control frame. A failed/abandoned pong needs no
-                    // surfacing of its own: the socket is dead or dying, and the next read (or the
-                    // bounded close()) surfaces that. Fibers start in spawn order, so multiple
-                    // pongs still answer in arrival order.
+                    // Answer with a pong carrying the same application data - via the answer
+                    // slots, never inline: this runs inside the READ fiber, and an inline write
+                    // could (a) THROW on a just-died socket, discarding the data frames already
+                    // decoded into $out from the same read (their bytes are consumed - core NATS
+                    // never resends), or (b) SUSPEND on a backpressure-stalled peer, parking the
+                    // whole read path behind an outbound control frame. A failed/abandoned pong
+                    // needs no surfacing of its own: the socket is dead or dying, and the next
+                    // read (or the bounded close()) surfaces that. Coalesced pings collapse to ONE
+                    // pong answering the newest (RFC 6455 5.5.3).
                     $this->answerControlFrame(WebSocketFrameCodec::OP_PONG, $frame['payload']);
                     break;
 
@@ -579,8 +620,9 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                     // RFC 6455 5.5.1: an endpoint receiving a Close MUST send a Close in response.
                     // Echo one mirroring the received status code (the first two payload bytes; empty
                     // when the peer sent no status), best-effort - the socket may already be gone (#161).
-                    // Sent on its own fiber like the pong answer above: an inline echo could suspend
-                    // the read fiber on a stalled peer, delaying the close from surfacing.
+                    // Queued in its own answer slot (which a preceding ping flood can never displace)
+                    // and flushed by the writer fiber: an inline echo could suspend the read fiber on
+                    // a stalled peer, delaying the close from surfacing.
                     $echo = strlen($frame['payload']) >= 2 ? substr($frame['payload'], 0, 2) : '';
                     $this->answerControlFrame(WebSocketFrameCodec::OP_CLOSE, $echo);
 
@@ -869,12 +911,28 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 continue;
             }
 
-            if (strcasecmp($param, 'client_no_context_takeover') !== 0) {
-                throw new ConnectionException(
-                    'WebSocket handshake failed: unacceptable permessage-deflate parameter "' . $param
-                    . '" (this client offered client_no_context_takeover; server_no_context_takeover only)',
-                );
+            if (strcasecmp($param, 'client_no_context_takeover') === 0) {
+                continue;
             }
+
+            // RFC 7692 7.1.2.1: the server may volunteer server_max_window_bits - even when absent
+            // from the offer - to limit its OWN LZ77 window; the raw 15-bit inflater decodes any
+            // smaller-window stream, so 8..15 costs nothing to accept. The section 7 ABNF makes the
+            // value MANDATORY for this parameter ("server_max_window_bits" "=" window-bits, decimal
+            // without leading zeroes) - only client_max_window_bits has an optional-value form - so
+            // the bare spelling is rejected as an invalid response parameter (RFC 7692 section 5).
+            // The quoted-string spelling ="12" is a legal equivalent encoding per RFC 6455 9.1's
+            // extension-param ABNF (token | quoted-string). client_max_window_bits stays rejected
+            // below: it was not offered (7.1.2.2 forbids the server sending it unsolicited) and
+            // would change what this client deflates.
+            if (preg_match('/^server_max_window_bits=(?:([89]|1[0-5])|"([89]|1[0-5])")$/i', $param) === 1) {
+                continue;
+            }
+
+            throw new ConnectionException(
+                'WebSocket handshake failed: unacceptable permessage-deflate parameter "' . $param
+                . '" (accepted: client_no_context_takeover, server_no_context_takeover, server_max_window_bits=8..15)',
+            );
         }
 
         // RFC 7692 7.1.1.1: a server that received server_no_context_takeover in the offer MUST echo

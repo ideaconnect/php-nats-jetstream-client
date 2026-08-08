@@ -1,6 +1,7 @@
 # README KV watch example calls $js->stopOrderedConsumer() but the snippet never defines $js — copy-paste fatals
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — the snippet now defines `$js = $client->jetStream();` and derives `$kv`
+  from it, so the `$js->stopOrderedConsumer($watchSid)` teardown is runnable verbatim.
 - **Severity:** minor
 - **Type:** documentation (broken runnable example)
 - **Area:** README (round-1 fix follow-up: teardown switched to stopOrderedConsumer)

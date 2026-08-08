@@ -1164,7 +1164,11 @@ final class JetStreamContext
      * heartbeats-keep-flowing case defeated the #113 total-silence watchdog and the loss was
      * PERMANENT and invisible. Surfaced once per gap episode via the error listener + logger
      * (nats.go ErrConsumerSequenceMismatch parity); a delivery that advances the local sequence
-     * re-arms the signal.
+     * re-arms the signal. A sequence REGRESSION (heartbeat or delivery below the tracked max)
+     * means the consumer was replaced server-side (delete + recreate resets cseq to 1 - within
+     * one instance cseq only advances, and redeliveries get fresh cseqs), so the tracker REBASES
+     * to the new instance instead of masking its real gaps behind the stale high-water mark
+     * (2nd-round review; nats.go fires on any ldseq != dseq).
      *
      * @param callable(NatsMessage):void $handler
      * @return \Closure(NatsMessage):void
@@ -1189,15 +1193,32 @@ final class JetStreamContext
 
                 if ($status === 100) {
                     $lastDelivered = $this->heartbeatLastConsumerSeq($headers);
-                    if ($sawDeliveryThisSession && $lastDelivered !== null && $lastDelivered > $deliveredConsumerSeq && !$gapSignaled) {
-                        $gapSignaled = true;
-                        $this->emitClientError(new JetStreamException(sprintf(
-                            'Push consumer %s on stream "%s": consumer sequence mismatch - the server has delivered up to sequence %d but only %d reached this client; the missed deliveries will not be redelivered on an ack-none/max_deliver=1 consumer (ADR-9)',
-                            $consumerLabel,
-                            $stream,
-                            $lastDelivered,
-                            $deliveredConsumerSeq,
-                        )));
+                    if ($sawDeliveryThisSession && $lastDelivered !== null) {
+                        if ($lastDelivered > $deliveredConsumerSeq && !$gapSignaled) {
+                            $gapSignaled = true;
+                            $this->emitClientError(new JetStreamException(sprintf(
+                                'Push consumer %s on stream "%s": consumer sequence mismatch - the server has delivered up to sequence %d but only %d reached this client; the missed deliveries will not be redelivered on an ack-none/max_deliver=1 consumer (ADR-9)',
+                                $consumerLabel,
+                                $stream,
+                                $lastDelivered,
+                                $deliveredConsumerSeq,
+                            )));
+                        } elseif ($lastDelivered < $deliveredConsumerSeq) {
+                            // The reported last-delivered cseq REGRESSED below this session's max:
+                            // the consumer was replaced server-side (see the docblock). Surface the
+                            // mismatch once - the rebase itself ends the episode (the next report of
+                            // this instance is >= the rebased value) - and re-arm the gap signal so
+                            // a real gap in the NEW instance is reported against ITS numbering.
+                            $this->emitClientError(new JetStreamException(sprintf(
+                                'Push consumer %s on stream "%s": consumer sequence mismatch - the server reports last delivered sequence %d below the %d already seen this session; the consumer appears to have been replaced (sequence regressed), rebasing gap detection to the new instance (ADR-9)',
+                                $consumerLabel,
+                                $stream,
+                                $lastDelivered,
+                                $deliveredConsumerSeq,
+                            )));
+                            $deliveredConsumerSeq = $lastDelivered;
+                            $gapSignaled = false;
+                        }
                     }
 
                     return;
@@ -1212,12 +1233,18 @@ final class JetStreamContext
             }
 
             // Null-tolerant: a delivery without parseable $JS.ACK metadata skips tracking rather
-            // than throwing out of the shared dispatch loop (#90).
+            // than throwing out of the shared dispatch loop (#90). The > 0 guard keeps a malformed
+            // cseq token ((int)-cast to 0) from resetting the tracker (mirrors the ordered path's
+            // stream-seq guard).
             $metadata = JsMessageMetadata::fromMessage($message);
-            if ($metadata !== null && $metadata->consumerSequence > $deliveredConsumerSeq) {
+            if ($metadata !== null && $metadata->consumerSequence > 0 && $metadata->consumerSequence !== $deliveredConsumerSeq) {
+                // Above the max: normal progress. BELOW it: a replaced consumer instance (within
+                // one instance cseq only advances and redeliveries get fresh cseqs; the in-order
+                // transport makes heartbeat/delivery ordering exact) - rebase silently so gap
+                // detection follows the new instance. Either way progress re-arms the one-shot
+                // so a LATER gap episode is reported again.
                 $deliveredConsumerSeq = $metadata->consumerSequence;
                 $sawDeliveryThisSession = true;
-                // Progress re-arms the one-shot so a LATER gap episode is reported again.
                 $gapSignaled = false;
             }
 
@@ -1409,6 +1436,24 @@ final class JetStreamContext
                 $newDeliver = Inbox::generate('_INBOX.JS.ORD');
                 $newSid = null;
 
+                // Deferral rewind snapshot (2nd-round review): the retry loop adopts each candidate
+                // BEFORE its create await, so a disconnect-collision deferral must be able to rewind
+                // the dispatch state to the pre-episode instance. If the episode's initial delete
+                // never took effect server-side, that old consumer SURVIVES - and its post-reconnect
+                // frames would touch() the watchdog yet be silently name-filtered, delaying recovery
+                // until the first idle heartbeat exposes the tail gap.
+                $oldDeliver = $deliver;
+                $oldExpectedConsumerSeq = $expectedConsumerSeq;
+                $oldAckParseErrorEmitted = $ackParseErrorEmitted;
+                $oldLastStreamSeq = $lastStreamSeq;
+
+                // Latched whenever this episode observes the connection away from Open, so the
+                // deferral decision below cannot depend on WHEN it samples state(): the orphan-reap
+                // awaits yield event-loop turns a completing reconnect can win, and sampling only
+                // after them would turn a genuine disconnect collision into a loud terminal
+                // teardown (2nd-round review).
+                $sawNotOpen = false;
+
                 // Names this episode asked the server to create but did NOT adopt. A create whose
                 // reply we never saw (timeout / connection loss - NOT a definitive JetStream API
                 // rejection) may have SUCCEEDED server-side, leaving an ephemeral bound to $newDeliver.
@@ -1511,6 +1556,10 @@ final class JetStreamContext
 
                             return;
                         } catch (\Throwable $e) {
+                            if ($this->client->state() !== ConnectionState::Open) {
+                                $sawNotOpen = true;
+                            }
+
                             if (!$e instanceof JetStreamException) {
                                 // Not a definitive server API rejection (timeout / connection loss): the
                                 // consumer named $candidateName may exist server-side. Remember it to
@@ -1526,11 +1575,38 @@ final class JetStreamContext
                         }
                     }
                 } catch (\Throwable $e) {
+                    // Sampled BEFORE the reap's awaits: this also covers the delete/subscribe-step
+                    // failures that bypass the per-attempt catch above.
+                    if ($this->client->state() !== ConnectionState::Open) {
+                        $sawNotOpen = true;
+                    }
+
                     // Containment: see the docblock above. Best-effort reap any orphans this episode
                     // may have leaked, then surface through the error listener (#114/#122).
                     $this->reapOrphanedConsumers($stream, $orphanCandidates);
 
-                    if ($this->client->state() !== ConnectionState::Open && !$state->stopped) {
+                    if ($state->stopped) {
+                        // A stop raced this recreate and its remaining attempts then exhausted: the
+                        // consumer was deliberately shut down, so a terminal "recreate failed" error
+                        // here would page for an intentional stop. Mirror the silent post-create
+                        // stopped teardown: release the never-adopted fresh inbox and return quietly
+                        // (the stop closure already unsubscribed the old inbox and deleted the
+                        // consumer) (2nd-round review).
+                        if ($newSid !== null) {
+                            try {
+                                $this->client->unsubscribe($newSid)->await();
+                            } catch (\Throwable) {
+                                // Best-effort; local state release is what stops delivery.
+                            }
+                        }
+
+                        return;
+                    }
+
+                    // Stopped episodes returned above, so this decides deferral-vs-terminal only.
+                    // The live re-sample alongside the latch covers the other race direction: a
+                    // connection dropping DURING the reap awaits is a disconnect collision too.
+                    if ($sawNotOpen || $this->client->state() !== ConnectionState::Open) {
                         // The CONNECTION dropped mid-recreate - this is not a terminal consumer
                         // failure (requests fail fast while not Open, so all attempts burn in
                         // milliseconds during a reconnect window). Do NOT tear the consumer down:
@@ -1558,6 +1634,29 @@ final class JetStreamContext
                         // idle intervals after the connection is Open - the fresh-attempt retry this
                         // branch defers to (the not-Open ticks already rebase the silence clock).
                         $state->notified = false;
+
+                        // Rewind the adopt-before-await dispatch state to the pre-episode instance:
+                        // no candidate was installed, and if the episode's initial delete never took
+                        // effect server-side the OLD consumer may still be live - its post-reconnect
+                        // frames must pass the name filter and resume in-order delivery immediately,
+                        // not touch() the watchdog while being silently dropped until the first idle
+                        // heartbeat exposes the tail gap (2nd-round review). A no-op when the episode
+                        // died before the attempt loop adopted anything.
+                        //
+                        // ONLY when the episode delivered nothing (3rd-round review): a candidate
+                        // whose create succeeded with a lost reply can have replayed frames to the
+                        // handler during the create's own read-pump, advancing $lastStreamSeq past
+                        // the survivor's position. Rewinding then would re-admit the survivor's
+                        // frames for stream sequences the handler already saw - duplicate ordered
+                        // deliveries. Keeping the adopted state instead falls back to the
+                        // filtered-until-heartbeat recovery (survivor frames name-dropped, the next
+                        // watchdog episode resumes from $lastStreamSeq+1), which is exactly-once.
+                        if ($lastStreamSeq === $oldLastStreamSeq) {
+                            $consumerName = $oldConsumerName;
+                            $deliver = $oldDeliver;
+                            $expectedConsumerSeq = $oldExpectedConsumerSeq;
+                            $ackParseErrorEmitted = $oldAckParseErrorEmitted;
+                        }
 
                         return;
                     }
@@ -1745,6 +1844,39 @@ final class JetStreamContext
             // inbox to unsubscribe - "dead" is actually dead (#122).
             $state->deliverSid = $sid;
             $initialSid = $sid;
+
+            // Legacy-stop cleanup (2nd-round review): the baseline watch() documented a plain
+            // unsubscribe($sid) as the stop mechanism, but the connection knows nothing of the
+            // orderedStops registry and the watchdog tick holds only WeakReferences - so that path
+            // stranded one registry entry per watch, forever. The self-cancel tick invokes this
+            // when the guarded sid goes dead; the entry check makes it a no-op after
+            // stopOrderedConsumer() / the terminal teardown already released the entry. Weakly
+            // referenced so the state held by the registry entry cannot root the context graph.
+            $weakContext = \WeakReference::create($this);
+            $state->onDefunct = static function () use ($weakContext, $state, $sid, $stream, &$consumerName): void {
+                // Latch the stop FIRST, exactly like stopOrderedConsumer()'s closure: a recreate
+                // parked in its delete/subscribe/create awaits re-checks this before installing a
+                // fresh instance. Without the latch, a tick firing mid-recreate would release the
+                // registry entry here and the recreate would then install anyway - a live consumer
+                // whose stop handle is gone, permanently unstoppable short of a disconnect.
+                $state->stopped = true;
+
+                $context = $weakContext->get();
+                if ($context === null || !isset($context->orderedStops[$sid])) {
+                    return;
+                }
+
+                unset($context->orderedStops[$sid]);
+
+                // The entry was still live, so nothing stopped this consumer proactively:
+                // best-effort delete the CURRENT server-side instance, mirroring
+                // stopOrderedConsumer()'s faster-than-inactive_threshold cleanup.
+                try {
+                    $context->deleteConsumer($stream, $consumerName)->await();
+                } catch (\Throwable) {
+                    // Best-effort; the dropped interest already lets inactive_threshold reap it.
+                }
+            };
 
             $this->armHeartbeatWatchdog($sid, $idleHeartbeatNs, $state);
 
@@ -2503,8 +2635,9 @@ final class JetStreamContext
             // a single tail empty behind a delivering head is not proof of idleness.
             $emptyRetireStreak = 0;
             // One-shot signal latch for a transient no-JS-responder streak: the FIRST 503 retire of a
-            // streak fires onError so operators see the outage; re-armed by the next delivery so a
-            // later outage is reported again, without per-poll spam while JS is down.
+            // streak fires onError so operators see the outage; re-armed by the next delivery OR any
+            // routine non-503 retire (a 404/408/deadline proves the JS API answers again) - one
+            // onError per no-responders episode, without per-poll spam while JS is down.
             $noRespondersSignaled = false;
             // FIX1 latch: an empty pull stops refilling the generation; it drains, backs off, relaunches.
             $idleDraining = false;
@@ -2653,7 +2786,8 @@ final class JetStreamContext
                         // it. Pre-fix it was terminal, and with no onError the run resolved NORMALLY with
                         // the processed count: an infinite worker silently stopped forever on a momentary
                         // outage. The outage is still observable: the first 503 of a streak fires onError
-                        // (one-shot, re-armed by the next delivery), and pacing comes from the normal
+                        // (one-shot, re-armed by the next delivery or any routine non-503 retire - one
+                        // onError per no-responders episode), and pacing comes from the normal
                         // empty-retire backoff below.
                         $routine = $code === null
                             || $code === 404
@@ -3211,6 +3345,12 @@ final class JetStreamContext
                 EventLoop::cancel($timerId);
                 if ($state->watchdogTimerId === $timerId) {
                     $state->watchdogTimerId = null;
+                    // Only the CURRENT timer may run the defunct cleanup: a rotated-out old
+                    // timer's sid is dead by design while the consumer lives on under a new sid
+                    // (see HeartbeatWatchdogState::$onDefunct).
+                    if ($state->onDefunct !== null) {
+                        ($state->onDefunct)();
+                    }
                 }
 
                 return;

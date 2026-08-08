@@ -232,6 +232,69 @@ final class BatchPublisherTest extends TestCase
     }
 
     /**
+     * commit() on a NEVER-CONNECTED client: serverInfo() is null, so the version pre-flight must
+     * null-safely skip the gate (unknown version falls through to reply-shape detection) and the
+     * failure surfaces as the transport-level NatsException from the request - never as a PHP
+     * Error from dereferencing the missing ServerInfo.
+     */
+    public function testCommitBeforeConnectSkipsVersionPreflightNullSafely(): void
+    {
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 100), new FakeTransport());
+
+        $batch = $client->jetStream()->batch('b-unconnected')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b');
+
+        try {
+            $batch->commit()->await();
+            self::fail('an unconnected commit must fail at the wire, not succeed');
+        } catch (\IDCT\NATS\Exception\NatsException $e) {
+            // The failure is the request layer's, reached only because the null serverInfo()
+            // pre-flight fell through instead of crashing on a null dereference.
+            self::assertNotInstanceOf(UnsupportedFeatureException::class, $e);
+        }
+    }
+
+    /**
+     * Reply-shape abort with NO advertised server version (INFO omits `version`): the
+     * UnsupportedFeatureException message must omit the version slot cleanly - no dangling space
+     * from gluing an empty version onto "connected server".
+     */
+    public function testReplyShapeAbortMessageOmitsMissingServerVersionCleanly(): void
+    {
+        $plainPubAck = '{"stream":"ORDERS","seq":41}';
+
+        $transport = new FakeTransport([
+            // No "version" field: ServerInfo::version defaults to '' and the pre-flight cannot parse it.
+            'INFO {"server_id":"S1","server_name":"n1","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            // The batch-incapable server acks the batch-start request with a NORMAL PubAck.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($plainPubAck), $plainPubAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $batch = $client->jetStream()->batch('b-no-version')
+            ->add('orders.created', 'a')
+            ->add('orders.created', 'b');
+
+        try {
+            $batch->commit()->await();
+            self::fail('expected UnsupportedFeatureException for a plain-publish batch start ack');
+        } catch (UnsupportedFeatureException $e) {
+            // Exact wording: with no version, "connected server" is followed directly by "treated"
+            // (single space) - an unknown version must not inject a blank version token.
+            self::assertSame(
+                'Atomic batch publish requires NATS server 2.12+ (connected server treated the batch as plain publishes)',
+                $e->getMessage(),
+            );
+        }
+    }
+
+    /**
      * Reply-shape detection in a mixed-version cluster: the connected server advertises 2.12+ (so
      * the pre-flight passes) but the JS leader is older and answers the batch START with a normal
      * PubAck instead of ADR-50's zero-byte ack - it stored the message as a plain publish.

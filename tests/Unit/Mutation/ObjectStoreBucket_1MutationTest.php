@@ -213,7 +213,18 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         // kills Coalesce @ 131 - targetBucket ('other') is used, not $this->bucket ('assets').
         $link = $bucket->addLink('shortcut', 'real.bin', 'other')->await();
         self::assertSame(['bucket' => 'other', 'name' => 'real.bin'], $link->link);
-        self::assertStringContainsString('"link":{"bucket":"other","name":"real.bin"}', $this->writes());
+        $w = $this->writes();
+        self::assertStringContainsString('"link":{"bucket":"other","name":"real.bin"}', $w);
+
+        // kills Identical/LogicalOr @ 149 (targetBucket === $this->bucket flip) - a DIFFERENT
+        // target bucket must resolve the target's info on THE OTHER bucket's stream and meta
+        // subject, not this one's: routing the lookup to OBJ_assets would consult the wrong bucket.
+        self::assertStringContainsString('PUB $JS.API.DIRECT.GET.OBJ_other ', $w);
+        self::assertStringContainsString(
+            '"last_by_subj":"$O.other.M.' . strtr(base64_encode('real.bin'), '+/', '-_') . '"',
+            $w,
+        );
+        self::assertStringNotContainsString('DIRECT.GET.OBJ_assets', $w, 'the cross-bucket target lookup must not touch this bucket\'s stream');
     }
 
     public function testAddLinkRejectsEmptyName(): void

@@ -1,6 +1,11 @@
 # orderedStops registry leaks on plain unsubscribe($sid) — the documented legacy stop path strands one closure + watchdog state per watch, forever
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — HeartbeatWatchdogState gained an onDefunct closure (WeakReference-based);
+  the watchdog's self-cancel tick invokes it only when the firing timer is the CURRENT one,
+  releasing the orderedStops entry and best-effort deleting the ephemeral. Pinned by
+  `testPlainUnsubscribeReleasesOrderedStopRegistryAndDeletesConsumer` (pre-fix red: entry leaked)
+  and `testRotatedOutWatchdogTimerDoesNotReleaseStopRegistryOrDeleteConsumer` (red against a
+  removed current-timer guard).
 - **Severity:** minor
 - **Type:** unbounded memory growth / missed server-side consumer cleanup
 - **Area:** JetStream ordered consumers / KV+OS watches (round-1 fix follow-up)

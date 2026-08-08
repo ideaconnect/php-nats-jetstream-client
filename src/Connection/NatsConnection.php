@@ -258,6 +258,16 @@ final class NatsConnection
      */
     private bool $closing = false;
     /**
+     * Monotonic deadline of the drain in progress; set when drain() computes its budget, cleared in
+     * its teardown. Shared with {@see writePublishFrame()}'s Draining branch and
+     * {@see drainPendingForSid()} so a handler ack/reply published while drain delivers backlog is
+     * bounded by the REMAINING drain budget - not a fresh full request timeout per publish - and a
+     * delivery pass stops delivering (past its head message) once the budget is exhausted: K queued
+     * messages whose handlers each publish could otherwise serially extend drain() to
+     * ~K x requestTimeoutMs, far past its documented single ~requestTimeoutMs bound (#149).
+     */
+    private ?float $drainDeadline = null;
+    /**
      * Publish callback bound onto every delivered {@see NatsMessage} so it can reply to its own
      * reply subject via {@see NatsMessage::respond()}. Built once and reused for all messages.
      *
@@ -810,6 +820,9 @@ final class NatsConnection
             // sequential deadline for the backlog wait would roughly double worst-case drain latency;
             // #149 requires the wait be bounded by the existing (singular) drain deadline.
             $drainDeadline = $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000);
+            // Recorded on the instance so mid-drain handler publishes (writePublishFrame's Draining
+            // branch) and the per-sid delivery loop (drainPendingForSid) share this same budget.
+            $this->drainDeadline = $drainDeadline;
 
             try {
                 // Send UNSUB for all active subscriptions so no new messages arrive. Each write's
@@ -928,11 +941,19 @@ final class NatsConnection
                 delay(0.001);
             }
 
+            // The drain budget ends with the delivery phases above; writePublishFrame()'s Draining
+            // branch falls back to its fixed per-publish bound once cleared.
+            $this->drainDeadline = null;
+
             // Clear subscription state (also errors out any still-parked pong slots, e.g. this
             // drain's own slot when the flush ended via the deadline).
             $this->releaseRuntimeState();
 
-            $this->transport->close()->await();
+            // Best-effort like every other terminal path: TransportInterface::close() gives no
+            // no-throw guarantee, and drain deliberately routes known-broken sockets here (the
+            // dead-socket write failures contained above), so a throwing close() must not rethrow
+            // out of drain() and strand the state in Draining - drain() always reaches Closed (#150).
+            $this->closeTransportBestEffort();
             $this->state = ConnectionState::Closed;
         });
     }
@@ -1187,12 +1208,22 @@ final class NatsConnection
         }
 
         if ($this->state === ConnectionState::Draining) {
-            // Bounded like drain()'s own writes: a handler ack/reply published while drain delivers
-            // backlog rides a socket whose heartbeat is already cancelled, so an unbounded write on
-            // a backpressure-stalled peer would wedge the drain past its budget with no escalation
-            // left. On the wedge the caller's failure is contained by drain's handler-error paths.
+            // Bounded by drain()'s own REMAINING budget, not a fresh full request timeout: a handler
+            // ack/reply published while drain delivers backlog rides a socket whose heartbeat is
+            // already cancelled, so an unbounded write on a backpressure-stalled peer would wedge
+            // the drain with no escalation left - and a fresh per-publish bound would let K queued
+            // handlers serially extend drain() to ~K x requestTimeoutMs past its documented single
+            // budget (#149). The fixed fallback covers a Draining state with no recorded deadline
+            // (defensive: drain() always records one before delivering). On the wedge the caller's
+            // failure is contained by drain's handler-error paths.
+            $drainDeadline = $this->drainDeadline;
             try {
-                $this->writeBounded($frame, new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)));
+                $this->writeBounded(
+                    $frame,
+                    $drainDeadline !== null
+                        ? $this->remainingBudgetCancellation($drainDeadline)
+                        : new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)),
+                );
             } catch (CancelledException) {
                 throw new TimeoutException('Publish during drain timed out (transport backpressure)');
             }
@@ -3565,7 +3596,12 @@ final class NatsConnection
         }
 
         if ($protocolViolation !== null) {
-            $this->emitError($protocolViolation);
+            // emitErrorSafely, not emitError: emitError() logs BEFORE its listener-throw guard, so a
+            // throwing user logger would skip the recovery below and escape into the event-loop
+            // timer - and the violation is ONE-SHOT (the WS transport nulls it before throwing), so
+            // the skipped recovery would never be retried from a re-raised violation, leaving the
+            // corrupt stream running as Open (#150 containment).
+            $this->emitErrorSafely($protocolViolation);
             try {
                 $this->recoverConnection();
             } catch (\Throwable) {
@@ -3851,8 +3887,28 @@ final class NatsConnection
 
         $this->dispatchingSids[$sid] = true;
 
+        // Deliveries made by THIS pass, for the mid-drain budget check below: the head delivery of a
+        // pass is always permitted (drain()'s dedicated final pass keeps its pinned deliver-what-the-
+        // flush-could-not contract), so only iteration 2+ consults the deadline.
+        $deliveredThisPass = 0;
+
         try {
             while (!$queue->isEmpty()) {
+                if (
+                    $deliveredThisPass > 0
+                    && $this->drainDeadline !== null
+                    && $this->state === ConnectionState::Draining
+                    && $this->monotonicSeconds() >= $this->drainDeadline
+                ) {
+                    // The drain budget ran out mid-pass: stop before the NEXT delivery, so a handler
+                    // that consumes budget per message (e.g. a bounded ack publish timing out per
+                    // delivery) cannot serially extend drain() a whole pass (~K x the per-publish
+                    // bound) past its deadline. The remainder stays queued (the sid stays dirty via
+                    // the finally below) and drain()'s own deadline check then reports the discard
+                    // loudly, exactly as it does for a backlog that never got a pass (#149).
+                    break;
+                }
+
                 if (!array_key_exists($sid, $this->subscriptions)) {
                     break;
                 }
@@ -3873,6 +3929,7 @@ final class NatsConnection
                 /** @var NatsMessage $message */
                 $message = $queue->dequeue();
                 $this->deliveredCounts[$sid] = ($this->deliveredCounts[$sid] ?? 0) + 1;
+                $deliveredThisPass++;
                 $this->subscriptions[$sid]($message);
 
                 $max = $this->autoUnsubMax[$sid] ?? null;

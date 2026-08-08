@@ -232,11 +232,13 @@ final class PullPipelineTest extends TestCase
         // Chain onto the harness responder: answer the pull-inbox SUB with the server's async
         // permissions -ERR naming the exact subject, as a real server does.
         $inner = $transport->onWrite;
-        $transport->onWrite = static function (string $bytes) use ($inner): array {
+        $rejectedSubject = null;
+        $transport->onWrite = static function (string $bytes) use ($inner, &$rejectedSubject): array {
             $frames = $inner !== null ? $inner($bytes) : [];
             $head = strtok($bytes, "\r\n");
             if (is_string($head) && str_starts_with($head, 'SUB _INBOX.JS.PULL.')) {
                 $subject = explode(' ', $head)[1] ?? '';
+                $rejectedSubject = $subject;
                 $frames[] = "-ERR 'Permissions Violation for Subscription to \"" . $subject . "\"'\r\n";
             }
 
@@ -252,8 +254,18 @@ final class PullPipelineTest extends TestCase
                 ->handle(static function (): void {})->await(new \Amp\TimeoutCancellation(10.0));
             self::fail('a permission-rejected pull inbox must fail the run');
         } catch (JetStreamException $e) {
-            self::assertStringContainsString('rejected by server permissions', $e->getMessage());
-            self::assertStringContainsString('_INBOX.JS.PULL.>', $e->getMessage(), 'the error must name the wildcard to grant');
+            // The message is the operator's signal for a permissions misconfiguration; pin the FULL
+            // wording (subject, server error, wildcard to grant, remedy) so no fragment can be
+            // dropped or reordered without failing here.
+            self::assertIsString($rejectedSubject);
+            self::assertSame(
+                'Pull consumer reply inbox "' . $rejectedSubject . '" was rejected by server permissions: '
+                . "'Permissions Violation for Subscription to \"" . $rejectedSubject . "\"'"
+                . '. Grant the account subscribe permission for the pull '
+                . 'reply-inbox wildcard "_INBOX.JS.PULL.>" (or the configured inbox prefix) '
+                . 'to use pull consumers.',
+                $e->getMessage(),
+            );
         }
 
         self::assertLessThan(8.0, (hrtime(true) - $startedNs) / 1e9, 'the failure must be prompt, not an eventual timeout');
@@ -616,5 +628,153 @@ final class PullPipelineTest extends TestCase
         $pulls = $this->pullWrites($transport);
         self::assertStringNotContainsString('"id"', $pulls[0], 'the run-1 bootstrap pull has no pin yet');
         self::assertStringContainsString('"id":"p1"', $pulls[$pullsAfterRun1], "run 2's first pull must carry the pin captured in run 1");
+    }
+
+    /**
+     * A delivery must RE-ARM the one-shot no-responders signal (set it back to un-signaled), so a
+     * 503 outage that starts AFTER a productive stretch is still reported. A latch that a delivery
+     * wrongly SET would swallow the first 503 of the following outage entirely.
+     */
+    public function testFirstNoRespondersAfterADeliveryIsStillSignaled(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a']],                                              // pull#0: delivers
+            [['status' => 503, 'desc' => 'No Responders Available For Request']], // pull#1: outage starts
+            [['status' => 409, 'desc' => 'Consumer Deleted']],             // pull#2: terminal
+        ]);
+        $js = $this->context($transport);
+
+        $errors = [];
+        $processed = $js->pullConsumer('S', 'C')
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e;
+            })
+            ->handle(static function (): void {})->await();
+
+        self::assertSame(1, $processed);
+        self::assertCount(2, $errors, 'the post-delivery 503 outage must be signaled, then the terminal 409');
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertSame(503, $errors[0]->getCode());
+        self::assertStringContainsString('Consumer Deleted', $errors[1]->getMessage());
+    }
+
+    /**
+     * The no-responders signal is ONE-SHOT per outage episode: the first 503 of a streak fires
+     * onError and LATCHES; the second consecutive 503 must NOT fire again (no per-poll spam while
+     * JetStream is down). Only the terminal 409 afterwards adds a second report.
+     */
+    public function testConsecutiveNoRespondersSignalOnlyOnce(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
+        ]);
+        $js = $this->context($transport);
+
+        $errors = [];
+        $processed = $js->pullConsumer('S', 'C')
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e;
+            })
+            ->handle(static function (): void {})->await();
+
+        self::assertSame(0, $processed);
+        self::assertCount(2, $errors, 'one 503 signal for the whole streak plus the terminal 409 - never one per poll');
+        self::assertSame(503, $errors[0]->getCode());
+        self::assertStringContainsString('Consumer Deleted', $errors[1]->getMessage());
+    }
+
+    /**
+     * A 503 empty retire is an IMMEDIATELY answered empty, so it must warrant the escalating idle
+     * backoff (#153): three consecutive 503 generations pace their relaunches by 10 + 20 + 40 ms
+     * before the terminal pull. Without the 503 code in the backoff-warranted set the engine would
+     * hot-poll a downed JetStream API with zero pacing.
+     */
+    public function testNoRespondersEmptiesPaceTheirRelaunches(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
+        ]);
+        $js = $this->context($transport);
+
+        $startNs = hrtime(true);
+        $processed = $js->pullConsumer('S', 'C')
+            ->setDepth(1)
+            ->setOnError(static function (): void {})
+            ->handle(static function (): void {})->await();
+        $elapsedNs = hrtime(true) - $startNs;
+
+        self::assertSame(0, $processed);
+        self::assertSame(4, $this->pullPubCount($transport));
+        // Escalating backoff boundaries: 10 + 20 + 40 ms of guaranteed pacing (timers never fire early).
+        self::assertGreaterThanOrEqual(60_000_000, $elapsedNs, 'consecutive 503 empties must pace their relaunches');
+    }
+
+    /**
+     * The retire phase must retire EVERY due head pull in one turn (a routine empty continues the
+     * retire loop): with depth 2 and both in-flight pulls answered 404 under drain(), the run ends
+     * promptly. A retire loop that stopped after the first empty would leave the second (already
+     * done) pull in flight and sit out its ~1.3 s client-side deadline on a blocking read first.
+     */
+    public function testDrainRetiresAllDueEmptiesInOneTurnWithoutDeadlineWait(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
+        $js = $this->context($transport);
+
+        $iter = $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setExpiresMs(300);
+
+        // Custom responder: capture each pull's reply token; when the 2nd pull request hits the
+        // wire, latch drain() and answer BOTH pulls' 404s in a SINGLE read chunk - so one pump
+        // turn buffers both due heads and the retire phase faces them together.
+        $pullSid = 1;
+        $replyTos = [];
+        $transport->onWrite = static function (string $bytes) use ($iter, &$pullSid, &$replyTos): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB _INBOX.JS.PULL.') && str_contains($head, '.* ')) {
+                $pullSid = (int) (explode(' ', $head)[2] ?? 1);
+
+                return [];
+            }
+
+            if (!str_starts_with($head, 'PUB $JS.API.CONSUMER.MSG.NEXT.')) {
+                return [];
+            }
+
+            $replyTos[] = explode(' ', $head)[2] ?? '';
+            if (count($replyTos) < 2) {
+                return [];
+            }
+
+            $iter->drain();
+            $hdr = "NATS/1.0 404 No Messages\r\n\r\n";
+            $chunk = '';
+            foreach ($replyTos as $replyTo) {
+                $chunk .= sprintf("HMSG %s %d %d %d\r\n%s\r\n", $replyTo, $pullSid, strlen($hdr), strlen($hdr), $hdr);
+            }
+
+            return [$chunk];
+        };
+
+        $startNs = hrtime(true);
+        $processed = $iter->handle(static function (): void {})->await();
+        $elapsedNs = hrtime(true) - $startNs;
+
+        self::assertSame(0, $processed);
+        self::assertSame(2, $this->pullPubCount($transport));
+        self::assertLessThan(800_000_000, $elapsedNs, 'both due empties must retire in one turn - no deadline sit-out on a blocking read');
     }
 }

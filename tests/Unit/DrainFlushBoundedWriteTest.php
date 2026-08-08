@@ -4,8 +4,10 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
@@ -14,6 +16,9 @@ use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\WedgedWriteTransport;
 use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\async;
+use function Amp\delay;
 
 /**
  * drain() and flush() document bounded completion (~requestTimeoutMs), but their WRITES used to be
@@ -240,5 +245,164 @@ final class DrainFlushBoundedWriteTest extends TestCase
         self::assertInstanceOf(TimeoutException::class, $captured, 'a wedged mid-drain publish must fail with the documented TimeoutException');
         self::assertStringContainsString('Publish during drain timed out', $captured->getMessage());
         self::assertSame(ConnectionState::Closed, $client->state(), 'drain must still reach Closed');
+    }
+
+    /**
+     * Mid-drain handler publishes share drain()'s SINGLE budget instead of each getting a fresh full
+     * requestTimeoutMs: with a wedged transport and K backlog messages whose (robust, self-catching)
+     * handler publishes two acks per message, the old per-publish bound made drain() take
+     * ~K x 2 x requestTimeoutMs (here ~36 s). Now the first ack consumes the remaining budget, the
+     * second is clamped to the ~expired remainder, the delivery pass stops at the next inter-message
+     * boundary, and the dropped remainder is reported loudly - drain() completes in ~one budget.
+     */
+    public function testDrainBudgetBoundsSerialHandlerPublishesAcrossBacklog(): void
+    {
+        $backlog = '';
+        for ($i = 1; $i <= 6; $i++) {
+            $backlog .= "MSG updates 1 2\r\nm{$i}\r\n";
+        }
+
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        // The whole backlog (and the flush PONG behind it) arrives only once drain's UNSUB hits the
+        // wire, so every handler invocation below runs inside drain's flush phase, state Draining.
+        $transport->enqueueOnWriteContaining = ['UNSUB' => [$backlog, "PONG\r\n"]];
+
+        $errors = [];
+        $client = new NatsClient(
+            new NatsOptions(
+                // 3 s budget (3rd-round review): the discrimination margins scale with it - the
+                // post-fix run takes ~1 budget, the smallest pre-fix overshoot adds a FULL extra
+                // budget (6 s), so the 4.5 s ceiling keeps >= 1.5 s scheduling headroom on BOTH
+                // sides even on a loaded, xdebug-instrumented CI runner (#70 family).
+                requestTimeoutMs: 3000,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $client->connect()->await();
+
+        $received = [];
+        /** @var list<\Throwable> $ackFailures */
+        $ackFailures = [];
+        // Robust-handler pattern: two acks per message, each containing its own failure - exactly
+        // the shape that serially re-armed the old fresh-per-publish bound.
+        $client->subscribe('updates', static function (NatsMessage $message) use ($client, &$received, &$ackFailures): void {
+            $received[] = $message->payload;
+            foreach (['first', 'second'] as $ack) {
+                try {
+                    $client->publish('updates.ack', $ack)->await();
+                } catch (\Throwable $e) {
+                    $ackFailures[] = $e;
+                }
+            }
+        })->await();
+
+        // Only the handler ack publishes wedge; drain's own UNSUB/PING writes stay healthy.
+        $transport->wedgeOnWriteContaining = 'PUB ';
+
+        $startedNs = hrtime(true);
+        // Pre-fix this took ~6 messages x 2 acks x 3 s = ~36 s; the outer cancellation only
+        // bounds a pathological regression.
+        $client->drain()->await(new TimeoutCancellation(45.0));
+        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+
+        self::assertSame(ConnectionState::Closed, $client->state(), 'drain must always reach Closed');
+        // ~1 budget (3 s) plus scheduling overhead; far below both the pre-fix ~36 s and even a
+        // single extra fresh full bound (3 + 3 = 6 s), which timers cannot undercut.
+        self::assertLessThan(4.5, $elapsedSeconds, 'mid-drain handler publishes must share the single drain budget');
+        // Delivery stops at the first inter-message boundary past the deadline: m1's acks consume
+        // the budget (flush-phase pass), the dedicated backlog pass delivers its head message m2,
+        // and the remaining four are dropped - loudly.
+        self::assertSame(['m1', 'm2'], $received, 'deliveries must stop once the drain budget is exhausted');
+        self::assertNotSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, 'drain deadline exceeded: 4 buffered message(s)')),
+            'the dropped remainder must be reported loudly with its count',
+        );
+        self::assertNotSame([], $ackFailures, 'the wedged acks must fail into the handler, not hang');
+        self::assertInstanceOf(TimeoutException::class, $ackFailures[0]);
+        self::assertStringContainsString('Publish during drain timed out', $ackFailures[0]->getMessage());
+        self::assertStringContainsString('PUB updates.ack', implode('', $transport->writes), 'the acks must have been attempted on the wire');
+    }
+
+    /**
+     * drain()'s teardown closes the transport best-effort like every other terminal path:
+     * TransportInterface::close() gives no no-throw guarantee, and drain deliberately routes
+     * known-broken sockets into this close - a throwing close() must not rethrow out of
+     * drain()->await() and strand the connection in Draining (connect() refuses while Draining),
+     * contradicting the documented "drain() always reaches Closed" contract (#150).
+     */
+    public function testDrainStillClosesWhenTransportCloseThrows(): void
+    {
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        // Answer drain's flush PING promptly so the teardown is reached well inside the budget.
+        $transport->enqueueOnWriteContaining = ['PING' => ["PONG\r\n"]];
+        $transport->throwOnClose = new \RuntimeException('close() failed on the already-broken socket');
+
+        // Pre-fix the RuntimeException rethrew out of this await with state stranded in Draining.
+        $client->drain()->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(ConnectionState::Closed, $client->state(), 'a throwing close() must not strand drain in Draining');
+        self::assertTrue($transport->closed, 'the close attempt must still have run');
+    }
+
+    /**
+     * The deadline-exceeded discard report names the count of QUEUED messages being dropped. A
+     * drain whose only remaining backlog is a dispatch suspended mid-handler - with NOTHING queued
+     * behind it - drops no message, so it must NOT emit a "0 buffered message(s)" discard error
+     * (#149: either delivered, or an error naming the count of what was actually dropped).
+     */
+    public function testDrainDeadlineWithOnlySuspendedHandlerReportsNoZeroCountDiscard(): void
+    {
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+
+        /** @var list<string> $errors */
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                requestTimeoutMs: 300,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        /** @var DeferredFuture<void> $gate */
+        $gate = new DeferredFuture();
+        /** @var list<string> $received */
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $m) use (&$received, $gate): void {
+            $received[] = $m->payload;
+            $gate->getFuture()->await(); // suspend past the drain deadline; nothing queued behind
+        })->await();
+
+        $transport->pushReadChunk("MSG updates 1 2\r\nm1\r\n");
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.02);
+        self::assertSame(['m1'], $received, 'the handler must be suspended on m1');
+
+        // Answer drain's flush PING promptly so only the backlog wait consumes the budget.
+        $transport->enqueueOnWriteContaining = ['PING' => ["PONG\r\n"]];
+        $connection->drain()->await(new TimeoutCancellation(5));
+
+        self::assertSame(ConnectionState::Closed, $connection->state(), 'drain must reach Closed past the suspended handler');
+        self::assertSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, 'drain deadline exceeded')),
+            'no queued message was dropped, so no deadline-exceeded discard may be reported',
+        );
+
+        $gate->complete();
+        delay(0.02);
+        $pump->await(new TimeoutCancellation(5));
     }
 }

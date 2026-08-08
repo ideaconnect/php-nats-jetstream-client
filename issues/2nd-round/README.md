@@ -8,9 +8,12 @@ confirmed, 1 refuted, 0 undecided). Nits skipped verification and are marked as 
 
 Gates at review time: 1800 unit tests OK, PHPStan level 8 clean.
 
-**26 findings: 1 major (FIXED 2026-08-08), 17 minor (2 FIXED, 15 OPEN), 8 nit (OPEN).** (Two nits
-were added during the adversarial verification of the major's fix; the two test-coverage minors
-were fixed while restoring the CI coverage gate.)
+**26 findings — ALL RESOLVED (2026-08-08): 1 major, 17 minor, 8 nit.** (Two nits were added during
+the adversarial verification of the major's fix; the two test-coverage minors were fixed while
+restoring the CI coverage gate; the remaining 15 minors + 8 nits were fixed in the follow-up batch
+— every per-finding Status block below names the fix and its confirming tests, nearly all verified
+red against the pre-fix code. One deliberate deviation: `ws-codec-unmask-production-dead` kept the
+helper as `@deprecated` instead of removing it, since removal would be an undisclosed bc-break.)
 
 ## Major
 

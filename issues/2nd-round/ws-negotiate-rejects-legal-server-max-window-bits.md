@@ -1,6 +1,10 @@
 # negotiateCompression() fails the handshake on a server_max_window_bits response parameter that RFC 7692 explicitly permits and the codec could decode for free
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; nit — not adversarially verified)
+- **Status:** FIXED (2026-08-08) — the handshake accepts a server-volunteered `server_max_window_bits` of
+  8..15 (or the bare, value-less form) per RFC 7692 7.1.2.1; out-of-range values,
+  `client_max_window_bits`, and other foreign parameters still fail. Pinned by
+  `testHandshakeAcceptsServerMaxWindowBitsWithinRange` (pre-fix red) and
+  `testHandshakeRejectsOutOfRangeWindowBitsAndClientMaxWindowBits`.
 - **Severity:** nit
 - **Type:** spec interop (conformant-but-unusual peer)
 - **Area:** WebSocket permessage-deflate negotiation (round-1 fix follow-up)

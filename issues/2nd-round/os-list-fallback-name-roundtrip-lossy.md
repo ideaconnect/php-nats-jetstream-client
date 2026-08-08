@@ -1,6 +1,9 @@
 # list()'s 503 fallback round-trips meta-subject token → name → re-encoded subject — lossy for non-canonical (unpadded) tokens, silently dropping those records
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; nit — not adversarially verified)
+- **Status:** FIXED (2026-08-08) — the fallback queries the leader by the ENUMERATED subject via the new
+  fetchInfoBySubject() helper (fetchInfo() delegates to it, semantics preserved). Pinned by
+  `testListFallbackQueriesLeaderByEnumeratedSubjectForNonCanonicalToken` (pre-fix red:
+  last_by_subj carried the re-padded QQ== instead of the enumerated QQ).
 - **Severity:** nit
 - **Type:** interop edge (foreign-client-written buckets) / path inconsistency
 - **Area:** ObjectStore enumeration fallback (round-1 fix follow-up)

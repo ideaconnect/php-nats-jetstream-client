@@ -424,9 +424,13 @@ final class WebSocketFrameCodecTest extends TestCase
     {
         $tooLarge = 64 * 1024 * 1024 + 1; // MAX_FRAME_PAYLOAD + 1
 
-        $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessageMatches('/payload length out of bounds/');
-        WebSocketFrameCodec::frameRequiredBytes(pack('CC', 0x82, 127) . pack('J', $tooLarge));
+        try {
+            WebSocketFrameCodec::frameRequiredBytes(pack('CC', 0x82, 127) . pack('J', $tooLarge));
+            self::fail('Expected a ProtocolException for the oversized declared length');
+        } catch (ProtocolException $e) {
+            // Full-message pin: the offending length is the operator's diagnostic for a hostile frame.
+            self::assertSame('WebSocket frame payload length out of bounds: ' . $tooLarge, $e->getMessage());
+        }
     }
 
     /**
@@ -446,7 +450,7 @@ final class WebSocketFrameCodecTest extends TestCase
         self::assertFalse($header['rsv1']);
         self::assertFalse($header['masked']);
 
-        // 7-bit masked: header + 4-byte mask key + payload; the key is surfaced for unmask().
+        // 7-bit masked: header + 4-byte mask key + payload; the key is surfaced for spanning-frame consumers.
         $masked = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'hello', true, 'ABCD');
         $header = WebSocketFrameCodec::parseFrameHeader($masked);
         self::assertNotNull($header);
@@ -495,16 +499,21 @@ final class WebSocketFrameCodecTest extends TestCase
         $tooLarge = 64 * 1024 * 1024 + 1; // MAX_FRAME_PAYLOAD + 1
         $maskedHeaderWithoutKey = pack('CC', 0x82, 0x80 | 127) . pack('J', $tooLarge);
 
-        $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessageMatches('/payload length out of bounds/');
-        WebSocketFrameCodec::parseFrameHeader($maskedHeaderWithoutKey);
+        try {
+            WebSocketFrameCodec::parseFrameHeader($maskedHeaderWithoutKey);
+            self::fail('Expected a ProtocolException for the oversized declared length');
+        } catch (ProtocolException $e) {
+            // Full-message pin: the offending length is the operator's diagnostic for a hostile frame.
+            self::assertSame('WebSocket frame payload length out of bounds: ' . $tooLarge, $e->getMessage());
+        }
     }
 
     /**
-     * Verifies unmask() inverts the masking encode() applies: the masked payload bytes taken from an
-     * encoded client frame unmask back to the original payload with the frame's key (#164).
+     * Verifies the @deprecated unmask() helper still inverts the masking encode() applies (#164):
+     * it is production-dead (masked server frames are a terminal RFC 6455 5.1 violation) but public
+     * since 2.7.x, so it stays behavior-pinned until a major release removes it.
      */
-    public function testUnmaskInvertsEncodeMasking(): void
+    public function testDeprecatedUnmaskStillInvertsEncodeMasking(): void
     {
         $payload = random_bytes(133);
         $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, true, "\x01\x7F\xAA\x00");

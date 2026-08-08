@@ -1,7 +1,10 @@
 # A stop that races a recreate whose attempts then exhaust emits a spurious terminal "recreate failed" error for a deliberately stopped consumer
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified — found
-  independently by two lenses)
+- **Status:** FIXED (2026-08-08) — the recreate catch handles $state->stopped FIRST: it releases the never-
+  adopted fresh inbox best-effort and returns silently, mirroring the post-create stopped
+  teardown; the deferral's now-redundant !stopped clause was removed. Pinned by
+  `testStopRacingRecreateWhoseAttemptsExhaustEmitsNoTerminalError` (wire-triggered stop, all
+  attempts fail while Open; pre-fix red on the spurious terminal error).
 - **Severity:** minor
 - **Type:** spurious operator signal (false alarm)
 - **Area:** JetStream ordered consumers / stopOrderedConsumer (round-1 fix follow-up)

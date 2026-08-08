@@ -111,16 +111,13 @@ final class KeyValueBucket
             // without it, sourced entries sit in the stream under the origin subject where every
             // read/watch path (filtered on this bucket's prefix) is blind to them (nats.go parity).
             $subjects = ['$KV.' . $this->bucket . '.>'];
+            $mirror = null;
             if (isset($mapped['mirror'])) {
                 $mirror = $this->kvMirrorConfig($mapped['mirror']);
                 $mapped['mirror'] = $mirror;
                 // nats.go CreateKeyValue parity: mirrors answer origin DIRECT.GET traffic.
                 $mapped['mirror_direct'] ??= true;
                 $subjects = [];
-                // This handle now fronts a mirror: writes go through to the ORIGIN bucket's
-                // subjects (the mirror stream ingests nothing itself), reads follow nats.go's
-                // prefix rules. bind() applies the same resolution for attached handles.
-                $this->applyMirrorPrefixes($mirror);
             }
             if (isset($mapped['sources']) && is_array($mapped['sources'])) {
                 $mapped['sources'] = array_values(array_map(
@@ -129,22 +126,48 @@ final class KeyValueBucket
                 ));
             }
 
-            return $this->jetStream->createStream(
+            $info = $this->jetStream->createStream(
                 $this->streamName(),
                 $subjects,
                 array_merge($defaults, $mapped),
             )->await();
+
+            // A handle must never carry mirror prefixes from a configuration the server did not
+            // confirm - and, symmetrically, a FAILED create() must never disturb prefixes the
+            // server DID confirm earlier (via a prior create() or bind()): a working mirror handle
+            // whose re-create fails would otherwise go silently blind (reads at the wrong
+            // subjects, writes into a stream that ingests nothing). So the reset happens only
+            // HERE, after the await proved the new configuration, atomically with the re-apply -
+            // no suspension point separates them, mirroring bind()'s reset placement
+            // (nats.go builds the KV handle only from a successful create - mapStreamToKVS parity).
+            $this->readPrefix = null;
+            $this->writePrefix = null;
+            if ($mirror !== null) {
+                // The mirror is CONFIRMED server-side: this handle now fronts it - writes go
+                // through to the ORIGIN bucket's subjects (the mirror stream ingests nothing
+                // itself), reads follow nats.go's prefix rules. bind() applies the same
+                // resolution for attached handles.
+                $this->applyMirrorPrefixes($mirror);
+            }
+
+            return $info;
         });
     }
 
     /**
-     * Normalizes a KV SOURCE entry per nats.go/ADR-57: a bare bucket name (or a `bucket` key) becomes
-     * the backing `KV_`-prefixed stream name, a `domain` is converted to the external API prefix, and
-     * - unless the caller supplied its own `subject_transforms` (full-control pass-through: the name
-     * is then used as-is, allowing non-KV streams) - the mandatory KV transform is attached so
-     * sourced records are re-subjected into THIS bucket's prefix:
+     * Normalizes a KV SOURCE entry per nats.go/ADR-57: the referenced bucket becomes the backing
+     * `KV_`-prefixed stream name, a `domain` is converted to the external API prefix, and - unless
+     * the caller supplied its own `subject_transforms` (full-control pass-through: the name is then
+     * used as-is, allowing non-KV streams) - the mandatory KV transform is attached so sourced
+     * records are re-subjected into THIS bucket's prefix:
      * `{src: "$KV.<srcBucket>.>", dest: "$KV.<thisBucket>.>"}`. The transform is skipped only for an
      * external source of the SAME bucket name, whose subjects already match (nats.go rule).
+     *
+     * Name resolution: the `bucket` alias explicitly declares a KV BUCKET (nats.go has no such
+     * alias), so its value is `KV_`-prefixed UNCONDITIONALLY - a bucket legitimately named `KV_x`
+     * maps to its backing stream `KV_KV_x`, never to bucket x's stream. A bare-string entry and the
+     * `name` key follow nats.go's ambiguous stream-name semantics instead: a value already starting
+     * with `KV_` is taken as the backing stream name itself (idempotent, no double prefix).
      *
      * @param string|array<string,mixed> $source
      * @return array<string,mixed>
@@ -155,9 +178,10 @@ final class KeyValueBucket
             $source = ['name' => $source];
         }
 
-        $fromBucketAlias = isset($source['bucket']);
-        if ($fromBucketAlias) {
-            $source['name'] = (string) $source['bucket'];
+        $bucketAlias = null;
+        if (isset($source['bucket'])) {
+            $bucketAlias = (string) $source['bucket'];
+            $source['name'] = 'KV_' . $bucketAlias;
             unset($source['bucket']);
         }
 
@@ -165,22 +189,21 @@ final class KeyValueBucket
 
         // Caller-supplied transforms pass through verbatim - full control of the source (e.g. a
         // non-KV stream); the name is NOT KV_-prefixed in this branch (nats.go jetstream parity).
-        // Exception: the `bucket` alias explicitly declares a KV bucket (nats.go has no such
-        // alias), so it is still translated to the backing stream name.
+        // The `bucket` alias was already translated to its backing stream name above.
         if (isset($source['subject_transforms']) && $source['subject_transforms'] !== []) {
-            if ($fromBucketAlias && !str_starts_with((string) ($source['name'] ?? ''), 'KV_')) {
-                $source['name'] = 'KV_' . (string) $source['name'];
-            }
-
             return $source;
         }
 
-        $name = (string) ($source['name'] ?? '');
-        if (str_starts_with($name, 'KV_')) {
-            $sourceBucket = substr($name, 3);
+        if ($bucketAlias !== null) {
+            $sourceBucket = $bucketAlias;
         } else {
-            $sourceBucket = $name;
-            $source['name'] = 'KV_' . $name;
+            $name = (string) ($source['name'] ?? '');
+            if (str_starts_with($name, 'KV_')) {
+                $sourceBucket = substr($name, 3);
+            } else {
+                $sourceBucket = $name;
+                $source['name'] = 'KV_' . $name;
+            }
         }
 
         if (!isset($source['external']) || $sourceBucket !== $this->bucket) {
@@ -194,10 +217,15 @@ final class KeyValueBucket
     }
 
     /**
-     * Normalizes a KV MIRROR entry: `KV_`-prefixes the name (or `bucket` key) and converts a
-     * `domain` to the external API prefix. Unlike sources, a mirror gets NO subject transforms -
-     * mirrored records keep the ORIGIN's subjects, which is why the runtime prefixes are
-     * re-resolved via {@see applyMirrorPrefixes()} (nats.go parity).
+     * Normalizes a KV MIRROR entry: resolves the origin's backing `KV_`-prefixed stream name and
+     * converts a `domain` to the external API prefix. Unlike sources, a mirror gets NO subject
+     * transforms - mirrored records keep the ORIGIN's subjects, which is why the runtime prefixes
+     * are re-resolved via {@see applyMirrorPrefixes()} (nats.go parity).
+     *
+     * Name resolution matches {@see kvSourceConfig()}: the `bucket` alias declares a KV BUCKET and
+     * is prefixed unconditionally (bucket `KV_x` mirrors stream `KV_KV_x`), while a bare string and
+     * the `name` key keep nats.go's stream-name semantics (a `KV_`-prefixed value is already the
+     * backing stream name).
      *
      * @param string|array<string,mixed> $mirror
      * @return array<string,mixed>
@@ -209,18 +237,16 @@ final class KeyValueBucket
         }
 
         if (isset($mirror['bucket'])) {
-            $mirror['name'] = (string) $mirror['bucket'];
+            $mirror['name'] = 'KV_' . (string) $mirror['bucket'];
             unset($mirror['bucket']);
+        } else {
+            $name = (string) ($mirror['name'] ?? '');
+            if (!str_starts_with($name, 'KV_')) {
+                $mirror['name'] = 'KV_' . $name;
+            }
         }
 
-        $mirror = $this->convertKvDomain($mirror);
-
-        $name = (string) ($mirror['name'] ?? '');
-        if (!str_starts_with($name, 'KV_')) {
-            $mirror['name'] = 'KV_' . $name;
-        }
-
-        return $mirror;
+        return $this->convertKvDomain($mirror);
     }
 
     /**
@@ -312,6 +338,11 @@ final class KeyValueBucket
                 ));
             }
 
+            // Re-resolve from the CONFIRMED server config: clear first so a handle previously
+            // fronting a mirror (created or bound earlier) drops its stale prefixes when the
+            // stream it re-binds to is no longer a mirror.
+            $this->readPrefix = null;
+            $this->writePrefix = null;
             if (isset($config['mirror']) && is_array($config['mirror'])) {
                 $this->applyMirrorPrefixes($config['mirror']);
             }

@@ -97,6 +97,32 @@ final class CredentialsParserTest extends TestCase
         CredentialsParser::fromFile('/nonexistent/path/user.creds');
     }
 
+    /**
+     * Pins the defense-in-depth contract of extractBlock(): the block type is matched
+     * LITERALLY (preg_quote), never as a regex. A block type containing a regex
+     * metacharacter ('A.B') must not match markers whose text merely regex-matches it
+     * ('AXB') — neither on the BEGIN marker nor on the END marker.
+     *
+     * The public block types ('NATS USER JWT', 'USER NKEY SEED') contain no
+     * metacharacters, so this contract is only reachable through the private method.
+     */
+    public function testExtractBlockTreatsBlockTypeLiterallyOnBothMarkers(): void
+    {
+        $method = new \ReflectionMethod(CredentialsParser::class, 'extractBlock');
+
+        // BEGIN marker regex-matches 'A.B' but is not literally 'A.B': must NOT match.
+        $beginMetachar = "-----BEGIN AXB-----\ncontent\n-----END A.B-----";
+        self::assertNull($method->invoke(null, $beginMetachar, 'A.B'));
+
+        // END marker regex-matches 'A.B' but is not literally 'A.B': must NOT match.
+        $endMetachar = "-----BEGIN A.B-----\ncontent\n-----END AXB-----";
+        self::assertNull($method->invoke(null, $endMetachar, 'A.B'));
+
+        // Literal metacharacter markers on both sides DO match.
+        $literal = "-----BEGIN A.B-----\ncontent\n-----END A.B-----";
+        self::assertSame('content', $method->invoke(null, $literal, 'A.B'));
+    }
+
     public function testFromFileReadsValidCredsFile(): void
     {
         $contents = <<<'CREDS'

@@ -1,7 +1,9 @@
 # addLink() allows linking over a DELETED object's tombstone — nats.go rejects it with ErrObjectAlreadyExists, contradicting the "exact nats.go guard shape" claim
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified against
-  nats.go v1.52.0 source, both legacy and jetstream APIs)
+- **Status:** FIXED (2026-08-08) — assertNameFreeForLink() now matches nats.go exactly: any non-link record
+  blocks, deleted or not; message updated to 'an object record with that name already exists'.
+  Pinned by `testAddLinkRejectsDeletedTombstoneName` (pre-fix red: the link was created over the
+  tombstone). The round-1 issue's 'exact nats.go guard shape' claim is accurate again.
 - **Severity:** minor
 - **Type:** cross-client behavioral divergence / incorrect parity claim in docs
 - **Area:** ObjectStore links (round-1 fix follow-up)

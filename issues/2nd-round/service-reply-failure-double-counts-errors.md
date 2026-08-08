@@ -1,7 +1,10 @@
 # Reply-publish failure catch double-counts endpoint errors — one request can add 2 to num_errors, so $SRV.STATS can report num_errors > num_requests
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified with an
-  empirical repro: num_requests=1, num_errors=2)
+- **Status:** FIXED (2026-08-08) — the reply-publish-failure catch gates errors++/request_error on
+  $errorHeaders === null (handler succeeded, reply write is the request's sole fault) and always
+  records lastError; num_errors can no longer exceed num_requests. Pinned by
+  `testHandlerErrorWithFailedErrorReplyCountsSingleError` (pre-fix red: num_errors 2) plus the
+  preserved handler-success arm.
 - **Severity:** minor
 - **Type:** ADR-32 stats correctness / observer-event ordering
 - **Area:** micro services (round-1 fix follow-up)

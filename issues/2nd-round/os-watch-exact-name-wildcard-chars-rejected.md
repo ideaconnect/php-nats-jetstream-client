@@ -1,6 +1,9 @@
 # ObjectStore watch() rejects exact names containing '*'/'>' even though such names are legal, stored base64url-encoded, and would filter correctly
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — watch() gained `bool $exactName = false`: when true the pattern is always
+  base64url-encoded (names containing '*' or '>' work); the default rejection message now names
+  the escape hatch. Pinned by `testWatchExactNameEncodesNameContainingWildcardChars` (pre-fix
+  red).
 - **Severity:** minor
 - **Type:** self-contradictory API restriction
 - **Area:** ObjectStore watch (round-1 fix follow-up)

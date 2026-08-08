@@ -1,7 +1,13 @@
 # Control-answer cap drops the NEWEST answers — including the RFC 6455 5.5.1 required Close echo — and fires with zero backpressure on a healthy socket
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified, empirically
-  reproduced with a 17-ping + Close read batch)
+- **Status:** FIXED (2026-08-08) — the counted-fiber cap was replaced by answer SLOTS drained by a single
+  writer fiber: a latest-pong slot (a newer ping's payload replaces a queued-but-unsent pong, RFC
+  6455 5.5.3) and a dedicated always-flushed OP_CLOSE echo slot (RFC 6455 5.5.1);
+  MAX_PENDING_CONTROL_ANSWERS removed — constant memory by construction. Pinned by
+  `testReadLineCoalescesPingFloodIntoSinglePongForNewestPing`,
+  `testReadLineFlushesCloseEchoAfterCoalescedPingFlood` (the exact 17-pings+Close scenario), and
+  `testQueuedControlAnswerIsDroppedSilentlyOnceSocketReleased` — all verified red pre-fix; the old
+  oldest-16 pin was rewritten.
 - **Severity:** minor
 - **Type:** spec correctness (RFC 6455 5.5.1 MUST / 5.5.3 inversion) / partial regression of #161
 - **Area:** WebSocket transport

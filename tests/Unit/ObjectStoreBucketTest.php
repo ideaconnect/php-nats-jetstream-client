@@ -908,6 +908,45 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
+     * A DELETED object's tombstone blocks addLink() exactly like a live object (nats.go parity:
+     * AddLink reads the info with ShowDeleted and returns ErrObjectAlreadyExists for any non-link
+     * record) - put -> delete -> addLink on the same name must throw, not create the link.
+     * Pre-fix the tombstone passed the guard, silently diverging from nats.go on shared buckets.
+     */
+    public function testAddLinkRejectsDeletedTombstoneName(): void
+    {
+        $tombstone = $this->metaGetResponse('shortcut', ['nuid' => '', 'size' => 0, 'chunks' => 0, 'deleted' => true]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            // Name check: "shortcut" holds a DELETED tombstone (STREAM.MSG.GET envelope).
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($tombstone), $tombstone),
+            // Only consumed by the PRE-FIX path (tombstone passes the guard): a live target and a
+            // publish ack would let the link complete, turning the missing rejection into a fail().
+            $this->directMetaReply('real.bin', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('abc')], 2),
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();
+            self::fail('a link over a deleted tombstone must be rejected (nats.go ErrObjectAlreadyExists)');
+        } catch (JetStreamException $e) {
+            // Pin the contract (the NAME is blocked with the already-exists error), not the exact
+            // phrasing - a message reword must not break this test (3rd-round review).
+            self::assertStringContainsString('shortcut', $e->getMessage());
+            self::assertStringContainsString('already exists', $e->getMessage());
+        }
+
+        self::assertStringNotContainsString('HPUB $O.assets.M.', implode('', $transport->writes), 'no link meta record may be written');
+    }
+
+    /**
      * addLink() must reject a deleted (or absent) target and a target that is itself a link -
      * both dangle by construction (nats.go parity).
      */
@@ -1327,6 +1366,66 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
+     * The list() 503 fallback must query the leader by the ENUMERATED meta subject verbatim, so a
+     * record stored under a NON-CANONICAL token survives the fallback: "QQ" (unpadded base64url of
+     * "A", as some non-Go clients write it) decodes to "A" but re-encodes padded as "QQ==" - a
+     * different subject the leader 404s on. Pre-fix the fallback round-tripped token -> name ->
+     * padded re-encode, silently dropping such records from the listing while the Direct Get paths
+     * (which never rebuild the subject) returned them.
+     */
+    public function testListFallbackQueriesLeaderByEnumeratedSubjectForNonCanonicalToken(): void
+    {
+        // "QQ" = unpadded base64url("A"); canonical padded form would be "QQ==".
+        $subjectsReply = '{"state":{"subjects":{"$O.assets.M.QQ":1}}}';
+        $metaJson = (string) json_encode([
+            'name' => 'A',
+            'bucket' => 'assets',
+            'nuid' => 'nA',
+            'size' => 1,
+            'chunks' => 1,
+            'mtime' => '2030-01-01T00:00:00Z',
+            'deleted' => false,
+        ], JSON_THROW_ON_ERROR);
+        $envelope = (string) json_encode([
+            'message' => [
+                'subject' => '$O.assets.M.QQ',
+                'seq' => 6,
+                'data' => base64_encode($metaJson),
+            ],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            // 2.10 server: no batched Direct Get -> the per-subject fan-out path under test.
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($subjectsReply), $subjectsReply),  // STREAM.INFO subjects page 1
+            sprintf("MSG _INBOX.a2 1 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'),  // page 2: empty -> pagination ends
+            $this->directStatusReply(1, 503, 'No Responders'),                               // Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),            // STREAM.MSG.GET fallback
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $objects = $client->jetStream()->objectStore('assets')->list()->await();
+
+        self::assertCount(1, $objects, 'the non-canonical token\'s record must survive the fallback');
+        self::assertSame('A', $objects[0]->name);
+        self::assertSame(6, $objects[0]->revision);
+
+        // The leader read carries the ENUMERATED subject byte-for-byte - never a padded re-encode.
+        $msgGetWrites = array_values(array_filter(
+            $transport->writes,
+            static fn(string $w): bool => str_contains($w, '$JS.API.STREAM.MSG.GET.OBJ_assets'),
+        ));
+        self::assertCount(1, $msgGetWrites);
+        self::assertStringContainsString('"last_by_subj":"$O.assets.M.QQ"', $msgGetWrites[0]);
+        self::assertStringNotContainsString('QQ==', $msgGetWrites[0]);
+    }
+
+    /**
      * Verifies info returns null when JetStream reports the object metadata is not found.
      */
     public function testInfoReturnsNullWhenNotFound(): void
@@ -1523,10 +1622,64 @@ final class ObjectStoreBucketTest extends TestCase
             'an exact-name pattern must be base64url-encoded into the filter subject',
         );
 
-        // Wildcards can never match encoded tokens: loud rejection, not a silent no-op watch.
-        $this->expectException(JetStreamException::class);
-        $this->expectExceptionMessage('wildcard');
-        $bucket->watch(static function (ObjectInfo $info): void {}, 'logs-*')->await();
+        // Wildcards can never match encoded tokens: loud rejection, not a silent no-op watch. The
+        // message is the operator's ONLY explanation of why the watch cannot work and what to do
+        // instead, so it is pinned VERBATIM.
+        try {
+            $bucket->watch(static function (ObjectInfo $info): void {}, 'logs-*')->await();
+            self::fail('a wildcard watch pattern must be rejected');
+        } catch (JetStreamException $e) {
+            self::assertSame(
+                'Object Store watch patterns cannot use subject wildcards: meta subjects encode '
+                . 'object names (base64url), so a wildcard never matches. Use ">" for all objects '
+                . 'or an exact object name (pass exactName: true for a name that itself contains '
+                . '"*" or ">"), and filter client-side for anything else.',
+                $e->getMessage(),
+            );
+        }
+    }
+
+    /**
+     * Object names may legally contain '*'/'>' (they are stored as base64url tokens), so watch()
+     * offers `exactName: true` to bypass the wildcard guard and ALWAYS encode the pattern as a
+     * name - pre-fix such names were watchable only via '>' plus client-side filtering, while the
+     * guard's own message told the caller to pass "an exact object name". The default (no
+     * exactName) still rejects the pattern, with the message naming the escape hatch.
+     */
+    public function testWatchExactNameEncodesNameContainingWildcardChars(): void
+    {
+        $createReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH","config":{"deliver_subject":"_INBOX.JS.ORD.x","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+        $bucket = $client->jetStream()->objectStore('assets');
+
+        // Without the escape the name still reads as a wildcard pattern and is rejected - and the
+        // rejection tells the caller how to watch such a name.
+        try {
+            $bucket->watch(static function (ObjectInfo $info): void {}, 'report>2024')->await();
+            self::fail('a ">"-containing pattern must be rejected without exactName');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('wildcard', $e->getMessage());
+            self::assertStringContainsString('exactName: true', $e->getMessage());
+        }
+        self::assertStringNotContainsString('CONSUMER.CREATE', implode('', $transport->writes), 'the rejected watch must not create a consumer');
+
+        // With exactName the pattern is a NAME: the consumer filter carries the encoded token.
+        $bucket->watch(static function (ObjectInfo $info): void {}, 'report>2024', exactName: true)->await();
+        self::assertStringContainsString(
+            '"filter_subject":"$O.assets.M.' . $this->encodeName('report>2024') . '"',
+            implode('', $transport->writes),
+            'exactName must base64url-encode the name into the meta filter',
+        );
     }
 
     public function testWatchWithOptionsRequestsSnapshotDeliverPolicy(): void
@@ -1888,6 +2041,51 @@ final class ObjectStoreBucketTest extends TestCase
         $writes = implode('', $transport->writes);
         self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
         self::assertStringNotContainsString('PUB $O.assets.M.', $writes);
+    }
+
+    /**
+     * ONE seq-less ack (seq 0, a success-shaped PubAck without `seq`) must not disable the order
+     * check for the REST of the upload: the unverifiable pair is skipped, later pairs are still
+     * checked, and an inversion after the gap aborts the upload. Pre-fix the check returned at the
+     * first non-positive sequence, silently reverting all later chunks to corrupt-as-success.
+     */
+    public function testPutOrderCheckStillDetectsInversionAfterSeqlessAck(): void
+    {
+        $seqlessAck = '{"stream":"OBJ_assets","seq":0,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            // Chunk acks in chunk order: seq 1, NO seq (0), seq 5, then the INVERSION seq 3.
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($seqlessAck), $seqlessAck),
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(5)), $this->pubAck(5)),
+            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            // Purge of the partial NUID (abandonPartialUpload).
+            sprintf("MSG _INBOX.f 6 %d\r\n%s\r\n", strlen('{"success":true,"purged":4}'), '{"success":true,"purged":4}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // chunkSize 4, 14 bytes -> 4 pipelined chunks matching the four acks above.
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+
+        try {
+            $bucket->put('multi.bin', 'abcdefghijklmn')->await();
+            self::fail('the inversion after the seq-less ack must abort the upload');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('reordered', $e->getMessage());
+            // The violating pair straddles the unreported sequence: 5 (chunk 3) then 3 (chunk 4).
+            self::assertStringContainsString('ack sequence 3 after 5', $e->getMessage());
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes, 'the partial NUID must be purged');
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes, 'no meta record may be published for a corrupt upload');
     }
 
     /**
@@ -3337,5 +3535,359 @@ final class ObjectStoreBucketTest extends TestCase
 
         $this->expectException(\InvalidArgumentException::class);
         new ObjectStoreWatchOptions(idleHeartbeat: -1);
+    }
+
+    /**
+     * addLink()'s name-free guard must PROPAGATE a lookup failure, never swallow it: a transient
+     * error read as "name free" would let the rollup meta publish overwrite a live object - the
+     * exact loss the guard exists to prevent. Nothing may be published after the failed lookup.
+     */
+    public function testAddLinkPropagatesNameLookupErrorAndPublishesNothing(): void
+    {
+        $lookupError = '{"error":{"code":500,"description":"name lookup failed"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($lookupError), $lookupError),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();
+            self::fail('a failed name-free lookup must fail the addLink, not read as "name free"');
+        } catch (JetStreamException $e) {
+            self::assertSame('name lookup failed', $e->getMessage());
+            self::assertSame(500, $e->getCode());
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertStringNotContainsString('DIRECT.GET', $writes, 'the target lookup must never run after the failed guard');
+        self::assertStringNotContainsString('HPUB $O.assets.M.', $writes, 'no link meta may be published after the failed guard');
+    }
+
+    /**
+     * The upload pipeline window is a hard in-flight bound: when the flush of a FULL window
+     * (exactly UPLOAD_PIPELINE_DEPTH = 16 chunks) fails, NO further chunk is published - the 17th
+     * chunk must never reach the wire past the failed window.
+     */
+    public function testPutStopsPublishingChunksWhenAWindowFlushFails(): void
+    {
+        $windowError = '{"error":{"code":400,"description":"window flush rejected"}}';
+
+        $reads = [sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound())];
+        for ($i = 1; $i <= 15; $i++) {
+            $reads[] = sprintf("MSG _INBOX.c%d 1 %d\r\n%s\r\n", $i, strlen($this->pubAck($i)), $this->pubAck($i));
+        }
+        // The 16th chunk of the full window is rejected -> the flush fails.
+        $reads[] = sprintf("MSG _INBOX.e 1 %d\r\n%s\r\n", strlen($windowError), $windowError);
+        $reads[] = sprintf("MSG _INBOX.p 1 %d\r\n%s\r\n", strlen('{"success":true,"purged":16}'), '{"success":true,"purged":16}');
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, $reads);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 1);
+
+        try {
+            $bucket->put('many.bin', str_repeat('x', 17))->await();
+            self::fail('the failed window flush must abort the upload');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('window flush rejected', $e->getMessage());
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertSame(16, substr_count($writes, 'PUB $O.assets.C.'), 'exactly one full window may reach the wire; chunk 17 must be gated on the flush');
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes);
+    }
+
+    /**
+     * putStream() twin of the pipeline-window bound above: a failed flush of the full 16-chunk
+     * window stops the streaming upload before chunk 17 is published.
+     */
+    public function testPutStreamStopsPublishingChunksWhenAWindowFlushFails(): void
+    {
+        $windowError = '{"error":{"code":400,"description":"window flush rejected"}}';
+
+        $reads = [sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound())];
+        for ($i = 1; $i <= 15; $i++) {
+            $reads[] = sprintf("MSG _INBOX.c%d 1 %d\r\n%s\r\n", $i, strlen($this->pubAck($i)), $this->pubAck($i));
+        }
+        $reads[] = sprintf("MSG _INBOX.e 1 %d\r\n%s\r\n", strlen($windowError), $windowError);
+        $reads[] = sprintf("MSG _INBOX.p 1 %d\r\n%s\r\n", strlen('{"success":true,"purged":16}'), '{"success":true,"purged":16}');
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, $reads);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 1);
+        $blocks = [str_repeat('y', 17)];
+        $i = 0;
+
+        try {
+            $bucket->putStream('many.bin', static function () use (&$i, $blocks): ?string {
+                return $blocks[$i++] ?? null;
+            })->await();
+            self::fail('the failed window flush must abort the streaming upload');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('window flush rejected', $e->getMessage());
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertSame(16, substr_count($writes, 'PUB $O.assets.C.'), 'the streaming path must gate chunk 17 on the full window\'s flush too');
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes);
+    }
+
+    /**
+     * putStream() runs the same upload-order guard as put(): acked sequences that are not strictly
+     * increasing in chunk order abort the streaming upload with the full diagnostic, purge the
+     * partial NUID, and never publish meta. The message is pinned VERBATIM - it is the operator's
+     * only signal that a reported-success upload would have been corrupt.
+     */
+    public function testPutStreamAbortsAndPurgesWhenChunkAcksArriveReordered(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            // Chunk order [seq 2, seq 1]: chunk #2 was stored ahead of chunk #1.
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
+            sprintf("MSG _INBOX.p 1 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+        $blocks = ['abcd', 'efgh'];
+        $i = 0;
+
+        try {
+            $bucket->putStream('s.bin', static function () use (&$i, $blocks): ?string {
+                return $blocks[$i++] ?? null;
+            })->await();
+            self::fail('a reordered streaming upload must abort, not report success');
+        } catch (JetStreamException $e) {
+            self::assertSame(
+                'Object upload for "s.bin" was reordered on the wire (ack sequence 1 after 2): a '
+                . 'retried chunk publish landed out of order, which would corrupt the stored object. '
+                . 'The partial upload is purged - retry the upload.',
+                $e->getMessage(),
+            );
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes, 'no meta record may be published for a corrupt streaming upload');
+    }
+
+    /**
+     * The order guard is STRICTLY increasing: a REPEATED ack sequence (the stream cannot store two
+     * chunks at one sequence - a duplicate means a lost/deduped chunk) aborts the upload exactly
+     * like an inversion. `<=` at the boundary, not `<`.
+     */
+    public function testPutAbortsWhenAckSequenceRepeats(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($this->pubAck(5)), $this->pubAck(5)),
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($this->pubAck(5)), $this->pubAck(5)),
+            sprintf("MSG _INBOX.p 1 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+
+        try {
+            $bucket->put('dup.bin', 'abcdefgh')->await();
+            self::fail('a repeated ack sequence must abort the upload (strictly increasing guard)');
+        } catch (JetStreamException $e) {
+            self::assertSame(
+                'Object upload for "dup.bin" was reordered on the wire (ack sequence 5 after 5): a '
+                . 'retried chunk publish landed out of order, which would corrupt the stored object. '
+                . 'The partial upload is purged - retry the upload.',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', implode('', $transport->writes));
+    }
+
+    /**
+     * abandonPartialUpload() must DRAIN the still-in-flight chunk publishes BEFORE purging: a
+     * sibling chunk sitting in publish()'s 503-retry delay would otherwise re-publish AFTER the
+     * purge and re-orphan its chunk under the meta-less NUID - the exact leak the cleanup exists to
+     * prevent. Pinned on the wire: the retried chunk PUB lands BEFORE the purge request.
+     */
+    public function testAbandonedUploadDrainsInFlightRetryBeforePurging(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        // Token-aware responder: chunk #1's ack is a hard 400 (fails the upload); chunk #2's first
+        // request draws a no-responders STATUS (the transport-level 503 publishWithRetry() actually
+        // retries after its delay); the retry is acked cleanly; lookup/purge answer immediately.
+        $base = null;
+        $chunkPubs = 0;
+        $transport->onWrite = static function (string $bytes) use (&$base, &$chunkPubs): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1);
+                }
+
+                return [];
+            }
+
+            if (!str_starts_with($head, 'PUB ') || $base === null) {
+                return [];
+            }
+
+            $parts = explode(' ', $head);
+            $subject = $parts[1] ?? '';
+            $replyTo = $parts[2] ?? '';
+            $msg = static fn(string $rt, string $body): string => sprintf("MSG %s 1 %d\r\n%s\r\n", $rt, strlen($body), $body);
+            $noResponders = static function (string $rt): string {
+                $status = "NATS/1.0 503\r\n\r\n";
+
+                return sprintf("HMSG %s 1 %d %d\r\n%s\r\n", $rt, strlen($status), strlen($status), $status);
+            };
+
+            if (str_starts_with($subject, '$JS.API.STREAM.MSG.GET')) {
+                return [$msg($replyTo, '{"error":{"code":404,"description":"message not found"}}')];
+            }
+
+            if (str_starts_with($subject, '$JS.API.STREAM.PURGE')) {
+                return [$msg($replyTo, '{"success":true,"purged":2}')];
+            }
+
+            if (str_starts_with($subject, '$O.assets.C.')) {
+                $chunkPubs++;
+
+                return [match ($chunkPubs) {
+                    1 => $msg($replyTo, '{"error":{"code":400,"description":"chunk one rejected"}}'),
+                    2 => $noResponders($replyTo),
+                    default => $msg($replyTo, '{"stream":"OBJ_assets","seq":9,"duplicate":false}'),
+                }];
+            }
+
+            return [];
+        };
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+
+        try {
+            $bucket->put('drain.bin', 'abcdefgh')->await();
+            self::fail('the rejected chunk must abort the upload');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('chunk one rejected', $e->getMessage(), 'the ORIGINAL failure must surface');
+        }
+
+        // Locate the purge request among the recorded frames and count the chunk publishes that
+        // PRECEDED it: the drain must have let chunk #2's delayed retry (the 3rd chunk PUB) land
+        // before the purge was issued - otherwise the retry re-orphans its chunk post-purge.
+        $purgeIndex = null;
+        foreach ($transport->writes as $index => $frame) {
+            if (str_contains($frame, '$JS.API.STREAM.PURGE.OBJ_assets')) {
+                $purgeIndex = $index;
+                break;
+            }
+        }
+        self::assertNotNull($purgeIndex, 'the partial NUID must be purged');
+
+        $chunkPubsBeforePurge = 0;
+        foreach ($transport->writes as $index => $frame) {
+            if ($index < $purgeIndex && str_starts_with($frame, 'PUB $O.assets.C.')) {
+                $chunkPubsBeforePurge++;
+            }
+        }
+        self::assertSame(3, $chunkPubsBeforePurge, 'both original publishes AND the drained 503-retry must precede the purge');
+
+        // Quiesce: no fibers/timers may leak into later tests.
+        $client->disconnect()->await();
+        foreach (\Revolt\EventLoop::getIdentifiers() as $id) {
+            \Revolt\EventLoop::cancel($id);
+        }
+    }
+
+    /**
+     * list() batched fast path: a 503 (the STREAM lacks Direct Get - allow_direct disabled /
+     * legacy interop bucket) falls through to the per-subject fan-out instead of failing the
+     * enumeration, exactly at the 503 code.
+     */
+    public function testListBatched503FallsBackToPerSubjectFanOut(): void
+    {
+        $logoEnc = $this->encodeName('logo.txt');
+        $streamInfo = (string) json_encode([
+            'config' => ['name' => 'OBJ_assets'],
+            'state' => ['subjects' => ['$O.assets.M.' . $logoEnc => 1]],
+        ], JSON_THROW_ON_ERROR);
+        $emptyPage = '{"state":{"subjects":{}}}';
+        $batch503 = "NATS/1.0 503 No Responders Available For Request\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // The batched request's reply arrives on the DGET inbox (sid 2: mux SUB=1, DGET SUB=2).
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.DGET' => [
+                sprintf("HMSG _INBOX.JS.DGET.x 2 %d %d\r\n%s\r\n", strlen($batch503), strlen($batch503), $batch503),
+            ],
+        ];
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),  // metaSubjects() page 1
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),     // terminator page
+            // Per-subject fan-out Direct Get answers the meta record.
+            $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 1),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $objects = $client->jetStream()->objectStore('assets')->list()->await();
+
+        self::assertCount(1, $objects, 'the batched 503 must fall through to the fan-out');
+        self::assertSame('logo.txt', $objects[0]->name);
+        self::assertStringContainsString(
+            '"last_by_subj":"$O.assets.M.' . $logoEnc . '"',
+            implode('', $transport->writes),
+            'the fallback must query the meta record per subject',
+        );
     }
 }

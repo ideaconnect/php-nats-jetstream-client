@@ -33,6 +33,8 @@ use function Amp\delay;
 
 final class JetStreamContextTest extends TestCase
 {
+    private const INFO_2_12 = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
     /**
      * A subscription's idle-heartbeat watchdog (#113) is a live EventLoop timer that outlives a test
      * whose client is never disconnect()ed. Cancel every callback left registered so the shared loop
@@ -4127,13 +4129,17 @@ final class JetStreamContextTest extends TestCase
      * watchdog never fires - and with ack-none or max_deliver=1 nothing redelivers, making the
      * gap PERMANENT and previously invisible on every channel (the heartbeat frames were swallowed
      * before the user handler could inspect them). The mismatch must surface via the error
-     * listener; a matching heartbeat must NOT false-positive.
+     * listener; a matching heartbeat must NOT false-positive. The signal is ONE-SHOT PER GAP
+     * EPISODE: a second heartbeat reporting the same persistent gap must not spam a second report,
+     * and a delivery that advances the local sequence re-arms it so a LATER gap episode is
+     * reported again (2nd-round review: neither property was pinned before).
      */
     public function testPushConsumerHeartbeatSequenceMismatchIsSurfaced(): void
     {
         $createReply = '{"stream_name":"EVENTS","name":"EPH1","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
         $hbOk = "NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 1\r\n\r\n";
         $hbGap = "NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 3\r\n\r\n";
+        $hbGap2 = "NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 6\r\n\r\n";
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -4146,6 +4152,12 @@ final class JetStreamContextTest extends TestCase
                 "MSG events.a 2 \$JS.ACK.EVENTS.EPH1.1.5.1.0.0 2\r\nm1\r\n",
                 sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbOk), strlen($hbOk), $hbOk),
                 sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbGap), strlen($hbGap), $hbGap),
+                // The SAME gap episode persists: this heartbeat must NOT produce a second report.
+                sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbGap), strlen($hbGap), $hbGap),
+                // A delivery advancing the local sequence (to 4) re-arms the one-shot ...
+                "MSG events.a 2 \$JS.ACK.EVENTS.EPH1.2.9.4.0.0 2\r\nm2\r\n",
+                // ... so a NEW gap episode (server at 6, client at 4) is reported again.
+                sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbGap2), strlen($hbGap2), $hbGap2),
             ],
         ];
         $this->muxReplies($transport, [
@@ -4167,18 +4179,19 @@ final class JetStreamContextTest extends TestCase
             consumerOptions: ['idle_heartbeat' => 5_000_000_000],
         )->await();
 
-        for ($i = 0; $i < 5; $i++) {
+        for ($i = 0; $i < 8; $i++) {
             $client->processIncoming()->await();
         }
         $client->disconnect()->await();
 
-        self::assertSame(['m1'], $received, 'heartbeats stay withheld from the user handler');
+        self::assertSame(['m1', 'm2'], $received, 'heartbeats stay withheld from the user handler');
         $mismatches = array_values(array_filter(
             $errors,
             static fn (\Throwable $e): bool => str_contains($e->getMessage(), 'consumer sequence mismatch'),
         ));
-        self::assertCount(1, $mismatches, 'the gap heartbeat must surface exactly one mismatch (the agreeing one must not)');
+        self::assertCount(2, $mismatches, 'exactly one report per gap episode: the repeated gap heartbeat must not spam, the post-delivery gap must re-report');
         self::assertStringContainsString('up to sequence 3 but only 1', $mismatches[0]->getMessage());
+        self::assertStringContainsString('up to sequence 6 but only 4', $mismatches[1]->getMessage(), 'the delivery must re-arm the signal for the second episode');
     }
 
     /**
@@ -4227,6 +4240,139 @@ final class JetStreamContextTest extends TestCase
             $errors,
             static fn (\Throwable $e): bool => str_contains($e->getMessage(), 'consumer sequence mismatch'),
         )), 'a pre-first-delivery heartbeat reporting history must not false-alarm');
+    }
+
+    /**
+     * ADR-9 replacement detection, heartbeat arm (2nd-round review): a heartbeat reporting
+     * Nats-Last-Consumer BELOW the session's tracked max means the consumer was replaced
+     * server-side (delete + recreate resets cseq to 1 - within one instance cseq only advances).
+     * Pre-fix the strictly-greater check ignored the regression AND the stale high-water mark then
+     * masked every real gap in the new instance until it passed the old maximum. The regression
+     * must surface exactly once (the rebase ends the episode: a repeat of the same report is
+     * silent), REBASE the tracker to the reported value, and re-arm the gap signal so a real gap
+     * in the NEW instance fires against ITS numbering.
+     */
+    public function testPushConsumerHeartbeatRegressionSignalsReplacementAndRebasesTracker(): void
+    {
+        $createReply = '{"stream_name":"EVENTS","name":"EPH1","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+        $hbBehind = "NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 1\r\n\r\n";
+        $hbNewGap = "NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 3\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.PUSH' => [
+                // Delivery fixes the session baseline at cseq 2 ...
+                "MSG events.a 2 \$JS.ACK.EVENTS.EPH1.1.6.2.0.0 2\r\nm1\r\n",
+                // ... then a heartbeat REGRESSES to 1: the consumer was replaced - one report.
+                sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbBehind), strlen($hbBehind), $hbBehind),
+                // The same report again is silent: the tracker was rebased to 1 (1 == 1).
+                sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbBehind), strlen($hbBehind), $hbBehind),
+                // A REAL gap in the NEW instance (server at 3, client rebased to 1) fires again;
+                // its "but only 1" (not "but only 2") pins that the tracker followed the new
+                // instance rather than the stale session max.
+                sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbNewGap), strlen($hbNewGap), $hbNewGap),
+            ],
+        ];
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $errors = [];
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        }), $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeEphemeralPushConsumer(
+            'EVENTS',
+            static function (NatsMessage $m) use (&$received): void {
+                $received[] = $m->payload;
+            },
+            consumerOptions: ['idle_heartbeat' => 5_000_000_000],
+        )->await();
+
+        for ($i = 0; $i < 6; $i++) {
+            $client->processIncoming()->await();
+        }
+        $client->disconnect()->await();
+
+        self::assertSame(['m1'], $received);
+        $mismatches = array_values(array_filter(
+            $errors,
+            static fn (\Throwable $e): bool => str_contains($e->getMessage(), 'consumer sequence mismatch'),
+        ));
+        self::assertCount(2, $mismatches, 'one replacement report (not two for the same regression) plus one gap report in the new instance');
+        self::assertStringContainsString('last delivered sequence 1 below the 2 already seen', $mismatches[0]->getMessage());
+        self::assertStringContainsString('appears to have been replaced', $mismatches[0]->getMessage());
+        self::assertStringContainsString('up to sequence 3 but only 1', $mismatches[1]->getMessage(), 'the tracker must have been REBASED to the reported value, re-arming gap detection for the new instance');
+    }
+
+    /**
+     * ADR-9 replacement detection, delivery arm (2nd-round review): a delivered consumerSequence
+     * LOWER than the session's tracked max means a replaced instance (redeliveries always get
+     * fresh cseqs, and the in-order transport makes heartbeat/delivery ordering exact) - the
+     * tracker must rebase to it SILENTLY so gap detection follows the new instance. Pre-fix the
+     * monotonic-max tracker ignored the regression and a subsequent heartbeat compared against
+     * the stale high-water mark.
+     */
+    public function testPushConsumerDeliveryRegressionRebasesTrackerSilently(): void
+    {
+        $createReply = '{"stream_name":"EVENTS","name":"EPH1","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+        $hbNewGap = "NATS/1.0 100 Idle Heartbeat\r\nNats-Last-Consumer: 2\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.PUSH' => [
+                // Session baseline at cseq 5 ...
+                "MSG events.a 2 \$JS.ACK.EVENTS.EPH1.1.9.5.0.0 2\r\nm1\r\n",
+                // ... then the REPLACED instance delivers its cseq 1: silent rebase (still a
+                // delivery - it must reach the handler).
+                "MSG events.a 2 \$JS.ACK.EVENTS.EPH1.1.10.1.0.0 2\r\nm2\r\n",
+                // A heartbeat at 2: against the rebased tracker (1) this is a REAL gap in the new
+                // instance and must fire; against the stale max (5) it would have been treated as
+                // yet another regression (or pre-fix: silently masked).
+                sprintf("HMSG _INBOX.hb 2 %d %d\r\n%s\r\n", strlen($hbNewGap), strlen($hbNewGap), $hbNewGap),
+            ],
+        ];
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $errors = [];
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        }), $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeEphemeralPushConsumer(
+            'EVENTS',
+            static function (NatsMessage $m) use (&$received): void {
+                $received[] = $m->payload;
+            },
+            consumerOptions: ['idle_heartbeat' => 5_000_000_000],
+        )->await();
+
+        for ($i = 0; $i < 5; $i++) {
+            $client->processIncoming()->await();
+        }
+        $client->disconnect()->await();
+
+        self::assertSame(['m1', 'm2'], $received, 'the regressed delivery is still user data and must reach the handler');
+        $mismatches = array_values(array_filter(
+            $errors,
+            static fn (\Throwable $e): bool => str_contains($e->getMessage(), 'consumer sequence mismatch'),
+        ));
+        self::assertCount(1, $mismatches, 'the delivery regression itself must be SILENT; only the new instance\'s real gap reports');
+        self::assertStringContainsString('up to sequence 2 but only 1', $mismatches[0]->getMessage(), 'the gap must be measured against the REBASED tracker, not the stale max');
+        self::assertStringNotContainsString('appears to have been replaced', $mismatches[0]->getMessage());
     }
 
     /**
@@ -4281,26 +4427,40 @@ final class JetStreamContextTest extends TestCase
 
         // The whole gap->recreate saga runs INSIDE one dispatch (the recreate's awaits are part of
         // the delivering processIncoming call), so the stop cannot be issued from this fiber
-        // mid-recreate - schedule it on the event loop instead: it fires at ~50 ms, squarely inside
-        // attempt #1's 300 ms parked await, while this fiber is still blocked in the dispatch.
+        // mid-recreate - and a wall-clock timer could fire BEFORE the recreate even starts under
+        // CI load (stopping the not-yet-recreating consumer and spinning the pump to its
+        // deadline). Trigger it from the WIRE instead: attempt #1's CONSUMER.CREATE - the second
+        // CREATE overall, and the FIRST this hook observes (the initial create predates it) -
+        // proves the recreate is parked in that attempt's 300 ms await, so queue the stop the
+        // moment that request is written: it lands on the next event-loop turn, squarely inside
+        // the parked await, regardless of scheduler stalls.
         $stopDone = false;
-        \Revolt\EventLoop::delay(0.05, static function () use ($js, $sid, &$stopDone): void {
-            $js->stopOrderedConsumer($sid)->await();
-            $stopDone = true;
-        });
+        $createWrites = 0;
+        $serverResponder = $transport->onWrite;
+        $transport->onWrite = static function (string $bytes) use ($serverResponder, $js, $sid, &$stopDone, &$createWrites): array {
+            if (str_contains($bytes, '$JS.API.CONSUMER.CREATE.EVENTS') && ++$createWrites === 1) {
+                EventLoop::queue(static function () use ($js, $sid, &$stopDone): void {
+                    $js->stopOrderedConsumer($sid)->await();
+                    $stopDone = true;
+                });
+            }
+
+            return $serverResponder !== null ? $serverResponder($bytes) : [];
+        };
 
         // One pump delivers the gap frames and blocks through the recreate saga: attempt #1 parks
-        // (reply withheld), the scheduled stop fires, attempt #1 times out, attempt #2 succeeds -
-        // and must then observe the stop and tear itself down instead of installing.
+        // (reply withheld), the queued stop fires inside that await, attempt #1 times out,
+        // attempt #2 succeeds - and must then observe the stop and tear itself down instead of
+        // installing.
         $deadlineNs = hrtime(true) + 5_000_000_000;
         while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.CREATE.EVENTS') < 3 && hrtime(true) < $deadlineNs) {
             try {
                 $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
             } catch (\Amp\CancelledException) {
-                // Idle slice; timers (the stop, the retry) advance regardless.
+                // Idle slice; timers (the retry) and the queued stop advance regardless.
             }
         }
-        self::assertTrue($stopDone, 'precondition: the scheduled stop must have completed');
+        self::assertTrue($stopDone, 'precondition: the wire-triggered stop must have completed');
 
         // The stop must have landed DURING the recreate: its UNSUB of the then-current inbox
         // (sid 2) precedes attempt #2's CREATE on the wire.
@@ -4323,6 +4483,120 @@ final class JetStreamContextTest extends TestCase
         self::assertSame(3, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'a stopped consumer must never be recreated again');
         // Stop + recreate-delete + stopped-teardown delete all reached the server.
         self::assertGreaterThanOrEqual(2, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'), 'the stopped instances must be deleted');
+    }
+
+    /**
+     * Sibling of {@see testStopOrderedConsumerDuringInFlightRecreateDoesNotResurrect} covering the
+     * OTHER arm of the race (2nd-round review): the stop lands during an in-flight recreate whose
+     * remaining attempts then ALL fail while the connection stays Open. Pre-fix the catch only
+     * excluded stopped consumers from the (skipped-anyway) deferral, so execution fell through to
+     * the terminal branch and emitted "Ordered consumer recreate failed" - paging on-call for a
+     * consumer the operator just deliberately stopped. The catch must handle the stop FIRST:
+     * release the never-adopted fresh inbox and return silently, mirroring the silent post-create
+     * stopped teardown.
+     */
+    public function testStopRacingRecreateWhoseAttemptsExhaustEmitsNoTerminalError(): void
+    {
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                // Recreate attempts #1-#3: NO replies - every attempt times out while the
+                // connection stays Open, exhausting the budget with the stop already latched.
+                static fn (string $rt): array => [],
+                static fn (string $rt): array => [],
+                static fn (string $rt): array => [],
+            ],
+            onDelete: [
+                // Episode delete of ORD1, the stop's delete of the adopted candidate, and the
+                // best-effort orphan reap of all three attempt candidates.
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap -> recreate starts and parks awaiting attempt #1's (withheld) reply.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
+
+        $errors = [];
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 100, pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        }), $transport);
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, 'events.>')->await();
+
+        // Observe the recreate settling through the shared watchdog state (recreateInFlight is
+        // cleared in the recreate's finally on every path), reached via the orderedStops closure.
+        $stops = (new \ReflectionProperty(JetStreamContext::class, 'orderedStops'))->getValue($js);
+        self::assertIsArray($stops);
+        self::assertInstanceOf(\Closure::class, $stops[$sid]);
+        $watchdogState = (new \ReflectionFunction($stops[$sid]))->getStaticVariables()['state'] ?? null;
+        self::assertInstanceOf(HeartbeatWatchdogState::class, $watchdogState);
+
+        // Wire-triggered stop (same mechanism as the sibling test): attempt #1's CONSUMER.CREATE -
+        // the first this hook observes, the initial create predates it - proves the recreate is
+        // parked in that attempt's await; queue the stop there.
+        $stopDone = false;
+        $createWrites = 0;
+        $serverResponder = $transport->onWrite;
+        $transport->onWrite = static function (string $bytes) use ($serverResponder, $js, $sid, &$stopDone, &$createWrites): array {
+            if (str_contains($bytes, '$JS.API.CONSUMER.CREATE.EVENTS') && ++$createWrites === 1) {
+                EventLoop::queue(static function () use ($js, $sid, &$stopDone): void {
+                    $js->stopOrderedConsumer($sid)->await();
+                    $stopDone = true;
+                });
+            }
+
+            return $serverResponder !== null ? $serverResponder($bytes) : [];
+        };
+
+        // Pump until the exhausted episode settles: the gap frames dispatch, attempt #1 parks, the
+        // queued stop lands, attempts #1-#3 time out, and the catch must take the stopped branch.
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while ((!$stopDone || $watchdogState->recreateInFlight || substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.CREATE.EVENTS') < 4) && hrtime(true) < $deadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
+            } catch (\Amp\CancelledException) {
+                // Idle slice; timers (the retries) and the queued stop advance regardless.
+            }
+        }
+        self::assertTrue($stopDone, 'precondition: the wire-triggered stop must have completed');
+        self::assertFalse($watchdogState->recreateInFlight, 'precondition: the exhausted recreate episode must settle');
+
+        $client->disconnect()->await();
+
+        self::assertSame([], $errors, 'a deliberately stopped consumer whose racing recreate then exhausts its attempts must NOT surface a terminal "recreate failed" error');
+
+        $written = implode('', $transport->writes);
+        // Teardown is clean: the stop released the then-current inbox (sid 2), the stopped branch
+        // released the never-adopted fresh inbox (sid 3), and no further recreate ever ran.
+        self::assertStringContainsString("UNSUB 2\r\n", $written, 'the stop must unsubscribe the pre-rotation inbox');
+        self::assertStringContainsString("UNSUB 3\r\n", $written, 'the stopped branch must release the never-adopted fresh inbox');
+        self::assertSame(4, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'exactly the initial create plus the three exhausted attempts');
+        $stopsAfter = (new \ReflectionProperty(JetStreamContext::class, 'orderedStops'))->getValue($js);
+        self::assertIsArray($stopsAfter);
+        self::assertArrayNotHasKey($sid, $stopsAfter, 'the stop must have deregistered the ordered-stop handle');
     }
 
     /**
@@ -5668,8 +5942,14 @@ final class JetStreamContextTest extends TestCase
 
         self::assertCount(1, $errors, 'a silent caller-owned push consumer must surface exactly one stall error');
         self::assertInstanceOf(JetStreamException::class, $errors[0]);
-        self::assertStringContainsString('not active', $errors[0]->getMessage());
-        self::assertStringContainsString('PROC', $errors[0]->getMessage());
+        // The not-active wording is the ErrConsumerNotActive-style operator signal (#113): pin the
+        // FULL message - consumer, stream, cause, and the resubscribe/recreate remedy.
+        self::assertSame(
+            'Push consumer "PROC" on stream "EVENTS" is not active: no message or idle heartbeat for 2 x idle_heartbeat '
+            . '(consumer reaped, deleted, or interest lost); the library cannot recreate a caller-owned consumer '
+            . '- resubscribe or recreate it',
+            $errors[0]->getMessage(),
+        );
         // A caller-owned consumer is never deleted/recreated by the library.
         self::assertSame(0, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE'), 'the library must not recreate a caller-owned push consumer');
     }
@@ -6026,8 +6306,11 @@ final class JetStreamContextTest extends TestCase
      * CONSUMER.CREATE attempt - AFTER the fresh deliver inbox was subscribed and the candidate name
      * adopted (adopt-before-await). Attempt 1 times out, attempts 2-3 fail fast while not Open, and
      * the deferral must release the adopted-but-never-confirmed fresh inbox ($newSid !== null arm),
-     * clear the miss latch, and let the post-reconnect watchdog re-fire. The second episode then
-     * deletes the ROTATED candidate name (not ORD1), pinning the adopt-before-await consequence.
+     * clear the miss latch, and let the post-reconnect watchdog re-fire. The deferral REWINDS the
+     * adopted-but-never-created candidate to the pre-episode instance (2nd-round review: a
+     * surviving old consumer's frames must pass the name filter after reconnect), so the second
+     * episode deletes ORD1 AGAIN - not the rotated candidate, which the episode's orphan reap
+     * already covers.
      */
     public function testWatchdogRecreateDeferredAfterAdoptedInboxRefiresOnceOpenAgain(): void
     {
@@ -6105,7 +6388,9 @@ final class JetStreamContextTest extends TestCase
         self::assertFalse($watchdogState->notified, 'the deferral must clear the miss latch so the watchdog can re-fire once Open');
 
         // Phase 3: Open again, silence continues -> the watchdog must fire a fresh episode, which
-        // deletes the ROTATED adopted candidate (attempt 1's client-chosen name), not ORD1.
+        // deletes ORD1 AGAIN: the deferral rewound the adopted-but-never-created candidate to the
+        // pre-episode instance, so a survivor of episode 1's delete would be recognised - and is
+        // what episode 2 replaces.
         $stateProp->setValue($connection, ConnectionState::Open);
 
         $deadlineNs = hrtime(true) + 2_000_000_000;
@@ -6118,7 +6403,417 @@ final class JetStreamContextTest extends TestCase
 
         self::assertSame(3, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'the watchdog must re-fire after reconnect and re-establish the deferred consumer');
         self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.'), 'each episode must delete exactly one prior instance');
-        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the second episode must target the rotated adopted candidate, not ORD1');
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the deferral must rewind the adopted candidate so the second episode targets the pre-episode instance');
+        self::assertSame([], $errors, 'a deferred-then-recovered recreate must stay silent');
+    }
+
+    /**
+     * The baseline watch() documented a plain unsubscribe($sid) as the stop mechanism (and the
+     * current docblock still sanctions it until the first recreate), but the connection knows
+     * nothing of the orderedStops registry and the watchdog tick holds only WeakReferences -
+     * pre-fix every such stop stranded one registry entry (rooting the stop closure, the watchdog
+     * state, and the user handler) per watch FOREVER, and left the ephemeral to server-side
+     * interest-loss reaping. The watchdog's self-cancel tick must invoke the state's onDefunct
+     * hook: release the registry entry and best-effort delete the server-side consumer
+     * (2nd-round review).
+     */
+    public function testPlainUnsubscribeReleasesOrderedStopRegistryAndDeletesConsumer(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+        );
+
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100), $transport);
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        // 30 ms heartbeat -> the self-cancel tick notices the dead sid within ~30 ms.
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+
+        $stopsProp = new \ReflectionProperty(JetStreamContext::class, 'orderedStops');
+        $stops = $stopsProp->getValue($js);
+        self::assertIsArray($stops);
+        self::assertArrayHasKey($sid, $stops, 'precondition: the ordered consumer must register its stop handle');
+
+        // The documented legacy stop path: a plain unsubscribe of the (pre-recreate) deliver sid.
+        $client->unsubscribe($sid)->await();
+
+        // The next watchdog tick sees the inactive sid, self-cancels, and must run the cleanup.
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (hrtime(true) < $deadlineNs) {
+            $stops = $stopsProp->getValue($js);
+            if (is_array($stops) && !array_key_exists($sid, $stops)) {
+                break;
+            }
+            delay(0.01);
+        }
+        $stops = $stopsProp->getValue($js);
+        self::assertIsArray($stops);
+        self::assertArrayNotHasKey($sid, $stops, 'the self-cancel tick must release the orderedStops entry for the plainly-unsubscribed watch');
+
+        // The still-live entry proves nothing stopped the consumer proactively, so the cleanup
+        // must also best-effort delete the server-side ephemeral (faster than inactive_threshold).
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORD1') < 1 && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+        self::assertSame(1, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the cleanup must best-effort delete the current server-side consumer');
+
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Negative arm of the onDefunct cleanup: only the CURRENT timer may run it. A rotated-out old
+     * watchdog timer's sid is dead BY DESIGN (the recreate moved the consumer to a fresh sid), so
+     * were it to fire the self-cancel branch it must NOT release the stop registry or delete the
+     * consumer that lives on. Simulated by re-pointing the state's watchdogTimerId at a newer
+     * timer (what a rotation's re-arm does) before the guarded sid goes inactive.
+     */
+    public function testRotatedOutWatchdogTimerDoesNotReleaseStopRegistryOrDeleteConsumer(): void
+    {
+        $createReply = json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => 'ORD1',
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, (string) $createReply)],
+            ],
+        );
+
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100), $transport);
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+
+        $stopsProp = new \ReflectionProperty(JetStreamContext::class, 'orderedStops');
+        $stops = $stopsProp->getValue($js);
+        self::assertIsArray($stops);
+        self::assertInstanceOf(\Closure::class, $stops[$sid]);
+        $watchdogState = (new \ReflectionFunction($stops[$sid]))->getStaticVariables()['state'] ?? null;
+        self::assertInstanceOf(HeartbeatWatchdogState::class, $watchdogState);
+
+        // Simulate a rotation having armed a NEWER timer: the shared state no longer points at
+        // the still-armed initial timer, exactly the situation the tick's identity guard covers.
+        $newerTimerId = EventLoop::repeat(3600.0, static function (): void {});
+        $watchdogState->watchdogTimerId = $newerTimerId;
+
+        $timersBefore = self::countRepeatTimers();
+        $client->unsubscribe($sid)->await();
+
+        // The stale timer's next tick still self-cancels (its sid is gone) ...
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (self::countRepeatTimers() > $timersBefore - 1 && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+        self::assertSame($timersBefore - 1, self::countRepeatTimers(), 'the stale timer must still self-cancel');
+
+        // ... but must NOT have run the cleanup: the registry entry and the (conceptually live,
+        // new-sid) consumer belong to the current timer's watch.
+        $stops = $stopsProp->getValue($js);
+        self::assertIsArray($stops);
+        self::assertArrayHasKey($sid, $stops, 'a rotated-out timer must not release the stop registry of a consumer living on a new sid');
+        self::assertSame(0, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS'), 'a rotated-out timer must not delete the live consumer');
+
+        EventLoop::cancel($newerTimerId);
+        $client->disconnect()->await();
+    }
+
+    /**
+     * The disconnect-collision deferral must REWIND the adopt-before-await dispatch state
+     * (2nd-round review): the retry loop re-points consumerName/expectedConsumerSeq at each
+     * never-created candidate before its create await, and pre-fix the deferral returned without
+     * restoring them. If the episode's initial delete never took effect server-side (request
+     * timeout under a degraded JS API), the OLD consumer survives - and its post-reconnect frames
+     * then touch() the watchdog while being silently dropped by the name filter: delivery stalls
+     * until the first idle heartbeat instead of resuming immediately. Post-fix the survivor's
+     * next in-order frame passes the filter and delivers.
+     */
+    public function testDeferralRewindsAdoptionSoSurvivorFramesDeliverAfterReconnect(): void
+    {
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $connection = (new \ReflectionProperty(NatsClient::class, 'connection'))->getValue($client);
+        self::assertIsObject($connection);
+        $stateProp = new \ReflectionProperty($connection::class, 'state');
+
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                // Recreate attempt #1: the fresh inbox is subscribed and the candidate adopted.
+                // The connection leaves Open HERE and the reply is withheld, so attempt #1 times
+                // out and attempts #2-#3 fail fast -> the deferral runs with the dispatch state
+                // still pointing at the never-created candidate (pre-fix).
+                static function (string $rt) use ($connection, $stateProp): array {
+                    $stateProp->setValue($connection, ConnectionState::Connecting);
+
+                    return [];
+                },
+            ],
+            onDelete: [
+                // The episode's initial delete of ORD1 is ANSWERED but - as far as the scenario
+                // goes - never took effect server-side: ORD1 survives and resumes delivering.
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (cseq 3, expected 2) -> recreate -> deferral.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
+
+        // An object (not a by-ref array) shared with the dispatch fiber, so the cross-fiber waits
+        // below observe live values instead of a constant-folded snapshot.
+        /** @var \ArrayObject<int, string> $received */
+        $received = new \ArrayObject();
+        $js = $client->jetStream();
+        // A LONG idle heartbeat keeps the watchdog out of the test: only the gap drives recreates,
+        // and recovery must NOT have to wait for a heartbeat - that delayed path is the pre-fix
+        // behavior this test rules out.
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use ($received): void {
+            $received->append($message->payload);
+        }, 'events.>', 60_000_000_000)->await();
+
+        $stops = (new \ReflectionProperty(JetStreamContext::class, 'orderedStops'))->getValue($js);
+        self::assertIsArray($stops);
+        self::assertInstanceOf(\Closure::class, $stops[$sid]);
+        $watchdogState = (new \ReflectionFunction($stops[$sid]))->getStaticVariables()['state'] ?? null;
+        self::assertInstanceOf(HeartbeatWatchdogState::class, $watchdogState);
+
+        // Pump through the gap -> recreate -> deferral saga (attempt #1's CREATE is the 2nd on
+        // the wire; recreateInFlight clears in the recreate's finally on every path).
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while ((substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.CREATE.EVENTS') < 2 || $watchdogState->recreateInFlight) && hrtime(true) < $deadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
+            } catch (\Amp\CancelledException | NatsException) {
+                // Idle slice, or a fail-fast read while the connection is not Open; the saga's
+                // timers advance regardless.
+            }
+        }
+        self::assertFalse($watchdogState->recreateInFlight, 'precondition: the deferred episode must settle');
+        self::assertSame(['msg1'], $received->getArrayCopy(), 'precondition: only the pre-gap message is delivered before the reconnect');
+
+        // Reconnect completes, and the surviving OLD consumer resumes: its next in-order frame
+        // (cseq 2) arrives on the OLD inbox - which the deferral keeps subscribed.
+        $stateProp->setValue($connection, ConnectionState::Open);
+        $transport->pushReadChunk("MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.2.2.2.0.0 4\r\nmsg2\r\n");
+
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (count($received) < 2 && hrtime(true) < $deadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
+            } catch (\Amp\CancelledException) {
+                // Idle slice.
+            }
+        }
+
+        $client->disconnect()->await();
+
+        self::assertSame(['msg1', 'msg2'], $received->getArrayCopy(), 'the deferral must rewind the adoption state so a surviving old consumer\'s frames pass the name filter and deliver immediately after reconnect');
+        self::assertSame([], $errors, 'the deferred episode must stay silent');
+    }
+
+    /**
+     * The deferral decision must be LATCHED, not sampled (2nd-round review): pre-fix the
+     * state() !== Open condition was evaluated only AFTER reapOrphanedConsumers(), whose
+     * per-candidate awaits yield event-loop turns - a reconnect completing in that window made
+     * the check read Open and turned a genuine disconnect collision into a loud terminal
+     * teardown. Here attempts #1-#2 observe the connection away from Open (latching the
+     * observation), the reconnect completes BEFORE the reap - whose deletes then run against the
+     * Open connection - and the deferral must still run: no terminal error, and the watchdog
+     * re-fires a fresh episode that re-establishes the consumer.
+     */
+    public function testWatchdogRecreateDeferralLatchesNotOpenObservationAcrossReapAwaits(): void
+    {
+        $createReply = static fn(string $name): string => json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $connection = (new \ReflectionProperty(NatsClient::class, 'connection'))->getValue($client);
+        self::assertIsObject($connection);
+        $stateProp = new \ReflectionProperty($connection::class, 'state');
+
+        // Episode 1's create attempts are withheld until the test flips answerCreates for the
+        // post-deferral watchdog retry; the FIRST attempt also drops the connection out of Open.
+        // An object holder (not by-ref scalars) so the responder observes the main fiber's writes.
+        $serverMode = new class {
+            public bool $answerCreates = false;
+            public bool $flippedNotOpen = false;
+        };
+        $attemptResponder = static function (string $rt) use ($connection, $stateProp, $createReply, $serverMode): array {
+            if ($serverMode->answerCreates) {
+                return [self::muxMsg($rt, $createReply('ORD2'))];
+            }
+
+            if (!$serverMode->flippedNotOpen) {
+                $serverMode->flippedNotOpen = true;
+                $stateProp->setValue($connection, ConnectionState::Connecting);
+            }
+
+            return [];
+        };
+
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                $attemptResponder,
+                $attemptResponder,
+                $attemptResponder,
+                $attemptResponder,
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+        );
+
+        // 30 ms heartbeat -> the watchdog fires episode 1 after ~60 ms of total silence.
+        $js = $client->jetStream();
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 30_000_000)->await();
+
+        $stopsProp = new \ReflectionProperty(JetStreamContext::class, 'orderedStops');
+        $stops = $stopsProp->getValue($js);
+        self::assertIsArray($stops);
+        self::assertInstanceOf(\Closure::class, $stops[$sid]);
+        $watchdogState = (new \ReflectionFunction($stops[$sid]))->getStaticVariables()['state'] ?? null;
+        self::assertInstanceOf(HeartbeatWatchdogState::class, $watchdogState);
+
+        // State-flag-driven reconnect completion: the by-ref $consumerName visible through the
+        // registered stop closure changes to a fresh candidate at each attempt's adoption. The
+        // SECOND distinct candidate proves attempt #1 already failed (and latched its not-Open
+        // observation), so flipping Open here lands before attempt #3 - whose failure then leaves
+        // orphan candidates for a reap that runs against the RE-OPENED connection.
+        $observed = [];
+        EventLoop::repeat(0.001, static function (string $timerId) use ($stopsProp, $js, $sid, $connection, $stateProp, &$observed): void {
+            $stops = $stopsProp->getValue($js);
+            if (!is_array($stops) || !isset($stops[$sid]) || !$stops[$sid] instanceof \Closure) {
+                EventLoop::cancel($timerId);
+
+                return;
+            }
+
+            $name = (new \ReflectionFunction($stops[$sid]))->getStaticVariables()['consumerName'] ?? null;
+            if (is_string($name) && $name !== 'ORD1') {
+                $observed[$name] = true;
+            }
+
+            if (count($observed) >= 2) {
+                EventLoop::cancel($timerId);
+                $stateProp->setValue($connection, ConnectionState::Open);
+            }
+        });
+
+        // Phase 1: silence -> watchdog fires episode 1 (its DELETE of ORD1 marks it running).
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORD1') < 1 && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+        self::assertSame(1, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the watchdog must fire a recreate for the silent consumer');
+
+        // Phase 2: wire-driven, not window-driven. The deferral clears the miss latch WITHOUT
+        // rebasing the silence clock (the not-Open ticks did that), so once the connection is Open
+        // again the watchdog can re-fire its fresh episode almost immediately - there is no
+        // quiescent gap to sample "exactly one episode" in. The proof this episode DEFERRED rather
+        // than went terminal is therefore: its three orphan candidates were reaped against the
+        // re-opened connection, no error was emitted, and the watch is still registered. (The
+        // latch-clearing itself is pinned by testWatchdogRecreateDeferredByReconnectRefiresOnceOpenAgain.)
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ord-') < 3 && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+
+        $writtenDeferred = implode('', $transport->writes);
+        self::assertGreaterThanOrEqual(3, substr_count($writtenDeferred, '$JS.API.CONSUMER.DELETE.EVENTS.ord-'), 'the orphan reap must have run against the RE-OPENED connection (all three candidate deletes reach the wire)');
+        self::assertSame([], $errors, 'the latched not-Open observation must defer the episode - no terminal "recreate failed" despite the check sampling an Open connection');
+        $stops = $stopsProp->getValue($js);
+        self::assertIsArray($stops);
+        self::assertArrayHasKey($sid, $stops, 'the deferral must keep the watch alive (no teardown)');
+
+        // Phase 3: answer the watchdog's fresh-episode create; it must re-establish the consumer.
+        // The rotation of deliverSid to a fresh sid marks the replacement instance installed.
+        $serverMode->answerCreates = true;
+
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while ($watchdogState->deliverSid === $sid && hrtime(true) < $deadlineNs) {
+            delay(0.01);
+        }
+
+        $written = implode('', $transport->writes);
+
+        $client->disconnect()->await();
+
+        self::assertNotNull($watchdogState->deliverSid, 'the retry episode must install the replacement instance');
+        self::assertNotSame($sid, $watchdogState->deliverSid, 'the retry episode must rotate to a fresh deliver sid');
+        // Every deferred episode targets ORD1 again because the deferral rewound the adoption to
+        // it; at least the initial episode plus the succeeding retry must have done so (the exact
+        // count depends on how many watchdog episodes elapsed before the creates were answered).
+        self::assertGreaterThanOrEqual(2, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS.ORD1'), 'the retry episode must target the rewound pre-episode instance');
         self::assertSame([], $errors, 'a deferred-then-recovered recreate must stay silent');
     }
 
@@ -7198,8 +7893,13 @@ final class JetStreamContextTest extends TestCase
         self::assertCount(1, $errors);
         self::assertInstanceOf(JetStreamException::class, $errors[0]);
         self::assertSame(400, $errors[0]->getCode());
-        self::assertStringContainsString('terminal status 400', $errors[0]->getMessage());
-        self::assertStringContainsString('(Bad Request)', $errors[0]->getMessage());
+        // The terminal-status wording is the #121 operator signal for a caller-owned consumer: pin
+        // the FULL message - consumer, stream, status + description, and the resubscribe remedy.
+        self::assertSame(
+            'Push consumer "DUR" on stream "ORDERS" received a terminal status 400 (Bad Request); delivery has stopped '
+            . 'and the library cannot recreate a caller-owned consumer - resubscribe or recreate it',
+            $errors[0]->getMessage(),
+        );
     }
 
     /**
@@ -7250,9 +7950,19 @@ final class JetStreamContextTest extends TestCase
         $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
-        $this->expectException(JetStreamException::class);
-        // expiresMs=100 -> internal deadline ~1.1s; the incomplete batch surfaces as an error.
-        $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 100)->await();
+        try {
+            // expiresMs=100 -> internal deadline ~1.1s; the incomplete batch surfaces as an error.
+            $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 100)->await();
+            self::fail('an incomplete batch must surface as a stall error, not a truncated success');
+        } catch (JetStreamException $e) {
+            // The stall wording is the operator's #121 signal: pin the FULL message - stream name,
+            // stall window in ms (expires + 1000ms slack), and how much arrived before the stall.
+            self::assertSame(
+                'Direct Get batch for stream "ORDERS" stalled: no progress for 1100 ms '
+                . '(received 1 message(s), no end-of-batch marker)',
+                $e->getMessage(),
+            );
+        }
     }
 
     /**
@@ -8461,5 +9171,1206 @@ final class JetStreamContextTest extends TestCase
         $client = new NatsClient($options, new FakeTransport());
 
         self::assertSame($options, $client->options());
+    }
+
+    /**
+     * The invalid-name rejection wording is the operator's diagnosis: it must name the kind, echo
+     * the offending name, and enumerate EVERY forbidden character class. Pin the complete message
+     * once so no clause can be dropped from it (#131).
+     */
+    public function testInvalidNameRejectionCarriesTheCompleteForbiddenCharacterList(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        try {
+            $client->jetStream()->createOrUpdateStream('bad.name', ['orders.*'])->await();
+            self::fail('a dotted stream name must be rejected before dispatch');
+        } catch (JetStreamException $e) {
+            self::assertSame(
+                'Invalid stream name "bad.name": must be non-empty and must not contain spaces, tabs, '
+                . "'.', '*', '>', '/' or '\\'",
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(2, $transport->writes, 'createOrUpdateStream must validate the name before any write');
+    }
+
+    /**
+     * Verifies addConsumer() rejects a dotted STREAM name before dispatch (#131).
+     */
+    public function testAddConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->addConsumer('bad.name', ConsumerConfiguration::create()->durable('worker'))->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies addOrUpdateConsumer() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testAddOrUpdateConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->addOrUpdateConsumer('bad.name', 'PROC')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies addOrUpdateConsumer() rejects a dotted consumer name before dispatch (#131).
+     */
+    public function testAddOrUpdateConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "bad.consumer"');
+
+        try {
+            $client->jetStream()->addOrUpdateConsumer('ORDERS', 'bad.consumer')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies createPushConsumer() rejects a dotted STREAM name before dispatch (#131).
+     */
+    public function testCreatePushConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->createPushConsumer('bad.name', 'PROC', 'deliver.x')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies subscribePushConsumer() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testSubscribePushConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->subscribePushConsumer('bad.name', 'PROC', static function (): void {})->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies subscribePushConsumer() rejects a dotted consumer name before dispatch (#131).
+     */
+    public function testSubscribePushConsumerRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "bad.consumer"');
+
+        try {
+            $client->jetStream()->subscribePushConsumer('ORDERS', 'bad.consumer', static function (): void {})->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies subscribeEphemeralPushConsumer() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testSubscribeEphemeralPushConsumerRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->subscribeEphemeralPushConsumer('bad.name', static function (): void {})->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies counterValue() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testCounterValueRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->counterValue('bad.name', 'counter.hits')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies fetchNext() rejects a dotted stream name before dispatch (#131).
+     */
+    public function testFetchNextRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->fetchNext('bad.name', 'PROC')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies fetchNext() rejects a dotted consumer name before dispatch (#131).
+     */
+    public function testFetchNextRejectsDottedConsumerName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid consumer name "bad.consumer"');
+
+        try {
+            $client->jetStream()->fetchNext('ORDERS', 'bad.consumer')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies fetchBatch() rejects a dotted STREAM name before dispatch (#131).
+     */
+    public function testFetchBatchRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->fetchBatch('bad.name', 'PROC', 1)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * ADR-31 chunked multi_last: a chunk whose subjects are ALL absent answers with a lone 404 -
+     * "no stored messages here", not an error. That chunk must contribute zero messages while the
+     * OTHER chunks' results are kept: a 404 on chunk 1 of 2 must not throw away chunk 2 (#110).
+     */
+    public function testDirectGetLastForSubjectsKeepsLaterChunksWhenAnEarlierChunkIs404(): void
+    {
+        // max_payload 200 -> budget 136 after the 64-byte envelope. Three 60-char subjects encode
+        // to 63 bytes each: chunk 1 = [s1, s2] (126 <= 136), chunk 2 = [s3].
+        $s1 = str_repeat('a', 60);
+        $s2 = str_repeat('b', 60);
+        $s3 = str_repeat('c', 60);
+
+        $status404 = "NATS/1.0 404 No Results\r\n\r\n";
+        $h3 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: {$s3}\r\nNats-Sequence: 9\r\nNats-Num-Pending: 0\r\n\r\n";
+        $b3 = 'v3';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":200,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // Chunk 1 (inbox sid 1): all-miss 404. Chunk 2 (inbox sid 2): one hit, Num-Pending 0.
+            sprintf("HMSG _INBOX.JS.DGET.c1 1 %d %d\r\n%s\r\n", strlen($status404), strlen($status404), $status404),
+            sprintf("HMSG _INBOX.JS.DGET.c2 2 %d %d\r\n%s%s\r\n", strlen($h3), strlen($h3) + strlen($b3), $h3, $b3),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', [$s1, $s2, $s3])->await();
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        self::assertCount(2, $directGets, 'precondition: the subject list must split into two chunks');
+
+        // The 404 chunk contributed nothing; chunk 2's hit survived it.
+        self::assertCount(1, $messages);
+        self::assertSame($s3, $messages[0]->subject);
+        self::assertSame('v3', $messages[0]->payload);
+    }
+
+    /**
+     * The 1 MiB fallback payload budget is byte-exact at its UPPER edge: with no advertised
+     * max_payload the budget is 1_048_576 - 64 = 1_048_512 bytes, and two subjects encoding to
+     * exactly that total share ONE chunk. A budget even one byte smaller would spill the second
+     * subject into its own request.
+     */
+    public function testDefaultBudgetPacksTwoSubjectsFillingItExactlyIntoOneChunk(): void
+    {
+        // entry bytes = strlen(json_encode($s)) + 1 = len + 3 for plain ASCII.
+        // (1_048_499 + 3) + (7 + 3) = 1_048_512 = the exact fallback budget.
+        $s1 = str_repeat('a', 1_048_499);
+        $s2 = str_repeat('b', 7);
+
+        $reads = [
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        for ($sid = 1; $sid <= 2; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', [$s1, $s2])->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        self::assertCount(1, $directGets, 'two subjects filling the fallback budget exactly must share one request');
+        self::assertStringContainsString('"batch":2', $directGets[0]);
+    }
+
+    /**
+     * The 1 MiB fallback payload budget is byte-exact at its LOWER edge too: two subjects encoding
+     * to ONE byte more than the 1_048_512-byte budget must split into two requests. A budget even
+     * one byte larger would wrongly pack them into a single over-budget request.
+     */
+    public function testDefaultBudgetSplitsTwoSubjectsOneByteOverItIntoTwoChunks(): void
+    {
+        // (1_048_500 + 3) + (7 + 3) = 1_048_513 = fallback budget + 1.
+        $s1 = str_repeat('a', 1_048_500);
+        $s2 = str_repeat('b', 7);
+
+        $reads = [
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ];
+        $eob = "NATS/1.0 204\r\n\r\n";
+        for ($sid = 1; $sid <= 3; $sid++) {
+            $reads[] = sprintf("HMSG _INBOX.JS.DGET.c%d %d %d %d\r\n%s\r\n", $sid, $sid, strlen($eob), strlen($eob), $eob);
+        }
+
+        $transport = new FakeTransport($reads);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $messages = $client->jetStream()->directGetLastForSubjects('ORDERS', [$s1, $s2])->await();
+        self::assertSame([], $messages);
+
+        $directGets = array_values(array_filter(
+            $transport->writes,
+            static fn (string $frame): bool => str_contains($frame, '$JS.API.DIRECT.GET.ORDERS'),
+        ));
+        self::assertCount(2, $directGets, 'one byte over the fallback budget must split into two requests');
+        self::assertStringContainsString('"batch":1', $directGets[0]);
+        self::assertStringContainsString('"batch":1', $directGets[1]);
+    }
+
+    /**
+     * unpinConsumer() coerces a truthy-but-non-boolean `success` strictly: an explicit 0 must come
+     * back as boolean false (not surface a TypeError from the typed closure, not read as true).
+     */
+    public function testUnpinConsumerCoercesNumericSuccessToBool(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [$this->jsOkResponse('{"success":0}')]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        self::assertFalse($client->jetStream()->unpinConsumer('ORDERS', 'PROC', 'g1')->await());
+    }
+
+    /**
+     * publishRetryWaitMs is sanitized before it becomes a delay: a (mis)configured NEGATIVE wait
+     * must clamp to zero and retry immediately - not blow up the retry loop with an invalid
+     * negative sleep. The retried publish still resolves to the ack.
+     */
+    public function testPublishRetryClampsNegativeRetryWaitToZero(): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+        $ackPayload = '{"stream":"ORDERS","seq":50,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+        $js = new JetStreamContext($client, publishRetryAttempts: 2, publishRetryWaitMs: -5);
+
+        $ack = $js->publish('orders.created', '{"id":1}')->await();
+
+        self::assertSame(50, $ack->seq);
+    }
+
+    /**
+     * The retry wait is a REAL pause: with publishRetryWaitMs=40 the retried publish may not
+     * complete before ~40ms have passed - dropping the wait would hammer a recovering JetStream
+     * API with an immediate retry.
+     */
+    public function testPublishRetryActuallyWaitsBetweenAttempts(): void
+    {
+        $status = "NATS/1.0 503\r\n\r\n";
+        $ackPayload = '{"stream":"ORDERS","seq":51,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($ackPayload), $ackPayload),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+        $js = new JetStreamContext($client, publishRetryAttempts: 2, publishRetryWaitMs: 40);
+
+        $startNs = hrtime(true);
+        $ack = $js->publish('orders.created', '{"id":1}')->await();
+        $elapsedNs = hrtime(true) - $startNs;
+
+        self::assertSame(51, $ack->seq);
+        // Timers never fire early: the one retry must have paused >= ~40ms.
+        self::assertGreaterThanOrEqual(35_000_000, $elapsedNs, 'the 503 retry must honour publishRetryWaitMs');
+    }
+
+    /**
+     * The ADR-13 idle_heartbeat <= expires/2 gate is byte-exact on the EXPIRES side: a heartbeat
+     * 400ns above half of a 1000ms expiry must be rejected with the precise ns figures - an
+     * expires conversion inflated by even 1 ppm would wave it through.
+     */
+    public function testFetchBatchRejectsIdleHeartbeatJustAboveHalfOfExpires(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        try {
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 1000, ['idle_heartbeat' => 500_000_400])->await();
+            self::fail('an idle_heartbeat just above expires/2 must be rejected');
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame(
+                'Pull idle_heartbeat (500000400 ns) must not exceed 50% of expires (1000000000 ns) per ADR-13',
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(2, $transport->writes, 'the ADR-13 gate must fire before any wire traffic');
+    }
+
+    /**
+     * The heartbeat-miss deadline is exactly TWO idle_heartbeat intervals - and the thrown message
+     * reports that window in ms. With expires=2200ms (deadline 3200ms) and idle_heartbeat=1100ms,
+     * the miss (2 x 1100 = 2200ms) fires BEFORE the deadline; a 3-interval miss (3300ms) would
+     * instead ride past the deadline and degrade into the generic 408 timeout.
+     */
+    public function testFetchBatchHeartbeatMissWindowIsExactlyTwoIntervals(): void
+    {
+        $transport = new FakeTransport(
+            readQueue: [
+                'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+                "PONG\r\n",
+            ],
+            blockWhenEmpty: true,
+        );
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000, pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 2200, ['idle_heartbeat' => 1_100_000_000])->await();
+            self::fail('Expected a heartbeat-miss JetStreamException.');
+        } catch (JetStreamException $e) {
+            self::assertSame(
+                'JetStream pull fetch missed idle heartbeats: no message or heartbeat received for 2200 ms (2 x idle_heartbeat)',
+                $e->getMessage(),
+            );
+        }
+    }
+
+    /**
+     * ADR-9 tracker hygiene: a delivery whose $JS.ACK consumer-sequence token (int)-casts to 0 (a
+     * malformed token) must NOT rebase the delivered-sequence tracker. If it did, the next idle
+     * heartbeat reporting the true last-delivered sequence would false-alarm a "sequence mismatch"
+     * for deliveries this client actually processed.
+     */
+    public function testPushConsumerZeroConsumerSeqTokenDoesNotRebaseTracker(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"DUR","config":{"deliver_subject":"deliver.dur","ack_policy":"none"}}';
+        $hb = NatsHeaders::toWireBlock([
+            'Status' => '100',
+            'Description' => 'Idle Heartbeat',
+            'Nats-Last-Consumer' => '5',
+        ]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.dur '] = [
+            // Baseline delivery: consumer seq 5.
+            "MSG deliver.dur 2 \$JS.ACK.ORDERS.DUR.5.5.5.0.0 2\r\nm5\r\n",
+            // Malformed token delivery: consumer-seq token "0" - must not reset the tracker.
+            "MSG deliver.dur 2 \$JS.ACK.ORDERS.DUR.6.6.0.0.0 2\r\nm0\r\n",
+            // Heartbeat reporting last-delivered 5: EQUAL to the tracked max -> silence.
+            sprintf("HMSG deliver.dur 2 %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb),
+        ];
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'DUR',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+            'deliver.dur',
+        )->await();
+
+        for ($i = 0; $i < 6; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        self::assertSame(['m5', 'm0'], $received);
+        self::assertSame([], $errors, 'a zero consumer-seq token must not rebase the tracker into a false heartbeat gap alarm');
+    }
+
+    /**
+     * Every inbound frame must feed the push watchdog (#113): a consumer receiving steady traffic
+     * may NEVER be reported "not active", no matter how the frame timing aligns with the watchdog
+     * ticks. Dropping the per-frame touch would false-alarm on any busy consumer.
+     */
+    public function testPushConsumerSteadyTrafficNeverTripsTheWatchdog(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"DUR","config":{"deliver_subject":"deliver.dur","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'DUR',
+            static function (NatsMessage $message): void {},
+            'deliver.dur',
+            null,
+            ['idle_heartbeat' => 100_000_000],
+        )->await();
+
+        // Feed a frame every ~20ms for ~260ms: far inside the 100ms heartbeat interval, while the
+        // watchdog (2 x 100ms threshold) gets several chances to tick.
+        for ($i = 1; $i <= 13; $i++) {
+            $transport->pushReadChunk("MSG deliver.dur 2 \$JS.ACK.ORDERS.DUR.$i.$i.$i.0.0 1\r\nx\r\n");
+            $client->processIncoming()->await();
+            delay(0.02);
+        }
+
+        $client->disconnect()->await();
+
+        self::assertSame([], $errors, 'steady traffic must keep the watchdog quiet - each frame rearms it');
+    }
+
+    /**
+     * A watchdog tick that discovers its guarded subscription GONE must stop at the teardown: it
+     * cancels itself (and runs the defunct cleanup) but may NOT fall through into the miss check
+     * and report a stall for a subscription the caller already unsubscribed - even when the tick
+     * fires late, with more than two silent intervals on the clock.
+     */
+    public function testLateWatchdogTickAfterUnsubscribeDoesNotReportAStall(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"DUR","config":{"deliver_subject":"deliver.dur","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $sid = $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'DUR',
+            static function (NatsMessage $message): void {},
+            'deliver.dur',
+            null,
+            ['idle_heartbeat' => 40_000_000],
+        )->await();
+
+        // Unsubscribe immediately, then BLOCK the event loop past 2 x idle_heartbeat (80ms): the
+        // first watchdog tick runs late, already over the miss threshold, against a dead sid.
+        $client->unsubscribe($sid)->await();
+        usleep(120_000);
+        delay(0.05); // let the overdue tick fire
+
+        $client->disconnect()->await();
+
+        self::assertSame([], $errors, 'a late tick on an unsubscribed sid must tear down silently, never report a stall');
+    }
+
+    /**
+     * idle_heartbeat gating (#113): only a POSITIVE INTEGER arms the watchdog. A zero interval and
+     * a numeric STRING must both be ignored - no repeat timer is registered and the subscription
+     * still succeeds (a zero/aberrant option must never produce a hot timer or a type error).
+     */
+    public function testPushConsumerWatchdogArmsOnlyForPositiveIntegerIdleHeartbeat(): void
+    {
+        $createReply = static fn (string $name): string => sprintf(
+            '{"stream_name":"ORDERS","name":"%s","config":{"deliver_subject":"deliver.%s","ack_policy":"none"}}',
+            $name,
+            strtolower($name),
+        );
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply('D0')), $createReply('D0')),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($createReply('D1')), $createReply('D1')),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // Zero: not a positive interval -> no watchdog.
+        $sidZero = $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'D0',
+            static function (): void {},
+            'deliver.d0',
+            null,
+            ['idle_heartbeat' => 0],
+        )->await();
+        self::assertSame(0, self::countRepeatTimers(), 'idle_heartbeat=0 must not arm a watchdog timer');
+
+        // Numeric string: not an int -> no watchdog, and no type error from the extractor.
+        $sidString = $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'D1',
+            static function (): void {},
+            'deliver.d1',
+            null,
+            ['idle_heartbeat' => '40000000'],
+        )->await();
+        self::assertSame(0, self::countRepeatTimers(), 'a string idle_heartbeat must not arm a watchdog timer');
+
+        self::assertGreaterThan(0, $sidZero);
+        self::assertGreaterThan($sidZero, $sidString);
+    }
+
+    /**
+     * The EPHEMERAL push subscription arms its heartbeat watchdog when idle_heartbeat is set: the
+     * repeat timer must actually be registered (the #113 guard exists), built from the watchdog
+     * state - not skipped, and not built without a state to feed it.
+     */
+    public function testSubscribeEphemeralPushConsumerArmsWatchdogForIdleHeartbeat(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"E1","config":{"deliver_subject":"deliver.eph","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $sid = $client->jetStream()->subscribeEphemeralPushConsumer(
+            'ORDERS',
+            static function (): void {},
+            'deliver.eph',
+            null,
+            ['idle_heartbeat' => 50_000_000],
+        )->await();
+
+        self::assertSame(1, self::countRepeatTimers(), 'an idle_heartbeat ephemeral push subscription must arm exactly one watchdog timer');
+
+        $client->unsubscribe($sid)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * A NON-100 status frame is never a flow-control request: even when it carries a $JS.FC reply
+     * subject, the control interception must withhold it WITHOUT acking that reply - a 409 with a
+     * reply subject must not be answered as if it were flow control.
+     */
+    public function testNon100StatusFrameWithFlowControlReplyIsNotAcked(): void
+    {
+        $createReply = '{"stream_name":"ORDERS","name":"DUR","config":{"deliver_subject":"deliver.dur","ack_policy":"none"}}';
+        $terminal = "NATS/1.0 409 Consumer Deleted\r\n\r\n";
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+        $transport->enqueueOnWriteContaining['SUB deliver.dur '] = [
+            // A terminal status frame that (aberrantly) carries a $JS.FC reply subject.
+            sprintf("HMSG deliver.dur 2 \$JS.FC.ack9 %d %d\r\n%s\r\n", strlen($terminal), strlen($terminal), $terminal),
+        ];
+
+        $errors = [];
+        $options = new NatsOptions(errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribePushConsumer(
+            'ORDERS',
+            'DUR',
+            static function (NatsMessage $message) use (&$received): void {
+                $received[] = $message->payload;
+            },
+            'deliver.dur',
+        )->await();
+
+        for ($i = 0; $i < 5; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        self::assertSame([], $received, 'the status frame must be withheld from the handler');
+        self::assertCount(1, $errors, 'the terminal status is surfaced for the caller-owned consumer');
+        self::assertStringNotContainsString('PUB $JS.FC.', implode('', $transport->writes), 'a non-100 status frame must never be acked as flow control');
+    }
+
+    /**
+     * A terminal status control frame triggers exactly ONE recreate - the handler returns right
+     * after it. Falling through into the heartbeat tail-gap check (the frame here also carries a
+     * Nats-Last-Consumer header) would immediately trigger a SECOND, spurious recreate of the
+     * just-recreated consumer.
+     */
+    public function testOrderedConsumerTerminalStatusWithLastConsumerHeaderRecreatesExactlyOnce(): void
+    {
+        $createReply = static fn(string $name): string => (string) json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+        $terminal = NatsHeaders::toWireBlock([
+            'Status' => '409',
+            'Description' => 'Consumer Deleted',
+            'Nats-Last-Consumer' => '5',
+        ]);
+
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    sprintf("HMSG deliver.ord $sid %d %d\r\n%s\r\n", strlen($terminal), strlen($terminal), $terminal),
+                ],
+            ],
+        );
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (): void {}, 'events.>')->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        $written = implode('', $transport->writes);
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'a terminal status frame must recreate exactly once');
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.EVENTS'), 'only the replaced instance is deleted - no second recreate cascade');
+    }
+
+    /**
+     * The by_start_sequence resume cursor ignores a malformed stream-seq token (int)-cast to 0: a
+     * later recreate must restart from the last GENUINE in-order stream sequence + 1, not from an
+     * initial-policy re-application (loss on \'new\', full re-replay on \'all\').
+     */
+    public function testOrderedConsumerZeroStreamSeqTokenDoesNotResetResumeCursor(): void
+    {
+        $createReply = static fn(string $name): string => (string) json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    // In-order msg at STREAM seq 7 -> the resume cursor.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.7.1.0.0 2\r\nm1\r\n",
+                    // Malformed stream-seq token "0" (consumer seq 2, in order): cursor must stay 7.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.2.0.2.0.0 2\r\nm0\r\n",
+                    // Consumer-seq gap (9, expected 3) -> recreate from stream seq 7 + 1 = 8.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.9.30.9.0.0 2\r\nm9\r\n",
+                ],
+            ],
+        );
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $received = [];
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $m) use (&$received): void {
+            $received[] = $m->payload;
+        }, 'events.>')->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        self::assertSame(['m1', 'm0'], $received);
+        $written = implode('', $transport->writes);
+        self::assertStringContainsString('"deliver_policy":"by_start_sequence"', $written);
+        self::assertStringContainsString('"opt_start_seq":8', $written, 'the resume cursor must survive a zero stream-seq token');
+    }
+
+    /**
+     * A recreate trigger that fires while stopOrderedConsumer() is still mid-teardown (its UNSUB
+     * write in flight, the subscription therefore still locally registered) must observe the stop
+     * latch and do NOTHING: no delete of the already-stopped instance, no fresh inbox, no
+     * CONSUMER.CREATE - a stopped consumer stays stopped.
+     */
+    public function testRecreateTriggeredDuringStopTeardownDoesNotRecreate(): void
+    {
+        $createReply = static fn(string $name): string => (string) json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+        );
+        // Park the stop's UNSUB write: the stop latch is set, but the deliver subscription is
+        // still registered while the write is in flight - the race window for a late recreate.
+        $transport->wedgeOnWriteContaining = 'UNSUB';
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $received = [];
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $m) use (&$received): void {
+            $received[] = $m->payload;
+        }, 'events.>')->await();
+
+        // Start the stop; it parks inside its wedged UNSUB write with the latch already set.
+        $stopFuture = $js->stopOrderedConsumer($sid);
+        delay(0.02);
+
+        // A terminal status frame lands NOW - dispatched to the still-registered handler, it
+        // triggers the recreate path mid-stop.
+        $terminal = "NATS/1.0 409 Consumer Deleted\r\n\r\n";
+        $transport->pushReadChunk(sprintf("HMSG deliver.ord %d %d %d\r\n%s\r\n", $sid, strlen($terminal), strlen($terminal), $terminal));
+        $client->processIncoming()->await();
+        delay(0.02);
+
+        $written = implode('', $transport->writes);
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'a recreate triggered mid-stop must not create a replacement');
+        self::assertSame(1, substr_count($written, 'SUB _INBOX.JS.ORD'), 'a recreate triggered mid-stop must not subscribe a fresh inbox');
+
+        // Unwedge (close fails the parked write out) and let the stop finish its best-effort tail.
+        $client->disconnect()->await();
+        $stopFuture->await();
+
+        self::assertSame([], $received);
+    }
+
+    /**
+     * 3rd-round pin (deferral-rewind-duplicate-deliveries): the deferral rewind is guarded by
+     * "the episode delivered NOTHING". Here the adopted candidate's create succeeded server-side
+     * with a lost reply and REPLAYED one message to the handler during the create's own read-pump,
+     * advancing lastStreamSeq past the survivor's position. The deferral must KEEP the adopted
+     * state (skip the rewind): the surviving old consumer's post-reconnect frame for a stream
+     * sequence the handler already saw is name-filtered - NOT re-delivered as a duplicate. The
+     * deferral still releases the never-installed fresh inbox, so no orphan traffic can reach the
+     * dispatch (or re-trigger recreates) through it after the reconnect.
+     */
+    public function testDeferralKeepsAdoptionWhenCandidateDeliveredSoSurvivorReplayIsNotDuplicated(): void
+    {
+        $createReply = static fn(string $name): string => (string) json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"], blockWhenEmpty: true);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        $connection = (new \ReflectionProperty(NatsClient::class, 'connection'))->getValue($client);
+        self::assertIsObject($connection);
+        $stateProp = new \ReflectionProperty($connection::class, 'state');
+
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                // Recreate attempts are orchestrated by the wrapper below (2nd/3rd CREATE writes).
+            ],
+            onDelete: [
+                // The episode's initial delete of ORD1 is ANSWERED but - scenario-wise - never took
+                // effect server-side: ORD1 survives and resumes delivering after the reconnect.
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (cseq 3, expected 2) -> recreate episode starts.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
+
+        // Wrapper over the harness responder: capture the rotated fresh inbox (the 2nd non-mux
+        // SUB), and script the recreate attempts: attempt #1's create (2nd CREATE write) gets NO
+        // reply but its candidate consumer REPLAYS one message on the fresh inbox (create
+        // succeeded server-side, reply lost); attempt #2's create (3rd CREATE write) coincides
+        // with the connection leaving Open, so it times out with the not-Open observation latched
+        // and attempt #3 fails fast -> the deferral runs with the candidate already delivered.
+        $inner = $transport->onWrite;
+        $freshSid = null;
+        $createWrites = 0;
+        $transport->onWrite = static function (string $bytes) use ($inner, $connection, $stateProp, &$freshSid, &$createWrites): array {
+            $frames = $inner !== null ? $inner($bytes) : [];
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return $frames;
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                $parts = explode(' ', $head);
+                $subject = $parts[1] ?? '';
+                if (!str_ends_with($subject, '.*') && str_starts_with($subject, '_INBOX.JS.ORD')) {
+                    // Ordered deliver inboxes: initial then rotated; remember the LATEST (rotation).
+                    $rotated = (int) ($parts[2] ?? 0);
+                    if ($freshSid === null || $rotated > $freshSid) {
+                        $freshSid = $rotated;
+                    }
+                }
+
+                return $frames;
+            }
+
+            if (str_contains($bytes, '$JS.API.CONSUMER.CREATE.EVENTS')) {
+                ++$createWrites;
+                if ($createWrites === 2 && preg_match('/"name":"(ord-[0-9a-f]+)"/', $bytes, $m) === 1) {
+                    // Candidate replay: cseq 1 against the freshly reset expectation, stream seq 2
+                    // (the survivor's next message) - delivered during the create's own read-pump.
+                    $frames[] = "MSG deliver.fresh {$freshSid} \$JS.ACK.EVENTS.{$m[1]}.1.2.1.0.0 11\r\nmsg2-replay\r\n";
+                }
+                if ($createWrites === 3) {
+                    // Attempt #2 coincides with the disconnect: its await times out while the
+                    // connection is away from Open, latching the deferral observation.
+                    $stateProp->setValue($connection, ConnectionState::Connecting);
+                }
+            }
+
+            return $frames;
+        };
+
+        /** @var \ArrayObject<int, string> $received */
+        $received = new \ArrayObject();
+        $js = $client->jetStream();
+        // A LONG idle heartbeat keeps the watchdog out: only the gap drives this episode.
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message) use ($received): void {
+            $received->append($message->payload);
+        }, 'events.>', 60_000_000_000)->await();
+
+        $stops = (new \ReflectionProperty(JetStreamContext::class, 'orderedStops'))->getValue($js);
+        self::assertIsArray($stops);
+        self::assertInstanceOf(\Closure::class, $stops[$sid]);
+        $watchdogState = (new \ReflectionFunction($stops[$sid]))->getStaticVariables()['state'] ?? null;
+        self::assertInstanceOf(HeartbeatWatchdogState::class, $watchdogState);
+
+        // Pump through gap -> recreate -> candidate replay -> disconnect -> deferral.
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while (($createWrites < 3 || $watchdogState->recreateInFlight) && hrtime(true) < $deadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
+            } catch (\Amp\CancelledException | NatsException) {
+                // Idle slice, or a fail-fast read while the connection is not Open.
+            }
+        }
+        self::assertFalse($watchdogState->recreateInFlight, 'precondition: the deferred episode must settle');
+        self::assertSame(['msg1', 'msg2-replay'], $received->getArrayCopy(), 'precondition: the candidate must have replayed one message during the episode');
+        self::assertIsInt($freshSid);
+
+        // Reconnect completes; the surviving OLD consumer resumes with the very stream sequence
+        // the candidate already replayed (sseq 2). The kept adoption name-filters it: NO duplicate.
+        $stateProp->setValue($connection, ConnectionState::Open);
+        $transport->pushReadChunk("MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.2.2.2.0.0 4\r\nmsg2\r\n");
+
+        // The deferral dropped the never-installed fresh inbox: a stray heartbeat on it reporting
+        // a huge tail must be inert - no delivery, no recreate storm through a dead subscription.
+        $strayHb = NatsHeaders::toWireBlock(['Status' => '100', 'Description' => 'Idle Heartbeat', 'Nats-Last-Consumer' => '99']);
+        $transport->pushReadChunk(sprintf("HMSG deliver.fresh %d %d %d\r\n%s\r\n", $freshSid, strlen($strayHb), strlen($strayHb), $strayHb));
+
+        $graceDeadlineNs = hrtime(true) + 400_000_000;
+        while (hrtime(true) < $graceDeadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
+            } catch (\Amp\CancelledException) {
+                // Idle slice.
+            }
+        }
+
+        $client->disconnect()->await();
+
+        self::assertSame(['msg1', 'msg2-replay'], $received->getArrayCopy(), 'the survivor\'s replayed stream sequence must be name-filtered, never re-delivered as a duplicate');
+        self::assertSame(3, $createWrites, 'the dropped fresh inbox must not re-trigger recreates after reconnect');
+        self::assertSame([], $errors, 'the deferred episode must stay silent');
+    }
+
+    /**
+     * 3rd-round pin (ondefunct-race-resurrects-unstoppable-consumer): onDefunct latches
+     * $state->stopped FIRST. A plain unsubscribe while a recreate is PARKED in its
+     * CONSUMER.CREATE await lets the watchdog's defunct tick run mid-recreate; when the create
+     * reply is then released, the resumed recreate must observe the latch and TEAR DOWN the fresh
+     * instance (UNSUB its rotated inbox, best-effort delete the created consumer) instead of
+     * installing it - a defunct consumer must never come back as an unstoppable zombie.
+     */
+    public function testDefunctTickDuringParkedRecreateCreatePreventsInstall(): void
+    {
+        $createReply = static fn(string $name): string => (string) json_encode([
+            'stream_name' => 'EVENTS',
+            'name' => $name,
+            'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
+        ], JSON_THROW_ON_ERROR);
+        $deleteReply = '{"success":true}';
+
+        // NON-blocking transport: an idle read yields immediately, so the parked create's own
+        // read-pump keeps the event loop turning - queued tasks, the watchdog timer, and the
+        // delayed reply release below all run WHILE the dispatch fiber is parked in the create.
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+
+        $parkedReplyTo = null;
+        $this->orderedConsumerServer(
+            $transport,
+            onCreate: [
+                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                // The recreate's create: WITHHOLD the reply (park), remember where to send it later.
+                static function (string $rt) use (&$parkedReplyTo): array {
+                    $parkedReplyTo = $rt;
+
+                    return [];
+                },
+            ],
+            onDelete: [
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+            ],
+            deliverEpochs: [
+                static fn (int $sid): array => [
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
+                    // Gap (cseq 3, expected 2) -> the recreate starts and parks in its create await.
+                    "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.3.4.3.0.0 4\r\nbad3\r\n",
+                ],
+            ],
+        );
+
+        // Long request timeout keeps the create parked for the whole orchestration; a short idle
+        // heartbeat makes the watchdog tick (and its defunct discovery) prompt.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000, pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $received = [];
+        $sid = $js->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $m) use (&$received): void {
+            $received[] = $m->payload;
+        }, 'events.>', 50_000_000)->await();
+
+        // Wire-driven orchestration (no wall-clock race, mirrors the stop-during-recreate test):
+        // track the rotated fresh inbox sid, and the moment the recreate's CONSUMER.CREATE (the
+        // 2nd overall) is written - i.e. the recreate is parked in that await - queue the plain
+        // unsubscribe of the deliver sid and schedule the create reply's release for AFTER the
+        // 50ms-interval watchdog tick has discovered the dead sid and run onDefunct.
+        $inner = $transport->onWrite;
+        $freshSid = null;
+        $createWrites = 0;
+        $transport->onWrite = static function (string $bytes) use ($inner, $client, $transport, $sid, $createReply, &$freshSid, &$createWrites, &$parkedReplyTo): array {
+            $frames = $inner !== null ? $inner($bytes) : [];
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return $frames;
+            }
+
+            if (str_starts_with($head, 'SUB _INBOX.JS.ORD')) {
+                $parts = explode(' ', $head);
+                $subSid = (int) ($parts[2] ?? 0);
+                if ($freshSid === null || $subSid > $freshSid) {
+                    $freshSid = $subSid;
+                }
+
+                return $frames;
+            }
+
+            // The initial CREATE predates this wrapper, so the FIRST create it observes is the
+            // recreate's parked attempt (mirrors the stop-during-recreate test's counting).
+            if (str_contains($bytes, '$JS.API.CONSUMER.CREATE.EVENTS') && ++$createWrites === 1) {
+                EventLoop::queue(static function () use ($client, $sid): void {
+                    $client->unsubscribe($sid)->await();
+                });
+                // Release the withheld reply well after the next watchdog tick (<= 100ms) has run
+                // the defunct cleanup, and well before the 2s request timeout.
+                EventLoop::delay(0.4, static function () use ($transport, $createReply, &$parkedReplyTo): void {
+                    if (is_string($parkedReplyTo)) {
+                        $transport->pushReadChunk(self::muxMsg($parkedReplyTo, $createReply('ORDX')));
+                    }
+                });
+            }
+
+            return $frames;
+        };
+
+        // One pump delivers msg1 + the gap and blocks through the whole saga: recreate parks in
+        // the withheld create, the queued unsubscribe lands, the watchdog tick runs onDefunct
+        // (latching the stop + best-effort delete), the delayed release resumes the create - and
+        // the resumed recreate must tear the fresh instance down instead of installing it.
+        $deadlineNs = hrtime(true) + 5_000_000_000;
+        while (strpos(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE.EVENTS.ORDX') === false && hrtime(true) < $deadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.1))->await();
+            } catch (\Amp\CancelledException) {
+                // Idle slice.
+            }
+            delay(0.01);
+        }
+
+        self::assertIsString($parkedReplyTo, 'precondition: the recreate must have parked in its create await');
+        self::assertIsInt($freshSid);
+        $defunctDeletes = array_values(array_filter(
+            $transport->writes,
+            static fn (string $w): bool => str_contains($w, '$JS.API.CONSUMER.DELETE.EVENTS.ord-'),
+        ));
+        self::assertNotSame([], $defunctDeletes, 'precondition: the defunct tick must have best-effort deleted the adopted candidate');
+
+        $written = implode('', $transport->writes);
+        // Teardown, not install: the fresh inbox is released and the just-created instance deleted.
+        self::assertStringContainsString("UNSUB {$freshSid}\r\n", $written, 'the never-installed fresh inbox must be unsubscribed');
+        self::assertStringContainsString('$JS.API.CONSUMER.DELETE.EVENTS.ORDX', $written, 'the created-but-not-installed instance must be best-effort deleted');
+        self::assertSame(0, self::countRepeatTimers(), 'no watchdog may be re-armed for a defunct consumer');
+
+        // And nothing may deliver through the fresh inbox: a post-release frame on it is inert.
+        $transport->pushReadChunk("MSG deliver.fresh {$freshSid} \$JS.ACK.EVENTS.ORDX.1.9.1.0.0 5\r\nnope!\r\n");
+        $graceDeadlineNs = hrtime(true) + 200_000_000;
+        while (hrtime(true) < $graceDeadlineNs) {
+            try {
+                $client->processIncoming(new \Amp\TimeoutCancellation(0.05))->await();
+            } catch (\Amp\CancelledException) {
+                // Idle slice.
+            }
+        }
+
+        $client->disconnect()->await();
+
+        self::assertSame(['msg1'], $received, 'a defunct consumer must never resurrect and deliver');
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'no further recreate may run after the defunct stop');
     }
 }

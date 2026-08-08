@@ -1,6 +1,11 @@
 # KV_-prefix idempotence guard applied to the `bucket` alias — a bucket legitimately named "KV_x" now sources/mirrors bucket "x"'s data instead
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — the `bucket` alias is KV_-prefixed unconditionally in kvSourceConfig() and
+  kvMirrorConfig() (bucket 'KV_x' maps to stream KV_KV_x with src transform on $KV.KV_x.>); the
+  idempotence guard remains only for the `name` key and bare strings (nats.go stream-name
+  semantics), documented in the docblocks. Pinned by
+  `testCreateSourceBucketAliasIsKvPrefixedUnconditionally` and
+  `testCreateMirrorBucketAliasIsKvPrefixedUnconditionally` (both pre-fix red).
 - **Severity:** minor
 - **Type:** wrong-bucket data routing (regression vs baseline for KV_-prefixed bucket names)
 - **Area:** KV sources/mirror name mapping (round-1 ADR-57 fix follow-up)
