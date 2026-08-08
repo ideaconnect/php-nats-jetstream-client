@@ -1,6 +1,13 @@
 # The disclosed "drain() no longer throws on a dead-socket write failure" contract has no pinning test
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — pinned by
+  `DrainFlushBoundedWriteTest::testDrainReportsDeadSocketPingWriteFailureAndStillCloses` and
+  `testDrainReportsDeadSocketUnsubWriteFailureAndStillCloses` (write THROWS → drain() does not
+  throw, state reaches Closed, the error listener receives the failure), plus
+  `testDrainStillClosesWhenLoggerThrowsWhileReportingWriteFailure` for the emitErrorSafely
+  containment and `testDrainSkipsFlushPhaseWhenPingWriteWedges` /
+  `testPublishDuringDrainTimesOutWhenWriteWedges` for the bounded-write arms. Added while closing
+  the post-review coverage gap.
 - **Severity:** minor
 - **Type:** test coverage gap for a disclosed contract change
 - **Area:** tests — connection drain

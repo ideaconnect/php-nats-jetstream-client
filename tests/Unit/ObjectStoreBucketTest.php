@@ -3192,4 +3192,150 @@ final class ObjectStoreBucketTest extends TestCase
 
         self::assertSame([], $result);
     }
+
+    /**
+     * putStream() twin of testPutFailurePurgesPartialChunksBeforeRethrowing: when a chunk publish of
+     * a STREAMED upload fails, the partial upload must be abandoned - the already-stored chunks of
+     * the fresh NUID purged (nothing references them; without the purge they leak forever) and the
+     * ORIGINAL failure rethrown. No meta record may be published for the failed object.
+     */
+    public function testPutStreamFailurePurgesPartialChunksBeforeRethrowing(): void
+    {
+        $failure = '{"error":{"code":400,"err_code":10077,"description":"maximum bytes exceeded"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // lookup
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),       // chunk1 ack
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($failure), $failure),                       // chunk2 rejected
+            // Purge of the partial NUID (abandonPartialUpload).
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // 3-byte chunks: one 'hello' block re-chunks to 'hel' + 'lo'; the second chunk's ack fails.
+        $store = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 3);
+        $blocks = ['hello'];
+        $index = 0;
+
+        try {
+            $store->putStream('big.txt', static function () use (&$index, $blocks): ?string {
+                return $blocks[$index++] ?? null;
+            })->await();
+            self::fail('a failed chunk publish must abort the streamed upload');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('maximum bytes exceeded', $e->getMessage(), 'the ORIGINAL failure must surface, not a cleanup error');
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes, 'the partial chunks must be purged (no meta references the NUID)');
+        self::assertStringNotContainsString('HPUB $O.assets.M.', $writes, 'no meta record may be published for the failed upload');
+    }
+
+    /**
+     * list() batched fast path (2.11+ server): an error that is NOT the 503 "stream lacks Direct
+     * Get" fallback trigger must propagate verbatim - code and description - instead of being
+     * silently retried through the per-subject fan-out (which would double-report a genuine fault).
+     */
+    public function testListBatchedRethrowsNonUnavailableError(): void
+    {
+        $streamInfo = (string) json_encode([
+            'config' => ['name' => 'OBJ_assets'],
+            'state' => ['subjects' => ['$O.assets.M.' . $this->encodeName('doc.txt') => 1]],
+        ], JSON_THROW_ON_ERROR);
+        $emptyPage = '{"state":{"subjects":{}}}';
+        // Batch reply: a single 500 error status frame on the batched Direct Get inbox (sid 2).
+        $errHdrs = "NATS/1.0 500 Internal Error\r\nStatus: 500\r\nDescription: direct get batch exploded\r\n\r\n";
+        $eh = strlen($errHdrs);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $transport->enqueueOnWriteContaining = [
+            '_INBOX.JS.DGET' => [
+                sprintf("HMSG _INBOX.JS.DGET.x 2 %d %d\r\n%s\r\n", $eh, $eh, $errHdrs),
+            ],
+        ];
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),  // metaSubjects() page 1
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),     // terminator page
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->objectStore('assets')->list()->await();
+            self::fail('a non-503 batched Direct Get error must fail list()');
+        } catch (JetStreamException $e) {
+            self::assertSame(500, $e->getCode());
+            self::assertSame('direct get batch exploded', $e->getMessage());
+        }
+
+        // No fallback was attempted: neither a per-subject Direct Get fan-out nor a leader read.
+        self::assertStringNotContainsString('"last_by_subj"', implode('', $transport->writes));
+        self::assertStringNotContainsString('STREAM.MSG.GET', implode('', $transport->writes));
+    }
+
+    /**
+     * The pipelined-upload reorder check is gated on the server actually REPORTING ack sequences: a
+     * server (or interop layer) that acks without a `seq` must not false-positive as a reordered
+     * upload - the put succeeds and the object meta is published normally.
+     */
+    public function testPutSucceedsWhenServerReportsNoAckSequences(): void
+    {
+        $seqlessAck = '{"stream":"OBJ_assets","seq":0,"duplicate":false}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // lookup
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($seqlessAck), $seqlessAck),                 // chunk1 (no seq)
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($seqlessAck), $seqlessAck),                 // chunk2 (no seq)
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($seqlessAck), $seqlessAck),                 // chunk3 (no seq)
+            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),       // meta ack
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // 4-byte chunks: 10 bytes split into 3 pipelined chunks, exercising the order check.
+        $store = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+        $stored = $store->put('multi.bin', 'abcdefghij')->await();
+
+        self::assertSame(10, $stored->size);
+        self::assertSame(3, $stored->chunks);
+        self::assertSame($this->digestOf('abcdefghij'), $stored->digest);
+
+        $writes = implode('', $transport->writes);
+        // The upload completed: meta published, and no reorder abort purged the fresh NUID.
+        self::assertStringContainsString('HPUB $O.assets.M.' . $this->encodeName('multi.bin'), $writes);
+        self::assertStringNotContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
+    }
+
+    /**
+     * ObjectStoreWatchOptions rejects a non-positive idleHeartbeat at construction: a zero/negative
+     * interval could never drive the missed-heartbeat watchdog and would otherwise be sent to the
+     * server as a nonsense consumer config (#113 parity with the KV watch options).
+     */
+    public function testWatchOptionsRejectNonPositiveIdleHeartbeat(): void
+    {
+        try {
+            new ObjectStoreWatchOptions(idleHeartbeat: 0);
+            self::fail('idleHeartbeat: 0 must be rejected');
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame('idleHeartbeat must be a positive integer (nanoseconds)', $e->getMessage());
+        }
+
+        $this->expectException(\InvalidArgumentException::class);
+        new ObjectStoreWatchOptions(idleHeartbeat: -1);
+    }
 }

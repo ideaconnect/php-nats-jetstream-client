@@ -431,4 +431,52 @@ final class ProtocolCodecTest extends TestCase
         self::assertSame('INFO', $result['command']);
         self::assertSame('{"server_id":"Y"}', $result['payload']);
     }
+
+    /**
+     * When Composer's runtime metadata does not know this package (a from-source checkout / vendored
+     * copy: getPrettyVersion() throws OutOfBoundsException), the CONNECT frame must advertise the
+     * FALLBACK_CLIENT_VERSION constant instead of failing the handshake or sending an empty version.
+     *
+     * The package IS registered in this test process, so the datasets Composer\InstalledVersions
+     * consults are swapped for empty ones (and restored in finally): each registered vendor dir is
+     * pre-seeded with an empty versions map - which also stops getInstalled() re-reading
+     * installed.php from disk - and the root dataset is blanked.
+     */
+    public function testEncodeConnectFallsBackToConstantVersionWhenPackageMetadataIsUnavailable(): void
+    {
+        $ref = new \ReflectionClass(\Composer\InstalledVersions::class);
+        $originalInstalled = $ref->getStaticPropertyValue('installed');
+        $originalByVendor = $ref->getStaticPropertyValue('installedByVendor');
+        $hasLocalDirFlag = $ref->hasProperty('installedIsLocalDir');
+        $originalIsLocalDir = $hasLocalDirFlag ? $ref->getStaticPropertyValue('installedIsLocalDir') : null;
+
+        $emptyDataSet = ['versions' => []];
+        $byVendor = [];
+        foreach (\Composer\Autoload\ClassLoader::getRegisteredLoaders() as $vendorDir => $loader) {
+            $byVendor[strtr($vendorDir, '\\', '/')] = $emptyDataSet;
+        }
+
+        try {
+            $ref->setStaticPropertyValue('installed', []);
+            $ref->setStaticPropertyValue('installedByVendor', $byVendor);
+            if ($hasLocalDirFlag) {
+                $ref->setStaticPropertyValue('installedIsLocalDir', false);
+            }
+
+            $result = (new ProtocolCodec())->encodeConnect(new NatsOptions());
+        } finally {
+            $ref->setStaticPropertyValue('installed', $originalInstalled);
+            $ref->setStaticPropertyValue('installedByVendor', $originalByVendor);
+            if ($hasLocalDirFlag) {
+                $ref->setStaticPropertyValue('installedIsLocalDir', $originalIsLocalDir);
+            }
+        }
+
+        $fallback = (new \ReflectionClassConstant(ProtocolCodec::class, 'FALLBACK_CLIENT_VERSION'))->getValue();
+        if (!is_string($fallback) || $fallback === '') {
+            self::fail('FALLBACK_CLIENT_VERSION must be a non-empty string');
+        }
+
+        self::assertStringContainsString('"version":"' . $fallback . '"', $result);
+    }
 }

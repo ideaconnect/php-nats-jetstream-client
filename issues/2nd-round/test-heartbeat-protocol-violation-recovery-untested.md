@@ -1,6 +1,11 @@
 # The disclosed heartbeat-timer protocol-violation recovery has no test — and no transport double can even throw ProtocolException from readLine()
 
-- **Status:** OPEN (filed 2026-08-08, second-round review; adversarially verified)
+- **Status:** FIXED (2026-08-08) — `FakeTransport` gained a one-shot `throwOnNextRead` failure
+  mode (modelling the WS codec's one-shot deferred violations), and the branch is pinned by
+  `NatsConnectionTest::testHeartbeatReadRecoversFromOneShotProtocolViolation` (error listener
+  receives the ProtocolException and a second CONNECT proves recovery) and
+  `testHeartbeatProtocolViolationForcesClosedWhenRecoveryUnavailable` (failed recovery marks the
+  connection Closed). Added while closing the post-review coverage gap.
 - **Severity:** minor
 - **Type:** test coverage gap for a disclosed contract change
 - **Area:** tests — connection heartbeat / WS one-shot terminal recovery

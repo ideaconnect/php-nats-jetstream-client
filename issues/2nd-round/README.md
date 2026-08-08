@@ -8,8 +8,9 @@ confirmed, 1 refuted, 0 undecided). Nits skipped verification and are marked as 
 
 Gates at review time: 1800 unit tests OK, PHPStan level 8 clean.
 
-**26 findings: 1 major (FIXED 2026-08-08), 17 minor, 8 nit (minors/nits OPEN).** (Two nits were
-added during the adversarial verification of the major's fix.)
+**26 findings: 1 major (FIXED 2026-08-08), 17 minor (2 FIXED, 15 OPEN), 8 nit (OPEN).** (Two nits
+were added during the adversarial verification of the major's fix; the two test-coverage minors
+were fixed while restoring the CI coverage gate.)
 
 ## Major
 
@@ -73,11 +74,11 @@ added during the adversarial verification of the major's fix.)
   — the stop-vs-recreate race test sequences the stop with a 50 ms wall-clock delay; can flake red
   under CI load.
 - [test-drain-dead-socket-write-contract-untested](test-drain-dead-socket-write-contract-untested.md)
-  — the disclosed "drain() no longer throws on dead-socket write failure" contract has no pinning
-  test.
+  — **FIXED (2026-08-08)** — the disclosed "drain() no longer throws on dead-socket write failure"
+  contract is now pinned by five DrainFlushBoundedWriteTest cases.
 - [test-heartbeat-protocol-violation-recovery-untested](test-heartbeat-protocol-violation-recovery-untested.md)
-  — the disclosed heartbeat-timer violation recovery has no test; no double can even throw
-  ProtocolException from readLine().
+  — **FIXED (2026-08-08)** — FakeTransport gained a one-shot readLine ProtocolException mode; the
+  recovery and forced-Closed arms are pinned in NatsConnectionTest.
 
 ## Nits (not adversarially verified)
 

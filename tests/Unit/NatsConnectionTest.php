@@ -10528,4 +10528,891 @@ final class NatsConnectionTest extends TestCase
         $method = new \ReflectionMethod(NatsConnection::class, 'inboundFrameBound');
         self::assertSame(64 * 1024 * 1024, $method->invoke($connection), 'the no-max_payload fallback must be exactly 64 MiB');
     }
+
+    /**
+     * Polls a condition on a monotonic (hrtime) deadline so multi-fiber tests wait on observable
+     * state instead of sleeping fixed amounts, and fail loudly when the state never materializes.
+     *
+     * @param callable(): bool $condition
+     */
+    private static function awaitUntil(callable $condition, string $what): void
+    {
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (!$condition()) {
+            if (hrtime(true) >= $deadlineNs) {
+                self::fail('Timed out waiting for: ' . $what);
+            }
+
+            delay(0.005);
+        }
+    }
+
+    /**
+     * Concurrent user connects coalesce (#145): the second connect() must JOIN the first in-flight
+     * dial - awaiting its outcome - rather than dialing the server a second time. Exactly one
+     * socket connect and one CONNECT handshake may reach the wire, and both callers resolve Open.
+     */
+    public function testConcurrentConnectJoinsTheInFlightDial(): void
+    {
+        // Hold the INFO chunk briefly (under the 50 ms handshake read slice) so the first connect()
+        // suspends mid-handshake, leaving the second connect() to observe the in-flight dial.
+        $transport = new FakeTransport(
+            [self::HANDSHAKE_INFO, "PONG\r\n"],
+            holdChunkContaining: 'INFO',
+            holdSeconds: 0.03,
+        );
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+
+        $first = $connection->connect();
+        $second = $connection->connect();
+
+        $first->await(new TimeoutCancellation(5.0));
+        $second->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(1, $transport->connectCalls, 'the second connect must join the first dial, not dial again');
+        $connects = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'CONNECT '));
+        self::assertCount(1, $connects, 'exactly one CONNECT handshake may reach the wire');
+    }
+
+    /**
+     * Terminal teardown is best-effort about the socket: when the reconnect-disabled path closes the
+     * transport and that close() itself THROWS (the socket is already broken), the failure must be
+     * swallowed - the terminal ConnectionException, the Closed state, and the Closed event must all
+     * still surface unmasked (#133/#146).
+     */
+    public function testTerminalTeardownSurvivesFailingSocketClose(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event, ?\Throwable $error = null) use (&$events): void {
+                    $events[] = $event;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $transport->pushReadChunk(FakeTransport::EOF);
+        $transport->throwOnClose = new \RuntimeException('close() failed on the broken socket');
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('the reconnect-disabled terminal close must surface');
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect is disabled', $e->getMessage(), 'the close failure must not mask the terminal error');
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state(), 'the failing close must not strand the state');
+        self::assertTrue($transport->closed, 'the close attempt must still have run');
+        self::assertContains(ConnectionEvent::Closed, $events, 'the terminal Closed event must still fire');
+    }
+
+    /**
+     * publishHeaderBlock() with an empty batch is a wire no-op: nothing may be written (and nothing
+     * validated), matching the documented "coalesced segment writes" contract for zero messages.
+     */
+    public function testPublishHeaderBlockWritesNothingForEmptyBatch(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $writesBefore = count($transport->writes);
+        $connection->publishHeaderBlock([])->await();
+
+        self::assertCount($writesBefore, $transport->writes, 'an empty block must not touch the wire');
+    }
+
+    /**
+     * publishHeaderBlock() shares publishWithHeaders()'s HPUB capability guard (#132): against a
+     * server whose INFO advertises "headers":false the whole block must fail client-side with a
+     * clear ConnectionException before any HPUB byte reaches the wire.
+     */
+    public function testPublishHeaderBlockThrowsWhenServerLacksHeadersSupport(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":false}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $this->expectException(ConnectionException::class);
+        $this->expectExceptionMessage('Server does not advertise headers support');
+
+        try {
+            $connection->publishHeaderBlock([
+                ['subject' => 'a.b', 'payload' => 'x', 'headers' => ['h' => 'v']],
+            ])->await();
+        } finally {
+            self::assertStringNotContainsString('HPUB', implode('', $transport->writes));
+        }
+    }
+
+    /**
+     * flush(): a PING write that FAILS outright (dead socket - distinct from the wedged/timeout
+     * path) must rethrow the write error to the caller AND discard the failed PING's pong slot
+     * (nats.go removePongFromList parity). The discard is observable: the next flush's PONG must
+     * complete THAT flush - a stale head slot would consume it and time the second flush out.
+     */
+    public function testFlushRethrowsPingWriteFailureAndKeepsPongCorrelationAligned(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 300), $transport);
+        $connection->connect()->await();
+
+        $transport->throwOnWriteContaining = 'PING';
+        try {
+            $connection->flush()->await();
+            self::fail('a failed PING write must surface, not report a successful flush');
+        } catch (TransportClosedException $e) {
+            self::assertSame('Simulated write failure', $e->getMessage());
+        }
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a failed flush write is not terminal');
+
+        $transport->throwOnWriteContaining = null;
+        $transport->enqueueOnWriteContaining = ['PING' => ["PONG\r\n"]];
+        // Regression detector: a stale (undiscarded) slot at the queue head would eat this PONG
+        // and turn this bounded flush into a TimeoutException.
+        $connection->flush()->await(new TimeoutCancellation(5.0));
+
+        $pings = array_filter($transport->writes, static fn(string $w): bool => $w === "PING\r\n");
+        self::assertCount(2, $pings, 'only the handshake PING and the second flush PING reached the wire');
+    }
+
+    /**
+     * A mid-chunk parse failure surfaces via emitError() BEFORE recovery - and emitError() logs
+     * before its listener-throw guard, so a throwing user-supplied PSR logger could break the
+     * containment. The recovery must run regardless (#147/#128): frames parsed before the corrupt
+     * bytes are delivered first, then the connection reconnects.
+     */
+    public function testParseErrorRecoveryRunsEvenWhenLoggerThrows(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+
+        // Throws only while the parse failure is reported - a logger throwing on every call would
+        // already fail the connect() handshake logging and miss the point of the test.
+        $throwingLogger = new class extends \Psr\Log\AbstractLogger {
+            public function log($level, \Stringable|string $message, array $context = []): void
+            {
+                if (str_contains((string) $message, 'Unsupported control frame')) {
+                    throw new \RuntimeException('logger failed');
+                }
+            }
+        };
+
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                logger: $throwingLogger,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // One chunk: a complete MSG followed by a corrupt control line; then the reconnect handshake.
+        $transport->pushReadChunk("MSG updates 1 5\r\nhello\r\nBOGUS\r\n");
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        $frames = $connection->processIncoming()->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(1, $frames, 'the MSG parsed before the corrupt line must count as dispatched');
+        self::assertSame(['hello'], $received, 'the recovered frame must be delivered before reconnecting');
+        self::assertCount(2, $transport->connectCalls, 'recovery must run even though the logger threw during emitError');
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * A mux-inbox establishment whose SUB write fails must surface the transport error through the
+     * request AND roll back cleanly (the serialization deferred is errored and cleared): the next
+     * request must re-attempt the establishment and succeed, instead of joining a dead setup or
+     * silently timing out (#118).
+     */
+    public function testRequestRetriesMuxInboxEstablishmentAfterFailedSubWrite(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $transport->throwOnWriteContaining = 'SUB ';
+        try {
+            $connection->request('svc.echo', 'x', 100)->await();
+            self::fail('a failed mux-inbox SUB write must fail the request');
+        } catch (TransportClosedException $e) {
+            self::assertSame('Simulated write failure', $e->getMessage());
+        }
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        // Heal the transport and serve the retried establishment: echo a reply for the PUB on the
+        // (client-chosen) mux sid captured from the retried SUB.
+        $transport->throwOnWriteContaining = null;
+        $muxSid = null;
+        $transport->onWrite = static function (string $bytes) use (&$muxSid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+            if (str_starts_with($head, 'SUB _INBOX.')) {
+                $muxSid = (int) (explode(' ', $head)[2] ?? 0);
+
+                return [];
+            }
+            if (!str_starts_with($head, 'PUB svc.echo ') || $muxSid === null) {
+                return [];
+            }
+            $replyTo = explode(' ', $head)[2] ?? '';
+
+            return $replyTo === '' ? [] : [sprintf("MSG %s %d 5\r\nhello\r\n", $replyTo, $muxSid)];
+        };
+
+        $reply = $connection->request('svc.echo', 'x', 500)->await(new TimeoutCancellation(5.0));
+
+        self::assertSame('hello', $reply->payload, 'the retried mux establishment must serve replies');
+        $inboxSubs = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'SUB _INBOX.'));
+        self::assertCount(1, $inboxSubs, 'only the successful (retried) mux SUB reached the wire');
+    }
+
+    /**
+     * #135: a requestMany() collector parked behind ANOTHER fiber's socket read must wake when that
+     * read releases the slot, take over the read itself, and still collect its reply - instead of
+     * staying parked while the reply sits in the socket buffer.
+     */
+    public function testRequestManyParkedBehindForeignReadCollectsReplyOnceSlotFrees(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        // A foreign fiber takes the read slot and parks on the idle socket.
+        $readerCancellation = new DeferredCancellation();
+        $reader = $connection->processIncoming($readerCancellation->getCancellation());
+        self::awaitUntil(static fn(): bool => $transport->startedReads >= 1, 'the foreign read to park on the socket');
+
+        $muxSid = null;
+        $replyTo = null;
+        $transport->onWrite = static function (string $bytes) use (&$muxSid, &$replyTo): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+            if (str_starts_with($head, 'SUB _INBOX.')) {
+                $muxSid = (int) (explode(' ', $head)[2] ?? 0);
+            } elseif (str_starts_with($head, 'PUB svc.all ')) {
+                $replyTo = explode(' ', $head)[2] ?? null;
+            }
+
+            return [];
+        };
+
+        $collect = $connection->requestMany('svc.all', 'q', maxResponses: 1, totalTimeoutMs: 3000);
+        self::awaitUntil(
+            // A full closure with by-ref captures: an arrow fn would capture the nulls by value.
+            static function () use (&$replyTo, &$muxSid): bool {
+                return $replyTo !== null && $muxSid !== null;
+            },
+            'the scatter-gather PUB to reach the wire',
+        );
+        self::assertNotNull($replyTo);
+        self::assertNotNull($muxSid);
+
+        // After its PUB the collector runs suspension-free to its parked wait, so one event-loop
+        // turn later it is provably parked behind the reader. Queue the reply, then free the slot
+        // by cancelling the foreign read: the collector must wake and take over.
+        delay(0.01);
+        $transport->pushReadChunk(sprintf("MSG %s %d 5\r\nhello\r\n", $replyTo, $muxSid));
+        $readerCancellation->cancel();
+
+        $messages = $collect->await(new TimeoutCancellation(5.0));
+        self::assertCount(1, $messages, 'the parked collector must still collect its reply');
+        self::assertSame('hello', $messages[0]->payload);
+
+        try {
+            $reader->await();
+            self::fail('the cancelled foreign read must surface its cancellation');
+        } catch (CancelledException) {
+            // expected
+        }
+    }
+
+    /**
+     * #135's deadline half: a requestMany() collector parked behind another fiber's read must still
+     * honor its TOTAL deadline - returning what it collected (nothing here) in bounded time - and
+     * must never steal the read slot from the still-parked foreign read.
+     */
+    public function testRequestManyParkedBehindForeignReadHonorsTotalDeadline(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        $readerCancellation = new DeferredCancellation();
+        $reader = $connection->processIncoming($readerCancellation->getCancellation());
+        self::awaitUntil(static fn(): bool => $transport->startedReads >= 1, 'the foreign read to park on the socket');
+
+        $startedNs = hrtime(true);
+        $messages = $connection->requestMany('svc.none', 'q', totalTimeoutMs: 150)->await(new TimeoutCancellation(5.0));
+        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+
+        self::assertSame([], $messages, 'no reply ever arrived: the deadline returns an empty collection');
+        self::assertLessThan(3.0, $elapsedSeconds, 'the parked collector must honor its total deadline, not deadlock');
+        self::assertSame(1, $transport->startedReads, 'the collector must never have taken a socket read of its own');
+        self::assertSame(0, $transport->resolvedReads, 'the foreign read must still be parked, undisturbed');
+
+        $readerCancellation->cancel();
+        try {
+            $reader->await();
+            self::fail('the cancelled foreign read must surface its cancellation');
+        } catch (CancelledException) {
+            // expected
+        }
+    }
+
+    /**
+     * #84: disconnect() issued while a reconnect sits in its backoff sleep must stop the loop at
+     * the next attempt gate - no further dial may happen, and the connection stays Closed instead
+     * of being resurrected by attempt 2.
+     */
+    public function testDisconnectDuringReconnectBackoffStopsFurtherAttempts(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $logger = new class extends \Psr\Log\AbstractLogger {
+            /** @var list<string> */
+            public array $messages = [];
+
+            public function log($level, \Stringable|string $message, array $context = []): void
+            {
+                $this->messages[] = (string) $message;
+            }
+        };
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 2,
+                reconnectDelayMs: 300,
+                reconnectJitterMs: 0,
+                connectTimeoutMs: 60,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event, ?\Throwable $error = null) use (&$events): void {
+                    $events[] = $event;
+                },
+                logger: $logger,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+        $transport->pushReadChunk(FakeTransport::EOF);
+
+        $incoming = $connection->processIncoming();
+        // Attempt 1 dials and fails fast (its handshake reads nothing), putting the recovery into
+        // its 300 ms backoff sleep before attempt 2.
+        self::awaitUntil(
+            static fn(): bool => array_filter(
+                $logger->messages,
+                static fn(string $m): bool => str_contains($m, 'reconnect attempt 1/2 failed'),
+            ) !== [],
+            'reconnect attempt 1 to fail into its backoff sleep',
+        );
+
+        $connection->disconnect()->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(0, $incoming->await(new TimeoutCancellation(5.0)));
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertCount(2, $transport->connectCalls, 'attempt 2 must never dial after disconnect()');
+        self::assertNotContains(ConnectionEvent::Reconnected, $events, 'a user-closed connection must not resurrect');
+    }
+
+    /**
+     * #84: a disconnect() landing INSIDE a recovery attempt's CONNECT write must not be overridden
+     * when that attempt's handshake then completes: the fresh socket is torn straight back down
+     * (best-effort - here its close() even throws) and the recovery aborts without ever flipping
+     * Open or emitting Reconnected.
+     */
+    public function testUserCloseDuringReconnectHandshakeAbortsRecoveryEvenWhenCloseFails(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event, ?\Throwable $error = null) use (&$events): void {
+                    $events[] = $event;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // Reconnect handshake material, consumed by recovery attempt 1 after the EOF.
+        $transport->pushReadChunk(FakeTransport::EOF);
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        // Installed AFTER the initial connect, so the first CONNECT this responder sees is the
+        // recovery attempt's.
+        $transport->onWrite = function (string $bytes) use ($connection, $transport): array {
+            if (str_starts_with($bytes, 'CONNECT ')) {
+                // The user closes while the recovery attempt is mid-handshake; afterwards the
+                // socket is a corpse whose close() fails.
+                $connection->disconnect()->await();
+                $transport->throwOnClose = new \RuntimeException('socket already torn down');
+            }
+
+            return [];
+        };
+
+        self::assertSame(0, $connection->processIncoming()->await(new TimeoutCancellation(5.0)));
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertCount(2, $transport->connectCalls, 'the aborted recovery must not redial');
+        self::assertContains(ConnectionEvent::Closed, $events);
+        self::assertNotContains(ConnectionEvent::Reconnected, $events, 'the recovery must not flip a user-closed connection back to life');
+    }
+
+    /**
+     * #84's replay window: a disconnect() landing during the recovery's subscription replay (after
+     * the fresh handshake succeeded) must abort the recovery at the post-replay close-intent
+     * re-check - tearing the new socket down (even when that close throws) instead of flipping
+     * Open and emitting Reconnected over a connection the user just closed.
+     */
+    public function testUserCloseDuringSubscriptionReplayAbortsRecoveryBeforeOpen(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                connectionListener: static function (ConnectionEvent $event, ?\Throwable $error = null) use (&$events): void {
+                    $events[] = $event;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
+
+        $transport->pushReadChunk(FakeTransport::EOF);
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        // Installed AFTER the original subscribe, so only the recovery's replayed SUB triggers it.
+        $transport->onWrite = function (string $bytes) use ($connection, $transport): array {
+            if (str_starts_with($bytes, 'SUB updates ')) {
+                $connection->disconnect()->await();
+                $transport->throwOnClose = new \RuntimeException('socket already torn down');
+            }
+
+            return [];
+        };
+
+        self::assertSame(0, $connection->processIncoming()->await(new TimeoutCancellation(5.0)));
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertCount(2, $transport->connectCalls, 'the aborted recovery must not redial');
+        self::assertNotContains(ConnectionEvent::Reconnected, $events, 'a user-closed connection must not reach Reconnected');
+    }
+
+    /**
+     * #147/#128 during subscription replay: a replay-response chunk whose parsed head holds a MSG
+     * and a fatal -ERR, and whose tail is corrupt, must FAIL that reconnect attempt (never leave
+     * the connection open on a corrupt stream) while the MSG parsed before the corruption survives
+     * the failed attempt and is delivered once the next attempt recovers.
+     */
+    public function testCorruptReplayResponseFailsTheAttemptAndTheNextAttemptRecovers(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $received = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        // Attempt 1: clean handshake, then the replay poll reads the corrupt chunk. Attempt 2:
+        // clean handshake, replay unanswered - recovery completes.
+        $transport->pushReadChunk(FakeTransport::EOF);
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+        $transport->pushReadChunk("MSG updates 1 5\r\nboom!\r\n-ERR 'Unknown Protocol Operation'\r\nBOGUS\r\n");
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        self::assertSame(0, $connection->processIncoming()->await(new TimeoutCancellation(5.0)));
+
+        self::assertCount(3, $transport->connectCalls, 'the corrupt replay response must fail attempt 1; attempt 2 redials');
+        self::assertSame(ConnectionState::Open, $connection->state(), 'the retried attempt must recover the connection');
+        self::assertSame(['boom!'], $received, 'the MSG parsed before the corrupt tail must be delivered, not lost with the failed attempt');
+    }
+
+    /**
+     * A stray frame the handshake reader cannot use (here a MSG delivered before the final PONG)
+     * must be tolerated - skipped, not fatal - so the handshake still completes on the later PONG.
+     * The stray frame is dropped, never dispatched (no subscription can exist yet): inMsgs stays 0.
+     */
+    public function testHandshakeToleratesStrayMsgFrameBeforePong(): void
+    {
+        $transport = new FakeTransport([
+            self::HANDSHAKE_INFO,
+            "MSG updates 1 5\r\nhello\r\n",
+            "PONG\r\n",
+        ]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+
+        $connection->connect()->await(new TimeoutCancellation(5.0));
+
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a stray pre-PONG frame must not fail the handshake');
+        self::assertSame(0, $connection->statistics()->inMsgs, 'the pre-handshake stray MSG is dropped, not delivered');
+    }
+
+    /**
+     * connect() against a silent server (socket accepts, nothing is ever sent) must fail within
+     * ~connectTimeoutMs with the documented handshake timeout error - the bounded per-slice reads
+     * (each cancelled read yields null and re-polls) must not hang the dial.
+     */
+    public function testConnectTimesOutAgainstSilentServer(): void
+    {
+        $transport = new FakeTransport([], blockWhenEmpty: true);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: false, connectTimeoutMs: 150, pingIntervalSeconds: 0),
+            $transport,
+        );
+
+        $startedNs = hrtime(true);
+        try {
+            $connection->connect()->await(new TimeoutCancellation(5.0));
+            self::fail('connect against a silent server must time out');
+        } catch (ConnectionException $e) {
+            self::assertStringContainsString('Expected INFO during connect', $e->getMessage());
+        }
+        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+
+        self::assertLessThan(3.0, $elapsedSeconds, 'the handshake must fail within its connect-timeout budget');
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * A registered per-sid rejection handler (#167 generalized) that THROWS while being notified of
+     * the server's permissions -ERR must be contained: frame dispatch continues, the recoverable
+     * error still reaches the error listener, and the connection stays Open.
+     */
+    public function testThrowingSubscriptionRejectionHandlerIsContained(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $sid = $connection->subscribe('js.reply.inbox', static function (NatsMessage $message): void {})->await();
+        $notified = [];
+        $connection->markSubscriptionRejectionHandler($sid, static function (string $error) use (&$notified): void {
+            $notified[] = $error;
+
+            throw new \RuntimeException('rejection handler blew up');
+        });
+
+        $transport->pushReadChunk("-ERR 'Permissions Violation for Subscription to \"js.reply.inbox\"'\r\n");
+        $connection->processIncoming()->await(new TimeoutCancellation(5.0));
+
+        self::assertCount(1, $notified, 'the rejection handler must be notified exactly once');
+        self::assertStringContainsString('js.reply.inbox', $notified[0]);
+        self::assertNotSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, 'Server sent recoverable error frame')),
+            'the recoverable -ERR must still reach the error listener despite the throwing handler',
+        );
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a per-subscription rejection is not terminal');
+    }
+
+    /**
+     * The heartbeat tick's PING write is a suspension point: a disconnect() completing inside it
+     * (#148) means the tick's follow-up self-read would target a socket mid-teardown. The state
+     * re-check must suppress that read entirely - no socket read may start after the teardown.
+     */
+    public function testHeartbeatTickSkipsSelfReadWhenDisconnectLandsDuringPingWrite(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0, maxPingsOut: 2),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $readsBeforeTick = $transport->startedReads;
+
+        // The disconnect lands inside the tick's PING write (the transport invokes this responder
+        // while the tick fiber awaits the write), completing the teardown before the write resolves.
+        $transport->onWrite = static function (string $bytes) use ($connection): array {
+            if (str_starts_with($bytes, 'PING')) {
+                $connection->disconnect()->await();
+            }
+
+            return [];
+        };
+
+        (new \ReflectionMethod($connection, 'pingTimerTick'))->invoke($connection);
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(
+            $readsBeforeTick,
+            $transport->startedReads,
+            'the heartbeat self-read must not start against a socket the disconnect just tore down',
+        );
+    }
+
+    /**
+     * Disclosed contract: a transport-level ProtocolException surfacing on the heartbeat timer's
+     * read (a one-shot deferred WebSocket violation - inflate failure, RSV1 gate, fragment bound -
+     * whose offending bytes are already consumed) must NOT be swallowed: it reaches the error
+     * listener and the connection recovers (second CONNECT on the wire), instead of the corrupt
+     * stream silently running forever.
+     */
+    public function testHeartbeatReadRecoversFromOneShotProtocolViolation(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        // Reconnect handshake material for the recovery the violation must trigger.
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        $violation = new ProtocolException('WebSocket inflate failure surfaced on the heartbeat read');
+        $transport->throwOnNextRead = $violation;
+
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertTrue(in_array($violation, $errors, true), 'the one-shot violation must reach the error listener, not be swallowed');
+        self::assertCount(2, $transport->connectCalls, 'the violation must recover the connection (a second dial)');
+        $connects = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'CONNECT '));
+        self::assertCount(2, $connects, 'the recovery must complete a second CONNECT handshake');
+        self::assertSame(ConnectionState::Open, $connection->state(), 'the recovered connection must be Open');
+    }
+
+    /**
+     * The same heartbeat-read protocol violation when recovery is unavailable (reconnect disabled):
+     * the violation still reaches the error listener, and the failed recovery forces the connection
+     * Closed - never a silent swallow that leaves a corrupt stream running as Open.
+     */
+    public function testHeartbeatProtocolViolationForcesClosedWhenRecoveryUnavailable(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $errors = [];
+        $events = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e;
+                },
+                connectionListener: static function (ConnectionEvent $event, ?\Throwable $error = null) use (&$events): void {
+                    $events[] = $event;
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $violation = new ProtocolException('WebSocket RSV1 violation surfaced on the heartbeat read');
+        $transport->throwOnNextRead = $violation;
+
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertTrue(in_array($violation, $errors, true), 'the violation must reach the error listener');
+        self::assertSame(ConnectionState::Closed, $connection->state(), 'a failed recovery must force the connection Closed');
+        self::assertContains(ConnectionEvent::Closed, $events, 'the terminal close must be announced');
+        self::assertCount(1, $transport->connectCalls, 'reconnect is disabled: no second dial may happen');
+    }
+
+    /**
+     * A heartbeat-read chunk whose parsed head is a fatal -ERR plus a MSG and whose tail is corrupt
+     * exercises BOTH containments at once (#147/#128): the recovered MSG is still delivered, and
+     * both failures - the parse error AND the fatal frame error raised while dispatching the
+     * recovered frames - surface via the error listener without escaping the timer.
+     */
+    public function testHeartbeatReadSurfacesFatalErrRecoveredFromMidChunkParseFailure(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $errors = [];
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                errorListener: static function (\Throwable $e) use (&$errors): void {
+                    $errors[] = $e->getMessage();
+                },
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+
+        $transport->pushReadChunk("-ERR 'Unknown Protocol Operation'\r\nMSG updates 1 5\r\nhello\r\nBOGUS\r\n");
+
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(['hello'], $received, 'the MSG recovered from the corrupt chunk must be delivered');
+        self::assertNotSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, 'Unsupported control frame')),
+            'the parse failure must surface via the error listener',
+        );
+        self::assertNotSame(
+            [],
+            array_filter($errors, static fn(string $m): bool => str_contains($m, 'Server sent error frame')),
+            'the fatal -ERR dispatched from the recovered frames must surface too',
+        );
+        self::assertSame(ConnectionState::Open, $connection->state(), 'escalation stays with the watchdog/user read, not the timer');
+        self::assertCount(1, $transport->connectCalls, 'the timer read itself must not trigger a recovery here');
+    }
+
+    /**
+     * A user handler that throws while the heartbeat's self-read drains its captured messages must
+     * be contained by the timer (escalation belongs to the next user read/tick): the message was
+     * delivered, nothing escapes the event-loop timer, and the connection stays Open and usable.
+     */
+    public function testHeartbeatReadContainsThrowingHandlerDuringBacklogDrain(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $invocations = 0;
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$invocations): void {
+            $invocations++;
+
+            throw new \RuntimeException('handler failed on ' . $message->payload);
+        })->await();
+
+        $transport->pushReadChunk("MSG updates 1 5\r\nhello\r\n");
+
+        // On regression (containment removed) the handler's RuntimeException escapes this invoke
+        // and fails the test.
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(1, $invocations, 'the captured message must have been delivered to the handler');
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a throwing handler must not kill the connection');
+
+        // Still usable: a publish reaches the wire.
+        $connection->publish('updates.ack', 'ok')->await();
+        self::assertStringContainsString("PUB updates.ack 2\r\nok\r\n", implode('', $transport->writes));
+    }
+
+    /**
+     * The destructor's deferred socket teardown for an abandoned Open connection (#126) is
+     * best-effort: a close() that throws must be swallowed inside the queued closure - never an
+     * uncaught exception escaping into the event loop.
+     */
+    public function testDestructorTeardownSurvivesThrowingClose(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $transport->throwOnClose = new \RuntimeException('close failed during GC teardown');
+
+        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection->connect()->await();
+        self::assertSame(ConnectionState::Open, $connection->state());
+
+        $weak = \WeakReference::create($connection);
+        unset($connection);
+        gc_collect_cycles();
+        self::assertNull($weak->get(), 'the abandoned connection must be collectable');
+
+        // Run the queued close; on regression its RuntimeException escapes the event loop here.
+        delay(0);
+        self::assertTrue($transport->closed, 'the close attempt must still mark the socket closed');
+    }
+
+    /**
+     * The validated-subject memo is bounded (#136): crossing VALIDATED_SUBJECTS_MAX (512) distinct
+     * subjects resets the memo, which must neither break publishing (previously-seen subjects
+     * revalidate cleanly) nor weaken validation (an invalid subject still throws after the reset).
+     */
+    public function testSubjectValidationMemoResetAtCapKeepsValidating(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        // Fill the memo to its 512-subject cap, then cross it.
+        for ($i = 0; $i < 512; $i++) {
+            $connection->publish('memo.s' . $i, 'x')->await();
+        }
+        $connection->publish('memo.overflow', 'x')->await();
+
+        // A subject validated before the reset publishes fine after it (revalidated, not corrupted).
+        $connection->publish('memo.s0', 'x')->await();
+
+        $pubs = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'PUB memo.'));
+        self::assertCount(514, $pubs, 'every publish across the memo reset must reach the wire');
+
+        try {
+            $connection->publish('memo..broken', 'x')->await();
+            self::fail('an invalid subject must still be rejected after the memo reset');
+        } catch (ProtocolException $e) {
+            self::assertStringContainsString('empty tokens', $e->getMessage());
+        }
+    }
 }

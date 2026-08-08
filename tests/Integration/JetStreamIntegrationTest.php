@@ -653,8 +653,13 @@ final class JetStreamIntegrationTest extends TestCase
 
         $js = $client->jetStream();
         $js->createStream($stream, [$subject])->await();
+        // ack_wait 3s (not 1s): the WPI is sent ~0.6s after delivery and the no-redelivery probe
+        // takes up to ~0.5s more - under an xdebug-instrumented run the pre-WPI steps can eat a
+        // 1s window entirely, letting ack_wait expire and the server legitimately redeliver
+        // before the WPI lands (#70 family). 3s keeps every step well inside the window while the
+        // redelivery poll below still sees the post-WPI redelivery within its deadline.
         $js->createConsumer($stream, $consumer, $subject, [
-            'ack_wait' => 1_000_000_000,
+            'ack_wait' => 3_000_000_000,
             'max_deliver' => 3,
         ])->await();
 
@@ -673,7 +678,7 @@ final class JetStreamIntegrationTest extends TestCase
             self::assertMatchesRegularExpression('/status (404|408)|No messages received within timeout/i', $e->getMessage());
         }
 
-        // Generous deadline: redelivery is due ~ack_wait (1s) after the WPI, but the poll must tolerate
+        // Generous deadline: redelivery is due ~ack_wait (3s) after the WPI, but the poll must tolerate
         // server-timer jitter and a slow (xdebug-instrumented) run without flaking (#70 family).
         $redelivered = null;
         $deadline = $this->monotonic() + 12.0;

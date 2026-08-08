@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Unit;
 
 use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
+use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
@@ -1893,5 +1894,212 @@ final class ServiceTest extends TestCase
         self::assertStringContainsString('UNSUB ', $writes);
     }
 
+    /**
+     * The VALIDATION_ERROR reply path is remotely reachable with hostile traffic, so a failing
+     * error-reply publish must be contained inside the dispatch callback (#97 class): the rejection
+     * stands unreplied, the endpoint records the validation error, and the terminal request_end
+     * observer event still fires - the shared dispatch loop never sees the publish failure.
+     */
+    public function testValidationErrorReplyPublishFailureIsContained(): void
+    {
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "MSG svc.v 13 _INBOX.reply9 2\r\nhi\r\n",
+        ]);
+        // Every write of the error reply (an HPUB to the request's reply-to) fails at the transport.
+        $transport->throwOnWriteContaining = '_INBOX.reply9';
 
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $handled = false;
+        $events = [];
+        $service = $client->service('val', '1.0.0')
+            ->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$events): void {
+                $events[] = $event;
+            })
+            ->withRequestValidator(static fn(NatsMessage $message, array $schema): string => 'bad input')
+            ->addEndpoint('v', 'svc.v', static function (NatsMessage $message) use (&$handled): string {
+                $handled = true;
+
+                return 'ok';
+            }, schema: ['type' => 'object']);
+        $service->start()->await();
+
+        // The publish failure must not escape the dispatch loop: the frame completes processing.
+        self::assertSame(1, $client->processIncoming()->await());
+
+        self::assertFalse($handled, 'a schema-rejected request must never reach the handler');
+        // request_end still fires after the failed reply, so observer spans/gauges are not leaked.
+        self::assertSame(['request_start', 'request_error', 'request_end'], $events);
+
+        $stats = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $stats['num_errors'] ?? null);
+        self::assertSame('bad input', $stats['last_error'] ?? null);
+
+        // The reply never reached the wire (the write threw before recording the bytes).
+        self::assertStringNotContainsString('VALIDATION_ERROR', implode('', $transport->writes));
+    }
+
+    /**
+     * stop() must swallow per-SID unsubscribe failures (a failing UNSUB write on an otherwise-open
+     * connection), still clear all state via the finally, fire the done handler, and leave the
+     * service restartable - a partial teardown must never abort stop() or wedge a later start().
+     */
+    public function testStopSwallowsUnsubscribeWriteFailureAndStillFiresDone(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $doneCount = 0;
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload)
+            ->onDone(static function () use (&$doneCount): void {
+                $doneCount++;
+            });
+        $service->start()->await();
+
+        // Make every UNSUB write fail so unsubscribe() throws for each SID during stop() (the catch).
+        $transport->throwOnWriteContaining = 'UNSUB';
+
+        $service->stop()->await();
+
+        self::assertSame(1, $doneCount, 'the done handler must fire despite the unsubscribe failures');
+        self::assertSame([], (new \ReflectionProperty($service, 'subscriptionSids'))->getValue($service));
+        self::assertFalse((new \ReflectionProperty($service, 'started'))->getValue($service));
+
+        // State was cleared cleanly: a subsequent start() re-subscribes without tripping the guard.
+        $transport->throwOnWriteContaining = null;
+        $service->start()->await();
+        self::assertTrue((new \ReflectionProperty($service, 'started'))->getValue($service));
+    }
+
+    /**
+     * run(): a dispatch-level failure surfacing from readIncoming (a subscription handler throwing
+     * on the shared connection) while the connection is still OPEN must not kill the loop - run()
+     * backs off and reads again. Pinned by the loop reaching a SECOND socket read after the error
+     * (the backoff completed), then exiting cleanly on cancellation with the service stopped and
+     * the connection still open - the handler error never escapes run().
+     */
+    public function testRunBacksOffAndKeepsReadingAfterDispatchError(): void
+    {
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            // One frame for the poisoned subscription (sid 1, subscribed before the service).
+            "MSG px.poison 1 4\r\nboom\r\n",
+        ], blockWhenEmpty: true);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $thrown = 0;
+        $client->subscribe('px.poison', static function () use (&$thrown): void {
+            $thrown++;
+
+            throw new \RuntimeException('poison handler');
+        })->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
+
+        $deferred = new DeferredCancellation();
+        $runner = async(static function () use ($service, $deferred): void {
+            $service->run(cancellation: $deferred->getCancellation())->await();
+        });
+
+        // State-driven wait: the loop survived the poison frame once a SECOND read starts (only the
+        // post-backoff idle read takes the blocking branch that increments startedReads).
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while ($transport->startedReads < 1 && hrtime(true) < $deadlineNs) {
+            delay(0.005);
+        }
+
+        self::assertSame(1, $thrown, 'the poisoned handler must have thrown inside the run loop');
+        self::assertGreaterThanOrEqual(1, $transport->startedReads, 'run() must back off and read again after a dispatch error');
+
+        $deferred->cancel();
+        $runner->await();
+
+        // The failure was contained: connection still open, service cleanly stopped.
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertStringContainsString('UNSUB ', implode('', $transport->writes));
+    }
+
+    /**
+     * run(): cancelling while the loop is in the dispatch-error BACKOFF must exit promptly - the
+     * backed-off loop still honors cancellation and stops the service. A queue of poison frames
+     * means an uncancelled loop would keep erroring/backing off (~20 ms each); the immediate cancel
+     * after the first error exits after at most a handful of them.
+     */
+    public function testRunCancellationDuringDispatchErrorBackoffStopsService(): void
+    {
+        $poison = "MSG px.poison 1 4\r\nboom\r\n";
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            ...array_fill(0, 25, $poison),
+        ], blockWhenEmpty: true);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $thrown = 0;
+        $client->subscribe('px.poison', static function () use (&$thrown): void {
+            $thrown++;
+
+            throw new \RuntimeException('poison handler');
+        })->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
+
+        $deferred = new DeferredCancellation();
+        $runner = async(static function () use ($service, $deferred): void {
+            $service->run(cancellation: $deferred->getCancellation())->await();
+        });
+
+        // State-driven: cancel right after the FIRST dispatch error, i.e. while run() sits in the
+        // 20 ms error backoff (one extra tick lets the run fiber resume with the error and enter it).
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while ($thrown === 0 && hrtime(true) < $deadlineNs) {
+            delay(0.001);
+        }
+        self::assertGreaterThan(0, $thrown, 'the poisoned handler must have thrown inside the run loop');
+        delay(0.001);
+        $deferred->cancel();
+
+        $runner->await();
+
+        // The cancellation exited the backed-off loop: the remaining poison frames were never
+        // drained (an uncancelled loop would process all 25 across its backoffs).
+        self::assertLessThan(25, $thrown, 'cancellation must exit the backoff loop, not drain every queued frame');
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertStringContainsString('UNSUB ', implode('', $transport->writes));
+    }
+
+    /**
+     * A class-string endpoint handler that does NOT implement ServiceEndpointHandlerInterface is
+     * rejected at registration with an exception naming both the class and the required interface -
+     * not silently wrapped into a handler that fails at request time. The declared parameter type
+     * (class-string<ServiceEndpointHandlerInterface>) already forbids this statically, so the
+     * runtime guard defends untyped callers; it is reached via reflection rather than by violating
+     * the public signature in-repo (the suite's established internals pattern).
+     */
+    public function testEndpointRejectsClassStringNotImplementingHandlerInterface(): void
+    {
+        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $service = $client->service('echo', '1.0.0');
+
+        try {
+            (new \ReflectionMethod($service, 'resolveHandler'))
+                ->invoke($service, ServiceTestInvalidClassHandler::class);
+            self::fail('a class-string handler not implementing the interface must be rejected');
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame(sprintf(
+                'Service endpoint class handler %s must implement %s.',
+                ServiceTestInvalidClassHandler::class,
+                ServiceEndpointHandlerInterface::class,
+            ), $e->getMessage());
+        }
+    }
 }

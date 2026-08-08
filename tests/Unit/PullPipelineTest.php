@@ -4,11 +4,17 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
+use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\PullServerTrait;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\delay;
 
 /**
  * End-to-end tests for the #120 pipelined pull engine (JetStreamContext::consumePipelined via
@@ -433,5 +439,182 @@ final class PullPipelineTest extends TestCase
         self::assertSame(3, $processed);
         self::assertSame(['a', 'b', 'c'], $received);
         self::assertSame(1, $this->pullPubCount($transport), 'drain must not issue a further pull');
+    }
+
+    /**
+     * stop() latched while the engine is suspended OUTSIDE the retire phase (here: inside a pull
+     * request's own publish) must end the run at the next loop turn's stop check - before any
+     * further pull is issued - not wait for a retire/deadline to notice it. The latch is armed
+     * event-driven, by the wire itself: the harness responder calls stop() the instant the 3rd
+     * CONSUMER.MSG.NEXT PUB is written, so there is no wall-clock race anywhere.
+     */
+    public function testStopLatchedOutsideRetirePhaseEndsRunAtNextLoopTurn(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 404, 'desc' => 'No Messages']],
+            // Spare: must never be pulled - a run that survives the stop would consume it.
+            [['status' => 404, 'desc' => 'No Messages']],
+        ]);
+        $js = $this->context($transport);
+
+        $iter = $js->pullConsumer('S', 'C')->setBatching(1)->setDepth(1);
+
+        // Chain onto the harness responder: latch stop() the moment the 3rd pull request hits the
+        // wire. The engine is then suspended in that pull's publish await, so the ONLY stop check
+        // it can encounter next is the loop-top one (retire ran before the issue phase).
+        $inner = $transport->onWrite;
+        $pulls = 0;
+        $transport->onWrite = static function (string $bytes) use ($inner, $iter, &$pulls): array {
+            $frames = $inner !== null ? $inner($bytes) : [];
+            if (str_starts_with($bytes, 'PUB $JS.API.CONSUMER.MSG.NEXT.') && ++$pulls === 3) {
+                $iter->stop();
+            }
+
+            return $frames;
+        };
+
+        $processed = $iter->handle(static function (): void {})->await();
+
+        self::assertSame(0, $processed);
+        self::assertSame(3, $this->pullPubCount($transport), 'stop() latched at the 3rd pull must end the run without a 4th pull');
+        // The long-lived pull inbox is still released exactly once on the stop exit path.
+        $unsubs = array_filter($transport->writes, static fn (string $w): bool => str_starts_with($w, 'UNSUB '));
+        self::assertCount(1, $unsubs);
+    }
+
+    /**
+     * FIX2 heartbeat semantics of the engine (driven directly via consumePipelined(), since the
+     * public iterator never sets idle_heartbeat): a route-wide heartbeat miss (2 x idle_heartbeat of
+     * total silence) is a WAKE-UP, not a terminal error. The engine must bound its first read
+     * segment by the miss deadline (a second read segment proves the early wake), then keep waiting
+     * to the per-pull deadline, retire the silent pull as a routine empty, and - in finite mode with
+     * a null status code - end WITHOUT onError. fetchBatch() by contrast throws on the same silence;
+     * this pins the engine's deliberately different contract.
+     */
+    public function testIdleHeartbeatMissWakesTheEngineButIsNotTerminal(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $errors = [];
+        $cfg = new PullPipelineConfig(
+            batch: 1,
+            expiresMs: 300,
+            depth: 1,
+            iterations: 1,
+            noWait: false,
+            grouped: false,
+            pullFields: [],
+            // Miss deadline (2 x 100ms = 200ms) fires long before the pull deadline (300+1000ms).
+            idleHeartbeatNs: 100_000_000,
+            onError: static function (JetStreamException $e) use (&$errors): void {
+                $errors[] = $e;
+            },
+        );
+        $ctl = new PullPipelineControl(
+            stopFn: static fn (): bool => false,
+            drainFn: static fn (): bool => false,
+            getPinFn: static fn (): ?string => null,
+            setPinFn: static function (?string $pinId): void {},
+        );
+
+        $startNs = hrtime(true);
+        $processed = $client->jetStream()->consumePipelined('S', 'C', $cfg, static function (): void {}, $ctl)->await();
+        $elapsedNs = hrtime(true) - $startNs;
+
+        self::assertSame(0, $processed);
+        self::assertSame([], $errors, 'a silent-deadline finite retire is terminal WITHOUT onError; the heartbeat miss alone must never be reported');
+        // Non-terminal: the run rode all the way to the per-pull deadline (expires + 1000ms slack)
+        // instead of dying at the 200ms miss the way fetchBatch() does.
+        self::assertGreaterThanOrEqual(1_250_000_000, $elapsedNs, 'a heartbeat miss must not terminate the pull early');
+        // The wake happened: the wait was split into a read bounded by the miss deadline plus at
+        // least one more to the pull deadline - a SINGLE deadline-bounded read means no wake
+        // occurred (the regression this pins). >= 2 rather than exactly 2: an instrumented (xdebug
+        // coverage) run can skew the cancellation timers enough to split the wait into an extra
+        // segment, which is still a correct early wake (#70 family).
+        self::assertGreaterThanOrEqual(2, $transport->startedReads, 'the miss deadline must bound the first read segment');
+    }
+
+    /**
+     * A sibling pull whose deadline expires while the handler is busy must be retired on the next
+     * loop turn WITHOUT the engine trying to build a read wait from the already-negative remainder
+     * (a negative TimeoutCancellation throws) and without blocking on a read first: the pump phase
+     * loops straight back to retire when the earliest deadline is already due. The run then
+     * continues - refilling the pipeline and surfacing the real terminal status - rather than
+     * crashing or hanging.
+     */
+    public function testExpiredSiblingDeadlineDuringSlowHandlerRetiresWithoutBlocking(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a']],                                   // pull#0: delivers; its handler is slow
+            [],                                                 // pull#1: never answered -> expires mid-handler
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#2: refill, real terminal
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // pull#3: refill sibling (fan-out)
+        ]);
+        $js = $this->context($transport);
+
+        $errors = [];
+        $received = [];
+        $processed = $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setExpiresMs(100)
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e;
+            })
+            ->handle(static function (NatsMessage $m) use (&$received): void {
+                $received[] = $m->payload;
+                // Slow handler: suspends the engine fiber past pull#1's deadline (100+1000ms after
+                // its issue, which precedes this handler's start - the margin is structural, the
+                // delay is a floor, so this cannot flake under load).
+                delay(1.2);
+            })->await();
+
+        self::assertSame(1, $processed);
+        self::assertSame(['a'], $received);
+        // The expired silent pull#1 was retired as a routine empty; the run went on to issue the
+        // refills and stopped on the genuine terminal 409 - reported exactly once.
+        self::assertCount(1, $errors);
+        self::assertStringContainsString('Consumer Deleted', $errors[0]->getMessage());
+        self::assertSame(4, $this->pullPubCount($transport), 'the engine must keep refilling after retiring the expired pull');
+    }
+
+    /**
+     * resetLifecycle() clears stop/drain between runs but deliberately KEEPS the pin: a pinned
+     * group's captured pin must survive into the next handle() run, so its very first pull re-joins
+     * the server-side pin instead of racing an unpinned bootstrap (buildPull() emits the `id` field
+     * from the retained pin).
+     */
+    public function testCapturedPinPersistsIntoTheNextRun(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['msg' => 'a', 'pin' => 'p1']],                    // run 1 bootstrap: captures p1
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // run 1: terminal
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // run 1: fan-out sibling
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // run 2: terminal
+            [['status' => 409, 'desc' => 'Consumer Deleted']],  // run 2: fan-out sibling
+        ]);
+        $js = $this->context($transport);
+
+        $iter = $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setGroup('g')
+            ->setOnError(static function (): void {});
+
+        self::assertSame(1, $iter->handle(static function (): void {})->await());
+        $pullsAfterRun1 = count($this->pullWrites($transport));
+
+        self::assertSame(0, $iter->handle(static function (): void {})->await());
+
+        $pulls = $this->pullWrites($transport);
+        self::assertStringNotContainsString('"id"', $pulls[0], 'the run-1 bootstrap pull has no pin yet');
+        self::assertStringContainsString('"id":"p1"', $pulls[$pullsAfterRun1], "run 2's first pull must carry the pin captured in run 1");
     }
 }

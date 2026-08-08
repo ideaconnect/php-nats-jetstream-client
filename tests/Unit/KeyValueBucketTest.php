@@ -2977,4 +2977,347 @@ final class KeyValueBucketTest extends TestCase
         self::assertCount(6, $entries);
         self::assertSame(['v1', 'v2', 'v3', 'v4', 'v5', 'v6'], array_map(static fn (KeyValueEntry $e): ?string => $e->value, $entries));
     }
+
+    /**
+     * The `bucket` alias is an explicit KV-bucket declaration, so it is translated to the backing
+     * `KV_` stream name EVEN in the custom-subject_transforms pass-through branch (which otherwise
+     * leaves the source verbatim for non-KV streams - nats.go has no such alias, so nothing else
+     * may be touched: the caller's transforms pass through and no auto transform is attached).
+     */
+    public function testCreateSourceBucketAliasWithCustomTransformsStillKvPrefixesName(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create([
+            'sources' => [[
+                'bucket' => 'legacy',
+                'subject_transforms' => [['src' => 'raw.>', 'dest' => '$KV.agg.>']],
+            ]],
+        ])->await();
+
+        $create = $transport->writes[3];
+        // The alias resolves to the backing stream name, the caller's transforms pass through verbatim.
+        self::assertStringContainsString(
+            '"sources":[{"subject_transforms":[{"src":"raw.>","dest":"$KV.agg.>"}],"name":"KV_legacy"}]',
+            $create,
+        );
+        // No mandatory KV transform is auto-attached in the full-control branch, and the client-side
+        // alias key never reaches the wire.
+        self::assertStringNotContainsString('"src":"$KV.legacy.>"', $create);
+        self::assertStringNotContainsString('"bucket":"legacy"', $create);
+    }
+
+    /**
+     * A source whose name is ALREADY the backing `KV_` stream name must not be double-prefixed: the
+     * bucket part is derived by stripping the prefix, so the mandatory ADR-57 transform re-subjects
+     * from the ORIGIN bucket's `$KV.<src>.>` keyspace - not from a bogus `$KV.KV_<src>.>`.
+     */
+    public function testCreateSourceWithKvPrefixedNameIsNotDoublePrefixed(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create(['sources' => ['KV_events']])->await();
+
+        $create = $transport->writes[3];
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_events","subject_transforms":[{"src":"$KV.events.>","dest":"$KV.agg.>"}]}]',
+            $create,
+        );
+        self::assertStringNotContainsString('KV_KV_', $create, 'an already-prefixed source name must be used as-is');
+    }
+
+    /**
+     * `domain` is a client-side shorthand FOR `external`, so an entry carrying both is ambiguous and
+     * must be rejected locally (nats.go parity) - before anything is sent, so no half-built stream
+     * create ever reaches the server.
+     */
+    public function testCreateRejectsMirrorWithBothDomainAndExternal(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, []);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('dst')->create([
+                'mirror' => ['name' => 'src', 'domain' => 'HUB', 'external' => ['api' => '$JS.HUB.API']],
+            ])->await();
+            self::fail('a mirror with both domain and external must be rejected');
+        } catch (JetStreamException $e) {
+            self::assertSame('A KV mirror/source cannot set both domain and external', $e->getMessage());
+        }
+
+        // The rejection is client-side: no STREAM.CREATE request was published.
+        self::assertStringNotContainsString('STREAM.CREATE', implode('', $transport->writes));
+    }
+
+    /**
+     * A mirror entry with an EMPTY name resolves to no origin bucket, so the prefix re-resolution
+     * must be a no-op: writes keep this handle's own `$KV.<bucket>.` prefix rather than forging a
+     * broken `$KV..`-style origin prefix from the empty name.
+     */
+    public function testCreateMirrorWithEmptyNameLeavesPrefixesUnchanged(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $putAck = '{"stream":"KV_dst","seq":5}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        $kv->create(['mirror' => ['name' => '']])->await();
+        $ack = $kv->put('theme', 'blue')->await();
+
+        $writes = implode('', $transport->writes);
+        // The write stays on this bucket's own prefix - no origin could be resolved.
+        self::assertStringContainsString('PUB $KV.dst.theme ', $writes);
+        self::assertStringNotContainsString('PUB $KV..theme', $writes);
+        self::assertSame(5, $ack->seq);
+    }
+
+    /**
+     * bind() sanity-checks the existing stream is KV-shaped before adopting it (nats.go ErrBadBucket
+     * parity): a stream without `max_msgs_per_subject >= 1` is not a KV bucket, and attaching to it
+     * would corrupt reads/writes - so bind() must fail loudly, naming the stream.
+     */
+    public function testBindRejectsStreamThatIsNotAKvBucket(): void
+    {
+        // STREAM.INFO of a plain (non-KV) stream: no max_msgs_per_subject in the config.
+        $info = '{"config":{"name":"KV_cfg","mirror":{"name":"KV_src"}}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($info), $info),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('cfg')->bind()->await();
+            self::fail('bind() must reject a stream that is not KV-shaped');
+        } catch (JetStreamException $e) {
+            self::assertSame('Stream "KV_cfg" is not a KV bucket (max_msgs_per_subject < 1)', $e->getMessage());
+        }
+    }
+
+    /**
+     * keys(): a delivery lacking a parseable $JS.ACK reply subject (a control / non-conformant
+     * frame) must be SKIPPED - not thrown out of the shared dispatch loop (the #90 class) and not
+     * enumerated as a key even when its subject looks like one. The frame uses a legitimate key
+     * subject precisely so a mutant that collects it anyway is caught by the returned set.
+     */
+    public function testKeysToleratesDeliveryWithoutMetadataAndKeepsEnumerating(): void
+    {
+        $consumerReply = '{"stream_name":"KV_cfg","name":"KEYS","num_pending":2,'
+            . '"config":{"deliver_subject":"_INBOX.KV.KEYS.x","ack_policy":"none",'
+            . '"deliver_policy":"last_per_subject","headers_only":true}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($consumerReply), $consumerReply),
+        ], [
+            '_INBOX.KV.KEYS' => [
+                // A metadata-less delivery (no $JS.ACK reply subject) on a real key subject.
+                "MSG \$KV.cfg.ghost 2 2\r\nxx\r\n",
+                // A well-formed delivery follows and completes the replay (num_pending token = 0).
+                "MSG \$KV.cfg.real 2 \$JS.ACK.KV_cfg.KEYS.1.6.1.0.0 0\r\n\r\n",
+            ],
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $keys = $client->jetStream()->keyValue('cfg')->keys()->await();
+
+        // Only the well-formed delivery is enumerated; the metadata-less frame is skipped entirely.
+        self::assertSame(['real'], $keys);
+        self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
+    }
+
+    /**
+     * #121 companion to testHistoryThrowsWhenDeadlineFiresBeforeCaughtUp: on a FULLY idle deliver
+     * subscription (a live but silent socket, modelled by a blocking read) the bounded wait is
+     * enforced by CANCELLING the in-flight socket read - the replay must surface the stall error
+     * instead of hanging forever inside the read, and the cancelled read must not leak.
+     */
+    public function testHistoryStallsOnFullyIdleDeliverSubscriptionAndUnsubscribes(): void
+    {
+        // One revision pending, but the deliver subscription never receives anything at all.
+        $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":1,"config":{"deliver_subject":"dlv","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000, pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('cfg')->history('theme', 0.05)->await();
+            self::fail('a fully idle replay must surface the stall, not hang in the blocked read');
+        } catch (JetStreamException $e) {
+            self::assertStringStartsWith('Key history for "theme" stalled', $e->getMessage());
+            self::assertStringContainsString('0.050 s', $e->getMessage());
+            self::assertStringContainsString('collected 0 revision(s)', $e->getMessage());
+        }
+
+        // The deliver subscription (sid 2) is torn down on the throw path, and the blocked socket
+        // read was actually cancelled (every started read resolved - nothing orphaned).
+        self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
+        self::assertGreaterThan(0, $transport->startedReads);
+        self::assertSame($transport->startedReads, $transport->resolvedReads);
+
+        // Quiesce leftover timers exactly as testKeysThrowsOnStalledReplayAndStillUnsubscribes does.
+        $client->disconnect()->await();
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
+    }
+
+    /**
+     * getAll() per-subject fan-out (pre-2.11 server, no batched Direct Get): an error that is
+     * neither 404 (missing key, skipped) nor 503 (Direct Get unavailable, leader fallback) must
+     * propagate VERBATIM - code and description - and fail the enumeration.
+     */
+    public function testGetAllFanOutPropagatesNon404Non503DirectGetError(): void
+    {
+        $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":1,"bytes":32,"subjects":{"$KV.cfg.theme":1}}}';
+        $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"messages":1,"bytes":32,"subjects":{}}}';
+        $errHdrs = "NATS/1.0 500 Internal Error\r\nStatus: 500\r\nDescription: kv direct get exploded\r\n\r\n";
+        $eh = strlen($errHdrs);
+
+        // Pre-2.11 server: the batched multi_last gate is off, so the per-subject fan-out runs.
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
+            sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $eh, $eh, $errHdrs),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->keyValue('cfg')->getAll()->await();
+            self::fail('a non-404/503 Direct Get error must fail the enumeration');
+        } catch (JetStreamException $e) {
+            self::assertSame(500, $e->getCode());
+            self::assertSame('kv direct get exploded', $e->getMessage());
+        }
+
+        $writes = implode('', $transport->writes);
+        // The fan-out path was taken: a per-subject last_by_subj lookup, no batched multi_last.
+        self::assertStringContainsString('"last_by_subj":"$KV.cfg.theme"', $writes);
+        self::assertStringNotContainsString('"multi_last"', $writes);
+    }
+
+    /**
+     * getAll() batched fast path: a batch REPLY frame whose stored subject is outside this bucket's
+     * keyspace (a rogue/foreign record in the multi_last stream) must be dropped from the result,
+     * not surfaced under a garbage key - mirroring the request-side candidate filtering.
+     */
+    public function testGetAllBatchedDropsReplyFramesOutsideBucketPrefix(): void
+    {
+        $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":1,"subjects":{"$KV.cfg.theme":1}}}';
+        $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
+        // A frame on a FOREIGN subject precedes the real key's frame (which terminates the batch).
+        $rogueHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.other.rogue\r\nNats-Sequence: 7\r\n\r\n";
+        $themeHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.theme\r\nNats-Sequence: 8\r\nNats-Num-Pending: 0\r\n\r\n";
+        $rogueBody = 'zzz';
+        $themeBody = 'dark';
+        $rh = strlen($rogueHdrs);
+        $rt = $rh + strlen($rogueBody);
+        $th = strlen($themeHdrs);
+        $tt = $th + strlen($themeBody);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
+        ], [
+            '_INBOX.JS.DGET' => [
+                sprintf("HMSG \$KV.other.rogue 2 %d %d\r\n%s%s\r\n", $rh, $rt, $rogueHdrs, $rogueBody),
+                sprintf("HMSG \$KV.cfg.theme 2 %d %d\r\n%s%s\r\n", $th, $tt, $themeHdrs, $themeBody),
+            ],
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
+
+        // Only the in-prefix record maps to a key; the rogue frame contributes nothing.
+        self::assertSame(['theme' => 'dark'], $all);
+        self::assertStringContainsString('"multi_last":["$KV.cfg.theme"]', implode('', $transport->writes));
+    }
+
+    /**
+     * KeyWatchOptions rejects a non-positive idleHeartbeat at construction: a zero/negative interval
+     * could never drive the missed-heartbeat watchdog and would otherwise be sent to the server as a
+     * nonsense consumer config.
+     */
+    public function testWatchOptionsRejectNonPositiveIdleHeartbeat(): void
+    {
+        try {
+            new KeyWatchOptions(idleHeartbeat: 0);
+            self::fail('idleHeartbeat: 0 must be rejected');
+        } catch (\InvalidArgumentException $e) {
+            self::assertSame('idleHeartbeat must be a positive integer (nanoseconds)', $e->getMessage());
+        }
+
+        $this->expectException(\InvalidArgumentException::class);
+        new KeyWatchOptions(idleHeartbeat: -1);
+    }
 }

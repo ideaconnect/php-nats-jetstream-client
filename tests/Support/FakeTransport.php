@@ -9,6 +9,7 @@ use Amp\DeferredFuture;
 use Amp\Future;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
+use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
@@ -35,6 +36,40 @@ final class FakeTransport implements TlsAwareTransportInterface
 
     /** When set, write() throws a TransportClosedException for bytes containing this substring. */
     public ?string $throwOnWriteContaining = null;
+
+    /**
+     * When set, write() of bytes containing this substring PARKS the calling fiber until close()
+     * fails it out with a TransportClosedException - modelling a peer stalling with a full send
+     * buffer (backpressure), where a real Amp socket write suspends until the socket is torn down.
+     * The bytes are still recorded in $writes (they entered the kernel buffer); no read chunks are
+     * enqueued for them (the peer never processed the frame).
+     */
+    public ?string $wedgeOnWriteContaining = null;
+
+    /**
+     * When set, the NEXT readLine() throws this (once - the mode self-clears before throwing).
+     * Models transport-level violations surfacing on a read: a ProtocolException reproduces the
+     * WebSocket codec's one-shot deferred terminals (inflate failure, RSV1 gate, fragment bound)
+     * whose offending bytes are already consumed, so ONLY the exception surfaces, never EOF.
+     */
+    public ?\Throwable $throwOnNextRead = null;
+
+    /**
+     * When set, close() still performs its teardown bookkeeping (fails wedged writes, marks
+     * $closed) but then throws this - modelling an already-broken socket whose close() errors.
+     * Persistent: every close() call throws until the test clears the mode.
+     */
+    public ?\Throwable $throwOnClose = null;
+
+    /** @var list<DeferredFuture<never>> Writes parked by $wedgeOnWriteContaining, failed by close(). */
+    private array $wedgedWrites = [];
+
+    /**
+     * Bounded referenced keep-alive while writes are parked, so unreferenced timers (every
+     * TimeoutCancellation) still fire; self-expires so a failing test cannot wedge the PHPUnit
+     * process at exit (mirrors WedgedWriteTransport).
+     */
+    private ?string $wedgeKeepAliveId = null;
 
     /**
      * Chunks appended to the read queue when write() sees bytes containing the key (each key fires
@@ -134,6 +169,18 @@ final class FakeTransport implements TlsAwareTransportInterface
                 throw new TransportClosedException('Simulated write failure');
             }
 
+            if ($this->wedgeOnWriteContaining !== null && str_contains($bytes, $this->wedgeOnWriteContaining)) {
+                // Backpressure wedge: record the bytes, then park the caller until close() fails the
+                // write out - exactly like a real Amp socket write against a zero-window peer.
+                $this->writes[] = $bytes;
+                $this->wedgeKeepAliveId ??= EventLoop::delay(10.0, static function (): void {});
+
+                /** @var DeferredFuture<never> $pending */
+                $pending = new DeferredFuture();
+                $this->wedgedWrites[] = $pending;
+                $pending->getFuture()->await();
+            }
+
             $this->writes[] = $bytes;
 
             foreach ($this->enqueueOnWriteContaining as $needle => $chunks) {
@@ -161,6 +208,14 @@ final class FakeTransport implements TlsAwareTransportInterface
     public function readLine(?Cancellation $cancellation = null): Future
     {
         return async(function () use ($cancellation): string {
+            if ($this->throwOnNextRead !== null) {
+                // One-shot: clear before throwing so the connection's recovery path reads normally.
+                $failure = $this->throwOnNextRead;
+                $this->throwOnNextRead = null;
+
+                throw $failure;
+            }
+
             if ($this->readQueue !== []) {
                 $chunk = (string) array_shift($this->readQueue);
                 if ($chunk === self::EOF) {
@@ -211,7 +266,23 @@ final class FakeTransport implements TlsAwareTransportInterface
                 delay($this->closeDelay);
             }
 
+            if ($this->wedgeKeepAliveId !== null) {
+                EventLoop::cancel($this->wedgeKeepAliveId);
+                $this->wedgeKeepAliveId = null;
+            }
+
+            // Fail parked (wedged) writes out, exactly like a real socket teardown.
+            $wedged = $this->wedgedWrites;
+            $this->wedgedWrites = [];
+            foreach ($wedged as $pending) {
+                $pending->error(new TransportClosedException('The transport was closed before writing completed'));
+            }
+
             $this->closed = true;
+
+            if ($this->throwOnClose !== null) {
+                throw $this->throwOnClose;
+            }
         });
     }
 }
