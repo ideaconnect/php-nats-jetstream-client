@@ -25,6 +25,25 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         return 'SHA-256=' . strtr(base64_encode(hash('sha256', $data, true)), '+/', '-_');
     }
 
+    /** Direct Get reply carrying a live stored-object meta record for the link target check. */
+    private function liveTargetMeta(string $name, string $bucket, int $sid): string
+    {
+        $body = (string) json_encode([
+            'name' => $name,
+            'bucket' => $bucket,
+            'nuid' => 'ntgt',
+            'size' => 3,
+            'chunks' => 1,
+            'mtime' => '2030-01-01T00:00:00Z',
+            'deleted' => false,
+        ], JSON_THROW_ON_ERROR);
+        $enc = strtr(base64_encode($name), '+/', '-_');
+        $hdrs = "NATS/1.0\r\nNats-Stream: OBJ_{$bucket}\r\nNats-Subject: \$O.{$bucket}.M.{$enc}\r\nNats-Sequence: 2\r\n\r\n";
+        $h = strlen($hdrs);
+
+        return sprintf("HMSG _INBOX.x %d %d %d\r\n%s%s\r\n", $sid, $h, $h + strlen($body), $hdrs, $body);
+    }
+
     private function notFound(): string
     {
         return '{"error":{"code":404,"description":"message not found"}}';
@@ -185,7 +204,9 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     public function testAddLinkValidatesNameAndUsesExplicitTargetBucket(): void
     {
         $client = $this->client([
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // name-free check
+            $this->liveTargetMeta('real.bin', 'other', 2),                                      // target lives in OBJ_other
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
         $bucket = $client->jetStream()->objectStore('assets');
 
@@ -222,7 +243,9 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
     public function testLinkMetaFieldsExactValues(): void
     {
         $client = $this->client([
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),  // name-free check
+            $this->liveTargetMeta('real.bin', 'assets', 2),                                     // live target
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
         $link = $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();

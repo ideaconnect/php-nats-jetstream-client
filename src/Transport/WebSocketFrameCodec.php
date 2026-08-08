@@ -85,10 +85,23 @@ final class WebSocketFrameCodec
      * Decodes as many complete frames as are present in $buffer, removing the consumed bytes (an
      * incomplete trailing frame is left in $buffer for the next read).
      *
+     * RFC 6455 strictness violations - an out-of-bounds declared length, a MASKED server-to-client
+     * frame (5.1), or a fragmented/oversized control frame (5.5) - do NOT throw mid-batch: throwing
+     * discarded the frames already decoded from the same read (their bytes consumed, unrecoverable)
+     * and left the buffer untrimmed. Instead the violation is reported via $terminal and parsing
+     * stops; the caller returns the prior frames first and surfaces the terminal condition on the
+     * next read (the #115 deferral pattern).
+     *
+     * @param ProtocolException|null $terminal Set to the strictness violation that stopped parsing.
+     * @param bool $allowMasked Accept and unmask MASKED frames instead of failing them. The
+     *        production server-to-client read path never sets this (RFC 6455 5.1: servers must not
+     *        mask); it exists for decoding CLIENT-written frames, where masking is mandatory
+     *        (tests asserting the client's own pong/close output, server-side harnesses).
      * @return list<array{opcode:int,payload:string,fin:bool,rsv1:bool}>
      */
-    public static function decode(string &$buffer): array
+    public static function decode(string &$buffer, ?ProtocolException &$terminal = null, bool $allowMasked = false): array
     {
+        $terminal = null;
         $frames = [];
         $total = strlen($buffer);
         // Advance a single cursor instead of re-slicing the whole remaining buffer per frame, so a read
@@ -131,7 +144,23 @@ final class WebSocketFrameCodec
             }
 
             if ($length < 0 || $length > self::MAX_FRAME_PAYLOAD) {
-                throw new ProtocolException('WebSocket frame payload length out of bounds: ' . $length);
+                $terminal = new ProtocolException('WebSocket frame payload length out of bounds: ' . $length);
+                break;
+            }
+
+            // RFC 6455 5.1: a server MUST NOT mask frames sent to the client; a masked frame MUST
+            // fail the connection rather than be silently unmasked and accepted.
+            if ($masked && !$allowMasked) {
+                $terminal = new ProtocolException('WebSocket server-to-client frame is masked (RFC 6455 5.1 violation)');
+                break;
+            }
+
+            // RFC 6455 5.5: control frames (opcode >= 0x8) MUST NOT be fragmented and MUST carry a
+            // payload of at most 125 bytes. Accepting a fragmented ping used to splice its
+            // continuation bytes into an in-progress fragmented DATA message - silent corruption.
+            if ($opcode >= 0x8 && (!$fin || $length > 125)) {
+                $terminal = new ProtocolException('WebSocket control frame is fragmented or oversized (RFC 6455 5.5 violation)');
+                break;
             }
 
             $maskKey = '';

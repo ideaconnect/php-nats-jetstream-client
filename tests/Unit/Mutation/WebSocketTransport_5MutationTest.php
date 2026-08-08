@@ -185,7 +185,7 @@ final class WebSocketTransport_5MutationTest extends TestCase
 
         $written = $socket->writtenBytes();
         self::assertNotSame('', $written, 'a Close echo must be written');
-        $frames = WebSocketFrameCodec::decode($written);
+        $frames = WebSocketFrameCodec::decode($written, allowMasked: true);
         self::assertNotSame([], $frames);
         self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
         // Exactly the 2-byte status - not 3 bytes, not the whole reason-carrying payload.

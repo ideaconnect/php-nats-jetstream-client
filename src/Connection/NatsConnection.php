@@ -182,6 +182,16 @@ final class NatsConnection
      * @var array<int, true>
      */
     private array $unboundedSids = [];
+    /**
+     * Per-sid callbacks invoked when the server rejects THAT subscription with an async permissions
+     * -ERR (generalizing the #167 mux latch): a long-lived reply inbox (the pull-pipeline engine's
+     * "_INBOX.JS.PULL.<nuid>.*") whose SUB is rejected can never deliver a reply, so every pull
+     * retires as a silent client-side deadline and the engine would spin forever with zero signal.
+     * The owning layer registers a handler to fail fast instead. Cleared with the sid's state.
+     *
+     * @var array<int, \Closure(string):void>
+     */
+    private array $subscriptionRejectionHandlers = [];
     private int $outstandingPings = 0;
     private ?string $pingTimerId = null;
     /**
@@ -702,6 +712,7 @@ final class NatsConnection
         // terminal close clears the rejection latch and lets ensureMuxInbox() re-attempt the mux (#167).
         $this->muxRejected = false;
         $this->unboundedSids = [];
+        $this->subscriptionRejectionHandlers = [];
         $this->reconnectBuffer = '';
         $this->parser = new ProtocolParser();
         // Terminal close: no PONG will ever arrive for a queued PING, so parked flush/rtt waiters
@@ -751,6 +762,33 @@ final class NatsConnection
     }
 
     /**
+     * Writes raw bytes with the WAIT bounded by $cancellation. A transport write suspends the
+     * calling fiber on backpressure (a peer stalling with a full send buffer) and cannot be
+     * cancelled mid-flight, so the write runs on its own fiber and only the wait is bounded: on
+     * cancellation the caller proceeds - drain() treats it as a wedged transport and tears down
+     * (its socket close then errors the abandoned write out), flush() times out - while the
+     * fiber's late outcome is ignored. Only bounded-time contracts (drain, flush) pay the extra
+     * fiber; hot paths keep the direct single-fiber write.
+     */
+    private function writeBounded(string $bytes, Cancellation $cancellation): void
+    {
+        $write = async(function () use ($bytes): void {
+            $this->transport->write($bytes)->await();
+        });
+        $write->ignore();
+        $write->await($cancellation);
+    }
+
+    /**
+     * The remaining budget until $deadline as a cancellation for one bounded drain write; never
+     * zero so a deadline razor-edge still surfaces as a cancellation, not an invalid timeout.
+     */
+    private function remainingBudgetCancellation(float $deadline): Cancellation
+    {
+        return new TimeoutCancellation(max(0.001, $deadline - $this->monotonicSeconds()));
+    }
+
+    /**
      * Gracefully drains all subscriptions, flushes pending messages, then closes.
      *
      * @return Future<void>
@@ -773,59 +811,78 @@ final class NatsConnection
             // #149 requires the wait be bounded by the existing (singular) drain deadline.
             $drainDeadline = $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000);
 
-            // Send UNSUB for all active subscriptions so no new messages arrive.
-            foreach (array_keys($this->subscriptionMeta) as $sid) {
-                $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
-            }
-
-            // Flush in-flight deliveries already emitted by the server before closing. The FIFO
-            // pong slot pairs this PING with ITS pong (#117): a stale PONG answering an earlier
-            // heartbeat PING (whose bounded self-read timed out without consuming it) completes
-            // that older slot instead of ending this flush early - ending early would close the
-            // socket with in-flight MSGs unread, silent loss on the documented lossless path.
-            $flushSlot = $this->enqueuePongSlot();
             try {
-                $this->transport->write($this->codec->encodePing())->await();
-            } catch (\Throwable $writeError) {
-                // The PING never hit the wire: drop its slot so correlation stays aligned.
-                $this->discardPongSlot($flushSlot);
+                // Send UNSUB for all active subscriptions so no new messages arrive. Each write's
+                // WAIT is bounded by the remaining drain budget: a peer stalling with a full send
+                // buffer suspends transport writes indefinitely (they cannot be cancelled, only
+                // abandoned), and drain() has already cancelled the heartbeat - the one escalation
+                // that could otherwise break such a wedge - so an unbounded write here hung drain()
+                // forever in violation of its documented ~requestTimeoutMs bound (#149).
+                foreach (array_keys($this->subscriptionMeta) as $sid) {
+                    $this->writeBounded(
+                        $this->codec->encodeUnsubscribe($sid),
+                        $this->remainingBudgetCancellation($drainDeadline),
+                    );
+                }
 
-                throw $writeError;
-            }
+                // Flush in-flight deliveries already emitted by the server before closing. The FIFO
+                // pong slot pairs this PING with ITS pong (#117): a stale PONG answering an earlier
+                // heartbeat PING (whose bounded self-read timed out without consuming it) completes
+                // that older slot instead of ending this flush early - ending early would close the
+                // socket with in-flight MSGs unread, silent loss on the documented lossless path.
+                $flushSlot = $this->enqueuePongSlot();
+                try {
+                    $this->writeBounded($this->codec->encodePing(), $this->remainingBudgetCancellation($drainDeadline));
+                } catch (CancelledException $wedged) {
+                    // The PING write wedged past the deadline but its bytes may still reach the wire
+                    // when the queue drains (or die with the socket close below); either way the
+                    // epoch teardown clears the slot, so leaving it queued stays FIFO-correct.
+                    throw $wedged;
+                } catch (\Throwable $writeError) {
+                    // The PING never hit the wire: drop its slot so correlation stays aligned.
+                    $this->discardPongSlot($flushSlot);
 
-            // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
-            // the slot), bounded by the REMAINING drain budget (shared with the backlog wait below)
-            // so a slow/wedged server cannot hang drain() forever. A partial chunk (0 complete frames
-            // yet) must NOT end the flush early - only the PONG or the deadline does.
-            $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
-            try {
-                while (!$flushCancellation->isRequested()) {
-                    $read = $this->readIncoming($flushCancellation)->await();
+                    throw $writeError;
+                }
 
-                    if ($flushSlot->isComplete()) {
-                        // The PONG answering the drain PING arrived (or a concurrent teardown
-                        // errored the slot - close-and-clean-up below is right either way).
-                        break;
+                // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
+                // the slot), bounded by the REMAINING drain budget (shared with the backlog wait below)
+                // so a slow/wedged server cannot hang drain() forever. A partial chunk (0 complete frames
+                // yet) must NOT end the flush early - only the PONG or the deadline does.
+                $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
+                try {
+                    while (!$flushCancellation->isRequested()) {
+                        $read = $this->readIncoming($flushCancellation)->await();
+
+                        if ($flushSlot->isComplete()) {
+                            // The PONG answering the drain PING arrived (or a concurrent teardown
+                            // errored the slot - close-and-clean-up below is right either way).
+                            break;
+                        }
+
+                        if (!$read->consumedBytes) {
+                            // Genuinely idle read (empty socket, or another fiber owns the read). Yield so
+                            // the event loop advances and the deadline can fire - without this the loop
+                            // would busy-spin and starve the timer forever. A read that consumed bytes but
+                            // did not complete this drain PONG frame (a large payload arriving in chunks)
+                            // loops immediately: the rest is already buffered, so no idle sleep is paid per
+                            // partial chunk (#119).
+                            delay(0.001, cancellation: $flushCancellation);
+                        }
                     }
-
-                    if (!$read->consumedBytes) {
-                        // Genuinely idle read (empty socket, or another fiber owns the read). Yield so
-                        // the event loop advances and the deadline can fire - without this the loop
-                        // would busy-spin and starve the timer forever. A read that consumed bytes but
-                        // did not complete this drain PONG frame (a large payload arriving in chunks)
-                        // loops immediately: the rest is already buffered, so no idle sleep is paid per
-                        // partial chunk (#119).
-                        delay(0.001, cancellation: $flushCancellation);
-                    }
+                } catch (CancelledException) {
+                    // Flush deadline reached; close with whatever was delivered.
                 }
             } catch (CancelledException) {
-                // Flush deadline reached; close with whatever was delivered.
+                // A drain WRITE wedged past the deadline (backpressure-stalled peer): the socket is
+                // unusable, so skip the flush phase - the teardown below closes it, which errors the
+                // abandoned write's fiber out. The drain bound now covers the write phase too (#149).
             } catch (\Throwable $flushError) {
-                // A fatal frame (e.g. a server -ERR) or a handler that threw/published while the
-                // flush-phase read delivered backlog surfaced here. Route it to the error listener
-                // (a swallowed handler failure during the lossless path was invisible before) and
-                // fall through to the cleanup below so drain() still closes rather than leaving the
-                // connection wedged in Draining with the socket open (#150).
+                // A failed drain write (dead socket), a fatal frame (e.g. a server -ERR), or a handler
+                // that threw/published while the flush-phase read delivered backlog surfaced here.
+                // Route it to the error listener (a swallowed failure during the lossless path was
+                // invisible before) and fall through to the cleanup below so drain() still closes
+                // rather than leaving the connection wedged in Draining with the socket open (#150).
                 $this->emitErrorSafely($flushError);
             }
 
@@ -1130,7 +1187,15 @@ final class NatsConnection
         }
 
         if ($this->state === ConnectionState::Draining) {
-            $this->transport->write($frame)->await();
+            // Bounded like drain()'s own writes: a handler ack/reply published while drain delivers
+            // backlog rides a socket whose heartbeat is already cancelled, so an unbounded write on
+            // a backpressure-stalled peer would wedge the drain past its budget with no escalation
+            // left. On the wedge the caller's failure is contained by drain's handler-error paths.
+            try {
+                $this->writeBounded($frame, new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)));
+            } catch (CancelledException) {
+                throw new TimeoutException('Publish during drain timed out (transport backpressure)');
+            }
 
             return;
         }
@@ -1255,6 +1320,17 @@ final class NatsConnection
     }
 
     /**
+     * Registers a callback invoked (with the raw -ERR text) when the server rejects this sid's
+     * subscription with an async permissions violation. See {@see $subscriptionRejectionHandlers}.
+     *
+     * @internal Low-level mechanism for long-lived JetStream reply inboxes; not general API.
+     */
+    public function markSubscriptionRejectionHandler(int $sid, \Closure $handler): void
+    {
+        $this->subscriptionRejectionHandlers[$sid] = $handler;
+    }
+
+    /**
      * Removes a subscription callback and sends an UNSUB command.
      *
      * With $maxMessages, arms auto-unsubscribe instead of removing immediately: the server keeps
@@ -1376,7 +1452,18 @@ final class NatsConnection
             // concurrent flush timing out cannot release this waiter.
             $slot = $this->enqueuePongSlot();
             try {
-                $this->transport->write($this->codec->encodePing())->await();
+                // The WAIT is bounded (the write itself cannot be cancelled): flush() documents a
+                // request-timeout bound, but a backpressure-suspended write held it forever before
+                // the read phase's deadline could even start (#149's write-phase twin).
+                $this->writeBounded(
+                    $this->codec->encodePing(),
+                    new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)),
+                );
+            } catch (CancelledException) {
+                // Write wedged past the flush budget. The PING may still reach the wire whenever
+                // the queue drains, so its slot deliberately STAYS queued (same rule as the
+                // read-phase timeout below); epoch teardown clears it if the PONG never comes.
+                throw new TimeoutException('Flush timed out writing PING (transport backpressure)');
             } catch (\Throwable $writeError) {
                 // The PING never hit the wire: drop its slot so correlation stays aligned with
                 // wire order (nats.go removePongFromList parity).
@@ -3061,6 +3148,24 @@ final class NatsConnection
                     $this->muxRejected = true;
                 }
 
+                // Generalized #167: a permissions violation naming a subscription subject starves
+                // whichever layer routes replies through that sid. Notify the owning layer's
+                // registered rejection handler (the pull-pipeline engine) so it fails fast with a
+                // clear error instead of spinning on silent deadline retires forever. The subject
+                // may appear quoted or bare in the server's -ERR text.
+                if (preg_match('/subscription to "?([^\s"\']+)"?/i', $error, $subjectMatch) === 1) {
+                    $rejectedSubject = $subjectMatch[1];
+                    foreach ($this->subscriptionMeta as $rejectedSid => $meta) {
+                        if ($meta['subject'] === $rejectedSubject && isset($this->subscriptionRejectionHandlers[$rejectedSid])) {
+                            try {
+                                ($this->subscriptionRejectionHandlers[$rejectedSid])($error);
+                            } catch (\Throwable) {
+                                // A throwing handler must never break frame dispatch.
+                            }
+                        }
+                    }
+                }
+
                 // Non-fatal server error (e.g. a per-subscription permissions violation): surface it
                 // to the async error listener instead of tearing down the connection.
                 $this->emitError(new NatsException('Server sent recoverable error frame: ' . $error));
@@ -3434,12 +3539,21 @@ final class NatsConnection
         $this->readInProgress = true;
 
         $closed = false;
+        $protocolViolation = null;
         try {
             $chunk = $this->transport->readLine(new TimeoutCancellation($timeoutSeconds))->await();
         } catch (TransportClosedException) {
             // The peer closed the socket during the heartbeat read. Recover, but only after the
             // finally clears readInProgress (recoverConnection -> connectOnce reads the socket).
             $closed = true;
+            $chunk = '';
+        } catch (ProtocolException $violation) {
+            // A transport-level protocol violation surfaced on the TIMER's read. Some of these are
+            // ONE-SHOT (the WebSocket transport's deferred processFrames terminals - inflate
+            // failure, RSV1 gate, fragment bound - whose offending bytes are already consumed):
+            // swallowing here would drop the violation forever and leave a corrupt stream running
+            // silently. Surface + recover after the finally, mirroring the user-read path.
+            $protocolViolation = $violation;
             $chunk = '';
         } catch (\Throwable) {
             // No PONG within the window (or a transient read error); leave escalation to the next
@@ -3448,6 +3562,17 @@ final class NatsConnection
         } finally {
             $this->readInProgress = false;
             $this->signalReadSlotFree();
+        }
+
+        if ($protocolViolation !== null) {
+            $this->emitError($protocolViolation);
+            try {
+                $this->recoverConnection();
+            } catch (\Throwable) {
+                $this->state = ConnectionState::Closed;
+            }
+
+            return;
         }
 
         if ($closed) {
@@ -3814,5 +3939,6 @@ final class NatsConnection
         unset($this->autoUnsubMax[$sid]);
         // Hygiene: the slow-consumer exemption flag must never outlive its sid (#118).
         unset($this->unboundedSids[$sid]);
+        unset($this->subscriptionRejectionHandlers[$sid]);
     }
 }

@@ -22,7 +22,7 @@ final class WebSocketFrameCodecTest extends TestCase
         self::assertSame(0x80 | 6, ord($encoded[1]));
 
         $buffer = $encoded;
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertSame('', $buffer);
         self::assertCount(1, $frames);
@@ -50,14 +50,14 @@ final class WebSocketFrameCodecTest extends TestCase
         $full = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'hello', true, 'WXYZ');
         // Feed everything but the last byte.
         $buffer = substr($full, 0, -1);
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertSame([], $frames);
         self::assertSame(substr($full, 0, -1), $buffer);
 
         // Deliver the final byte; the frame now decodes.
         $buffer .= substr($full, -1);
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
         self::assertCount(1, $frames);
         self::assertSame('hello', $frames[0]['payload']);
         self::assertSame('', $buffer);
@@ -72,7 +72,7 @@ final class WebSocketFrameCodecTest extends TestCase
             . WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'hb', false)
             . WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, '+OK', false);
 
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertCount(3, $frames);
         self::assertSame('INFO {}', $frames[0]['payload']);
@@ -91,7 +91,7 @@ final class WebSocketFrameCodecTest extends TestCase
         // Length marker 126 + 2-byte length.
         self::assertSame(126, ord($buffer[1]) & 0x7F);
 
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
         self::assertCount(1, $frames);
         self::assertSame($payload, $frames[0]['payload']);
     }
@@ -103,7 +103,7 @@ final class WebSocketFrameCodecTest extends TestCase
     {
         // Manually craft a non-final binary frame (FIN=0, opcode binary, unmasked, len 3).
         $buffer = chr(WebSocketFrameCodec::OP_BINARY) . chr(3) . 'abc';
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertCount(1, $frames);
         self::assertFalse($frames[0]['fin']);
@@ -200,7 +200,7 @@ final class WebSocketFrameCodecTest extends TestCase
         self::assertSame(0x40, ord($encoded[0]) & 0x40);
 
         $buffer = $encoded;
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
         self::assertCount(1, $frames);
         self::assertTrue($frames[0]['rsv1']);
         self::assertSame($payload, WebSocketFrameCodec::inflate($frames[0]['payload']));
@@ -234,7 +234,7 @@ final class WebSocketFrameCodecTest extends TestCase
 
         // Decode must reconstruct the original payload from the 64-bit-length frame.
         $buffer = $encoded;
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
         self::assertCount(1, $frames);
         self::assertSame($payload, $frames[0]['payload']);
         self::assertSame('', $buffer);
@@ -252,7 +252,7 @@ final class WebSocketFrameCodecTest extends TestCase
         $buffer = pack('CC', 0x82, 127) . str_repeat("\x00", 3);
         $original = $buffer;
 
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertSame([], $frames, 'No complete frame should be decoded');
         self::assertSame($original, $buffer, 'Buffer must be left unchanged when header is incomplete');
@@ -268,28 +268,77 @@ final class WebSocketFrameCodecTest extends TestCase
         $buffer = pack('CC', 0x82, 126) . "\x01";
         $original = $buffer;
 
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertSame([], $frames, 'No complete frame should be decoded');
         self::assertSame($original, $buffer, 'Buffer must not be consumed when 16-bit length is incomplete');
     }
 
     /**
-     * Verifies decode() throws when the declared payload length exceeds MAX_FRAME_PAYLOAD.
-     * We craft a 64-bit-length frame header with a length value of 64 MiB + 1.
+     * A declared payload length beyond MAX_FRAME_PAYLOAD no longer THROWS mid-batch (which
+     * discarded frames already decoded from the same read and left the buffer untrimmed): decode()
+     * reports it via the $terminal out-param, returns the valid frames parsed before it, and trims
+     * only their bytes - the caller delivers the data first and surfaces the violation deferred.
      */
-    public function testDecodePayloadLengthOutOfBoundsThrows(): void
+    public function testDecodePayloadLengthOutOfBoundsReportsTerminalAfterValidFrames(): void
     {
-        $this->expectException(ProtocolException::class);
-        $this->expectExceptionMessageMatches('/payload length out of bounds/');
-
         // MAX_FRAME_PAYLOAD is 64 * 1024 * 1024 = 67108864. Use one byte over.
         $tooLarge = 64 * 1024 * 1024 + 1;
-        // FIN+binary, 64-bit length marker, 8-byte big-endian length (no payload needed - decode
-        // throws before trying to read the payload).
-        $buffer = pack('CC', 0x82, 127) . pack('J', $tooLarge);
+        $valid = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'ok', false);
+        $poison = pack('CC', 0x82, 127) . pack('J', $tooLarge);
+        $buffer = $valid . $poison;
 
-        WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, $terminal);
+
+        self::assertCount(1, $frames, 'the valid frame before the violation must be returned');
+        self::assertSame('ok', $frames[0]['payload']);
+        self::assertInstanceOf(ProtocolException::class, $terminal);
+        self::assertMatchesRegularExpression('/payload length out of bounds/', $terminal->getMessage());
+        self::assertSame($poison, $buffer, 'only the valid frame\'s bytes are consumed');
+    }
+
+    /**
+     * RFC 6455 5.1: a server-to-client frame MUST NOT be masked - the default (server-frame) decode
+     * mode reports it as a terminal violation instead of silently unmasking; the explicit
+     * allowMasked mode (client-written frames: pong/close assertions, server-side harnesses) still
+     * unmasks.
+     */
+    public function testDecodeRejectsMaskedServerFrameUnlessAllowed(): void
+    {
+        $masked = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'data', true, 'MKEY');
+
+        $buffer = $masked;
+        $frames = WebSocketFrameCodec::decode($buffer, $terminal);
+        self::assertSame([], $frames);
+        self::assertInstanceOf(ProtocolException::class, $terminal);
+        self::assertStringContainsString('masked', $terminal->getMessage());
+
+        $buffer = $masked;
+        $frames = WebSocketFrameCodec::decode($buffer, $terminal, allowMasked: true);
+        self::assertNull($terminal);
+        self::assertSame('data', $frames[0]['payload'] ?? null);
+    }
+
+    /**
+     * RFC 6455 5.5: control frames MUST NOT be fragmented and MUST carry at most 125 payload
+     * bytes. A fragmented PING used to be answered and its continuation spliced into an
+     * in-progress fragmented DATA message - silent corruption; it is now a terminal violation.
+     */
+    public function testDecodeRejectsFragmentedOrOversizedControlFrames(): void
+    {
+        // PING with FIN cleared (fragmented control frame).
+        $ping = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'abc', false);
+        $ping[0] = chr(ord($ping[0]) & 0x7F);
+        $buffer = $ping;
+        WebSocketFrameCodec::decode($buffer, $terminal);
+        self::assertInstanceOf(ProtocolException::class, $terminal);
+        self::assertStringContainsString('control frame', $terminal->getMessage());
+
+        // PING with a 126-byte payload (oversized control frame).
+        $buffer = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, str_repeat('x', 126), false);
+        WebSocketFrameCodec::decode($buffer, $terminal);
+        self::assertInstanceOf(ProtocolException::class, $terminal);
+        self::assertStringContainsString('control frame', $terminal->getMessage());
     }
 
     /**
@@ -304,7 +353,7 @@ final class WebSocketFrameCodecTest extends TestCase
         $buffer = pack('CC', 0x82, 0x80 | 5) . "\xAB\xCD";
         $original = $buffer;
 
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         self::assertSame([], $frames, 'No frame decoded when mask key is incomplete');
         self::assertSame($original, $buffer, 'Buffer unchanged when mask key bytes are missing');

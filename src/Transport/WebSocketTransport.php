@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IDCT\NATS\Transport;
 
 use Amp\Cancellation;
+use Amp\CancelledException;
 use Amp\Future;
 use Amp\Socket\ClientTlsContext;
 use Amp\Socket\ConnectContext;
@@ -33,6 +34,17 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
     /** Hard cap on a reassembled fragmented message, bounding memory against a hostile/buggy server (#89). */
     private const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
+
+    /**
+     * Bound (seconds) on the best-effort Close-frame write in {@see close()}. Amp's socket write()
+     * SUSPENDS the calling fiber (it does not throw) while the write buffer is full, so an unbounded
+     * inline write on a backpressure-stalled peer would park close() forever before it reaches the
+     * socket close - and since close() is what errors pending writes out, nothing else could ever
+     * break that deadlock. Generous enough for a draining-but-slow buffer to flush the 6-byte frame;
+     * on timeout the frame is abandoned and the socket close below fails the pending write (RFC 6455
+     * permits closing without completing the Close handshake).
+     */
+    private const CLOSE_FRAME_WRITE_TIMEOUT = 0.25;
 
     /**
      * Outstanding-tail size above which a head frame that declares a 64-bit length switches from
@@ -105,6 +117,16 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
     /** Whether permessage-deflate was negotiated with the server (#61). */
     private bool $compressionActive = false;
+
+    /** Outstanding fire-and-forget control-frame answer fibers (see answerControlFrame()). */
+    private int $pendingControlAnswers = 0;
+
+    /**
+     * Cap on concurrently parked control-frame answers under write backpressure. RFC 6455 5.5.3
+     * permits answering only the most recent ping, so dropping the excess is conformant; the cap
+     * bounds hostile-peer memory the way #89 bounds fragment reassembly.
+     */
+    private const MAX_PENDING_CONTROL_ANSWERS = 16;
 
     /**
      * @param NatsOptions $options Client options controlling TLS (used for `wss://`) and socket behavior.
@@ -242,7 +264,13 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     public function readLine(?Cancellation $cancellation = null): Future
     {
         return async(function () use ($cancellation): string {
-            if ($this->socket === null) {
+            // Captured for the whole read loop: close() nulls the property BEFORE the socket is
+            // actually closed (up to the Close-frame write bound), so a looping reader re-reading
+            // $this->socket in that window would deref null. The local keeps this reader pinned to
+            // its own socket; once close() reaches the socket close, the pending read returns
+            // EOF/throws and the loop exits through the normal closed paths.
+            $socket = $this->socket;
+            if ($socket === null) {
                 return '';
             }
 
@@ -252,7 +280,7 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                     return $data;
                 }
 
-                $chunk = $this->socket->read($cancellation);
+                $chunk = $socket->read($cancellation);
                 if ($chunk === null) {
                     throw new TransportClosedException('WebSocket closed by peer (EOF)');
                 }
@@ -282,6 +310,9 @@ final class WebSocketTransport implements TlsAwareTransportInterface
      * frame is fully buffered.
      *
      * @return array{opcode: int, payload: string, fin: bool, rsv1: bool}
+     *
+     * @phpstan-impure Consumes readBuffer/readChunks state and throws on a masked frame; callers
+     *                 must not assume remembered property values (pendingTerminal) persist across it.
      */
     private function consumeSpanningFrame(): array
     {
@@ -329,8 +360,10 @@ final class WebSocketTransport implements TlsAwareTransportInterface
         $this->readChunksLength = 0;
 
         $payload = implode('', $pieces);
-        if ($header['masked'] && $payload !== '') {
-            $payload = WebSocketFrameCodec::unmask($payload, $header['maskKey']);
+        if ($header['masked']) {
+            // RFC 6455 5.1: server-to-client frames MUST NOT be masked; fail the connection instead
+            // of silently unmasking (the buffer state is already consumed - the caller defers this).
+            throw new ProtocolException('WebSocket server-to-client frame is masked (RFC 6455 5.1 violation)');
         }
 
         return [
@@ -342,7 +375,13 @@ final class WebSocketTransport implements TlsAwareTransportInterface
     }
 
     /**
-     * Sends a close frame (best effort) and closes the underlying socket.
+     * Sends a close frame (best effort, time-bounded) and closes the underlying socket.
+     *
+     * close() MUST always reach the socket close: recovery and drain await it, and the socket close
+     * is what errors out writes suspended on backpressure. The Close-frame courtesy write therefore
+     * runs in its own fiber with a bounded await - an inline write would suspend (not throw) on a
+     * full write buffer, the try/catch would never engage, and the wedged close() would deadlock the
+     * whole client (nothing else closes the socket once state has left Open).
      */
     public function close(): Future
     {
@@ -353,10 +392,20 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 return;
             }
 
+            $closeFrame = async(static function () use ($socket): void {
+                try {
+                    $socket->write(WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, ''));
+                } catch (\Throwable) {
+                    // The socket may already be gone, or the close below failed this write out
+                    // mid-suspension; closing is what matters.
+                }
+            });
+
             try {
-                $socket->write(WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, ''));
-            } catch (\Throwable) {
-                // The socket may already be gone; closing below is what matters.
+                $closeFrame->await(new TimeoutCancellation(self::CLOSE_FRAME_WRITE_TIMEOUT));
+            } catch (CancelledException) {
+                // The frame write is wedged on backpressure; abandon it - the socket close below
+                // fails the pending write and wakes its fiber.
             }
 
             $socket->close();
@@ -396,15 +445,28 @@ final class WebSocketTransport implements TlsAwareTransportInterface
             }
 
             $this->readFrameRequired = null;
-            $out .= $this->processFrames([$this->consumeSpanningFrame()]);
+            try {
+                $out .= $this->processFrames([$this->consumeSpanningFrame()]);
+            } catch (ProtocolException $violation) {
+                // A masked spilled frame (RFC 6455 5.1): defer like every other strictness
+                // violation so previously returned data stands and the failure surfaces cleanly.
+                $this->pendingTerminal ??= $violation;
+            }
         }
 
         // Skip the batch decode if the spilled frame's trailing bytes already carried a terminal
         // condition (Close or fragmentation violation).
         if ($this->pendingTerminal === null) {
-            $frames = WebSocketFrameCodec::decode($this->readBuffer);
+            $frames = WebSocketFrameCodec::decode($this->readBuffer, $codecTerminal);
             if ($frames !== []) {
                 $out .= $this->processFrames($frames);
+            }
+
+            // A strictness violation (oversized declared length, masked server frame, fragmented/
+            // oversized control frame) stopped the decode AFTER the valid frames above were
+            // collected: deliver them first, defer the violation to the next readLine() (#115).
+            if ($codecTerminal !== null) {
+                $this->pendingTerminal ??= $codecTerminal;
             }
         }
 
@@ -425,19 +487,61 @@ final class WebSocketTransport implements TlsAwareTransportInterface
         }
 
         // decode() consumed every complete frame, so the buffer now holds at most one incomplete head
-        // frame - and already threw on a hostile declared length (its own MAX_FRAME_PAYLOAD guard
-        // fires the moment the length bytes are in). Only a frame that declares a 64-bit length can
-        // exceed 65 535 bytes; size just those and, when the outstanding tail is large, switch that
-        // frame to O(1) chunk accumulation. Frames with a 7-bit/16-bit length are never sized here,
-        // so the small-frame and fragmented paths keep the pre-#164 `.=` + batch-decode cost exactly.
+        // frame - a hostile declared length on a COMPLETE frame was already deferred via the codec
+        // terminal above. Only a frame that declares a 64-bit length can exceed 65 535 bytes; size
+        // just those and, when the outstanding tail is large, switch that frame to O(1) chunk
+        // accumulation. Frames with a 7-bit/16-bit length are never sized here, so the small-frame
+        // and fragmented paths keep the pre-#164 `.=` + batch-decode cost exactly. An INCOMPLETE
+        // head frame declaring an out-of-bounds length throws from the sizing itself - defer it the
+        // same way so data decoded this call is returned first.
+        // (No pendingTerminal guard needed: the block above already returned/threw when one was set.)
         if (strlen($this->readBuffer) >= 2 && (ord($this->readBuffer[1]) & 0x7F) === 127) {
-            $required = WebSocketFrameCodec::frameRequiredBytes($this->readBuffer);
-            if ($required !== null && $required - strlen($this->readBuffer) > self::LARGE_FRAME_SPILL_BYTES) {
-                $this->readFrameRequired = $required;
+            try {
+                $required = WebSocketFrameCodec::frameRequiredBytes($this->readBuffer);
+                if ($required !== null && $required - strlen($this->readBuffer) > self::LARGE_FRAME_SPILL_BYTES) {
+                    $this->readFrameRequired = $required;
+                }
+            } catch (ProtocolException $oversize) {
+                $this->pendingTerminal = $oversize;
             }
         }
 
         return $out;
+    }
+
+    /**
+     * Writes a control-frame answer (pong / Close echo) on its own fire-and-forget fiber, swallowing
+     * any failure. Inline control-frame writes in the read fiber were a loss/stall hazard: a throw
+     * discarded the data frames decoded from the same read, and a backpressure suspension parked the
+     * read path indefinitely (the same suspension class as the close() wedge). The spawned fiber
+     * enqueues its bytes in spawn order; if the socket dies (or the bounded close() abandons the
+     * queue), the write's failure is swallowed - the failure that matters surfaces via the read path.
+     */
+    private function answerControlFrame(int $opcode, string $payload): void
+    {
+        $socket = $this->socket;
+        if ($socket === null) {
+            return;
+        }
+
+        // Cap outstanding answer fibers: a hostile peer flooding PINGs while zero-windowing its
+        // read side would otherwise turn every ~7 inbound bytes into a parked fiber plus queued
+        // pong bytes, unbounded until the heartbeat escalation closes the socket. RFC 6455 5.5.3
+        // explicitly permits answering only the most recent ping, so excess answers are dropped.
+        if ($this->pendingControlAnswers >= self::MAX_PENDING_CONTROL_ANSWERS) {
+            return;
+        }
+        $this->pendingControlAnswers++;
+
+        async(function () use ($socket, $opcode, $payload): void {
+            try {
+                $socket->write(WebSocketFrameCodec::encode($opcode, $payload));
+            } catch (\Throwable) {
+                // Dead/closing socket: the read path surfaces the failure; the answer is moot.
+            } finally {
+                $this->pendingControlAnswers--;
+            }
+        });
     }
 
     /**
@@ -456,8 +560,16 @@ final class WebSocketTransport implements TlsAwareTransportInterface
         foreach ($frames as $frame) {
             switch ($frame['opcode']) {
                 case WebSocketFrameCodec::OP_PING:
-                    // Answer with a pong carrying the same application data.
-                    $this->socket?->write(WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PONG, $frame['payload']));
+                    // Answer with a pong carrying the same application data - on its OWN fiber,
+                    // never inline: this runs inside the READ fiber, and an inline write could
+                    // (a) THROW on a just-died socket, discarding the data frames already decoded
+                    // into $out from the same read (their bytes are consumed - core NATS never
+                    // resends), or (b) SUSPEND on a backpressure-stalled peer, parking the whole
+                    // read path behind an outbound control frame. A failed/abandoned pong needs no
+                    // surfacing of its own: the socket is dead or dying, and the next read (or the
+                    // bounded close()) surfaces that. Fibers start in spawn order, so multiple
+                    // pongs still answer in arrival order.
+                    $this->answerControlFrame(WebSocketFrameCodec::OP_PONG, $frame['payload']);
                     break;
 
                 case WebSocketFrameCodec::OP_PONG:
@@ -467,13 +579,10 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                     // RFC 6455 5.5.1: an endpoint receiving a Close MUST send a Close in response.
                     // Echo one mirroring the received status code (the first two payload bytes; empty
                     // when the peer sent no status), best-effort - the socket may already be gone (#161).
+                    // Sent on its own fiber like the pong answer above: an inline echo could suspend
+                    // the read fiber on a stalled peer, delaying the close from surfacing.
                     $echo = strlen($frame['payload']) >= 2 ? substr($frame['payload'], 0, 2) : '';
-
-                    try {
-                        $this->socket?->write(WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CLOSE, $echo));
-                    } catch (\Throwable) {
-                        // The peer may have already dropped the socket; surfacing the close is what matters.
-                    }
+                    $this->answerControlFrame(WebSocketFrameCodec::OP_CLOSE, $echo);
 
                     // Flag the close and stop instead of throwing here: any data frames earlier in this
                     // batch have already been decoded out of the read buffer, so throwing would silently
@@ -502,9 +611,32 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                         return $out;
                     }
 
+                    if ($frame['rsv1'] && !$this->compressionActive) {
+                        // RFC 6455 5.2: a non-zero RSV bit outside a negotiated extension MUST fail
+                        // the connection. Inflating an uncompressed payload as before produced a
+                        // confusing zlib error (or garbage) instead of naming the violation.
+                        $this->pendingTerminal ??= new ProtocolException(
+                            'WebSocket data frame sets RSV1 but permessage-deflate was not negotiated (RFC 6455 5.2 violation)',
+                        );
+
+                        return $out;
+                    }
+
                     if ($frame['fin']) {
-                        // A compressed (RSV1) message is inflated once fully received.
-                        $out .= $frame['rsv1'] ? WebSocketFrameCodec::inflate($frame['payload']) : $frame['payload'];
+                        // A compressed (RSV1) message is inflated once fully received. An inflate
+                        // failure (corrupt deflate stream) is deferred like every terminal condition
+                        // so data already decoded from this read is returned first (#115).
+                        if ($frame['rsv1']) {
+                            try {
+                                $out .= WebSocketFrameCodec::inflate($frame['payload']);
+                            } catch (ProtocolException $inflateError) {
+                                $this->pendingTerminal ??= $inflateError;
+
+                                return $out;
+                            }
+                        } else {
+                            $out .= $frame['payload'];
+                        }
                     } else {
                         $this->fragmentBuffer = $frame['payload'];
                         $this->fragmentChunks = [];
@@ -512,7 +644,14 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                         $this->fragmenting = true;
                         // permessage-deflate marks RSV1 only on the first frame of the message.
                         $this->fragmentCompressed = $frame['rsv1'];
-                        $this->enforceFragmentBound();
+
+                        try {
+                            $this->enforceFragmentBound();
+                        } catch (ProtocolException $boundError) {
+                            $this->pendingTerminal ??= $boundError;
+
+                            return $out;
+                        }
                     }
                     break;
 
@@ -533,13 +672,32 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
                     $this->fragmentChunks[] = $frame['payload'];
                     $this->fragmentChunksLength += strlen($frame['payload']);
-                    $this->enforceFragmentBound();
+
+                    try {
+                        $this->enforceFragmentBound();
+                    } catch (ProtocolException $boundError) {
+                        // enforceFragmentBound() already reset the fragment state; defer the
+                        // violation so same-read data is returned first (#115).
+                        $this->pendingTerminal ??= $boundError;
+
+                        return $out;
+                    }
+
                     if ($frame['fin']) {
                         // Single join of all fragments (#164) - one copy of every byte.
                         $message = implode('', [$this->fragmentBuffer, ...$this->fragmentChunks]);
-                        $out .= $this->fragmentCompressed
-                            ? WebSocketFrameCodec::inflate($message)
-                            : $message;
+                        if ($this->fragmentCompressed) {
+                            try {
+                                $out .= WebSocketFrameCodec::inflate($message);
+                            } catch (ProtocolException $inflateError) {
+                                $this->resetFragmentState();
+                                $this->pendingTerminal ??= $inflateError;
+
+                                return $out;
+                            }
+                        } else {
+                            $out .= $message;
+                        }
                         $this->resetFragmentState();
                     }
                     break;
@@ -626,6 +784,9 @@ final class WebSocketTransport implements TlsAwareTransportInterface
         }
 
         $accept = null;
+        $upgradeOk = false;
+        $connectionOk = false;
+        $negotiatedExtensions = null;
         foreach (array_slice($lines, 1) as $line) {
             $colon = strpos($line, ':');
             if ($colon === false) {
@@ -636,17 +797,99 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
             if (strcasecmp($headerName, 'Sec-WebSocket-Accept') === 0) {
                 $accept = $headerValue;
-            } elseif (strcasecmp($headerName, 'Sec-WebSocket-Extensions') === 0
-                && stripos($headerValue, 'permessage-deflate') !== false
-            ) {
-                // The server accepted compression; (de)compress data frames from here on (#61).
-                $this->compressionActive = true;
+            } elseif (strcasecmp($headerName, 'Upgrade') === 0) {
+                $upgradeOk = strcasecmp($headerValue, 'websocket') === 0;
+            } elseif (strcasecmp($headerName, 'Connection') === 0) {
+                // A token list ("Upgrade", "keep-alive, Upgrade", ...) - require the Upgrade token.
+                foreach (explode(',', $headerValue) as $token) {
+                    if (strcasecmp(trim($token), 'upgrade') === 0) {
+                        $connectionOk = true;
+                    }
+                }
+            } elseif (strcasecmp($headerName, 'Sec-WebSocket-Extensions') === 0) {
+                $negotiatedExtensions = $headerValue;
             }
+        }
+
+        // RFC 6455 4.1 steps 2-3: a 101 without Upgrade: websocket / Connection: Upgrade is NOT a
+        // completed WebSocket handshake (e.g. a proxy answering 101 for something else); the client
+        // MUST fail the connection rather than speak WebSocket into a non-WebSocket stream.
+        if (!$upgradeOk || !$connectionOk) {
+            throw new ConnectionException(
+                'WebSocket handshake failed: the 101 response is missing the required '
+                . '"Upgrade: websocket" / "Connection: Upgrade" headers (RFC 6455 4.1)',
+            );
         }
 
         if ($accept === null || !hash_equals(WebSocketFrameCodec::acceptKey($clientKey), $accept)) {
             throw new ConnectionException('WebSocket handshake failed: invalid Sec-WebSocket-Accept');
         }
+
+        if ($negotiatedExtensions !== null) {
+            $this->compressionActive = $this->negotiateCompression($negotiatedExtensions);
+        }
+    }
+
+    /**
+     * Validates the server's Sec-WebSocket-Extensions response and reports whether permessage-deflate
+     * is active. RFC 6455 4.1 requires FAILING the connection on an extension that was not offered
+     * (pre-fix an unsolicited "permessage-deflate" flipped compression on, so the client started
+     * RSV1-deflating its CONNECT into a server that never negotiated it), and RFC 7692 requires
+     * rejecting unknown/unacceptable parameters - this codec inflates per message, so a server
+     * negotiating window-bits/context-takeover semantics beyond the offered
+     * client_no_context_takeover/server_no_context_takeover would garble every message after the
+     * first.
+     */
+    private function negotiateCompression(string $extensions): bool
+    {
+        if (!$this->options->webSocketCompression) {
+            throw new ConnectionException(
+                'WebSocket handshake failed: the server negotiated extension "' . $extensions
+                . '" that this client never offered (RFC 6455 4.1)',
+            );
+        }
+
+        $parts = array_map(trim(...), explode(';', $extensions));
+        $name = array_shift($parts);
+        if (strcasecmp((string) $name, 'permessage-deflate') !== 0 || str_contains($extensions, ',')) {
+            throw new ConnectionException(
+                'WebSocket handshake failed: unsupported extension response "' . $extensions . '"',
+            );
+        }
+
+        $serverNoContext = false;
+        foreach ($parts as $param) {
+            if ($param === '') {
+                continue;
+            }
+
+            if (strcasecmp($param, 'server_no_context_takeover') === 0) {
+                $serverNoContext = true;
+
+                continue;
+            }
+
+            if (strcasecmp($param, 'client_no_context_takeover') !== 0) {
+                throw new ConnectionException(
+                    'WebSocket handshake failed: unacceptable permessage-deflate parameter "' . $param
+                    . '" (this client offered client_no_context_takeover; server_no_context_takeover only)',
+                );
+            }
+        }
+
+        // RFC 7692 7.1.1.1: a server that received server_no_context_takeover in the offer MUST echo
+        // it or decline the extension. A server that accepts WITHOUT echoing may retain deflate
+        // context across messages - which this per-message-inflate codec cannot decode (every
+        // back-referencing message would fail, flakily). nats-server always echoes both params.
+        if (!$serverNoContext) {
+            throw new ConnectionException(
+                'WebSocket handshake failed: the server accepted permessage-deflate without echoing '
+                . 'server_no_context_takeover (RFC 7692 7.1.1.1) - it may use context takeover, which '
+                . 'this client cannot decode',
+            );
+        }
+
+        return true;
     }
 
     /**

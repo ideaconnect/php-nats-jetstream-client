@@ -11,6 +11,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Tests\Support\ScriptedChunkSocket;
+use IDCT\NATS\Tests\Support\WedgedWriteSocket;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\WebSocketFrameCodec;
@@ -310,7 +311,7 @@ final class WebSocketTransportTest extends TestCase
 
             // The server received the client's PONG (masked) carrying the ping payload.
             $buffer = (string) $serverSocket->read();
-            $frames = WebSocketFrameCodec::decode($buffer);
+            $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
             self::assertNotSame([], $frames);
             self::assertSame(WebSocketFrameCodec::OP_PONG, $frames[0]['opcode']);
             self::assertSame('hb', $frames[0]['payload']);
@@ -327,6 +328,9 @@ final class WebSocketTransportTest extends TestCase
     public function testReadLineInflatesCompressedFrameFromSocket(): void
     {
         [$transport, $server, $serverSocket] = $this->connectedWebSocketTransport();
+        // An RSV1 frame is only legal once permessage-deflate was NEGOTIATED (RFC 6455 5.2); this
+        // socket was injected without a handshake, so mark the negotiation explicitly.
+        (new \ReflectionProperty(WebSocketTransport::class, 'compressionActive'))->setValue($transport, true);
 
         try {
             $payload = 'INFO {"server_id":"x","headers":true}';
@@ -425,7 +429,7 @@ final class WebSocketTransportTest extends TestCase
 
             // The server received the client's masked PONG carrying the ping payload.
             $buffer = (string) $serverSocket->read(new \Amp\TimeoutCancellation(2.0));
-            $frames = WebSocketFrameCodec::decode($buffer);
+            $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
             self::assertNotSame([], $frames);
             self::assertSame(WebSocketFrameCodec::OP_PONG, $frames[0]['opcode']);
             self::assertSame('hb', $frames[0]['payload']);
@@ -500,18 +504,18 @@ final class WebSocketTransportTest extends TestCase
     {
         $mid = pack('N*', ...range(1000, 1074)); // 300 bytes, distinct
         $f1 = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'HEAD-', fin: false);
-        // Masked continuation: 2 base + 2 extended-length + 4 mask-key header bytes before the payload.
-        $f2 = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CONTINUATION, $mid, true, 'MKEY');
+        // Unmasked server continuation (RFC 6455 5.1): 2 base + 2 extended-length header bytes.
+        $f2 = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_CONTINUATION, $mid, false);
         $f2 = (chr(ord($f2[0]) & 0x7F)) . substr($f2, 1); // clear FIN: mid fragment
         $f3 = $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'TAIL', fin: true);
 
         $transport = $this->transportReadingChunks([
             $f1 . substr($f2, 0, 1),                  // f2 header cut after its first byte
-            substr($f2, 1, 2),                        // ...inside the 16-bit extended length
-            substr($f2, 3, 3),                        // ...inside the mask key
-            substr($f2, 6, 2) . substr($f2, 8, 100),  // rest of header + payload bytes 0-99
-            substr($f2, 108, 100),                    // payload bytes 100-199
-            substr($f2, 208) . substr($f3, 0, 1),     // payload tail + f3 header cut between its 2 bytes
+            substr($f2, 1, 1),                        // ...before the 16-bit extended length
+            substr($f2, 2, 1),                        // ...inside the extended length
+            substr($f2, 3, 1) . substr($f2, 4, 100),  // rest of header + payload bytes 0-99
+            substr($f2, 104, 100),                    // payload bytes 100-199
+            substr($f2, 204) . substr($f3, 0, 1),     // payload tail + f3 header cut between its 2 bytes
             substr($f3, 1),
         ]);
 
@@ -522,18 +526,16 @@ final class WebSocketTransportTest extends TestCase
      * Torture pin for a large masked frame delivered in one-byte reads (#164): the payload needs a
      * 64-bit length, so the frame spills to chunk-list accumulation and is sized from its length
      * bytes before the mask key has arrived - the mask key itself therefore spans the queued reads
-     * and must be assembled by the spanning-consume path before the payload is unmasked.
-     * Byte-identical delivery required. (Server frames are unmasked in production; this pins the
-     * codec's masked-decode symmetry on the spill path.)
+     * and must be assembled by the spanning-consume path. Byte-identical delivery required.
+     * (Unmasked, per RFC 6455 5.1 - masked server frames are now a terminal violation.)
      */
-    public function testReadLineAssemblesLargeMaskedFrameDeliveredInOneByteReads(): void
+    public function testReadLineAssemblesLargeFrameDeliveredInOneByteReads(): void
     {
-        // 70 000 distinct bytes: a 64-bit-length masked frame (> 65 535) that spills to the chunk path.
+        // 70 000 distinct bytes: a 64-bit-length frame (> 65 535) that spills to the chunk path.
         $payload = pack('N*', ...range(0, 17499));
         self::assertSame(70000, strlen($payload));
-        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, true, "\xA5\x01\xFE\x42");
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
         self::assertSame(127, ord($frame[1]) & 0x7F); // 64-bit extended length form
-        self::assertSame(0x80, ord($frame[1]) & 0x80); // mask bit set
 
         $transport = $this->transportReadingChunks(str_split($frame, 1));
 
@@ -543,6 +545,26 @@ final class WebSocketTransportTest extends TestCase
         }
 
         self::assertSame($payload, $received);
+    }
+
+    /**
+     * RFC 6455 5.1: a MASKED server frame on the large-frame spill path is a terminal protocol
+     * violation - previously it was silently unmasked and accepted.
+     */
+    public function testReadLineRejectsMaskedServerFrameOnSpillPath(): void
+    {
+        $payload = str_repeat('Z', 70000); // > 65535 -> 64-bit length -> spill path
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, true, "\xA5\x01\xFE\x42");
+        self::assertSame(0x80, ord($frame[1]) & 0x80); // mask bit set
+
+        $transport = $this->transportReadingChunks(str_split($frame, 4096));
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('masked');
+        // Loop until the spilled frame completes and the violation surfaces (bounded by chunks/EOF).
+        for ($i = 0; $i < 64; $i++) {
+            $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+        }
     }
 
     /**
@@ -610,7 +632,7 @@ final class WebSocketTransportTest extends TestCase
 
         // decode() consumes its buffer by reference, so run it on a copy after the raw mask check.
         $buffer = $written;
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
         self::assertNotSame([], $frames, 'no Close echo was written on the server close frame');
         self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
         self::assertSame($status, $frames[0]['payload']);
@@ -640,7 +662,7 @@ final class WebSocketTransportTest extends TestCase
         $written = $socket->writtenBytes();
         self::assertNotSame('', $written, 'the RFC 6455 Close echo (#161) must still be sent');
         $buffer = $written;
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
         self::assertNotSame([], $frames, 'no Close echo was written');
         self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
         self::assertSame(pack('n', 1001), $frames[0]['payload']);
@@ -652,6 +674,129 @@ final class WebSocketTransportTest extends TestCase
         } catch (TransportClosedException $e) {
             self::assertStringContainsString('close frame', $e->getMessage());
         }
+    }
+
+    /**
+     * close() must ALWAYS reach the socket close, even when the courtesy Close-frame write wedges on
+     * backpressure. Amp's socket write() SUSPENDS (it does not throw) while the write buffer is full,
+     * so the pre-fix inline write parked close() forever on a stalled peer - and because the socket
+     * close is the only thing that errors pending writes out, recovery (whose every path awaits
+     * transport close()) deadlocked permanently. The WedgedWriteSocket mirrors those exact semantics:
+     * write() suspends until close() fails it with a ClosedException.
+     */
+    public function testCloseCompletesWhenCloseFrameWriteWedgesOnBackpressure(): void
+    {
+        $socket = new WedgedWriteSocket();
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        // The outer cancellation turns a regression (close() suspended forever on the wedged write)
+        // into a clean test failure instead of a hung PHPUnit run. It is far above the transport's
+        // internal Close-frame write bound, so it never fires on the fixed path.
+        $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
+
+        self::assertTrue($socket->isClosed(), 'close() must close the socket despite the wedged Close-frame write');
+        self::assertSame(1, $socket->writeAttempts(), 'the Close frame write must still have been attempted');
+        // The transport released the socket: a follow-up close is a no-op and write() reports closed.
+        self::assertSame('', $transport->readLine()->await());
+    }
+
+    /**
+     * A server that coalesces [BINARY "MSG …"][PING] into one read and then dies before the pong
+     * answer must NOT cost the already-decoded MSG bytes: the pong write throwing inline in the read
+     * fiber used to propagate out of readLine() and discard them - consumed from the buffer, never
+     * delivered, and core NATS does not resend. The answer now goes out on its own fiber; the data
+     * is returned, and the peer death surfaces on the NEXT read as a clean EOF.
+     */
+    public function testReadLinePreservesSameReadDataWhenPongWriteFails(): void
+    {
+        $payload = "MSG orders 1 5\r\nhello\r\n";
+        $data = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
+        $ping = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'hb', false);
+        $socket = new ScriptedChunkSocket([$data . $ping], failWrites: true);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+
+        // The peer's death surfaces on the following read, after the data was delivered.
+        $this->expectException(TransportClosedException::class);
+        $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+    }
+
+    /**
+     * A backpressure-stalled peer must not park the READ path behind an outbound pong: the inline
+     * pong write used to SUSPEND the read fiber (the same suspension class as the close() wedge),
+     * stalling inbound delivery indefinitely. The answer now goes out on its own fiber, so the data
+     * frame from the same read is returned promptly and close() still completes.
+     */
+    public function testReadLineNotStalledByWedgedPongWrite(): void
+    {
+        $payload = "MSG orders 1 5\r\nhello\r\n";
+        $data = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
+        $ping = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'hb', false);
+        $socket = new WedgedWriteSocket([$data . $ping]);
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        // Pre-fix this await never returned (read fiber suspended in the pong write); the outer
+        // cancellation turns a regression into a bounded failure instead of a hung run.
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await());
+        self::assertSame(1, $socket->writeAttempts(), 'the pong answer must still have been attempted');
+
+        // close() releases the wedged pong fiber (socket close errors the pending write out).
+        $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
+        self::assertTrue($socket->isClosed());
+    }
+
+    /**
+     * close() on a never-connected transport (and a second close() after the first) must be a clean
+     * no-op: connection cleanup paths close transports whose connect() failed before a socket was
+     * ever assigned, and recovery/disconnect can race a second close onto an already-closed one.
+     */
+    public function testCloseWithoutSocketAndRepeatedCloseAreNoOps(): void
+    {
+        $transport = new WebSocketTransport(new NatsOptions());
+        $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
+
+        $socket = new ScriptedChunkSocket([]);
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+        $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
+        self::assertTrue($socket->isClosed());
+
+        // Second close on the already-released socket: a no-op, not a second frame write or error.
+        $written = $socket->writtenBytes();
+        $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
+        self::assertSame($written, $socket->writtenBytes());
+    }
+
+    /**
+     * On a responsive socket close() still sends the RFC 6455 Close frame (masked, opcode 0x8, empty
+     * payload) BEFORE closing - the wedge fix must not silently drop the courtesy frame from the
+     * healthy path.
+     */
+    public function testCloseStillWritesCloseFrameOnResponsiveSocket(): void
+    {
+        $socket = new ScriptedChunkSocket([]);
+        $transport = new WebSocketTransport(new NatsOptions());
+        (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $socket);
+
+        $transport->close()->await(new \Amp\TimeoutCancellation(5.0));
+
+        self::assertTrue($socket->isClosed());
+
+        $written = $socket->writtenBytes();
+        self::assertNotSame('', $written, 'the Close frame must still be written on a responsive socket');
+        // RFC 6455 5.3: client frames are masked - check the raw mask bit before decode() unmasks.
+        self::assertSame(0x80, ord($written[1]) & 0x80, 'the client Close frame must be masked');
+        $buffer = $written;
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
+        self::assertNotSame([], $frames);
+        self::assertSame(WebSocketFrameCodec::OP_CLOSE, $frames[0]['opcode']);
+        self::assertSame('', $frames[0]['payload']);
+        self::assertTrue($frames[0]['fin']);
     }
 
     /**
@@ -779,6 +924,178 @@ final class WebSocketTransportTest extends TestCase
         $this->expectException(ProtocolException::class);
         $this->expectExceptionMessageMatches('/continuation/i');
         $drain->invoke($transport);
+    }
+
+    /**
+     * The #115 deferral now covers codec strictness violations too: a read carrying
+     * [valid MSG][oversized-length declaration] must return the MSG first (its bytes are consumed
+     * and unrecoverable) and surface the violation on the NEXT readLine - pre-fix the throw
+     * discarded the already-decoded MSG.
+     */
+    public function testReadLineReturnsSameReadDataBeforeOversizedLengthViolation(): void
+    {
+        $payload = "MSG orders 1 5\r\nhello\r\n";
+        $data = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, $payload, false);
+        $poison = pack('CC', 0x82, 127) . pack('J', 64 * 1024 * 1024 + 1);
+
+        $transport = $this->transportReadingChunks([$data . $poison]);
+
+        self::assertSame($payload, $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await(), 'same-read data must be delivered before the violation');
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('out of bounds');
+        $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+    }
+
+    /**
+     * A fragmented PING arriving mid-fragmented-message is a terminal RFC 6455 5.5 violation - the
+     * pre-fix codec answered the pong and spliced the ping's CONTINUATION bytes into the data
+     * message: silently corrupted payload fed to the NATS parser.
+     */
+    public function testReadLineRejectsFragmentedControlFrameInsteadOfCorruptingReassembly(): void
+    {
+        $head = $this->serverFrame(WebSocketFrameCodec::OP_BINARY, 'HEAD-', fin: false);
+        $fragmentedPing = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_PING, 'abc', false);
+        $fragmentedPing[0] = chr(ord($fragmentedPing[0]) & 0x7F); // clear FIN on a control frame
+        $pingTail = $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'def', fin: true);
+        $realTail = $this->serverFrame(WebSocketFrameCodec::OP_CONTINUATION, 'TAIL', fin: true);
+
+        $transport = $this->transportReadingChunks([$head . $fragmentedPing . $pingTail . $realTail]);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('control frame');
+        // No corrupted "HEAD-defTAIL"-style delivery may precede the failure.
+        $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+    }
+
+    /**
+     * RFC 6455 5.2: RSV1 on a data frame without a negotiated extension must fail the connection
+     * with a NAMED violation - pre-fix the payload was blindly inflated, producing a confusing
+     * zlib error (or garbage delivered as NATS bytes).
+     */
+    public function testReadLineRejectsRsv1WithoutNegotiatedCompression(): void
+    {
+        $frame = WebSocketFrameCodec::encode(WebSocketFrameCodec::OP_BINARY, 'plain', false, null, true);
+
+        $transport = $this->transportReadingChunks([$frame]);
+
+        $this->expectException(ProtocolException::class);
+        $this->expectExceptionMessage('permessage-deflate was not negotiated');
+        $transport->readLine(new \Amp\TimeoutCancellation(3.0))->await();
+    }
+
+    /**
+     * Runs a real ws:// handshake against a scripted HTTP server whose response is built from the
+     * request's Sec-WebSocket-Key. Returns the connect() outcome (null = success) plus the transport.
+     *
+     * @param callable(string):string $responseFor Maps the accept key to the full HTTP response.
+     * @return array{0: ?\Throwable, 1: WebSocketTransport}
+     */
+    private function handshakeAgainst(callable $responseFor, bool $compression = false): array
+    {
+        $server = listen('tcp://127.0.0.1:0');
+        $address = (string) $server->getAddress();
+
+        async(static function () use ($server, $responseFor): void {
+            $socket = $server->accept();
+            if ($socket === null) {
+                return;
+            }
+
+            $request = '';
+            while (!str_contains($request, "\r\n\r\n")) {
+                $chunk = $socket->read();
+                if ($chunk === null) {
+                    return;
+                }
+                $request .= $chunk;
+            }
+
+            preg_match('/Sec-WebSocket-Key:\s*(\S+)/i', $request, $m);
+            $socket->write($responseFor(WebSocketFrameCodec::acceptKey($m[1] ?? '')));
+        });
+
+        $transport = new WebSocketTransport(new NatsOptions(webSocketCompression: $compression));
+        $error = null;
+        try {
+            $transport->connect('ws://' . $address . '/', 2000)->await();
+        } catch (\Throwable $e) {
+            $error = $e;
+        } finally {
+            $server->close();
+        }
+
+        return [$error, $transport];
+    }
+
+    /**
+     * RFC 6455 4.1: a 101 without "Upgrade: websocket" / "Connection: Upgrade" is NOT a completed
+     * WebSocket handshake (e.g. a proxy answering 101 for something else) - the client must fail
+     * instead of speaking WebSocket into a non-WebSocket stream. Pre-fix only the status line and
+     * accept key were checked.
+     */
+    public function testHandshakeRejectsMissingUpgradeHeaders(): void
+    {
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n\r\n");
+
+        self::assertInstanceOf(ConnectionException::class, $error);
+        self::assertStringContainsString('RFC 6455 4.1', $error->getMessage());
+    }
+
+    /**
+     * RFC 6455 4.1: a server negotiating an extension the client never offered must fail the
+     * handshake - pre-fix an unsolicited "permessage-deflate" silently flipped compression ON, so
+     * the client RSV1-deflated its CONNECT into a server that never negotiated it.
+     */
+    public function testHandshakeRejectsUnsolicitedCompression(): void
+    {
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n"
+            . "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n", compression: false);
+
+        self::assertInstanceOf(ConnectionException::class, $error);
+        self::assertStringContainsString('never offered', $error->getMessage());
+    }
+
+    /**
+     * RFC 7692: this codec inflates per message (no context takeover), so a server negotiating
+     * parameters beyond the offered client/server_no_context_takeover would garble every message
+     * after the first - the handshake must reject them. A conformant response negotiates cleanly.
+     */
+    public function testHandshakeValidatesCompressionParameters(): void
+    {
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n"
+            . "Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=10\r\n\r\n", compression: true);
+
+        self::assertInstanceOf(ConnectionException::class, $error);
+        self::assertStringContainsString('unacceptable permessage-deflate parameter', $error->getMessage());
+
+        // RFC 7692 7.1.1.1: server_no_context_takeover was offered, so the server must ECHO it or
+        // decline - accepting without it means the server may retain deflate context across
+        // messages, which this per-message-inflate codec cannot decode.
+        [$error] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n"
+            . "Sec-WebSocket-Extensions: permessage-deflate\r\n\r\n", compression: true);
+
+        self::assertInstanceOf(ConnectionException::class, $error);
+        self::assertStringContainsString('server_no_context_takeover', $error->getMessage());
+
+        [$error, $transport] = $this->handshakeAgainst(static fn (string $accept): string => "HTTP/1.1 101 Switching Protocols\r\n"
+            . "Upgrade: websocket\r\nConnection: keep-alive, Upgrade\r\n"
+            . "Sec-WebSocket-Accept: {$accept}\r\n"
+            . "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover; server_no_context_takeover\r\n\r\n", compression: true);
+
+        self::assertNull($error, 'a conformant negotiation must succeed');
+        self::assertTrue(
+            (new \ReflectionProperty(WebSocketTransport::class, 'compressionActive'))->getValue($transport),
+            'compression must be active after a clean negotiation',
+        );
+        $transport->close()->await();
     }
 
     /**

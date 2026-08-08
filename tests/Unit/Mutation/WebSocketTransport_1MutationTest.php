@@ -284,7 +284,7 @@ final class WebSocketTransport_1MutationTest extends TestCase
             // write (or early-returns) leaves the socket idle, so the deadline turns a hang into a clean
             // empty read and the assertions below fail.
             $buffer = (string) $serverSocket->read(new TimeoutCancellation(2.0));
-            $frames = WebSocketFrameCodec::decode($buffer);
+            $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
             // kills Identical (=== -> !== early-return) @ line 174 and MethodCallRemoval (write) @ line 179.
             self::assertNotSame([], $frames, 'A CLOSE frame must reach the peer');

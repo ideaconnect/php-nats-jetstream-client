@@ -107,13 +107,29 @@ final class NatsHeadersTest extends TestCase
         NatsHeaders::toWireBlock(['a:b' => 'value']);
     }
 
-    public function testHeaderValueSurroundingWhitespaceRoundTripsSymmetrically(): void
+    public function testHeaderValueIsEmittedVerbatimOnTheWire(): void
     {
-        // Encode and decode both trim surrounding whitespace, so a value round-trips consistently
-        // instead of asymmetrically losing leading/trailing spaces only on decode.
+        // The WIRE carries the caller's bytes untouched (nats.go parity): silently trimming
+        // mutated values a signature/checksum-carrying header trips over. This client's own
+        // decoder still trims surrounding whitespace as an inbound tolerance.
         $raw = NatsHeaders::toWireBlock(['X-Test' => '  spaced  ']);
 
-        self::assertSame(['X-Test' => 'spaced'], NatsHeaders::fromWireBlock($raw));
+        self::assertStringContainsString("X-Test:  spaced  \r\n", $raw, 'the wire bytes must be the caller\'s verbatim value');
+        self::assertSame(['X-Test' => 'spaced'], NatsHeaders::fromWireBlock($raw), 'inbound decode tolerance still trims');
+    }
+
+    /**
+     * Case-insensitive lookup for keys from non-canonicalizing publishers: nats.go canonicalizes
+     * names on READ, so a Go consumer matches `nats-msg-id` where an exact-case array access here
+     * misses it. NatsHeaders::get() bridges that interop asymmetry; exact-case hits win.
+     */
+    public function testGetLooksUpHeaderNamesCaseInsensitively(): void
+    {
+        $headers = NatsHeaders::fromWireBlock("NATS/1.0\r\nnats-msg-id:abc\r\nX-Case:exact\r\n\r\n");
+
+        self::assertSame('abc', NatsHeaders::get($headers, 'Nats-Msg-Id'));
+        self::assertSame('exact', NatsHeaders::get($headers, 'X-Case'));
+        self::assertNull(NatsHeaders::get($headers, 'Missing'));
     }
 
     /**

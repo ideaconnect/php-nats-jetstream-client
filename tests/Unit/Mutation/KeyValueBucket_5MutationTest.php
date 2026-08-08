@@ -189,9 +189,11 @@ final class KeyValueBucket_5MutationTest extends TestCase
             $transport,
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
             [
-                // Two PUT deliveries, each whose $JS.ACK last token (num_pending) is 0 -> both "caught up".
+                // Two PUT deliveries, each whose $JS.ACK last token (num_pending) is 0 -> both "caught
+                // up". Consumer sequences 1 then 2: the ordered-consumer watch verifies contiguity,
+                // and a repeated cseq would read as a gap and trigger a recreate instead of delivery.
                 "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
-                "MSG \$KV.cfg.alpha 2 \$JS.ACK.KV_cfg.KVWATCH.1.8.1.0.0 5\r\ngreen\r\n",
+                "MSG \$KV.cfg.alpha 2 \$JS.ACK.KV_cfg.KVWATCH.2.8.2.0.0 5\r\ngreen\r\n",
             ],
         );
 

@@ -49,6 +49,14 @@ final class ObjectStoreBucket
     private const MAX_LINK_HOPS = 8;
 
     /**
+     * Default idle-heartbeat (ns) requested by {@see watch()} so the missed-heartbeat watchdog arms
+     * (#113 parity with {@see \IDCT\NATS\JetStream\KeyValue\KeyValueBucket::WATCH_IDLE_HEARTBEAT_NS}):
+     * a silent or reaped watch consumer then surfaces a "not active" error instead of hanging forever,
+     * indistinguishable from an idle bucket. Override via {@see ObjectStoreWatchOptions::$idleHeartbeat}.
+     */
+    public const WATCH_IDLE_HEARTBEAT_NS = 5_000_000_000;
+
+    /**
      * Creates an Object Store bucket context bound to a client and bucket name.
      *
      * @param NatsClient $client Connected client used for chunk publish and metadata retrieval operations.
@@ -133,11 +141,56 @@ final class ObjectStoreBucket
         return async(function () use ($name, $targetName, $targetBucket): ObjectInfo {
             $this->assertValidName($name);
 
+            // nats.go AddLink guards: overwriting a LIVE object with a link would make its content
+            // unreachable in one call while orphaning its chunks (no purge runs on this path), and
+            // a link to a deleted target or to another link dangles by construction.
+            $this->assertNameFreeForLink($name);
+
+            $targetSource = ($targetBucket === null || $targetBucket === $this->bucket)
+                ? $this
+                : $this->jetStream->objectStore($targetBucket);
+            $target = $targetSource->info($targetName)->await();
+            if ($target === null || $target->deleted) {
+                throw new JetStreamException(sprintf(
+                    'Cannot link to "%s": the target object does not exist or is deleted',
+                    $targetName,
+                ));
+            }
+            if ($target->isLink()) {
+                throw new JetStreamException(sprintf(
+                    'Cannot link to "%s": the target is itself a link (links to links are not allowed)',
+                    $targetName,
+                ));
+            }
+
             $info = $this->linkMeta($name, ['bucket' => $targetBucket ?? $this->bucket, 'name' => $targetName]);
             $this->publishMeta($name, $info);
 
             return ObjectInfo::fromArray($this->bucket, $info);
         });
+    }
+
+    /**
+     * Rejects creating a link under a name currently held by a LIVE stored OBJECT (nats.go
+     * ErrObjectAlreadyExists parity): the rollup meta publish would silently replace the object's
+     * metadata, stranding its chunks forever. An existing LINK is deliberately allowed - nats.go
+     * permits re-pointing an alias (a link stores no chunks, so nothing is orphaned) - as is a
+     * deleted tombstone or no record at all. The lookup does NOT swallow errors: a transient
+     * lookup failure read as "name free" would let the publish overwrite a live object anyway -
+     * the exact loss this guard exists to prevent - so only a definitive 404 means free.
+     */
+    private function assertNameFreeForLink(string $name): void
+    {
+        // fetchInfo(swallowErrors: false) maps a definitive 404 to null and PROPAGATES everything
+        // else (a transient 503 must fail the addLink, not read as "name free").
+        $existing = $this->fetchInfo($name, false);
+
+        if ($existing !== null && !$existing->deleted && !$existing->isLink()) {
+            throw new JetStreamException(sprintf(
+                'Cannot create link "%s": a stored object with that name already exists (delete it first)',
+                $name,
+            ));
+        }
     }
 
     /**
@@ -150,6 +203,7 @@ final class ObjectStoreBucket
     {
         return async(function () use ($name, $targetBucket): ObjectInfo {
             $this->assertValidName($name);
+            $this->assertNameFreeForLink($name);
 
             $info = $this->linkMeta($name, ['bucket' => $targetBucket]);
             $this->publishMeta($name, $info);
@@ -256,44 +310,59 @@ final class ObjectStoreBucket
             $chunkSubject = $this->chunkSubjectForNuid($nuid);
             $totalSize = strlen($data);
             $chunks = 0;
+            /** @var list<Future<\IDCT\NATS\JetStream\Models\PubAck>> $pending */
+            $pending = [];
 
-            if ($totalSize === 0) {
-                // An empty object stores no chunks (matches the official Object Store layout, where a
-                // 0-byte object has chunks=0). Previously it published one empty chunk and set chunks=1.
-                $chunks = 0;
-            } elseif ($totalSize <= $this->chunkSize) {
-                $this->jetStream->publish($chunkSubject, $data)->await();
-                $chunks = 1;
-            } else {
-                // Pipeline chunk publishes in bounded in-flight windows instead of one full PubAck
-                // round-trip per chunk. The PUB frames are written to the single connection in chunk
-                // order (writes are serialized in call order), so stream order - and therefore
-                // download reassembly - is preserved; the acks for a window are awaited together.
-                $pending = [];
-                $offset = 0;
-                while ($offset < $totalSize) {
-                    $chunk = substr($data, $offset, $this->chunkSize);
-                    $pending[] = $this->jetStream->publish($chunkSubject, $chunk);
-                    $offset += strlen($chunk);
-                    $chunks++;
+            try {
+                /** @var list<int> $ackSequences */
+                $ackSequences = [];
 
-                    if (count($pending) >= self::UPLOAD_PIPELINE_DEPTH) {
-                        Future\await($pending);
+                if ($totalSize === 0) {
+                    // An empty object stores no chunks (matches the official Object Store layout, where a
+                    // 0-byte object has chunks=0). Previously it published one empty chunk and set chunks=1.
+                    $chunks = 0;
+                } elseif ($totalSize <= $this->chunkSize) {
+                    $this->jetStream->publish($chunkSubject, $data)->await();
+                    $chunks = 1;
+                } else {
+                    // Pipeline chunk publishes in bounded in-flight windows instead of one full PubAck
+                    // round-trip per chunk. The PUB frames are written to the single connection in chunk
+                    // order, but publish() RETRIES a 503 after a delay (ADR-21) - so a retried chunk can
+                    // land AFTER later chunks that were accepted first. The acked stream sequences are
+                    // therefore verified below: reassembly is in stream order, and a permuted upload
+                    // would produce a corrupted object that put() reports as success.
+                    $offset = 0;
+                    while ($offset < $totalSize) {
+                        $chunk = substr($data, $offset, $this->chunkSize);
+                        $pending[] = $this->jetStream->publish($chunkSubject, $chunk);
+                        $offset += strlen($chunk);
+                        $chunks++;
+
+                        if (count($pending) >= self::UPLOAD_PIPELINE_DEPTH) {
+                            $this->collectAckSequences($pending, $ackSequences);
+                            $pending = [];
+                        }
+                    }
+
+                    if ($pending !== []) {
+                        $this->collectAckSequences($pending, $ackSequences);
                         $pending = [];
                     }
+
+                    $this->assertUploadOrderPreserved($ackSequences, $name);
                 }
 
-                if ($pending !== []) {
-                    Future\await($pending);
+                $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->digestOf($data), $metadata);
+                if ($description !== null && $description !== '') {
+                    $info['description'] = $description;
                 }
-            }
 
-            $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->digestOf($data), $metadata);
-            if ($description !== null && $description !== '') {
-                $info['description'] = $description;
-            }
+                $this->publishMeta($name, $info);
+            } catch (\Throwable $uploadError) {
+                $this->abandonPartialUpload($nuid, $pending);
 
-            $this->publishMeta($name, $info);
+                throw $uploadError;
+            }
 
             // Best-effort cleanup of the previous revision's chunks (rollup keeps only the latest
             // meta, but chunk subjects are NUID-specific and must be purged explicitly).
@@ -334,55 +403,68 @@ final class ObjectStoreBucket
             /** @var list<Future<\IDCT\NATS\JetStream\Models\PubAck>> $pending */
             $pending = [];
 
-            $publishChunk = function (string $chunk) use (&$pending, &$chunks, $chunkSubject): void {
-                $pending[] = $this->jetStream->publish($chunkSubject, $chunk);
-                ++$chunks;
+            try {
+                /** @var list<int> $ackSequences */
+                $ackSequences = [];
 
-                if (count($pending) >= self::UPLOAD_PIPELINE_DEPTH) {
-                    Future\await($pending);
-                    $pending = [];
-                }
-            };
+                $publishChunk = function (string $chunk) use (&$pending, &$chunks, &$ackSequences, $chunkSubject): void {
+                    $pending[] = $this->jetStream->publish($chunkSubject, $chunk);
+                    ++$chunks;
 
-            while (true) {
-                $block = $producer();
-                if ($block === null) {
-                    break;
-                }
+                    if (count($pending) >= self::UPLOAD_PIPELINE_DEPTH) {
+                        $this->collectAckSequences($pending, $ackSequences);
+                        $pending = [];
+                    }
+                };
 
-                if ($block === '') {
-                    continue;
-                }
-
-                hash_update($hashContext, $block);
-                $totalSize += strlen($block);
-                $buffer .= $block;
-
-                // Emit whole chunks by advancing an offset, then drop the consumed prefix ONCE per
-                // producer block. Recopying the shrinking tail per chunk (substr after each publish)
-                // would be O(n^2) for a block much larger than chunkSize.
-                if (strlen($buffer) >= $this->chunkSize) {
-                    $offset = 0;
-                    while (strlen($buffer) - $offset >= $this->chunkSize) {
-                        $publishChunk(substr($buffer, $offset, $this->chunkSize));
-                        $offset += $this->chunkSize;
+                while (true) {
+                    $block = $producer();
+                    if ($block === null) {
+                        break;
                     }
 
-                    $buffer = substr($buffer, $offset);
+                    if ($block === '') {
+                        continue;
+                    }
+
+                    hash_update($hashContext, $block);
+                    $totalSize += strlen($block);
+                    $buffer .= $block;
+
+                    // Emit whole chunks by advancing an offset, then drop the consumed prefix ONCE per
+                    // producer block. Recopying the shrinking tail per chunk (substr after each publish)
+                    // would be O(n^2) for a block much larger than chunkSize.
+                    if (strlen($buffer) >= $this->chunkSize) {
+                        $offset = 0;
+                        while (strlen($buffer) - $offset >= $this->chunkSize) {
+                            $publishChunk(substr($buffer, $offset, $this->chunkSize));
+                            $offset += $this->chunkSize;
+                        }
+
+                        $buffer = substr($buffer, $offset);
+                    }
                 }
+
+                if ($buffer !== '') {
+                    $publishChunk($buffer);
+                }
+
+                if ($pending !== []) {
+                    $this->collectAckSequences($pending, $ackSequences);
+                    $pending = [];
+                }
+
+                // The 503-retry inside publish() can permute pipelined chunk order (see put()).
+                $this->assertUploadOrderPreserved($ackSequences, $name);
+
+                $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->finalizeDigest($hashContext), $metadata);
+
+                $this->publishMeta($name, $info);
+            } catch (\Throwable $uploadError) {
+                $this->abandonPartialUpload($nuid, $pending);
+
+                throw $uploadError;
             }
-
-            if ($buffer !== '') {
-                $publishChunk($buffer);
-            }
-
-            if ($pending !== []) {
-                Future\await($pending);
-            }
-
-            $info = $this->objectMeta($name, $nuid, $totalSize, $chunks, $this->finalizeDigest($hashContext), $metadata);
-
-            $this->publishMeta($name, $info);
 
             $previous = $previousFuture->await();
             if ($previous !== null && $previous->nuid !== '' && $previous->nuid !== $nuid) {
@@ -831,23 +913,50 @@ final class ObjectStoreBucket
      * updates-only (#98).
      *
      * @param callable(ObjectInfo):void $handler
-     * @return Future<int>
+     * @return Future<int> The watch handle sid. The watch rides an ordered consumer whose automatic
+     *         recreates rotate the internal sid, so stop it with
+     *         {@see \IDCT\NATS\JetStream\JetStreamContext::stopOrderedConsumer()} - a plain
+     *         `unsubscribe($sid)` only works until the first recreate.
      */
     public function watch(callable $handler, string $pattern = '>', ?ObjectStoreWatchOptions $options = null): Future
     {
         return async(function () use ($handler, $pattern, $options): int {
+            // Meta subjects carry base64url-ENCODED object names (ADR-20), so a raw subject
+            // wildcard like "logs-*" can never match an encoded token - it would subscribe
+            // successfully and silently observe nothing. Only ">" (all objects) or an EXACT object
+            // name (encoded here) is meaningful.
+            if ($pattern !== '>') {
+                if (str_contains($pattern, '*') || str_contains($pattern, '>')) {
+                    throw new JetStreamException(
+                        'Object Store watch patterns cannot use subject wildcards: meta subjects encode '
+                        . 'object names (base64url), so a wildcard never matches. Use ">" for all objects '
+                        . 'or an exact object name, and filter client-side for anything else.',
+                    );
+                }
+
+                $pattern = $this->encodeName($pattern);
+            }
+
             $filter = $this->metaPrefix() . $pattern;
 
-            // Deliver via a JetStream push consumer (not a plain core subscription) so each update
-            // carries its stream sequence, exposed as the ObjectInfo revision (this push-consumer
-            // mechanism is the part consistent with the KeyValue watch()). The read is ack-free.
+            // Deliver via an ORDERED JetStream push consumer (KV-watch parity): each update carries
+            // its stream sequence (the ObjectInfo revision), and the ordered machinery provides
+            // consumer-sequence gap detection with recreate-from-lastStreamSeq+1 (once a delivery
+            // has fixed a resume point, a drop/reconnect window is REPLAYED instead of becoming a
+            // silent permanent gap; a recreate BEFORE the first delivery re-applies the initial
+            // policy), flow control, and watchdog-driven recreation of a silent/reaped consumer (#113).
             // Default (no options) keeps live-updates-only semantics (deliver_policy=new); supplying
             // options selects the reference snapshot-then-follow default (last_per_subject), full
-            // history (all), or explicit updates-only (new).
+            // history (all), or explicit updates-only (new). Stop a watch with
+            // stopOrderedConsumer($sid): recreates rotate the internal sid, so a plain
+            // unsubscribe() only works until the first recreate.
             $consumerOptions = $options?->toConsumerConfig()
                 ?? ['deliver_policy' => 'new', 'ack_policy' => 'none'];
+            $consumerOptions['idle_heartbeat'] ??= self::WATCH_IDLE_HEARTBEAT_NS;
+            $idleHeartbeat = $consumerOptions['idle_heartbeat'];
+            unset($consumerOptions['idle_heartbeat']);
 
-            return $this->jetStream->subscribeEphemeralPushConsumer(
+            return $this->jetStream->subscribeOrderedConsumer(
                 $this->streamName(),
                 function (NatsMessage $message) use ($handler): void {
                     $headers = NatsHeaders::fromWireBlock($message->rawHeaders);
@@ -868,7 +977,8 @@ final class ObjectStoreBucket
                     $handler(ObjectInfo::fromArray($this->bucket, $metadata, $this->jetStream->streamSequenceOf($message)));
                 },
                 filterSubject: $filter,
-                consumerOptions: $consumerOptions,
+                idleHeartbeatNs: is_int($idleHeartbeat) ? $idleHeartbeat : null,
+                consumerOverrides: $consumerOptions,
             )->await();
         });
     }
@@ -893,10 +1003,22 @@ final class ObjectStoreBucket
             // of every object in a single request/reply, instead of one Direct Get round-trip per object.
             // Gated on server support (batched Direct Get needs NATS 2.11+); older servers take the
             // per-subject fan-out below. The returned objects and deleted-filtering are identical.
+            $infos = null;
             if ($this->jetStream->supportsBatchedDirectGet()) {
-                /** @var list<?ObjectInfo> $infos */
-                $infos = $this->listBatched($subjects);
-            } else {
+                try {
+                    /** @var list<?ObjectInfo> $infos */
+                    $infos = $this->listBatched($subjects);
+                } catch (JetStreamException $e) {
+                    if ($e->getCode() !== 503) {
+                        throw $e;
+                    }
+                    // The STREAM (not the server) lacks Direct Get - allow_direct disabled / legacy
+                    // interop bucket, invisible to the server-version gate. Fall through to the
+                    // per-subject fan-out, whose lookups fall back to the leader STREAM.MSG.GET.
+                }
+            }
+
+            if ($infos === null) {
                 // Read the latest meta record per object CONCURRENTLY via the Direct Get API (served by
                 // any replica; the round-trips overlap) instead of N+1 serial leader reads.
                 $lookups = [];
@@ -907,6 +1029,16 @@ final class ObjectStoreBucket
                         } catch (JetStreamException $e) {
                             if ($e->getCode() === 404) {
                                 return null;
+                            }
+
+                            if ($e->getCode() === 503) {
+                                // Direct Get unavailable (allow_direct disabled / legacy stream):
+                                // fall back to the leader read like info() does, instead of failing
+                                // the whole enumeration on a bucket whose single-object reads work.
+                                $encoded = substr($subject, strlen($this->metaPrefix()));
+                                $name = base64_decode(strtr($encoded, '-_', '+/'), true);
+
+                                return is_string($name) ? $this->fetchInfo($name, false) : null;
                             }
 
                             throw $e;
@@ -1076,6 +1208,92 @@ final class ObjectStoreBucket
     /**
      * Best-effort purge of all chunk messages for a given object NUID.
      */
+    /**
+     * Awaits a pipeline window's publish futures IN INPUT (chunk) ORDER and appends their acked
+     * stream sequences. Sequential awaits are essential, not stylistic: Amp's `Future\await()`
+     * returns results in COMPLETION order ("the order the futures resolved, not the order given" -
+     * amphp/amp Future/functions.php), and in the exact failure the order check targets, the
+     * 503-retried chunk completes LAST with the HIGHEST sequence - so a completion-ordered
+     * collection is monotonic by construction and the check never fires. Awaiting in input order
+     * costs no concurrency (every future is already in flight) and makes position i hold chunk i's
+     * sequence.
+     *
+     * @param list<Future<\IDCT\NATS\JetStream\Models\PubAck>> $pending
+     * @param list<int> $ackSequences Appended to, in chunk order.
+     */
+    private function collectAckSequences(array $pending, array &$ackSequences): void
+    {
+        foreach ($pending as $future) {
+            $ackSequences[] = $future->await()->seq;
+        }
+    }
+
+    /**
+     * Verifies the acked stream sequences of a pipelined upload are strictly increasing in chunk
+     * order. publish() retries a 503 (ADR-21) after a delay, so with up to UPLOAD_PIPELINE_DEPTH
+     * publishes in flight a retried chunk K can be STORED after chunks K+1... that were accepted
+     * first - every ack still succeeds, but get() reassembles in stream order, so the object would
+     * be permanently corrupted while put()/putStream() reported success (the digest check would
+     * only catch it at read time, when the data is already unrecoverable). A violation aborts the
+     * upload; the caller purges the partial NUID and surfaces the error so the writer can retry.
+     * Sequences the server did not report (<= 0) skip the check rather than false-positive.
+     *
+     * @param list<int> $ackSequences Acked stream sequences in chunk-publish order.
+     */
+    private function assertUploadOrderPreserved(array $ackSequences, string $name): void
+    {
+        $previous = null;
+        foreach ($ackSequences as $sequence) {
+            if ($sequence <= 0) {
+                // The server did not report a sequence (defensive): order cannot be verified.
+                return;
+            }
+
+            if ($previous !== null && $sequence <= $previous) {
+                throw new JetStreamException(sprintf(
+                    'Object upload for "%s" was reordered on the wire (ack sequence %d after %d): a '
+                    . 'retried chunk publish landed out of order, which would corrupt the stored object. '
+                    . 'The partial upload is purged - retry the upload.',
+                    $name,
+                    $sequence,
+                    $previous,
+                ));
+            }
+
+            $previous = $sequence;
+        }
+    }
+
+    /**
+     * Abandons a failed/aborted upload: silences still-pending chunk publish futures (their late
+     * errors have no awaiter) and best-effort purges every chunk already stored under the fresh
+     * NUID. Without the purge, chunks of an upload that never published its meta record were
+     * orphaned FOREVER - no meta references the NUID, so no later put()/delete() would ever purge
+     * them (nats.go purgePartial parity).
+     *
+     * @param list<Future<\IDCT\NATS\JetStream\Models\PubAck>> $pending
+     */
+    private function abandonPartialUpload(string $nuid, array $pending): void
+    {
+        // Drain the still-in-flight publishes BEFORE purging: a sibling chunk sitting in
+        // publish()'s 503-retry delay would otherwise re-publish AFTER the purge and re-orphan
+        // its chunk under the meta-less NUID - the exact leak this cleanup exists to prevent.
+        // Outcomes are irrelevant here (the upload is already failing); only quiescence matters.
+        foreach ($pending as $future) {
+            try {
+                $future->await();
+            } catch (\Throwable) {
+                // The original upload error (already captured by the caller) is what surfaces.
+            }
+        }
+
+        try {
+            $this->purgeChunks($nuid);
+        } catch (\Throwable) {
+            // Best-effort cleanup on an already-failing path; the original error must surface.
+        }
+    }
+
     private function purgeChunks(string $nuid): void
     {
         try {

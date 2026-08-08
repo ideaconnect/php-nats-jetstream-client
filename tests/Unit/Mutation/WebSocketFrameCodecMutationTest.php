@@ -135,21 +135,19 @@ final class WebSocketFrameCodecMutationTest extends \PHPUnit\Framework\TestCase
      * mutant would reorder it to "<length><prefix>"; the ConcatOperandRemoval mutant would drop the
      * length entirely. Asserting the full message string kills both.
      */
-    public function testOutOfBoundsLengthThrowsExactMessage(): void
+    public function testOutOfBoundsLengthReportsExactTerminalMessage(): void
     {
         $tooLarge = 64 * 1024 * 1024 + 1; // MAX + 1
         $buffer = pack('CC', 0x82, 127) . pack('J', $tooLarge);
 
-        try {
-            WebSocketFrameCodec::decode($buffer);
-            self::fail('Expected a ProtocolException for an oversized declared length');
-        } catch (ProtocolException $e) {
-            // kills Concat @ line 116  and  ConcatOperandRemoval @ line 116
-            self::assertSame(
-                'WebSocket frame payload length out of bounds: ' . $tooLarge,
-                $e->getMessage(),
-            );
-        }
+        WebSocketFrameCodec::decode($buffer, $terminal);
+
+        // kills Concat / ConcatOperandRemoval on the terminal message construction
+        self::assertInstanceOf(ProtocolException::class, $terminal);
+        self::assertSame(
+            'WebSocket frame payload length out of bounds: ' . $tooLarge,
+            $terminal->getMessage(),
+        );
     }
 
     /**
@@ -161,7 +159,7 @@ final class WebSocketFrameCodecMutationTest extends \PHPUnit\Framework\TestCase
     {
         // header(2) + 4-byte mask key, byte2 = 0x80|0 (masked, length 0) = exactly 6 bytes.
         $buffer = pack('CC', 0x82, 0x80) . 'ABCD';
-        $frames = WebSocketFrameCodec::decode($buffer);
+        $frames = WebSocketFrameCodec::decode($buffer, allowMasked: true);
 
         // kills IncrementInteger @ line 121 (+4 -> +5)  and  LessThan @ line 121 (< -> <=)
         self::assertCount(1, $frames, '6 bytes is exactly enough for a masked, empty-payload frame');

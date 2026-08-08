@@ -19,6 +19,174 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
+- `[bugfix]` Ordered consumers (and the KV/OS watches riding on them): the disconnect-collision
+  deferral introduced in this release cycle now clears the heartbeat watchdog's miss latch before
+  returning. Without it, a WATCHDOG-triggered recreate (silent/reaped consumer) whose attempts all
+  burned during a reconnect window left the latch set forever - no frame can arrive on the old
+  inbox to clear it (the consumer was already dead and the recreate deleted it) - so every
+  post-reconnect watchdog tick early-returned and the watch stalled permanently with zero signal.
+  The watchdog now genuinely re-fires two idle intervals after the connection is Open again, as
+  the deferral always promised.
+
+- `[bugfix]` WebSocket transport hardening to RFC 6455/7692 strictness: the handshake now requires
+  `Upgrade: websocket` / a `Connection` token list containing `Upgrade`, rejects extension
+  responses that were never offered (an unsolicited `permessage-deflate` used to silently flip
+  compression ON, deflating the CONNECT into a server that never negotiated it), and validates
+  permessage-deflate parameters against the offered no-context-takeover pair. Frame-level: masked
+  server-to-client frames, fragmented/oversized control frames (a fragmented PING used to splice
+  its continuation into an in-progress data message - silent payload corruption), and RSV1 without
+  negotiated compression are now terminal protocol violations - all deferred via the #115 pattern,
+  so data frames decoded from the same read are delivered BEFORE the violation surfaces (an
+  oversized declared length, corrupt deflate payload, or fragment-bound overflow previously threw
+  mid-batch and discarded them). The server must also echo `server_no_context_takeover` when
+  accepting compression (RFC 7692 7.1.1.1) - this per-message-inflate codec cannot decode context
+  takeover - and a one-shot deferred violation surfacing on the heartbeat timer's read now
+  recovers the connection instead of being silently swallowed.
+  Note the contract change on the public `WebSocketFrameCodec::decode()`: it no longer THROWS on a
+  strictness violation - it reports it via a new by-ref `$terminal` out-param and returns the valid
+  frames parsed before it - and MASKED frames are rejected by default (RFC 6455 5.1 covers
+  server-to-client frames); pass `allowMasked: true` to decode client-written frames (test
+  harnesses, server-side use).
+
+- `[bugfix]` A permission-rejected pull reply inbox (`_INBOX.JS.PULL.<nuid>.*`) now fails
+  `handle()` fast with a clear error naming the wildcard to grant, instead of polling forever with
+  zero signal (every retire was a silent client-side deadline) - #167's fail-fast generalized via a
+  per-sid subscription-rejection callback (`NatsClient::onSubscriptionRejected()`).
+
+- `[bugfix]` Caller-owned push consumers now perform the ADR-9 heartbeat gap check: each idle
+  heartbeat's `Nats-Last-Consumer` is compared against the locally delivered consumer sequence and
+  a mismatch is surfaced once per gap episode via the error listener AND logger (nats.go
+  ErrConsumerSequenceMismatch parity). Previously heartbeats kept the silence watchdog quiet while
+  being withheld from the handler, so an ack-none / max_deliver=1 gap was permanent, invisible loss.
+
+- `[bugfix]` JetStream read resilience: `directGetLastForSubjects()` treats an all-miss `multi_last`
+  chunk's lone 404 as "no matches" (ADR-31) instead of discarding every other chunk's results (the
+  KV/OS batched enumerations could throw spuriously when keys were purged mid-enumeration), and the
+  KV `getAll()` / ObjectStore `list()` per-subject lookups fall back to the leader STREAM.MSG.GET
+  path on a Direct Get 503 (allow_direct-disabled interop buckets) exactly like `get()`/`info()`.
+
+- `[bugfix]` Object Store links and watch patterns: `addLink()`/`addBucketLink()` refuse to
+  overwrite a LIVE object (which silently stranded its chunks forever), and `addLink()` rejects
+  deleted and link-to-link targets (nats.go parity); `watch()` base64url-encodes an exact-name
+  pattern into the meta-subject filter and rejects wildcard patterns loudly (they can never match
+  encoded name tokens - previously a wildcard watch subscribed successfully and observed nothing).
+
+- `[bugfix]` Headers interop: `NatsHeaders::toWireBlock()` emits values VERBATIM (the silent trim
+  mutated signature/checksum-carrying values; nats.go writes caller bytes untouched - the decoder
+  keeps its trim as an inbound tolerance), and the new case-insensitive `NatsHeaders::get()`
+  accessor bridges lookups against non-canonicalizing publishers.
+
+- `[bugfix]` Services/observability polish: endpoint names are validated against the ADR-32 token
+  rules at registration (previously advertised verbatim to conformant tooling);
+  `BasicJsonSchemaValidator` rejects non-empty JSON lists for `"type":"object"`; and JetStream
+  client-level errors (`emitClientError()` - e.g. a terminally dead ordered consumer) now reach the
+  PSR-3 logger as well as the error listener, so a logger-only configuration is no longer blind.
+
+- `[bugfix]` KV and Object Store watches are now LOSSLESS: both are rebuilt on the ordered-consumer
+  machinery (nats.go watcher parity), gaining consumer-sequence gap detection with automatic
+  recreate-from-last-revision+1 (a slow-consumer drop or reconnect window is REPLAYED instead of
+  becoming a silent permanent gap - ack-none watch deliveries are never redelivered on their own),
+  flow control, and watchdog-driven recreation of a silent/reaped consumer (which previously
+  surfaced an error at best - or, for the Object Store watch, hung forever with no signal: it never
+  requested an idle heartbeat at all; it now defaults one like KV, tunable via
+  `ObjectStoreWatchOptions::$idleHeartbeat`). A recreate before the first delivery re-applies the
+  watch's initial deliver policy, so a `new`/`last_per_subject` watch never replays from sequence 1.
+  `subscribeOrderedConsumer()` gained `consumerOverrides` and `onConsumerCreated` parameters, and
+  the new `JetStreamContext::stopOrderedConsumer(int $sid)` stops an ordered consumer / watch even
+  after recreates rotated its internal sid (a plain `unsubscribe()` only ever worked until the
+  first rotation).
+
+- `[bugfix]` KV buckets created with `sources` now attach the mandatory ADR-57 subject transforms
+  (`{src: "$KV.<src>.>", dest: "$KV.<bucket>.>"}`), so sourced entries are re-subjected into the
+  new bucket's prefix and visible to get/getAll/keys/watch - previously they were copied under the
+  origin's subjects where every read path was blind to them (invisible data). Caller-supplied
+  transforms pass through verbatim (full-control sources, e.g. non-KV streams; the name is then not
+  `KV_`-prefixed). Mirror buckets now set `mirror_direct: true` and write THROUGH to the origin's
+  prefix (nats.go `putPre` parity) instead of publishing to their own subject that no stream
+  ingests (503); cross-domain mirrors (`domain` shorthand → `external: {api: "$JS.<domain>.API"}`)
+  route writes via the external API prefix and reads via the origin prefix. The new
+  `KeyValueBucket::bind()` resolves the same prefixes from STREAM.INFO for handles attached to
+  mirror buckets created elsewhere - note this includes a FRESH `keyValue()` handle in the same
+  process (each handle is independent; only the instance that ran `create()` is auto-resolved).
+  Also note: a transform-less explicit source `name` and every mirror name are now `KV_`-prefixed
+  when not already (nats.go parity) - the previous used-as-is behavior produced invisible data;
+  supply `subject_transforms` to source a non-KV stream by its verbatim name.
+
+- `[bugfix]` Pipelined Object Store uploads can no longer store a silently corrupted object: the
+  ADR-21 503 retry inside `publish()` could re-order a retried chunk BEHIND later accepted chunks,
+  and `put()`/`putStream()` then published the meta record and reported success for an object whose
+  stream-order reassembly no longer matches its digest (every later read failed with a digest
+  mismatch). The acked stream sequences are now verified strictly increasing in chunk order; a
+  permuted upload aborts before the meta publish with a clear retryable error. Any failed/aborted
+  upload additionally purges the partial NUID's chunks (nats.go `purgePartial` parity) - previously
+  they were orphaned in the stream forever, since no meta record ever referenced them.
+
+- `[bugfix]` The infinite pipelined pull engine no longer treats a transient 503 (no JetStream API
+  responder - server restarting, JS still wiring up after a reconnect, a leader election window) as
+  terminal. Previously the worker stopped PERMANENTLY, and with no `onError` configured `handle()`
+  resolved normally with the processed count - indistinguishable from a clean drain while messages
+  piled up in the stream. 503 is now routine-with-backoff (nats.go `Consume()` parity; finite/fetch
+  semantics unchanged); the first 503 of a streak fires `onError` once as an operator signal,
+  re-armed by the next delivery.
+
+- `[bugfix]` The `fetchBatch()` and `directGetBatch()` reply inboxes are now slow-consumer-exempt
+  like the mux (#118) and pull-pipeline (#120) inboxes. A burst of small replies above the
+  per-subscription pending cap (default 1024) arriving within one read chunk was silently
+  DropOldest-discarded: a fetch returned with its head missing (permanently lost on a
+  `max_deliver: 1` consumer - the server counted every message as delivered), and a Direct Get
+  batch returned a truncated result presented as complete (its replies are never redelivered and
+  the 204 end-of-batch marker still arrived). Memory stays bounded by the requested batch size.
+
+- `[bugfix]` `drain()` and `flush()` can no longer hang forever on a backpressure-stalled peer:
+  transport writes suspend indefinitely when the send buffer is full (they cannot be cancelled),
+  and `drain()` cancels the heartbeat FIRST - removing the only escalation that could break such a
+  wedge - so its documented ~`requestTimeoutMs` bound was unenforceable. Drain writes are now
+  bounded by the drain budget (a wedged write is abandoned; the teardown's socket close fails it
+  out) and any drain write failure falls through to teardown, so `drain()` always reaches Closed.
+  Note the contract change: `drain()` no longer THROWS on a dead-socket write failure - it reports
+  it via the error listener and still closes cleanly (previously it threw and left the connection
+  stranded in Draining). `flush()`'s PING write is bounded by the request timeout and surfaces a
+  `TimeoutException` on a write-side wedge. Implemented at the connection layer -
+  `TransportInterface` is unchanged, so custom transports are unaffected.
+
+- `[bugfix]` The WebSocket transport's ping-answer (pong) and RFC 6455 Close-echo writes now run on
+  their own fire-and-forget fibers. Inline in the read fiber, a pong write that THREW (peer died
+  right after coalescing `[MSG][PING]` into one read) discarded the already-decoded MSG bytes from
+  the same read - consumed from the buffer, never delivered, never resent - and a pong write that
+  SUSPENDED on a backpressure-stalled peer parked the entire read path behind an outbound control
+  frame (the same suspension class as the `WebSocketTransport::close()` wedge fixed below).
+
+- `[bugfix]` Every `$SRV` discovery response (`PING`/`INFO`/`STATS`/`SCHEMA`) now serializes empty
+  `metadata` maps as JSON objects (`{}`) instead of arrays (`[]`), service-level and per-endpoint.
+  ADR-32 types metadata as `map[string]string`, and Go-based consumers (`nats micro ls`, nats.go
+  micro) hard-fail unmarshalling `[]` into a map - rejecting the whole discovery response, so a
+  metadata-less service (the default) was invisible to standard tooling. `statsSnapshot()` still
+  returns plain PHP arrays; the conversion happens only at the wire boundary.
+
+- `[bugfix]` Service reply-publish failures can no longer escape the endpoint callback into the
+  shared dispatch loop (which aborted delivery for every subscription on the connection): the
+  schema-validation error reply is guarded; a requester-controlled non-UTF-8 correlation header no
+  longer makes the JSON error reply throw at encode time (the correlation id is omitted instead -
+  this was remotely triggerable); connection-level reply failures are recorded on the endpoint and
+  swallowed; and a `ServiceError` code containing CR/LF is collapsed to one line like the
+  description instead of blowing up the header build.
+
+- `[bugfix]` `WebSocketTransport::close()` can no longer deadlock the client on a backpressure-stalled
+  peer. The best-effort RFC 6455 Close frame was written inline before the socket close; Amp's socket
+  `write()` SUSPENDS the calling fiber (it does not throw) while the write buffer is full - e.g. a peer
+  holding the TCP window at zero - so the `try/catch` never engaged, `close()` parked forever before
+  reaching the socket close, and since that close is the only thing that errors pending writes out,
+  every recovery/disconnect/drain path awaiting `transport->close()` wedged permanently (the heartbeat
+  had already self-cancelled once state left Open, so nothing remained to break the cycle). The Close
+  frame now goes out on its own fiber awaited with a 0.25 s bound: a responsive socket still sends it
+  before closing, and a wedged write is abandoned - the socket close then fails it out, waking its
+  fiber. Any other writes still queued behind a stalled buffer at that point are failed out the same
+  way (loudly, via their write futures) instead of being waited on - `disconnect()` is the documented
+  lossy path and `drain()` has already flushed and PONG-confirmed before it closes the transport.
+  `readLine()` now also pins its socket in a local for the whole read loop, so a reader resuming
+  inside the bounded close window cannot deref the already-nulled socket property. Plain-TCP
+  `AmpSocketTransport` was never affected (its `close()` does not write).
+
 - `[bugfix]` The pipelined pull engine no longer treats a single immediately-answered empty pull as proof
   of idleness when `setDepth()` > 1 (#169). Retires run in issue order, so under `no_wait` with steady
   traffic below `depth*batch` a tail pull that raced an already-drained stream would 404 right after a

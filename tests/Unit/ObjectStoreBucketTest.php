@@ -824,7 +824,11 @@ final class ObjectStoreBucketTest extends TestCase
             "PONG\r\n",
         ]);
         $this->muxReplies($transport, [
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            // Name-free check (STREAM.MSG.GET): no existing object under "shortcut".
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            // Target check (Direct Get): "real.bin" exists and is a live stored object.
+            $this->directMetaReply('real.bin', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('abc')], 2),
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
         $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
@@ -835,9 +839,110 @@ final class ObjectStoreBucketTest extends TestCase
         self::assertTrue($link->isLink());
         self::assertSame(['bucket' => 'assets', 'name' => 'real.bin'], $link->link);
 
-        $write = $transport->writes[3];
+        $write = $transport->writes[5];
         self::assertStringContainsString('HPUB $O.assets.M.' . $this->encodeName('shortcut') . ' ', $write);
         self::assertStringContainsString('"link":{"bucket":"assets","name":"real.bin"}', $write);
+    }
+
+    /**
+     * addLink() must refuse to overwrite a LIVE object (nats.go ErrObjectAlreadyExists): the
+     * rollup meta publish would make the object's content unreachable in one call and orphan its
+     * chunks forever (no purge runs on the link path). Pre-fix this silently succeeded.
+     */
+    public function testAddLinkRejectsExistingLiveObject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            // "shortcut" already holds a live stored object (STREAM.MSG.GET envelope).
+            sprintf(
+                "MSG _INBOX.a 1 %d\r\n%s\r\n",
+                strlen($this->metaGetResponse('shortcut', ['nuid' => 'nLive', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('abc')])),
+                $this->metaGetResponse('shortcut', ['nuid' => 'nLive', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('abc')]),
+            ),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();
+            self::fail('a link must not silently replace a live object');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('already exists', $e->getMessage());
+        }
+
+        self::assertStringNotContainsString('HPUB $O.assets.M.', implode('', $transport->writes), 'no meta record may be written');
+    }
+
+    /**
+     * Re-pointing an existing LINK is allowed (nats.go parity: `if !einfo.isLink() { return
+     * ErrObjectAlreadyExists }`): a link stores no chunks, so nothing is orphaned - the standard
+     * "latest"-alias flow must keep working.
+     */
+    public function testAddLinkAllowsRepointingAnExistingLink(): void
+    {
+        $existingLink = $this->metaGetResponse('latest', ['nuid' => '', 'options' => ['link' => ['bucket' => 'assets', 'name' => 'v1.bin']]]);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            // Name check: "latest" currently holds a LINK -> allowed to re-point.
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($existingLink), $existingLink),
+            // Target check: v2.bin is a live stored object.
+            $this->directMetaReply('v2.bin', ['nuid' => 'n2', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('two')], 2),
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $link = $client->jetStream()->objectStore('assets')->addLink('latest', 'v2.bin')->await();
+
+        self::assertTrue($link->isLink());
+        self::assertSame(['bucket' => 'assets', 'name' => 'v2.bin'], $link->link);
+    }
+
+    /**
+     * addLink() must reject a deleted (or absent) target and a target that is itself a link -
+     * both dangle by construction (nats.go parity).
+     */
+    public function testAddLinkRejectsDeletedTargetAndLinkTarget(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            // Case 1: name free (STREAM.MSG.GET 404), target deleted (Direct Get).
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            $this->directMetaReply('gone.bin', ['nuid' => 'n1', 'deleted' => true], 2),
+            // Case 2: name free, target is itself a link.
+            sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            $this->directMetaReply('alias.bin', ['nuid' => '', 'options' => ['link' => ['bucket' => 'assets', 'name' => 'real.bin']]], 4),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+        $bucket = $client->jetStream()->objectStore('assets');
+
+        try {
+            $bucket->addLink('l1', 'gone.bin')->await();
+            self::fail('a link to a deleted target must be rejected');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('deleted', $e->getMessage());
+        }
+
+        try {
+            $bucket->addLink('l2', 'alias.bin')->await();
+            self::fail('a link to another link must be rejected');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('itself a link', $e->getMessage());
+        }
     }
 
     /**
@@ -857,7 +962,9 @@ final class ObjectStoreBucketTest extends TestCase
         // addLink() issues one HPUB meta-publish request on the mux inbox; the server has no responder,
         // so it replies with a 503 no-responders status (echoed on the captured mux reply-to).
         $this->muxReplies($transport, [
-            'HMSG _INBOX.a 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            $this->directMetaReply('real.bin', ['nuid' => 'n1', 'size' => 3, 'chunks' => 1, 'digest' => $this->digestOf('abc')], 2),
+            'HMSG _INBOX.b 3 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
         $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
@@ -880,7 +987,8 @@ final class ObjectStoreBucketTest extends TestCase
             "PONG\r\n",
         ]);
         $this->muxReplies($transport, [
-            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
         $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
@@ -890,7 +998,7 @@ final class ObjectStoreBucketTest extends TestCase
 
         self::assertTrue($link->isLink());
         self::assertSame(['bucket' => 'other-bucket'], $link->link);
-        self::assertStringContainsString('"link":{"bucket":"other-bucket"}', $transport->writes[3]);
+        self::assertStringContainsString('"link":{"bucket":"other-bucket"}', $transport->writes[4]);
     }
 
     /**
@@ -1185,6 +1293,40 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
+     * list() must survive a bucket without Direct Get (allow_direct disabled / legacy interop
+     * bucket): the per-subject fan-out (pre-2.11 servers) falls back to the leader STREAM.MSG.GET
+     * path like info() does, instead of failing the whole enumeration with the 503.
+     */
+    public function testListFallsBackToStreamMessageWhenDirectGetUnavailable(): void
+    {
+        $enc = $this->encodeName('doc.txt');
+        $subjectsReply = sprintf('{"state":{"subjects":{"$O.assets.M.%s":1}}}', $enc);
+        $meta = $this->metaGetResponse('doc.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')]);
+
+        $transport = new FakeTransport([
+            // 2.10 server: no batched Direct Get -> the per-subject fan-out path under test.
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($subjectsReply), $subjectsReply),  // STREAM.INFO subjects page 1
+            sprintf("MSG _INBOX.a2 1 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'),  // page 2: empty -> pagination ends
+            $this->directStatusReply(1, 503, 'No Responders'),                               // Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),                    // STREAM.MSG.GET fallback
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $objects = $client->jetStream()->objectStore('assets')->list()->await();
+
+        self::assertCount(1, $objects, 'the enumeration must fall back per object, not fail on the 503');
+        self::assertSame('doc.txt', $objects[0]->name);
+        $writes = implode('||', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.MSG.GET.OBJ_assets', $writes);
+    }
+
+    /**
      * Verifies info returns null when JetStream reports the object metadata is not found.
      */
     public function testInfoReturnsNullWhenNotFound(): void
@@ -1232,7 +1374,7 @@ final class ObjectStoreBucketTest extends TestCase
         // SUB=1, CONSUMER.CREATE is a mux request, deliver SUB=2), not the mux inbox - enqueue it when
         // that deliver SUB is written.
         $transport->enqueueOnWriteContaining = [
-            'SUB _INBOX.JS.PUSH' => [
+            'SUB _INBOX.JS.ORD' => [
                 sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.7.1.0.0 %d\r\n%s\r\n", $enc, strlen((string) $metadata), (string) $metadata),
             ],
         ];
@@ -1261,6 +1403,130 @@ final class ObjectStoreBucketTest extends TestCase
         $writes = implode('', $transport->writes);
         self::assertStringContainsString('"deliver_policy":"new"', $writes);
         self::assertStringContainsString('"ack_policy":"none"', $writes);
+    }
+
+    /**
+     * An option-less Object Store watch must request the default idle heartbeat so the missed-
+     * heartbeat watchdog arms (#113 KV-watch parity): previously the OS watch requested no
+     * idle_heartbeat, so a reaped/lost watch consumer hung forever with no data and no error -
+     * total silence indistinguishable from an idle bucket.
+     */
+    public function testWatchRequestsDefaultIdleHeartbeat(): void
+    {
+        $createReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->objectStore('assets')->watch(static function (ObjectInfo $info): void {})->await();
+
+        self::assertStringContainsString(
+            '"idle_heartbeat":' . ObjectStoreBucket::WATCH_IDLE_HEARTBEAT_NS,
+            implode('', $transport->writes),
+            'an option-less OS watch must request the default idle heartbeat so the watchdog arms',
+        );
+
+        $client->disconnect()->await();
+    }
+
+    /**
+     * A silent/reaped Object Store watch consumer is RECREATED by the ordered-consumer watchdog
+     * instead of hanging forever (#113 KV-watch parity), with the heartbeat interval tunable
+     * through ObjectStoreWatchOptions::$idleHeartbeat. Having delivered nothing yet, the
+     * replacement re-applies the watch's INITIAL deliver policy (never a by_start_sequence replay
+     * from sequence 1). Falsifiable: pre-fix the OS watch never requested a heartbeat, so no
+     * watchdog armed and a dead watch stayed silent forever.
+     */
+    public function testWatchSilentConsumerIsRecreatedByWatchdog(): void
+    {
+        $createReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH","config":{"deliver_subject":"_INBOX.JS.ORD.x","ack_policy":"none"}}';
+        $deleteReply = '{"success":true}';
+        $recreateReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH2","config":{"deliver_subject":"_INBOX.JS.ORD.y","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ], blockWhenEmpty: true);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
+        ]);
+
+        $errors = [];
+        $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
+            $errors[] = $e;
+        });
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        // 30 ms heartbeat -> the watchdog reacts after ~60 ms of silence.
+        $client->jetStream()->objectStore('assets')->watch(
+            static function (ObjectInfo $info): void {},
+            '>',
+            new ObjectStoreWatchOptions(idleHeartbeat: 30_000_000),
+        )->await();
+
+        // The watch consumer must actually request the heartbeat, or the server would never emit
+        // the status-100 frames the watchdog relies on.
+        self::assertStringContainsString('"idle_heartbeat":30000000', implode('', $transport->writes));
+
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.CREATE.OBJ_assets') < 2 && hrtime(true) < $deadlineNs) {
+            \Amp\delay(0.01);
+        }
+
+        $client->disconnect()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.CONSUMER.DELETE.OBJ_assets.OBJWATCH', $writes, 'the silent instance must be replaced');
+        self::assertGreaterThanOrEqual(2, substr_count($writes, '$JS.API.CONSUMER.CREATE.OBJ_assets'), 'a replacement consumer must be created');
+        self::assertStringNotContainsString('by_start_sequence', $writes);
+        self::assertSame([], $errors, 'watchdog recreation is recovery, not an error');
+    }
+
+    /**
+     * Meta subjects carry base64url-ENCODED names, so watch() must encode an exact-name pattern
+     * (a raw name could never match) and REJECT wildcard patterns outright - previously a pattern
+     * like "logs-*" subscribed successfully and silently observed nothing, indistinguishable from
+     * an idle bucket.
+     */
+    public function testWatchEncodesExactNamePatternAndRejectsWildcards(): void
+    {
+        $createReply = '{"stream_name":"OBJ_assets","name":"OBJWATCH","config":{"deliver_subject":"_INBOX.JS.ORD.x","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+        $bucket = $client->jetStream()->objectStore('assets');
+
+        // Exact object name: the consumer filter must carry the ENCODED token.
+        $bucket->watch(static function (ObjectInfo $info): void {}, 'logo.txt')->await();
+        self::assertStringContainsString(
+            '$O.assets.M.' . $this->encodeName('logo.txt'),
+            implode('', $transport->writes),
+            'an exact-name pattern must be base64url-encoded into the filter subject',
+        );
+
+        // Wildcards can never match encoded tokens: loud rejection, not a silent no-op watch.
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('wildcard');
+        $bucket->watch(static function (ObjectInfo $info): void {}, 'logs-*')->await();
     }
 
     public function testWatchWithOptionsRequestsSnapshotDeliverPolicy(): void
@@ -1313,7 +1579,7 @@ final class ObjectStoreBucketTest extends TestCase
         // Both meta frames arrive on the push consumer's deliver subscription (sid 2), not the mux
         // inbox; enqueue them when that deliver SUB is written.
         $transport->enqueueOnWriteContaining = [
-            'SUB _INBOX.JS.PUSH' => [
+            'SUB _INBOX.JS.ORD' => [
                 // A malformed (non-JSON) meta delivery must be skipped, not throw out of the loop.
                 sprintf("MSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.5.1.0.0 %d\r\n%s\r\n", $enc, strlen('not-json'), 'not-json'),
                 // A subsequent valid meta on the same subscription is still delivered.
@@ -1376,7 +1642,7 @@ final class ObjectStoreBucketTest extends TestCase
         // Both frames arrive on the push consumer's deliver subscription (sid 2), not the mux inbox;
         // enqueue them when that deliver SUB is written.
         $transport->enqueueOnWriteContaining = [
-            'SUB _INBOX.JS.PUSH' => [
+            'SUB _INBOX.JS.ORD' => [
                 // A server delete-marker must be skipped, not surfaced as an ObjectInfo.
                 sprintf("HMSG \$O.assets.M.%s 2 \$JS.ACK.OBJ_assets.OBJWATCH.1.5.1.0.0 %d %d\r\n%s%s\r\n", $enc, $mh, $mh + strlen((string) $markerBody), $markerHdrs, (string) $markerBody),
                 // A subsequent valid meta on the same subscription is still delivered.
@@ -1491,6 +1757,177 @@ final class ObjectStoreBucketTest extends TestCase
         $writes = implode('', $transport->writes);
         self::assertSame(3, substr_count($writes, 'PUB $O.assets.C.' . $stored->nuid));
         self::assertStringContainsString('"chunks":3', $writes);
+    }
+
+    /**
+     * A pipelined upload whose acked stream sequences are NOT strictly increasing in chunk order
+     * (a 503-retried chunk landed after later chunks - ADR-21 retry inside publish()) must ABORT:
+     * reassembly is in stream order, so completing the meta publish would store a permanently
+     * corrupted object that put() reports as success (the digest check would only catch it at
+     * read time). The partial NUID is purged and no meta record is written.
+     */
+    public function testPutAbortsAndPurgesWhenChunkAcksArriveReordered(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            // Chunk acks with sequence 2 BEFORE sequence 1: chunk #2 was stored ahead of chunk #1.
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            // Purge of the partial NUID (abandonPartialUpload).
+            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+
+        try {
+            $bucket->put('multi.bin', 'abcdefghij')->await();
+            self::fail('a reordered upload must abort, not report success');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('reordered', $e->getMessage());
+        }
+
+        $writes = implode('', $transport->writes);
+        // The partial chunks were purged and the corrupt object was never made visible via meta.
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
+        self::assertStringContainsString('$O.assets.C.', $writes);
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes, 'no meta record may be published for a corrupt upload');
+    }
+
+    /**
+     * The REAL-WORLD reorder shape: on a single connection, ack ARRIVAL order always equals server
+     * storage order, so a 503-retried chunk's ack arrives LAST carrying the HIGHEST sequence while
+     * the earlier-published chunk stored later. A completion-order collection (Amp Future\await
+     * returns results in resolution order) sees a monotonic list and misses the corruption - the
+     * sequences must be collected in CHUNK order for the guard to fire. Here chunk #1's ack is
+     * withheld until after chunk #2's: arrival order [seq 1 (chunk2), seq 2 (chunk1)] is monotonic,
+     * chunk order [2, 1] is not - the upload must abort and purge.
+     */
+    public function testPutDetectsReorderEvenWhenAcksArriveInMonotonicCompletionOrder(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+
+        // Token-aware responder: replies to the lookup and purge immediately, but withholds chunk
+        // #1's ack until chunk #2's request is seen, then answers #2 first (seq 1) and #1 second
+        // (seq 2) - the ack pattern an actual delayed 503 retry produces.
+        $base = null;
+        $chunkReplyTos = [];
+        $transport->onWrite = static function (string $bytes) use (&$base, &$chunkReplyTos): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            if (str_starts_with($head, 'SUB ')) {
+                $subject = explode(' ', $head)[1] ?? '';
+                if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
+                    $base = substr($subject, 0, -1);
+                }
+
+                return [];
+            }
+
+            if (!str_starts_with($head, 'PUB ') || $base === null) {
+                return [];
+            }
+
+            $parts = explode(' ', $head);
+            $subject = $parts[1] ?? '';
+            $replyTo = $parts[2] ?? '';
+
+            $msg = static fn(string $rt, string $body): string => sprintf("MSG %s 1 %d\r\n%s\r\n", $rt, strlen($body), $body);
+
+            if (str_starts_with($subject, '$JS.API.DIRECT.GET') || str_starts_with($subject, '$JS.API.STREAM.MSG.GET')) {
+                return [$msg($replyTo, '{"error":{"code":404,"description":"message not found"}}')];
+            }
+
+            if (str_starts_with($subject, '$JS.API.STREAM.PURGE')) {
+                return [$msg($replyTo, '{"success":true,"purged":2}')];
+            }
+
+            if (str_starts_with($subject, '$O.assets.C.')) {
+                $chunkReplyTos[] = $replyTo;
+                if (count($chunkReplyTos) === 2) {
+                    // Storage order was 2 then 1: acks arrive monotonically (seq 1 then seq 2) but
+                    // belong to chunks [2, 1].
+                    return [
+                        $msg($chunkReplyTos[1], '{"stream":"OBJ_assets","seq":1,"duplicate":false}'),
+                        $msg($chunkReplyTos[0], '{"stream":"OBJ_assets","seq":2,"duplicate":false}'),
+                    ];
+                }
+
+                return [];
+            }
+
+            return [];
+        };
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        // chunkSize 4, 8 bytes -> exactly 2 chunks.
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+
+        try {
+            $bucket->put('multi.bin', 'abcdefgh')->await();
+            self::fail('the reordered upload must abort even though ack arrival order was monotonic');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('reordered', $e->getMessage());
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes);
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes);
+    }
+
+    /**
+     * A chunk publish failing outright mid-upload must purge the already-stored chunks of the fresh
+     * NUID before rethrowing: no meta record ever references that NUID, so without the purge the
+     * chunks were orphaned in the stream FOREVER (nats.go purgePartial parity).
+     */
+    public function testPutFailurePurgesPartialChunksBeforeRethrowing(): void
+    {
+        $failure = '{"error":{"code":400,"err_code":10077,"description":"maximum bytes exceeded"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
+            sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(1)), $this->pubAck(1)),
+            // Chunk #2 is rejected by the server.
+            sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($failure), $failure),
+            sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
+            // Purge of the partial NUID (abandonPartialUpload).
+            sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
+
+        try {
+            $bucket->put('multi.bin', 'abcdefghij')->await();
+            self::fail('a failed chunk publish must abort the upload');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('maximum bytes exceeded', $e->getMessage(), 'the ORIGINAL failure must surface, not a cleanup error');
+        }
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.PURGE.OBJ_assets', $writes, 'the partial chunks must be purged (no meta references the NUID)');
+        self::assertStringNotContainsString('PUB $O.assets.M.', $writes);
     }
 
     /**

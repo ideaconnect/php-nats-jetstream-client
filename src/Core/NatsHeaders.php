@@ -38,15 +38,42 @@ final class NatsHeaders
                 }
 
                 // Compact "key:value" form (no space after the colon) because some server-side header
-                // parsers do not trim a leading space from values. Surrounding whitespace in a value is
-                // not significant - it is trimmed here and again on decode - so values round-trip
-                // symmetrically rather than asymmetrically losing leading/trailing spaces.
-                $lines[] = $name . ':' . trim($singleValue);
+                // parsers do not trim a leading space from values. The value is emitted VERBATIM
+                // (nats.go writes caller bytes untouched): silently trimming mutated values a
+                // signature/checksum-carrying header would trip over, and made the same publish
+                // deliver different bytes through this client than through the reference client.
+                // This client's own decoder still trims surrounding whitespace as an inbound
+                // tolerance (see fromWireBlock()).
+                $lines[] = $name . ':' . $singleValue;
             }
         }
 
         // NATS headers terminate with an additional CRLF after all header lines.
         return implode("\r\n", $lines) . "\r\n\r\n";
+    }
+
+    /**
+     * Case-insensitive header lookup over a decoded header map. Wire header names are
+     * case-sensitive and this client returns them verbatim from {@see fromWireBlock()}, but
+     * publishers vary in canonicalization (nats.go canonicalizes on READ, so Go consumers match
+     * `nats-msg-id` where an exact-case lookup here misses it). Returns the first
+     * case-insensitively matching value, preferring an exact-case hit.
+     *
+     * @param array<string,string> $headers A map from {@see fromWireBlock()}.
+     */
+    public static function get(array $headers, string $name): ?string
+    {
+        if (isset($headers[$name])) {
+            return $headers[$name];
+        }
+
+        foreach ($headers as $key => $value) {
+            if (strcasecmp((string) $key, $name) === 0) {
+                return $value;
+            }
+        }
+
+        return null;
     }
 
     /**

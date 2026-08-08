@@ -554,9 +554,15 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
         self::assertSame([], $received);
 
         $written = implode('', $transport->writes);
-        // kills DecrementInteger @ 979 (lastStreamSeq 0 -> -1 would make opt_start_seq 0).
-        self::assertStringContainsString('"opt_start_seq":1', $written);
-        self::assertStringNotContainsString('"opt_start_seq":0', $written);
+        // A pre-first-delivery recreate (lastStreamSeq still 0) re-applies the INITIAL deliver
+        // policy instead of a by_start_sequence restart: for this default consumer that is
+        // semantically 'all' (identical to the old opt_start_seq 1), while for a
+        // 'new'/'last_per_subject' initial policy (a KV/OS watch) a sequence-1 replay would
+        // wrongly re-deliver the whole stream. Kills mutants that flip the lastStreamSeq > 0
+        // guard: a mutated guard would emit by_start_sequence/opt_start_seq here.
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.EVENTS'), 'the gap must trigger exactly one recreate');
+        self::assertStringNotContainsString('"by_start_sequence"', $written);
+        self::assertStringNotContainsString('"opt_start_seq"', $written);
     }
 
     /**

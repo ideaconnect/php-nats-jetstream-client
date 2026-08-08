@@ -37,8 +37,13 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
     /**
      * @param list<string> $chunks One chunk returned per read(), in order; read() returns null (EOF)
      *                             once they are exhausted.
+     * @param bool $failWrites When true every write() throws ClosedException, emulating a peer that
+     *                         died between delivering its last chunk and the client's answer write.
      */
-    public function __construct(private readonly array $chunks) {}
+    public function __construct(
+        private readonly array $chunks,
+        private readonly bool $failWrites = false,
+    ) {}
 
     #[\Override]
     public function read(?Cancellation $cancellation = null, ?int $limit = null): ?string
@@ -57,6 +62,10 @@ final class ScriptedChunkSocket implements Socket, \IteratorAggregate
     {
         if ($this->closed) {
             throw new ClosedException('The scripted socket is closed');
+        }
+
+        if ($this->failWrites) {
+            throw new ClosedException('The scripted socket rejects writes');
         }
 
         $this->written .= $bytes;

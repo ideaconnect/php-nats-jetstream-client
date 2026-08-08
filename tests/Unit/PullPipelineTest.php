@@ -122,6 +122,137 @@ final class PullPipelineTest extends TestCase
         self::assertStringContainsString('Consumer Deleted', $errors[0]->getMessage());
     }
 
+    /**
+     * A 503 (no JS API responder - server restart window, JetStream still wiring up after a
+     * reconnect, a leader election) is TRANSIENT: an infinite run must poll through it like the
+     * sibling "409 Leadership Change" (and like publish()'s ADR-21 retry), not die on it. The first
+     * 503 of a streak fires onError once as an operator signal; delivery re-arms the signal, and a
+     * genuinely terminal status afterwards still stops the run. Pre-fix the 503 was terminal.
+     */
+    public function testInfiniteRunPollsThroughTransientNoResponders(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['msg' => 'a']],
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
+        ]);
+        $js = $this->context($transport);
+
+        $errors = [];
+        $received = [];
+        $processed = $js->pullConsumer('S', 'C')
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e;
+            })
+            ->handle(static function (NatsMessage $m) use (&$received): void {
+                $received[] = $m->payload;
+            })->await();
+
+        self::assertSame(1, $processed, 'the run must survive the transient 503 and process the next pull');
+        self::assertSame(['a'], $received);
+        self::assertCount(2, $errors, 'exactly one 503 signal plus the terminal 409 report');
+        self::assertInstanceOf(JetStreamException::class, $errors[0]);
+        self::assertSame(503, $errors[0]->getCode());
+        self::assertInstanceOf(JetStreamException::class, $errors[1]);
+        self::assertStringContainsString('Consumer Deleted', $errors[1]->getMessage());
+    }
+
+    /**
+     * The headline pre-fix failure: with NO onError configured, an infinite worker hitting a
+     * momentary 503 terminated permanently and handle() resolved NORMALLY with the processed count -
+     * indistinguishable from a clean drain, zero error signal, messages piling up in the stream. It
+     * must keep consuming instead.
+     */
+    public function testInfiniteRunWithoutOnErrorSurvivesTransientNoResponders(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['msg' => 'a']],
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
+        ]);
+        $js = $this->context($transport);
+
+        $processed = $js->pullConsumer('S', 'C')
+            ->handle(static function (): void {})->await();
+
+        self::assertSame(1, $processed, 'pre-fix this resolved 0: the worker died silently on the 503');
+    }
+
+    /**
+     * The one-shot no-responders signal re-arms on any routine NON-503 retire (404/408/...), not
+     * only on a delivery: a 404 proves the JS API answers again, so a LATER outage on an idle
+     * stream (which may never deliver between outages) must be reported too - delivery-only
+     * re-arm left every outage after the first invisible for exactly the consumers least able to
+     * notice one any other way.
+     */
+    public function testNoRespondersSignalReArmsAfterRoutineNonEmptyGap(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', [
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 404, 'desc' => 'No Messages']],
+            [['status' => 503, 'desc' => 'No Responders Available For Request']],
+            [['status' => 409, 'desc' => 'Consumer Deleted']],
+        ]);
+        $js = $this->context($transport);
+
+        $errors = [];
+        $processed = $js->pullConsumer('S', 'C')
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e;
+            })
+            ->handle(static function (): void {})->await();
+
+        self::assertSame(0, $processed);
+        self::assertCount(3, $errors, 'both 503 outages plus the terminal 409 must be reported');
+        self::assertSame(503, $errors[0]->getCode());
+        self::assertSame(503, $errors[1]->getCode(), 'the second outage must be reported after the 404 re-armed the signal');
+        self::assertStringContainsString('Consumer Deleted', $errors[2]->getMessage());
+    }
+
+    /**
+     * A permission-rejected pull reply inbox can never deliver a reply: every pull retires as a
+     * silent client-side deadline (classified routine), so pre-fix the engine spun FOREVER with
+     * zero signal on any channel - handle() never returned and onError never fired. It must fail
+     * fast with a clear, catchable configuration error (#167's pull twin).
+     */
+    public function testPermissionRejectedPullInboxFailsFastInsteadOfSpinning(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->pullServer($transport, 'S', 'C', []);
+
+        // Chain onto the harness responder: answer the pull-inbox SUB with the server's async
+        // permissions -ERR naming the exact subject, as a real server does.
+        $inner = $transport->onWrite;
+        $transport->onWrite = static function (string $bytes) use ($inner): array {
+            $frames = $inner !== null ? $inner($bytes) : [];
+            $head = strtok($bytes, "\r\n");
+            if (is_string($head) && str_starts_with($head, 'SUB _INBOX.JS.PULL.')) {
+                $subject = explode(' ', $head)[1] ?? '';
+                $frames[] = "-ERR 'Permissions Violation for Subscription to \"" . $subject . "\"'\r\n";
+            }
+
+            return $frames;
+        };
+
+        $js = $this->context($transport);
+
+        $startedNs = hrtime(true);
+        try {
+            $js->pullConsumer('S', 'C')
+                ->setExpiresMs(300)
+                ->handle(static function (): void {})->await(new \Amp\TimeoutCancellation(10.0));
+            self::fail('a permission-rejected pull inbox must fail the run');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('rejected by server permissions', $e->getMessage());
+            self::assertStringContainsString('_INBOX.JS.PULL.>', $e->getMessage(), 'the error must name the wildcard to grant');
+        }
+
+        self::assertLessThan(8.0, (hrtime(true) - $startedNs) / 1e9, 'the failure must be prompt, not an eventual timeout');
+    }
+
     public function testStopAbandonsRemainingBatch(): void
     {
         // One pull of batch 3; the handler stops after the first message -> the rest are abandoned.

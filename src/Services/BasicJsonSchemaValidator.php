@@ -80,7 +80,9 @@ final class BasicJsonSchemaValidator implements ServiceSchemaValidatorInterface
             'number' => is_int($value) || is_float($value),
             'boolean' => is_bool($value),
             'array' => is_array($value) && array_is_list($value),
-            'object' => is_array($value),
+            // A JSON list is NOT an object; the empty array stays ambiguous under assoc decoding
+            // ({} and [] both decode to []) and is accepted as the empty object.
+            'object' => is_array($value) && ($value === [] || !array_is_list($value)),
             'null' => $value === null,
             default => true,
         };

@@ -213,6 +213,69 @@ final class ServiceTest extends TestCase
         self::assertStringContainsString('"metadata":{"team":"core"}', implode('', $transport->writes));
     }
 
+    /**
+     * ADR-32 requires endpoint names to satisfy the same token rules as service names; nats.go
+     * micro rejects invalid names at registration, and an accepted invalid name was advertised
+     * verbatim to conformant tooling via $SRV.INFO/$SRV.STATS.
+     */
+    public function testAddEndpointRejectsNonTokenName(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('ADR-32');
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('my endpoint!', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
+    }
+
+    /**
+     * Empty `metadata` maps must serialize as JSON objects (`{}`) in every $SRV discovery response,
+     * never as arrays (`[]`): ADR-32 types metadata as map[string]string, and Go-based consumers
+     * (nats micro ls, nats.go micro) hard-fail unmarshalling `[]` into a map — rejecting the whole
+     * discovery response, so a metadata-less service (the default) was invisible to standard
+     * tooling. Covers the service-level metadata (PING/STATS) and the per-endpoint metadata (INFO).
+     */
+    public function testDiscoveryEncodesEmptyMetadataAsObject(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            // sid 2 = $SRV.PING (endpoint SUB is sid 1), sid 5 = $SRV.INFO, sid 8 = $SRV.STATS.
+            "MSG \$SRV.PING 2 _INBOX.ping 0\r\n\r\n",
+            "MSG \$SRV.INFO 5 _INBOX.info 0\r\n\r\n",
+            "MSG \$SRV.STATS 8 _INBOX.stats 0\r\n\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        // No service metadata, no endpoint metadata: the empty-map default is exactly the broken case.
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+        $client->processIncoming()->await();
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringNotContainsString('"metadata":[]', $writes, 'ADR-32 metadata is a map; [] breaks Go unmarshalling');
+        // Service-level metadata in the PING reply and per-endpoint metadata in the INFO reply.
+        self::assertStringContainsString('"type":"io.nats.micro.v1.ping_response"', $writes);
+        self::assertStringContainsString('"type":"io.nats.micro.v1.info_response"', $writes);
+        self::assertStringContainsString('"type":"io.nats.micro.v1.stats_response"', $writes);
+        self::assertGreaterThanOrEqual(
+            3,
+            substr_count($writes, '"metadata":{}'),
+            'PING (service), INFO (service + endpoint), and STATS replies must all carry object-typed empty metadata',
+        );
+    }
+
     public function testInfoIncludesEndpointSchema(): void
     {
         // #101: ADR-32 stabilizes only PING/INFO/STATS, so a spec-conformant consumer reads schema from
@@ -877,6 +940,112 @@ final class ServiceTest extends TestCase
     }
 
     /**
+     * A requester-controlled non-UTF-8 X-Request-Id plus a schema-failing payload used to make the
+     * validation-error reply throw JsonException from INSIDE the (then unguarded) reply publish -
+     * escaping the subscription callback into the shared dispatch loop and aborting delivery for
+     * every subscription on the connection (#97's exact failure mode, remotely triggerable). The
+     * rejection reply must go out (without the poisoned correlation id) and nothing may escape.
+     */
+    public function testValidationReplyToleratesNonUtf8CorrelationHeader(): void
+    {
+        $headerPayload = "NATS/1.0\r\nX-Request-Id:\xC3\x28\xFF\r\n\r\n";
+        $bodyPayload = '{"id":"invalid"}';
+        $merged = $headerPayload . $bodyPayload;
+        $headerBytes = strlen($headerPayload);
+        $totalBytes = strlen($merged);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->withSchemaValidator(new BasicJsonSchemaValidator())
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload, schema: [
+                'type' => 'object',
+                'properties' => ['id' => ['type' => 'integer']],
+            ]);
+        $service->start()->await();
+
+        // Pre-fix: this threw JsonException (malformed UTF-8) out of the dispatch loop.
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"code":"VALIDATION_ERROR"', $writes, 'the rejection reply must still be published');
+        self::assertStringNotContainsString('correlation_id', $writes, 'the poisoned correlation id must be omitted, not encoded');
+    }
+
+    /**
+     * A handler throwing ServiceError with a CR/LF-crafted CODE used to blow up the header build
+     * inside publishResponse (InvalidArgumentException) and escape the dispatch loop - the injection
+     * itself was blocked, but by throwing, not sanely. The code is now collapsed to one line like
+     * the description, the reply goes out, and nothing escapes.
+     */
+    public function testServiceErrorCrLfCodeIsSanitizedAndReplyStillSent(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static function (): string {
+                throw new \IDCT\NATS\Services\ServiceError("400\r\nX-Injected: 1", 'bad request');
+            });
+        $service->start()->await();
+
+        // Pre-fix: InvalidArgumentException from the header build escaped the dispatch loop.
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('Nats-Service-Error-Code:400 X-Injected: 1', $writes, 'the code must be collapsed to one line');
+        self::assertStringNotContainsString("400\r\nX-Injected", $writes, 'no header injection');
+    }
+
+    /**
+     * A connection-level reply-publish failure (the connection closed between request delivery and
+     * the reply) used to escape the subscription callback into the shared dispatch loop as a
+     * spurious connection error. It must be recorded on the endpoint and swallowed.
+     */
+    public function testReplyPublishConnectionFailureIsRecordedNotEscaping(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+
+        $client = new NatsClient(new NatsOptions(reconnectEnabled: false), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static function () use ($client): string {
+                // The connection dies while the handler runs; the reply publish then fails at the
+                // connection level (not JsonException) - the previously unguarded escape path.
+                $client->disconnect()->await();
+
+                return 'reply';
+            });
+        $service->start()->await();
+
+        // Pre-fix: the ConnectionException from the reply publish escaped the dispatch loop.
+        $client->processIncoming()->await();
+
+        $stats = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $stats['num_errors'] ?? null, 'the reply failure must be recorded on the endpoint');
+        self::assertIsString($stats['last_error'] ?? null);
+        self::assertStringContainsString('not open', (string) $stats['last_error']);
+    }
+
+    /**
      * Verifies error responses carry correlation id when request headers provide one.
      */
     public function testErrorEnvelopeIncludesCorrelationIdFromHeaders(): void
@@ -1167,7 +1336,7 @@ final class ServiceTest extends TestCase
         $service = $client->service('echo', '1.0.0');
 
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('name must not be empty');
+        $this->expectExceptionMessage('name must be non-empty and match');
         $service->addEndpoint('   ', 'svc.echo', static fn(NatsMessage $m): string => 'x');
     }
 

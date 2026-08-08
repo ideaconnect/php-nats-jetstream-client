@@ -50,6 +50,22 @@ final class KeyValueBucket
     private const HISTORY_TIMEOUT_S = 5.0;
 
     /**
+     * READ-side subject prefix override, set only when this handle fronts an EXTERNAL
+     * (cross-domain) mirror: mirrored records keep the origin's `$KV.<origin>.` subjects, so reads
+     * against the local mirror stream must use that prefix. Null = own `$KV.<bucket>.` prefix.
+     * Resolved by create() (from its own config) or {@see bind()} (from STREAM.INFO).
+     */
+    private ?string $readPrefix = null;
+
+    /**
+     * WRITE-side subject prefix override, set for ANY mirror (nats.go putPre parity): a mirror
+     * stream ingests no subjects of its own, so put/delete/purge publish through to the origin -
+     * `$KV.<origin>.` same-domain, `<external api>.$KV.<origin>.` cross-domain. Null = writes use
+     * the read prefix.
+     */
+    private ?string $writePrefix = null;
+
+    /**
      * Creates a KV bucket context bound to a client and bucket name.
      *
      * @param NatsClient $client Connected client used for publish/subscribe operations behind KV APIs.
@@ -89,11 +105,22 @@ final class KeyValueBucket
             $mapped = $this->mapKvOptions($options);
 
             // Mirror/source KV buckets reference other buckets by name; translate them to the backing
-            // `KV_`-prefixed stream names (#62). A mirrored bucket defines no subjects of its own.
-            $subjects = [$this->subjectPrefix() . '>'];
+            // `KV_`-prefixed stream names (#62). A mirrored bucket defines no subjects of its own and
+            // gets mirror_direct; a sourced bucket keeps its own subjects and each source gets the
+            // ADR-57 subject transform re-subjecting copied records into THIS bucket's prefix -
+            // without it, sourced entries sit in the stream under the origin subject where every
+            // read/watch path (filtered on this bucket's prefix) is blind to them (nats.go parity).
+            $subjects = ['$KV.' . $this->bucket . '.>'];
             if (isset($mapped['mirror'])) {
-                $mapped['mirror'] = $this->kvSourceConfig($mapped['mirror']);
+                $mirror = $this->kvMirrorConfig($mapped['mirror']);
+                $mapped['mirror'] = $mirror;
+                // nats.go CreateKeyValue parity: mirrors answer origin DIRECT.GET traffic.
+                $mapped['mirror_direct'] ??= true;
                 $subjects = [];
+                // This handle now fronts a mirror: writes go through to the ORIGIN bucket's
+                // subjects (the mirror stream ingests nothing itself), reads follow nats.go's
+                // prefix rules. bind() applies the same resolution for attached handles.
+                $this->applyMirrorPrefixes($mirror);
             }
             if (isset($mapped['sources']) && is_array($mapped['sources'])) {
                 $mapped['sources'] = array_values(array_map(
@@ -111,8 +138,13 @@ final class KeyValueBucket
     }
 
     /**
-     * Normalizes a KV mirror/source entry to a stream-source config: a bare bucket name (or a `bucket`
-     * key) becomes the backing `KV_`-prefixed stream name; an explicit `name` is used as-is.
+     * Normalizes a KV SOURCE entry per nats.go/ADR-57: a bare bucket name (or a `bucket` key) becomes
+     * the backing `KV_`-prefixed stream name, a `domain` is converted to the external API prefix, and
+     * - unless the caller supplied its own `subject_transforms` (full-control pass-through: the name
+     * is then used as-is, allowing non-KV streams) - the mandatory KV transform is attached so
+     * sourced records are re-subjected into THIS bucket's prefix:
+     * `{src: "$KV.<srcBucket>.>", dest: "$KV.<thisBucket>.>"}`. The transform is skipped only for an
+     * external source of the SAME bucket name, whose subjects already match (nats.go rule).
      *
      * @param string|array<string,mixed> $source
      * @return array<string,mixed>
@@ -120,15 +152,172 @@ final class KeyValueBucket
     private function kvSourceConfig(string|array $source): array
     {
         if (is_string($source)) {
-            return ['name' => 'KV_' . $source];
+            $source = ['name' => $source];
         }
 
-        if (isset($source['bucket'])) {
-            $source['name'] = 'KV_' . $source['bucket'];
+        $fromBucketAlias = isset($source['bucket']);
+        if ($fromBucketAlias) {
+            $source['name'] = (string) $source['bucket'];
             unset($source['bucket']);
         }
 
+        $source = $this->convertKvDomain($source);
+
+        // Caller-supplied transforms pass through verbatim - full control of the source (e.g. a
+        // non-KV stream); the name is NOT KV_-prefixed in this branch (nats.go jetstream parity).
+        // Exception: the `bucket` alias explicitly declares a KV bucket (nats.go has no such
+        // alias), so it is still translated to the backing stream name.
+        if (isset($source['subject_transforms']) && $source['subject_transforms'] !== []) {
+            if ($fromBucketAlias && !str_starts_with((string) ($source['name'] ?? ''), 'KV_')) {
+                $source['name'] = 'KV_' . (string) $source['name'];
+            }
+
+            return $source;
+        }
+
+        $name = (string) ($source['name'] ?? '');
+        if (str_starts_with($name, 'KV_')) {
+            $sourceBucket = substr($name, 3);
+        } else {
+            $sourceBucket = $name;
+            $source['name'] = 'KV_' . $name;
+        }
+
+        if (!isset($source['external']) || $sourceBucket !== $this->bucket) {
+            $source['subject_transforms'] = [[
+                'src' => '$KV.' . $sourceBucket . '.>',
+                'dest' => '$KV.' . $this->bucket . '.>',
+            ]];
+        }
+
         return $source;
+    }
+
+    /**
+     * Normalizes a KV MIRROR entry: `KV_`-prefixes the name (or `bucket` key) and converts a
+     * `domain` to the external API prefix. Unlike sources, a mirror gets NO subject transforms -
+     * mirrored records keep the ORIGIN's subjects, which is why the runtime prefixes are
+     * re-resolved via {@see applyMirrorPrefixes()} (nats.go parity).
+     *
+     * @param string|array<string,mixed> $mirror
+     * @return array<string,mixed>
+     */
+    private function kvMirrorConfig(string|array $mirror): array
+    {
+        if (is_string($mirror)) {
+            $mirror = ['name' => $mirror];
+        }
+
+        if (isset($mirror['bucket'])) {
+            $mirror['name'] = (string) $mirror['bucket'];
+            unset($mirror['bucket']);
+        }
+
+        $mirror = $this->convertKvDomain($mirror);
+
+        $name = (string) ($mirror['name'] ?? '');
+        if (!str_starts_with($name, 'KV_')) {
+            $mirror['name'] = 'KV_' . $name;
+        }
+
+        return $mirror;
+    }
+
+    /**
+     * Converts a mirror/source `domain` shorthand to the external JetStream API prefix
+     * (`external: {api: "$JS.<domain>.API"}`), rejecting entries that set both (nats.go parity).
+     *
+     * @param array<string,mixed> $entry
+     * @return array<string,mixed>
+     */
+    private function convertKvDomain(array $entry): array
+    {
+        $domain = $entry['domain'] ?? null;
+        if (!is_string($domain) || $domain === '') {
+            return $entry;
+        }
+
+        if (isset($entry['external'])) {
+            throw new JetStreamException('A KV mirror/source cannot set both domain and external');
+        }
+
+        unset($entry['domain']);
+        $entry['external'] = ['api' => '$JS.' . $domain . '.API'];
+
+        return $entry;
+    }
+
+    /**
+     * Resolves the read/write subject prefixes for a mirror bucket from its mirror config, exactly
+     * as nats.go's mapStreamToKVS does: mirrored records keep the ORIGIN's `$KV.<origin>.` subjects
+     * and the mirror stream ingests no subjects of its own, so
+     *   - writes (put/create/update/delete/purge) always go through to the origin - via
+     *     `<external api>.$KV.<origin>.` cross-domain, or `$KV.<origin>.` same-domain (the origin
+     *     stream, not the mirror, stores them; the mirror replicates them back);
+     *   - reads switch to the origin prefix only for an EXTERNAL (cross-domain) mirror, where the
+     *     local mirror stream serves them under the origin subjects; a same-domain mirror handle
+     *     keeps its own prefix for reads (nats.go makes no read-side adjustment there either).
+     *
+     * @param array<string,mixed> $mirror
+     */
+    private function applyMirrorPrefixes(array $mirror): void
+    {
+        $origin = (string) ($mirror['name'] ?? '');
+        if (str_starts_with($origin, 'KV_')) {
+            $origin = substr($origin, 3);
+        }
+
+        if ($origin === '') {
+            return;
+        }
+
+        $externalApi = null;
+        if (isset($mirror['external']) && is_array($mirror['external'])) {
+            $api = $mirror['external']['api'] ?? null;
+            if (is_string($api) && $api !== '') {
+                $externalApi = $api;
+            }
+        }
+
+        if ($externalApi !== null) {
+            $this->readPrefix = '$KV.' . $origin . '.';
+            $this->writePrefix = rtrim($externalApi, '.') . '.$KV.' . $origin . '.';
+        } else {
+            $this->writePrefix = '$KV.' . $origin . '.';
+        }
+    }
+
+    /**
+     * Binds this handle to the EXISTING bucket's server-side configuration: fetches STREAM.INFO,
+     * sanity-checks the stream is KV-shaped (nats.go ErrBadBucket parity), and resolves the mirror
+     * read/write prefixes when the stream is a mirror. Required for a handle ATTACHED to a mirror
+     * bucket created elsewhere - without it, writes would target this bucket's own prefix, which no
+     * stream ingests (503), and cross-domain reads would miss the origin-prefixed records.
+     * create() applies the same resolution from its own config, so created handles need no bind().
+     *
+     * @return Future<self>
+     */
+    public function bind(): Future
+    {
+        return async(function (): self {
+            $info = $this->jetStream->getStream($this->streamName())->await();
+
+            /** @var array<string,mixed> $config */
+            $config = is_array($info->raw['config'] ?? null) ? $info->raw['config'] : [];
+
+            if ((int) ($config['max_msgs_per_subject'] ?? 0) < 1) {
+                throw new JetStreamException(sprintf(
+                    'Stream "%s" is not a KV bucket (max_msgs_per_subject < 1)',
+                    $this->streamName(),
+                ));
+            }
+
+            if (isset($config['mirror']) && is_array($config['mirror'])) {
+                $this->applyMirrorPrefixes($config['mirror']);
+            }
+
+            return $this;
+        });
     }
 
     /**
@@ -154,7 +343,7 @@ final class KeyValueBucket
         return async(function () use ($key, $value, $ttl): PubAck {
             $this->assertValidKey($key);
 
-            return $this->jetStream->publish($this->subjectForKey($key), $value, ttl: $ttl)->await();
+            return $this->jetStream->publish($this->writeSubjectForKey($key), $value, ttl: $ttl)->await();
         });
     }
 
@@ -172,7 +361,7 @@ final class KeyValueBucket
             }
 
             return $this->publishWithHeadersAck(
-                $this->subjectForKey($key),
+                $this->writeSubjectForKey($key),
                 $value,
                 ['Nats-Expected-Last-Subject-Sequence' => (string) $expectedRevision],
             )->await();
@@ -201,7 +390,7 @@ final class KeyValueBucket
                 $headers['Nats-Expected-Last-Subject-Sequence'] = (string) $expectedRevision;
             }
 
-            return $this->publishWithHeadersAck($this->subjectForKey($key), '', $headers)->await();
+            return $this->publishWithHeadersAck($this->writeSubjectForKey($key), '', $headers)->await();
         });
     }
 
@@ -227,7 +416,7 @@ final class KeyValueBucket
                 $headers['Nats-Expected-Last-Subject-Sequence'] = (string) $expectedRevision;
             }
 
-            return $this->publishWithHeadersAck($this->subjectForKey($key), '', $headers)->await();
+            return $this->publishWithHeadersAck($this->writeSubjectForKey($key), '', $headers)->await();
         });
     }
 
@@ -390,7 +579,10 @@ final class KeyValueBucket
      * resume-from-revision / ignore-deletes and an end-of-initial-data signal.
      *
      * @param callable(KeyValueEntry):void $handler
-     * @return Future<int>
+     * @return Future<int> The watch handle sid. The watch rides an ordered consumer whose automatic
+     *         recreates rotate the internal sid, so stop it with
+     *         {@see JetStreamContext::stopOrderedConsumer()} - a plain `unsubscribe($sid)` only
+     *         works until the first recreate.
      */
     public function watch(callable $handler, string $pattern = '>', ?KeyWatchOptions $options = null): Future
     {
@@ -411,10 +603,20 @@ final class KeyValueBucket
             $onCaughtUp = $options?->onCaughtUp;
             $caughtUpFired = false;
 
-            // Deliver via a JetStream push consumer (not a plain core subscription) so each update
-            // carries its stream sequence - i.e. the KV revision - which a watcher needs to feed back
-            // into update()/CAS.
-            return $this->jetStream->subscribeEphemeralPushConsumer(
+            // Deliver via an ORDERED JetStream push consumer (not a plain ephemeral): each update
+            // carries its stream sequence - i.e. the KV revision - and the ordered machinery adds
+            // what a lossless watch requires (nats.go KeyWatcher parity): consumer-sequence gap
+            // detection with recreate-from-lastStreamSeq+1 (once a delivery has fixed a resume
+            // point, a slow-consumer drop or reconnect window is REPLAYED instead of becoming a
+            // silent permanent gap - ack-none deliveries are never redelivered on their own; a
+            // recreate BEFORE the first delivery re-applies the initial policy, matching nats.go's
+            // no-cursor reset), flow control, and watchdog-driven recreation of a silent/reaped
+            // consumer. Stop a watch with stopOrderedConsumer($sid): recreates rotate the internal
+            // sid, so a plain unsubscribe() only works until the first recreate.
+            $idleHeartbeat = $consumerOptions['idle_heartbeat'];
+            unset($consumerOptions['idle_heartbeat']);
+
+            return $this->jetStream->subscribeOrderedConsumer(
                 $this->streamName(),
                 function (NatsMessage $message) use ($handler, $ignoreDeletes, $onCaughtUp, &$caughtUpFired): void {
                     $key = $this->keyFromSubject($message->subject);
@@ -458,7 +660,8 @@ final class KeyValueBucket
                     }
                 },
                 filterSubject: $filter,
-                consumerOptions: $consumerOptions,
+                idleHeartbeatNs: is_int($idleHeartbeat) ? $idleHeartbeat : null,
+                consumerOverrides: $consumerOptions,
                 onConsumerCreated: static function (ConsumerInfo $consumer) use ($onCaughtUp, &$caughtUpFired): void {
                     // End-of-initial-data on an empty / no-match bucket: the consumer starts with nothing
                     // pending, so no delivery will ever arrive to drive the in-handler caught-up check -
@@ -766,7 +969,16 @@ final class KeyValueBucket
             // on server support (batched Direct Get needs NATS 2.11+); older servers take the per-subject
             // fan-out below. The returned data, tombstone filtering, and 404/missing handling are identical.
             if ($this->jetStream->supportsBatchedDirectGet()) {
-                return $this->getAllBatched(array_keys($subjects));
+                try {
+                    return $this->getAllBatched(array_keys($subjects));
+                } catch (JetStreamException $e) {
+                    if ($e->getCode() !== 503) {
+                        throw $e;
+                    }
+                    // The STREAM (not the server) lacks Direct Get - allow_direct disabled / legacy
+                    // interop bucket: the server-version gate above cannot see that. Fall through to
+                    // the per-subject fan-out, whose lookups fall back to the leader STREAM.MSG.GET.
+                }
             }
 
             // Look up the latest record per key CONCURRENTLY via the Direct Get API (last_by_subj).
@@ -787,6 +999,16 @@ final class KeyValueBucket
                     } catch (JetStreamException $e) {
                         if ($e->getCode() === 404) {
                             return null;
+                        }
+
+                        if ($e->getCode() === 503) {
+                            // Direct Get unavailable (allow_direct disabled / legacy stream): fall
+                            // back to the leader read like get() does, instead of failing the whole
+                            // enumeration on a bucket whose single-key reads work. getAll() omits
+                            // tombstones, so a DEL/PURGE entry (null value) maps to null here.
+                            $entry = $this->getViaStreamMessage($key);
+
+                            return $entry?->value;
                         }
 
                         throw $e;
@@ -895,19 +1117,31 @@ final class KeyValueBucket
     }
 
     /**
-     * Returns KV subject prefix for this bucket.
+     * Returns the READ-side KV subject prefix for this bucket: its own `$KV.<bucket>.` normally, or
+     * the origin's prefix when this handle fronts an EXTERNAL (cross-domain) mirror - mirrored
+     * records keep the origin's subjects (see {@see applyMirrorPrefixes()}).
      */
     public function subjectPrefix(): string
     {
-        return '$KV.' . $this->bucket . '.';
+        return $this->readPrefix ?? '$KV.' . $this->bucket . '.';
     }
 
     /**
-     * Resolves a full subject for a key.
+     * Resolves a full READ subject for a key (gets, history/watch filters, purge-delete filters).
      */
     private function subjectForKey(string $key): string
     {
         return $this->subjectPrefix() . $key;
+    }
+
+    /**
+     * Resolves a full WRITE subject for a key (put/create/update/delete/purge publishes). Identical
+     * to the read subject except on a mirror bucket, where writes go through to the ORIGIN
+     * (nats.go putPre parity) - the mirror stream itself ingests no subjects.
+     */
+    private function writeSubjectForKey(string $key): string
+    {
+        return ($this->writePrefix ?? $this->subjectPrefix()) . $key;
     }
 
     /**
@@ -1001,7 +1235,7 @@ final class KeyValueBucket
             $headers['Nats-TTL'] = MessageTtl::format($ttl);
         }
 
-        return $this->publishWithHeadersAck($this->subjectForKey($key), $value, $headers);
+        return $this->publishWithHeadersAck($this->writeSubjectForKey($key), $value, $headers);
     }
 
     /**

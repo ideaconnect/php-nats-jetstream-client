@@ -252,8 +252,13 @@ final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
 
         $create = $transport->writes[3];
 
-        // kills UnwrapArrayValues @ 70
-        self::assertStringContainsString('"sources":[{"name":"KV_alpha"},{"name":"KV_beta"}]', $create);
+        // kills UnwrapArrayValues @ 70 - the sources list must re-index to a JSON ARRAY (each entry
+        // now also carries its mandatory ADR-57 subject transform).
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_alpha","subject_transforms":[{"src":"$KV.alpha.>","dest":"$KV.agg.>"}]},'
+            . '{"name":"KV_beta","subject_transforms":[{"src":"$KV.beta.>","dest":"$KV.agg.>"}]}]',
+            $create,
+        );
     }
 
     // ─── assertValidKey() guards removed (lines 140, 165, 191, 218, 259) ─────

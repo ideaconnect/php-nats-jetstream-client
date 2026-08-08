@@ -100,8 +100,11 @@ final class Service
         // Per the NATS micro spec endpoints share a queue group ("q" by default) so multiple
         // service instances load-balance requests. Pass null or '' to opt out (fan-out: every
         // instance receives every request).
-        if (trim($name) === '') {
-            throw new \InvalidArgumentException('Service endpoint name must not be empty');
+        // ADR-32 requires endpoint names to satisfy the same token rules as the service name
+        // (nats.go micro rejects invalid names at registration); an invalid name would otherwise
+        // be advertised verbatim in $SRV.INFO/$SRV.STATS to conformant tooling.
+        if (preg_match('/^[A-Za-z0-9_-]+$/', $name) !== 1) {
+            throw new \InvalidArgumentException('Service endpoint name must be non-empty and match ^[A-Za-z0-9_-]+$ (ADR-32)');
         }
 
         if (trim($subject) === '') {
@@ -239,15 +242,23 @@ final class Service
                                         'error' => $validationError,
                                     ]);
 
-                                    $this->publishResponse(
-                                        $message->replyTo,
-                                        $this->errorPayload(
-                                            code: 'VALIDATION_ERROR',
-                                            message: $validationError,
-                                            correlationId: $this->contextCorrelationId($resolveContext()),
-                                        ),
-                                        $this->serviceErrorHeaders('400', $validationError),
-                                    );
+                                    try {
+                                        $this->publishResponse(
+                                            $message->replyTo,
+                                            $this->errorPayload(
+                                                code: 'VALIDATION_ERROR',
+                                                message: $validationError,
+                                                correlationId: $this->contextCorrelationId($resolveContext()),
+                                            ),
+                                            $this->serviceErrorHeaders('400', $validationError),
+                                        );
+                                    } catch (\Throwable) {
+                                        // Schema-rejected traffic is often hostile, and this reply
+                                        // path is remotely reachable: an encode/publish failure here
+                                        // must never escape the shared dispatch loop (#97) - it would
+                                        // abort delivery of buffered frames for every subscription on
+                                        // the connection. Best effort: the rejection stands unreplied.
+                                    }
 
                                     // Emit the terminal request_end on the rejection path too, so an
                                     // observer that opened a span/timer/gauge on request_start does not
@@ -344,6 +355,20 @@ final class Service
                                 } catch (\Throwable) {
                                     // Best effort: never let a reply-publish failure escape the loop.
                                 }
+                            } catch (\Throwable $e) {
+                                // Any OTHER reply failure - a connection-level publish error (the
+                                // connection dropped between request delivery and the reply), a
+                                // header-build failure, ... - previously escaped the subscription
+                                // callback into the shared dispatch loop, aborting delivery for every
+                                // subscription on the connection (#97). The publish path itself is
+                                // broken, so no controlled reply can be attempted either: record the
+                                // fault and move on.
+                                $endpoint->errors++;
+                                $endpoint->lastError = $e->getMessage();
+                                $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
+                                    'code' => 'HANDLER_ERROR',
+                                    'error' => $e->getMessage(),
+                                ]);
                             }
                         },
                         $endpoint->queueGroup,
@@ -604,7 +629,7 @@ final class Service
 
                     try {
                         $payload = $this->discoveryPayloadForSubject($subject);
-                        $this->client->publish($message->replyTo, json_encode($payload, JSON_THROW_ON_ERROR))->await();
+                        $this->client->publish($message->replyTo, $this->encodeDiscoveryPayload($payload))->await();
                     } catch (\Throwable) {
                         // A discovery encode/publish failure (e.g. invalid-UTF-8 metadata) must not
                         // escape the shared dispatch loop and abort delivery of buffered frames for
@@ -653,7 +678,11 @@ final class Service
     {
         return [
             'Nats-Service-Error' => trim(preg_replace('/\s+/', ' ', $message) ?? $message),
-            'Nats-Service-Error-Code' => $code,
+            // The code is caller-supplied via ServiceError: collapse CR/LF/whitespace exactly like
+            // the message, or a crafted code ("400\r\nInjected: x") would make the header build
+            // throw from within publishResponse and escape the dispatch loop (the injection itself
+            // was already blocked by NatsHeaders' CR/LF validation - but by throwing, not sanely).
+            'Nats-Service-Error-Code' => trim(preg_replace('/\s+/', ' ', $code) ?? $code),
         ];
     }
 
@@ -740,7 +769,42 @@ final class Service
     {
         $correlationId = $context['correlation_id'] ?? null;
 
-        return is_string($correlationId) ? $correlationId : null;
+        if (!is_string($correlationId)) {
+            return null;
+        }
+
+        // Header values are raw bytes under requester control: a non-UTF-8 correlation id would
+        // make every JSON error reply carrying it throw at encode time (JSON_THROW_ON_ERROR) -
+        // a remotely triggerable escape from the dispatch loop. Omit it rather than mangle it.
+        return preg_match('//u', $correlationId) === 1 ? $correlationId : null;
+    }
+
+    /**
+     * Encodes a $SRV discovery payload for the wire, forcing empty `metadata` maps to serialize as
+     * JSON objects (`{}`) instead of arrays (`[]`): ADR-32 types `metadata` as `map[string]string`,
+     * and Go-based consumers (`nats micro ls`, nats.go micro) hard-fail unmarshalling `[]` into a
+     * map - rejecting the ENTIRE discovery response, so the service is invisible to standard
+     * tooling whenever metadata is empty (the default). Applied at the wire boundary only, so
+     * {@see statsSnapshot()} keeps returning plain arrays to PHP callers. The ObjectStore twin of
+     * this interop class was #109.
+     *
+     * @param array<string,mixed> $payload
+     */
+    private function encodeDiscoveryPayload(array $payload): string
+    {
+        if (($payload['metadata'] ?? null) === []) {
+            $payload['metadata'] = new \stdClass();
+        }
+
+        if (isset($payload['endpoints']) && is_array($payload['endpoints'])) {
+            foreach ($payload['endpoints'] as $index => $endpoint) {
+                if (is_array($endpoint) && ($endpoint['metadata'] ?? null) === []) {
+                    $payload['endpoints'][$index]['metadata'] = new \stdClass();
+                }
+            }
+        }
+
+        return json_encode($payload, JSON_THROW_ON_ERROR);
     }
 
     /**

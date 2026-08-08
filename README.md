@@ -897,7 +897,7 @@ try {
 } catch (CancelledException) {
 }
 
-$client->unsubscribe($watchSid)->await();
+$js->stopOrderedConsumer($watchSid)->await(); // watches ride ordered consumers: recreates rotate the internal sid, so stop via the context, not a plain unsubscribe
 $kv->deleteBucket()->await();
 $client->disconnect()->await();
 ```
@@ -1273,7 +1273,7 @@ $sid = $js->subscribeOrderedConsumer(
 $js->publish('events.order', '{"id":1}')->await();
 $client->processIncoming()->await();
 
-$client->unsubscribe($sid)->await();
+$js->stopOrderedConsumer($sid)->await(); // resolves the CURRENT sid even after gap-driven recreates rotated it
 $js->deleteStream('EVENTS')->await();
 $client->disconnect()->await();
 ```

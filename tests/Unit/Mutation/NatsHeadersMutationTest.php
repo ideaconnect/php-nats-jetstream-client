@@ -17,13 +17,14 @@ final class NatsHeadersMutationTest extends \PHPUnit\Framework\TestCase
     /**
      * Encoded value whitespace must be trimmed before the colon-joined line.
      */
-    public function testToWireBlockTrimsSurroundingWhitespaceFromValue(): void
+    public function testToWireBlockEmitsValueVerbatim(): void
     {
-        // kills UnwrapTrim @ line 44: trim($singleValue) -> $singleValue would emit "X-Pad:  v  ".
+        // The wire carries the caller's bytes untouched (nats.go parity): a mutant that trims (or
+        // otherwise rewrites) the value changes the emitted bytes and is killed here.
         $raw = NatsHeaders::toWireBlock(['X-Pad' => '  v  ']);
 
-        self::assertStringContainsString("X-Pad:v\r\n", $raw);
-        self::assertStringNotContainsString('X-Pad:  v  ', $raw);
+        self::assertStringContainsString("X-Pad:  v  \r\n", $raw);
+        self::assertStringNotContainsString("X-Pad:v\r\n", $raw);
     }
 
     /**

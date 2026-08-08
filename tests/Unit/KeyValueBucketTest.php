@@ -527,9 +527,163 @@ final class KeyValueBucketTest extends TestCase
         ])->await();
 
         $create = $transport->writes[3];
-        self::assertStringContainsString('"sources":[{"name":"KV_b1"},{"name":"KV_b2"}]', $create);
+        // Each KV source carries the mandatory ADR-57 transform re-subjecting copied records into
+        // THIS bucket's prefix - without it, sourced entries are invisible to every read/watch path.
+        self::assertStringContainsString(
+            '"sources":[{"name":"KV_b1","subject_transforms":[{"src":"$KV.b1.>","dest":"$KV.agg.>"}]},'
+            . '{"name":"KV_b2","subject_transforms":[{"src":"$KV.b2.>","dest":"$KV.agg.>"}]}]',
+            $create,
+        );
+        // A sourced bucket keeps its OWN subjects (only mirrors omit them).
+        self::assertStringContainsString('"subjects":["$KV.agg.>"]', $create);
         self::assertStringContainsString('"compression":"s2"', $create);
         self::assertStringContainsString('"placement":{"cluster":"c1"}', $create);
+    }
+
+    /**
+     * A source carrying its own subject_transforms passes through VERBATIM (nats.go jetstream /
+     * ADR-57 full-control rule): no KV_ name prefixing, no auto transform - this is how non-KV
+     * streams are sourced into a bucket.
+     */
+    public function testCreateSourceWithCustomTransformsPassesThroughVerbatim(): void
+    {
+        $reply = '{"config":{"name":"KV_agg"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $client->jetStream()->keyValue('agg')->create([
+            'sources' => [[
+                'name' => 'RAW_EVENTS',
+                'subject_transforms' => [['src' => 'raw.>', 'dest' => '$KV.agg.>']],
+            ]],
+        ])->await();
+
+        $create = $transport->writes[3];
+        self::assertStringContainsString(
+            '"sources":[{"name":"RAW_EVENTS","subject_transforms":[{"src":"raw.>","dest":"$KV.agg.>"}]}]',
+            $create,
+            'a source with custom transforms must pass through untouched (no KV_ prefix, no auto transform)',
+        );
+    }
+
+    /**
+     * A mirror bucket gets mirror_direct (nats.go CreateKeyValue parity) and this handle's WRITES
+     * go through to the ORIGIN's prefix: the mirror stream ingests no subjects of its own, so a
+     * put to the mirror bucket's own `$KV.<bucket>.` prefix would answer 503 no-responders - the
+     * pre-fix behavior that made mirror buckets unwritable.
+     */
+    public function testCreateMirrorEnablesMirrorDirectAndWritesThroughToOrigin(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $putAck = '{"stream":"KV_src","seq":11}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        $kv->create(['mirror' => 'src'])->await();
+        $ack = $kv->put('theme', 'blue')->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"mirror_direct":true', $writes);
+        self::assertStringContainsString('"mirror":{"name":"KV_src"}', $writes);
+        // Write-through: the put publishes to the ORIGIN's subject, not the mirror's own prefix.
+        self::assertStringContainsString('PUB $KV.src.theme ', $writes);
+        self::assertStringNotContainsString('PUB $KV.dst.theme', $writes);
+        self::assertSame(11, $ack->seq);
+    }
+
+    /**
+     * A cross-domain mirror (`domain` shorthand) converts to the external JetStream API prefix and
+     * routes WRITES through `<api>.$KV.<origin>.` while READS use the ORIGIN's prefix against the
+     * local mirror stream - mirrored records keep the origin's subjects (nats.go mapStreamToKVS
+     * parity; pre-fix both sides used the mirror's own prefix and found nothing).
+     */
+    public function testCreateCrossDomainMirrorRoutesWritesAndReadsThroughOrigin(): void
+    {
+        $createReply = '{"config":{"name":"KV_dst"}}';
+        $putAck = '{"stream":"KV_src","seq":3}';
+        // Direct-get reply carrying the ORIGIN-prefixed subject the mirror stream stores.
+        $direct = $this->kvDirectReply('$KV.src.cache', 'warm', 3, 1);
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+            $direct,
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst');
+        $kv->create(['mirror' => ['bucket' => 'src', 'domain' => 'HUB']])->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('"external":{"api":"$JS.HUB.API"}', $writes);
+        self::assertStringNotContainsString('"domain"', $writes, 'domain is a client-side shorthand, never sent');
+
+        $kv->put('cache', 'warm')->await();
+        $kv->get('cache')->await();
+
+        $writes = implode('', $transport->writes);
+        // Writes cross domains through the external API prefix to the origin subject.
+        self::assertStringContainsString('PUB $JS.HUB.API.$KV.src.cache ', $writes);
+        // Reads hit the LOCAL mirror stream, but under the ORIGIN's subject.
+        self::assertStringContainsString('"last_by_subj":"$KV.src.cache"', $writes);
+        self::assertStringNotContainsString('$KV.dst.cache', $writes);
+    }
+
+    /**
+     * bind() resolves the mirror prefixes for a handle ATTACHED to an existing mirror bucket
+     * (created elsewhere): STREAM.INFO reveals the mirror config, after which writes go through to
+     * the origin exactly as on a created handle. Pre-fix an attached mirror handle was unusable.
+     */
+    public function testBindResolvesMirrorPrefixesFromStreamInfo(): void
+    {
+        $info = '{"config":{"name":"KV_dst","max_msgs_per_subject":1,"mirror":{"name":"KV_src"}}}';
+        $putAck = '{"stream":"KV_src","seq":4}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($info), $info),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($putAck), $putAck),
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $kv = $client->jetStream()->keyValue('dst')->bind()->await();
+        $kv->put('theme', 'blue')->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.STREAM.INFO.KV_dst', $writes);
+        self::assertStringContainsString('PUB $KV.src.theme ', $writes, 'an attached mirror handle must write through to the origin after bind()');
+        self::assertStringNotContainsString('PUB $KV.dst.theme', $writes);
     }
 
     /**
@@ -964,17 +1118,18 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * Verifies a KV watch requests an idle heartbeat and its missed-heartbeat watchdog surfaces a
-     * "not active" error when the watch consumer goes silent (#113). The default KV watch config
-     * previously requested no idle_heartbeat, so a reaped/lost watch consumer left the watcher hanging
-     * forever with no data, heartbeat, or error - total silence indistinguishable from an idle stream.
-     * The watch now requests a heartbeat (tunable via KeyWatchOptions::$idleHeartbeat), arming the same
-     * push watchdog other push subscriptions use. Falsifiable: the branch requested no heartbeat, so no
-     * watchdog armed and no error was ever surfaced.
+     * A silent/reaped KV watch consumer is RECREATED by the ordered-consumer watchdog instead of
+     * hanging forever (#113) - and, having delivered nothing yet, the replacement re-applies the
+     * watch's INITIAL deliver policy rather than replaying the whole stream via by_start_sequence
+     * from sequence 1. Recovery, not failure: no error is surfaced. (Watches are built on the
+     * ordered machinery for lossless gap handling; pre-ordered behavior merely surfaced a
+     * "not active" error and left the watch dead.)
      */
-    public function testWatchSilentConsumerSurfacesNotActiveError(): void
+    public function testWatchSilentConsumerIsRecreatedByWatchdog(): void
     {
-        $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","config":{"deliver_subject":"_INBOX.JS.PUSH.x","ack_policy":"none"}}';
+        $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","config":{"deliver_subject":"_INBOX.JS.ORD.x","ack_policy":"none"}}';
+        $deleteReply = '{"success":true}';
+        $recreateReply = '{"stream_name":"KV_cfg","name":"KVWATCH2","config":{"deliver_subject":"_INBOX.JS.ORD.y","ack_policy":"none"}}';
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -982,6 +1137,8 @@ final class KeyValueBucketTest extends TestCase
         ], blockWhenEmpty: true);
         $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
         ]);
 
         $errors = [];
@@ -991,7 +1148,7 @@ final class KeyValueBucketTest extends TestCase
         $client = new NatsClient($options, $transport);
         $client->connect()->await();
 
-        // 30 ms heartbeat -> the watchdog surfaces a stall after ~60 ms of silence.
+        // 30 ms heartbeat -> the watchdog reacts after ~60 ms of silence.
         $client->jetStream()->keyValue('cfg')->watch(
             static function (KeyValueEntry $entry): void {},
             '>',
@@ -1003,18 +1160,19 @@ final class KeyValueBucketTest extends TestCase
         self::assertStringContainsString('"idle_heartbeat":30000000', implode('', $transport->writes));
 
         $deadlineNs = hrtime(true) + 2_000_000_000;
-        while ($errors === [] && hrtime(true) < $deadlineNs) {
+        while (substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.CREATE.KV_cfg') < 2 && hrtime(true) < $deadlineNs) {
             delay(0.01);
         }
 
         $client->disconnect()->await();
 
-        self::assertCount(1, $errors, 'a silent KV watch must surface exactly one stall error');
-        self::assertInstanceOf(JetStreamException::class, $errors[0]);
-        self::assertStringContainsString('not active', $errors[0]->getMessage());
-        self::assertStringContainsString('KV_cfg', $errors[0]->getMessage());
-        // A KV watch consumer is caller-owned from the library's view; it is never recreated, only surfaced.
-        self::assertSame(0, substr_count(implode('', $transport->writes), '$JS.API.CONSUMER.DELETE'), 'a KV watch stall must not delete/recreate the consumer');
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('$JS.API.CONSUMER.DELETE.KV_cfg.KVWATCH', $writes, 'the silent instance must be replaced');
+        self::assertGreaterThanOrEqual(2, substr_count($writes, '$JS.API.CONSUMER.CREATE.KV_cfg'), 'a replacement consumer must be created');
+        // Nothing was delivered before the stall: the replacement must re-apply the INITIAL watch
+        // policy, never a by_start_sequence replay from stream sequence 1.
+        self::assertStringNotContainsString('by_start_sequence', $writes);
+        self::assertSame([], $errors, 'watchdog recreation is recovery, not an error');
     }
 
     /**
@@ -1045,6 +1203,140 @@ final class KeyValueBucketTest extends TestCase
         );
 
         $client->disconnect()->await();
+    }
+
+    /**
+     * The headline lossless-watch guarantee: a KV watch that MISSES a delivery (consumer sequence
+     * skips - a slow-consumer drop, a reconnect window) must detect the gap and recreate its
+     * consumer from the last delivered revision + 1 so the server REPLAYS the missed range, instead
+     * of silently continuing with a permanent gap. Pre-fix the watch ran on a plain ack-none
+     * ephemeral with no sequence tracking at all: ack-none deliveries are never redelivered on
+     * their own, so every drop was invisible, unrecoverable loss.
+     */
+    public function testWatchDetectsDeliveryGapAndRecreatesFromLastRevision(): void
+    {
+        $createReply = '{"stream_name":"KV_cfg","name":"KVWATCH","config":{"deliver_subject":"_INBOX.JS.ORD.x","ack_policy":"none"}}';
+        $deleteReply = '{"success":true}';
+        $recreateReply = '{"stream_name":"KV_cfg","name":"KVWATCH2","config":{"deliver_subject":"_INBOX.JS.ORD.y","ack_policy":"none"}}';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($deleteReply), $deleteReply),
+            sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($recreateReply), $recreateReply),
+        ], [
+            // Delivered once the deliver-inbox SUB exists (muxServer's deliverOnSub is SUB-gated;
+            // a raw write-containing hook would also match the CREATE payload's deliver_subject
+            // and enqueue these before the subscription, dropping them on an unknown sid).
+            '_INBOX.JS.ORD' => [
+                // In-order: consumer seq 1, stream seq (revision) 7.
+                "MSG \$KV.cfg.a 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.1 2\r\nv1\r\n",
+                // Gap: consumer seq jumps to 3 (expected 2) - a delivery was missed. This entry is
+                // DISCARDED (never delivered out of order) and the consumer is recreated.
+                "MSG \$KV.cfg.b 2 \$JS.ACK.KV_cfg.KVWATCH.3.9.3.0.0 2\r\nv3\r\n",
+            ],
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000, pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $revisions = [];
+        $client->jetStream()->keyValue('cfg')->watch(static function (KeyValueEntry $entry) use (&$revisions): void {
+            $revisions[] = $entry->revision;
+        })->await();
+
+        for ($i = 0; $i < 8; $i++) {
+            $client->processIncoming()->await();
+        }
+
+        // Only the in-order entry reached the watcher; the out-of-order one was discarded.
+        self::assertSame([7], $revisions);
+
+        $written = implode('', $transport->writes);
+        self::assertSame(1, substr_count($written, '$JS.API.CONSUMER.DELETE.KV_cfg.KVWATCH'), 'the gapped consumer must be replaced');
+        self::assertSame(2, substr_count($written, '$JS.API.CONSUMER.CREATE.KV_cfg'), 'exactly one recreate');
+        // Resume from the last delivered revision + 1 (7 + 1 = 8): the missed range is REPLAYED.
+        self::assertStringContainsString('"deliver_policy":"by_start_sequence"', $written);
+        self::assertStringContainsString('"opt_start_seq":8', $written);
+    }
+
+    /**
+     * getAll() must survive a bucket without Direct Get (allow_direct disabled / legacy interop
+     * bucket): the per-key lookup falls back to the leader STREAM.MSG.GET path like get() does,
+     * instead of failing the whole enumeration with the 503 on a bucket whose single-key reads work.
+     */
+    public function testGetAllFallsBackToStreamMessageWhenDirectGetUnavailable(): void
+    {
+        $subjectsReply = '{"state":{"subjects":{"$KV.cfg.theme":1}}}';
+        $envelope = sprintf(
+            '{"message":{"subject":"$KV.cfg.theme","seq":9,"data":"%s"}}',
+            base64_encode('blue'),
+        );
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($subjectsReply), $subjectsReply),  // STREAM.INFO subjects page 1
+            sprintf("MSG _INBOX.a2 1 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'),  // page 2: empty -> pagination ends
+            $this->kvDirectStatus(1, 503, 'No Responders'),                                  // Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),            // STREAM.MSG.GET fallback
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
+
+        self::assertSame(['theme' => 'blue'], $all, 'the enumeration must fall back per key, not fail on the 503');
+        $writes = implode('||', $transport->writes);
+        self::assertStringContainsString('PUB $JS.API.STREAM.MSG.GET.KV_cfg', $writes);
+    }
+
+    /**
+     * On a MODERN server (2.11+, batched Direct Get supported) an allow_direct-disabled bucket
+     * answers the batched multi_last with 503 - the server-version gate cannot see per-STREAM
+     * Direct Get availability. getAll() must fall through to the per-subject fan-out (whose
+     * lookups fall back to the leader read) instead of failing the whole enumeration.
+     */
+    public function testGetAllFallsBackWhenBatchedDirectGetAnswers503(): void
+    {
+        $subjectsReply = '{"state":{"subjects":{"$KV.cfg.theme":1}}}';
+        $emptyPage = '{"state":{"subjects":{}}}';
+        $batch503 = "NATS/1.0 503 No Responders Available For Request\r\n\r\n";
+        $envelope = sprintf(
+            '{"message":{"subject":"$KV.cfg.theme","seq":9,"data":"%s"}}',
+            base64_encode('blue'),
+        );
+
+        $transport = new FakeTransport([
+            // 2.12 server: the BATCHED path is taken first.
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // The batched request's replies arrive on the DGET inbox (sid 2: mux SUB=1, DGET SUB=2).
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.DGET' => [
+                sprintf("HMSG _INBOX.JS.DGET.x 2 %d %d\r\n%s\r\n", strlen($batch503), strlen($batch503), $batch503),
+            ],
+        ];
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($subjectsReply), $subjectsReply),
+            sprintf("MSG _INBOX.a2 1 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),
+            $this->kvDirectStatus(1, 503, 'No Responders'),                          // per-key Direct Get -> 503
+            sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),    // STREAM.MSG.GET fallback
+        ]);
+
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client->connect()->await();
+
+        $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
+
+        self::assertSame(['theme' => 'blue'], $all, 'the batched 503 must fall through to the fan-out + leader read');
     }
 
     /**
@@ -1336,7 +1628,7 @@ final class KeyValueBucketTest extends TestCase
         $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], [
-            '_INBOX.JS.PUSH' => [
+            '_INBOX.JS.ORD' => [
                 sprintf("HMSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 %d %d\r\n%s\r\n", $mh, $mh, $markerHdrs),
             ],
         ]);
@@ -1551,7 +1843,7 @@ final class KeyValueBucketTest extends TestCase
         $this->muxServer($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], [
-            '_INBOX.JS.PUSH' => [
+            '_INBOX.JS.ORD' => [
                 "MSG \$KV.cfg.theme 2 \$JS.ACK.KV_cfg.KVWATCH.1.7.1.0.0 4\r\nblue\r\n",
             ],
         ]);
@@ -2090,7 +2382,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], [
             // A message on a completely different subject - keyFromSubject() will return null.
-            '_INBOX.JS.PUSH' => [
+            '_INBOX.JS.ORD' => [
                 "MSG some.other.subject 2 \$JS.ACK.KV_cfg.KVWATCH.1.1.1.0.0 4\r\ndata\r\n",
             ],
         ]);
@@ -2541,7 +2833,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ], [
             // Delivered WITHOUT a $JS.ACK reply subject -> JsMessageMetadata::fromMessage() returns null.
-            '_INBOX.JS.PUSH' => [
+            '_INBOX.JS.ORD' => [
                 "MSG \$KV.cfg.theme 2 4\r\nblue\r\n",
             ],
         ]);

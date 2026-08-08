@@ -1329,17 +1329,13 @@ final class JetStreamIntegrationTest extends TestCase
      * out-of-band stands in for an inactive_threshold reap - the deliver inbox is left with no producer
      * and no heartbeat - and the watchdog must notice the silence and notify the error listener.
      */
-    public function testJetStreamKeyValueWatchWatchdogSurfacesErrorOnReapedConsumer(): void
+    public function testJetStreamKeyValueWatchWatchdogRecreatesReapedConsumerAndRecovers(): void
     {
         $this->requireIntegrationEnabled();
 
         $bucket = 'wd' . strtolower(bin2hex(random_bytes(3)));
-        $errors = [];
         $client = new NatsClient(new NatsOptions(
             servers: [$this->integrationServerUrl()],
-            errorListener: static function (\Throwable $e) use (&$errors): void {
-                $errors[] = $e;
-            },
         ));
         $client->connect()->await();
 
@@ -1347,31 +1343,44 @@ final class JetStreamIntegrationTest extends TestCase
         $kv = $js->keyValue($bucket);
         $kv->create()->await();
 
-        // 150 ms heartbeat -> the watchdog surfaces a stall after ~300 ms of silence.
+        $seen = [];
+        // 150 ms heartbeat -> the watchdog reacts after ~300 ms of silence.
         $sid = $kv->watch(
-            static function (KeyValueEntry $entry): void {},
+            static function (KeyValueEntry $entry) use (&$seen): void {
+                $seen[$entry->key] = $entry->value;
+            },
             '>',
             new KeyWatchOptions(idleHeartbeat: 150_000_000),
         )->await();
 
-        // Reap the watch consumer server-side (before its first heartbeat), standing in for a reap: the
-        // deliver inbox now has no producer and no heartbeat.
+        // Reap the watch consumer server-side: the deliver inbox now has no producer and no
+        // heartbeat. The ordered-consumer watchdog must RECREATE it (lossless-watch contract),
+        // not merely surface an error and leave the watch dead.
         $names = $js->consumerNames($kv->streamName())->await();
         self::assertCount(1, $names, 'the watch consumer must be the only consumer on the KV stream');
         $js->deleteConsumer($kv->streamName(), $names[0])->await();
 
-        // The watchdog fires on its own EventLoop timer (no processIncoming pump needed); drive the loop
-        // until it surfaces the stall or a monotonic deadline elapses.
-        $deadlineNs = hrtime(true) + 10_000_000_000;
-        while ($errors === [] && hrtime(true) < $deadlineNs) {
+        // Wait until the watchdog's replacement consumer exists server-side.
+        $deadline = $this->monotonic() + 10.0;
+        $replacement = [];
+        while ($replacement === [] && $this->monotonic() < $deadline) {
             delay(0.05);
+            $replacement = $js->consumerNames($kv->streamName())->await();
+        }
+        self::assertNotSame([], $replacement, 'the watchdog must recreate the reaped watch consumer');
+
+        // The recovered watch must observe writes made AFTER the reap: end-to-end proof the
+        // replacement consumer delivers to the same handler.
+        $kv->put('recovered', 'yes')->await();
+        $deadline = $this->monotonic() + 10.0;
+        while (!isset($seen['recovered']) && $this->monotonic() < $deadline) {
+            $client->processIncoming()->await();
+            delay(0.02);
         }
 
-        self::assertNotSame([], $errors, 'a reaped KV watch consumer must surface a stall error via the watchdog');
-        self::assertInstanceOf(JetStreamException::class, $errors[0]);
-        self::assertStringContainsString('not active', $errors[0]->getMessage());
+        self::assertSame('yes', $seen['recovered'] ?? null, 'the recreated watch must deliver post-reap updates');
 
-        $client->unsubscribe($sid)->await();
+        $js->stopOrderedConsumer($sid)->await();
         $kv->deleteBucket()->await();
         $client->disconnect()->await();
     }

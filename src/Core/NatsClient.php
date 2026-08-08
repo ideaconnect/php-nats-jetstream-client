@@ -145,6 +145,18 @@ final class NatsClient
     }
 
     /**
+     * Registers a callback invoked when the server rejects the sid's subscription with an async
+     * permissions -ERR, so a long-lived JetStream reply inbox (the pipelined pull inbox, #120) can
+     * fail fast instead of spinning on silent deadline retires forever (#167's pull twin).
+     *
+     * @internal Low-level mechanism for the JetStream reply inboxes; not part of the supported API.
+     */
+    public function onSubscriptionRejected(int $sid, \Closure $handler): void
+    {
+        $this->connection->markSubscriptionRejectionHandler($sid, $handler);
+    }
+
+    /**
      * Subscribes and returns a SubscriptionQueue for polling-style message consumption.
      *
      * @return Future<SubscriptionQueue>

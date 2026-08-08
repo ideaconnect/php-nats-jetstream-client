@@ -23,11 +23,21 @@ final class ObjectStoreWatchOptions
      *                             no existing objects are replayed.
      * @param bool $includeHistory Deliver every metadata revision of each object (deliver_policy=all),
      *                             not just its current state.
+     * @param int|null $idleHeartbeat Idle-heartbeat interval in nanoseconds the watch consumer requests,
+     *                                arming the missed-heartbeat watchdog that surfaces a silent/reaped
+     *                                watch consumer as a "not active" error instead of hanging forever
+     *                                (#113 parity with the KV watch). Null keeps the bucket default
+     *                                ({@see ObjectStoreBucket::WATCH_IDLE_HEARTBEAT_NS}).
      */
     public function __construct(
         public readonly bool $updatesOnly = false,
         public readonly bool $includeHistory = false,
-    ) {}
+        public readonly ?int $idleHeartbeat = null,
+    ) {
+        if ($idleHeartbeat !== null && $idleHeartbeat <= 0) {
+            throw new \InvalidArgumentException('idleHeartbeat must be a positive integer (nanoseconds)');
+        }
+    }
 
     /**
      * Resolves the consumer config fragment (delivery policy) implied by these options.
@@ -45,6 +55,10 @@ final class ObjectStoreWatchOptions
         } else {
             // Reference ObjectStore.Watch default: current metadata of every existing object, then follow.
             $config['deliver_policy'] = 'last_per_subject';
+        }
+
+        if ($this->idleHeartbeat !== null) {
+            $config['idle_heartbeat'] = $this->idleHeartbeat;
         }
 
         return $config;

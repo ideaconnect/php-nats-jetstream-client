@@ -10,6 +10,23 @@ use PHPUnit\Framework\TestCase;
 
 final class BasicJsonSchemaValidatorTest extends TestCase
 {
+    /**
+     * A JSON LIST must fail `"type":"object"`: PHP's assoc decoding makes both maps and lists
+     * arrays, and the old bare is_array() check accepted `[1,2,3]` where every JSON Schema
+     * validator rejects it. The empty case stays accepted - `{}` and `[]` are indistinguishable
+     * after assoc decoding.
+     */
+    public function testObjectTypeRejectsNonEmptyJsonList(): void
+    {
+        $validator = new BasicJsonSchemaValidator();
+        $schema = ['type' => 'object', 'properties' => ['id' => ['type' => 'integer']]];
+        $message = static fn (string $payload): NatsMessage => new NatsMessage('svc.echo', 1, '_INBOX.1', $payload, null);
+
+        self::assertNotNull($validator->validate($message('[1,2,3]'), $schema), 'a non-empty list is not an object');
+        self::assertNull($validator->validate($message('{"id":5}'), $schema), 'a map still validates');
+        self::assertNull($validator->validate($message('{}'), $schema), 'the empty object stays accepted ({} decodes to [])');
+    }
+
     public function testRejectsInvalidJsonPayload(): void
     {
         $validator = new BasicJsonSchemaValidator();

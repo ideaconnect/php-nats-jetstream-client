@@ -49,6 +49,17 @@ final class HeartbeatWatchdogState
     public ?int $deliverSid = null;
 
     /**
+     * Latched by stopOrderedConsumer()'s stop closure BEFORE any of its awaits. The recreate closure
+     * checks it at entry AND again before installing a freshly-created replacement instance: a stop
+     * racing an in-flight recreate (the recreate suspended in its delete/subscribe/create awaits -
+     * seconds during a leadership election, exactly when an operator stops a misbehaving watch)
+     * would otherwise resurrect the consumer AFTER the stop returned - with the registry entry
+     * already gone, permanently unstoppable. Once set it is never cleared: a stopped ordered
+     * consumer is terminally stopped.
+     */
+    public bool $stopped = false;
+
+    /**
      * The EventLoop id of the currently-armed watchdog timer, so a deliver-inbox rotation (#122) or a
      * teardown can cancel it explicitly instead of relying on its next self-cancel tick - which would
      * otherwise keep ticking if the old inbox's best-effort UNSUB failed while the connection stayed
