@@ -625,10 +625,13 @@ final class KeyValueBucket
             // delete suppression, and an end-of-initial-data signal.
             $consumerOptions = $options?->toConsumerConfig()
                 ?? ['deliver_policy' => 'new', 'ack_policy' => 'none'];
-            // Request a periodic idle heartbeat so subscribeEphemeralPushConsumer arms the missed-
-            // heartbeat watchdog (#113): a silent or reaped watch consumer then surfaces a "not active"
-            // error instead of hanging forever. Without it the default watch requested no heartbeat, so
-            // no watchdog armed. Heartbeats are status-100 control frames, filtered before delivery.
+            // Pin the idle-heartbeat interval this watch requests (KeyWatchOptions::$idleHeartbeat may
+            // override it; subscribeOrderedConsumer would otherwise apply its own default). The interval
+            // drives the ordered consumer's missed-heartbeat watchdog (#113): after two intervals with
+            // no inbound frame at all (data, heartbeat or flow control) the consumer counts as silent or
+            // reaped, so the watch is RECREATED and resumes just after the last delivered revision
+            // instead of staying quiet forever. An error reaches the client only if every recreate
+            // attempt fails. Heartbeats are status-100 control frames, filtered before delivery.
             $consumerOptions['idle_heartbeat'] ??= self::WATCH_IDLE_HEARTBEAT_NS;
             $ignoreDeletes = $options !== null && $options->ignoreDeletes;
             $onCaughtUp = $options?->onCaughtUp;
@@ -659,7 +662,7 @@ final class KeyValueBucket
                     // headered deliveries (DEL/PURGE tombstones, TTL puts) it re-parses the block the
                     // push dispatch already parsed for its control-frame check: threading that parse
                     // through would change the public callable(NatsMessage):void handler contract of
-                    // subscribeEphemeralPushConsumer, so the rare double parse stays (#139). The two
+                    // subscribeOrderedConsumer, so the rare double parse stays (#139). The two
                     // reply-subject parses below also stay separate: streamSequenceOf() yields null
                     // for a malformed $JS.ACK sequence token where JsMessageMetadata (int)-casts it,
                     // and the metadata parse only runs until the caught-up signal has fired.

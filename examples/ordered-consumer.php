@@ -64,12 +64,17 @@ try {
         throw new RuntimeException('Ordered consumer delivered ' . count($received) . '/3 messages before the deadline');
     }
 
-    $client->unsubscribe($sid)->await();
+    // Stop through the context, not $client->unsubscribe($sid): a gap-driven recreate rotates the
+    // internal sid, so the sid returned above goes stale after the first recreate. The context
+    // resolves the CURRENT sid, cancels the heartbeat watchdog, and deletes the server-side
+    // ephemeral instead of leaving it for the inactive threshold to reap.
+    $js->stopOrderedConsumer($sid)->await();
 
     echo 'OK ordered-consumer: delivered=' . count($received)
         . ' order=' . implode(',', $received) . PHP_EOL;
 } finally {
-    // The ephemeral ordered consumer is auto-cleaned by the server; drop the stream we created.
+    // stopOrderedConsumer() already removed the ephemeral consumer on the success path, and the
+    // server reaps it on the failure path; drop the stream we created either way.
     try {
         $js->deleteStream($stream)->await();
     } catch (Throwable) {

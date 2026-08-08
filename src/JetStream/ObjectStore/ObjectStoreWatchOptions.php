@@ -23,10 +23,16 @@ final class ObjectStoreWatchOptions
      *                             no existing objects are replayed.
      * @param bool $includeHistory Deliver every metadata revision of each object (deliver_policy=all),
      *                             not just its current state.
-     * @param int|null $idleHeartbeat Idle-heartbeat interval in nanoseconds the watch consumer requests,
-     *                                arming the missed-heartbeat watchdog that surfaces a silent/reaped
-     *                                watch consumer as a "not active" error instead of hanging forever
-     *                                (#113 parity with the KV watch). Null keeps the bucket default
+     * @param int|null $idleHeartbeat Idle-heartbeat interval in nanoseconds the watch consumer requests.
+     *                                The watch runs on an ordered consumer, so this interval also drives
+     *                                its missed-heartbeat watchdog: after two intervals with no inbound
+     *                                frame at all (data, heartbeat or flow control) the watch RECREATES
+     *                                its consumer and resumes just after the last delivered revision,
+     *                                so a silent or reaped consumer recovers on its own instead of
+     *                                hanging forever (#113 parity with the KV watch). An error reaches
+     *                                the client only if every recreate attempt fails. A shorter interval
+     *                                detects the silence sooner at the cost of more heartbeat traffic.
+     *                                Null keeps the bucket default
      *                                ({@see ObjectStoreBucket::WATCH_IDLE_HEARTBEAT_NS}).
      */
     public function __construct(

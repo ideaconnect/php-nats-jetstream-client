@@ -16,7 +16,7 @@ require __DIR__ . '/../vendor/autoload.php';
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 
-$url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14222';
+$url = getenv('NATS_URL') ?: 'nats://127.0.0.1:4222';
 
 $client = new NatsClient(new NatsOptions(servers: [$url], name: 'example-connection-stats-rtt'));
 $client->connect()->await();

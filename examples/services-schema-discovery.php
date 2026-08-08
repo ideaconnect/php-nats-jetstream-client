@@ -22,7 +22,7 @@ use IDCT\NATS\Services\BasicJsonSchemaValidator;
 
 use function Amp\async;
 
-$url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14222';
+$url = getenv('NATS_URL') ?: 'nats://127.0.0.1:4222';
 
 $client = new NatsClient(new NatsOptions(servers: [$url], name: 'example-services-schema-discovery'));
 $client->connect()->await();

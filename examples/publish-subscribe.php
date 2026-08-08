@@ -19,7 +19,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 
-$url = getenv('NATS_URL') ?: 'nats://127.0.0.1:14222';
+$url = getenv('NATS_URL') ?: 'nats://127.0.0.1:4222';
 
 $client = new NatsClient(new NatsOptions(servers: [$url], name: 'example-publish-subscribe'));
 $client->connect()->await();

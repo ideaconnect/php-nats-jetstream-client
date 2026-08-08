@@ -35,9 +35,16 @@ final class KeyWatchOptions
      *                                          immediately without any delivery (#99). Mirrors the
      *                                          reference "end of initial data" signal.
      * @param int|null      $idleHeartbeat      Idle-heartbeat interval in nanoseconds the watch consumer
-     *                                          requests, driving the missed-heartbeat watchdog so a silent
-     *                                          or reaped watch surfaces an error instead of hanging forever
-     *                                          (#113). Null uses {@see KeyValueBucket::WATCH_IDLE_HEARTBEAT_NS}.
+     *                                          requests. The watch runs on an ordered consumer, so this
+     *                                          interval also drives its missed-heartbeat watchdog: after
+     *                                          two intervals with no inbound frame at all (data, heartbeat
+     *                                          or flow control) the watch RECREATES its consumer and
+     *                                          resumes just after the last delivered revision, so a silent
+     *                                          or reaped consumer recovers on its own instead of hanging
+     *                                          forever (#113). An error reaches the client only if every
+     *                                          recreate attempt fails. A shorter interval detects the
+     *                                          silence sooner at the cost of more heartbeat traffic.
+     *                                          Null uses {@see KeyValueBucket::WATCH_IDLE_HEARTBEAT_NS}.
      *                                          Must be a positive integer.
      */
     public function __construct(

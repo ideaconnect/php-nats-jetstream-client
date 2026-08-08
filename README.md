@@ -131,9 +131,12 @@ reactive - there is no per-request version probe - and depends on the feature:
   or `allow_msg_schedules`): an older server rejects the unknown field and the request fails fast
   with an `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`)
   carrying the feature name, the required version, and the version the server reported.
-- **Atomic batch publish**: a server without batch support acknowledges the batch start/commit as
-  plain publishes; `commit()` detects that and throws an `UnsupportedFeatureException` instead of
-  silently storing the batch message-by-message.
+- **Atomic batch publish**: when the server's advertised version parses as older than 2.12,
+  `commit()` fails fast before anything reaches the wire (`... nothing was published`). When the
+  version cannot be parsed (a proxy, a custom build, or a mixed-version cluster), the old server
+  acknowledges the batch start as a plain publish; `commit()` detects that reply shape and throws
+  an `UnsupportedFeatureException` (`... treated the batch as plain publishes`) instead of silently
+  storing the batch message-by-message.
 - **Other data-path calls** (for example `publish(..., ttl:)` or `directGetBatch()`) against a server
   or stream without the feature surface a plain `JetStreamException` built from the server's error
   response - or the server may silently ignore an unknown header - so consult the table before
@@ -158,7 +161,7 @@ use IDCT\NATS\Exception\UnsupportedFeatureException;
 try {
     $js->batch()->add('orders.created', $payload)->commit()->await();
 } catch (UnsupportedFeatureException $e) {
-    // e.g. "Atomic batch publish requires NATS server 2.12+ (connected server 2.10.5 treated the batch as plain publishes)"
+    // e.g. "Atomic batch publish requires NATS server 2.12+ (connected server 2.10.5; nothing was published)"
     echo "{$e->feature} needs NATS {$e->requiredVersion}; server is {$e->serverVersion}\n";
 }
 ```
@@ -267,6 +270,10 @@ $client->connect()->await();
 ```
 
 `ws://` / `wss://` URLs are only handled by `WebSocketTransport`; passing such a URL to the default TCP transport will not work. `wss://` requires `ext-openssl`, and `webSocketCompression` requires `ext-zlib`.
+
+The transport enforces RFC 6455 and RFC 7692 strictly. A masked server-to-client frame, a fragmented or oversized control frame, `RSV1` without negotiated compression, a handshake that omits the `Upgrade` headers, and an extension response the client never offered all fail the connection instead of being tolerated. When compression is negotiated the server must echo `server_no_context_takeover`, because this codec inflates each message independently.
+
+If you use the low-level `WebSocketFrameCodec` directly, note two contract changes in this release: `decode()` no longer throws on a strictness violation. It returns the frames it parsed before the violation and reports the violation through a new by-reference `$terminal` parameter, so no already-decoded data is discarded. It also rejects masked frames by default, since RFC 6455 forbids the server masking; pass `allowMasked: true` to decode client-written frames. `WebSocketFrameCodec::unmask()` is deprecated: use `decode(..., allowMasked: true)` instead.
 
 _Verified by: [WebSocketTransportTest](tests/Unit/WebSocketTransportTest.php), [WebSocketFrameCodecTest](tests/Unit/WebSocketFrameCodecTest.php); live: [ClientParityIntegrationTest](tests/Integration/ClientParityIntegrationTest.php) (`testWebSocketTransportCarriesPubSubAndJetStream`, `testWebSocketCompressionAndCustomHeaders`)._
 
@@ -401,6 +408,7 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsHeaders;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -414,11 +422,28 @@ $reply = $client->requestWithHeaders('svc.echo', 'hello', [
 	'X-Request-Id' => 'req-123',
 ], 2000)->await();
 
+// Read headers off a delivered message. get() matches the name case-insensitively, which
+// matters because publishers differ in how they canonicalize names (nats.go canonicalizes
+// on read, so a Go publisher's "Nats-Msg-Id" may arrive as "nats-msg-id").
+$headers = NatsHeaders::fromWireBlock($reply->rawHeaders);
+echo NatsHeaders::get($headers, 'x-request-id') ?? '(none)', PHP_EOL;
+
 echo $reply->payload . PHP_EOL;
 echo $client->serverInfo()?->serverName . PHP_EOL;
 
 $client->disconnect()->await();
 ```
+
+Header names must be non-empty tokens without whitespace or `:`, and values must not contain CR
+or LF; both throw `InvalidArgumentException`. A value may also be a `list<string>` to emit one
+line per element (ADR-4 multi-value headers).
+
+Values are written to the wire **verbatim**: surrounding whitespace is preserved byte for byte
+(nats.go parity), so a signature or checksum carried in a header is not mutated on the way out.
+The decoder still trims surrounding whitespace when reading, as an inbound tolerance. Use
+`NatsHeaders::fromWireBlock()` to decode a delivered `rawHeaders` block (`fromWireBlockMulti()`
+keeps repeated names) and `NatsHeaders::get()` for case-insensitive lookups; an exact-case match
+always wins over a case-insensitive one.
 
 ### JetStream Stream and Durable Consumer
 
@@ -903,6 +928,29 @@ $kv->deleteBucket()->await();
 $client->disconnect()->await();
 ```
 
+#### Mirrored and sourced KV buckets
+
+A bucket can be created with `sources` (copy entries in from other buckets, re-subjected into this
+bucket's own prefix per ADR-57) or with `mirror` (a read replica that writes through to the origin).
+Bucket names are translated to their backing `KV_`-prefixed streams for you. The `bucket` alias is
+always prefixed, so `['bucket' => 'KV_x']` means the bucket literally named `KV_x`; an explicit
+`name` (or a bare string entry) follows the nats.go convention of being used as-is when it already
+starts with `KV_`. Supply your own `subject_transforms` to source a non-KV stream verbatim.
+
+Mirror routing lives on the handle: the instance that ran `create()` resolves it automatically, but
+any other handle for the same bucket, including a fresh `keyValue()` in the same process, must call
+`bind()` first. `bind()` reads `STREAM.INFO` and resolves the read and write prefixes, so reads hit
+the origin's subjects and writes go through to the origin instead of into a stream that ingests
+nothing:
+
+```php
+$mirror = $js->keyValue('cfg-replica');
+$mirror->bind()->await();   // required on a handle that did not create the bucket
+
+$mirror->put('theme', 'dark')->await();   // written through to the origin bucket
+echo $mirror->get('theme')->await()?->value, PHP_EOL;
+```
+
 To read a specific historical revision (stream sequence) of a key, use `getRevision()`. It returns `null` when nothing is stored at that sequence or when the sequence belongs to a different key, and throws for a non-positive revision.
 
 _Verified by: [KeyValueBucketTest](tests/Unit/KeyValueBucketTest.php) (`testGetRevisionReturnsEntryAtSequence`, `testGetRevisionReturnsNullForDifferentKey`)._
@@ -968,6 +1016,10 @@ $client->disconnect()->await();
 
 Buckets and objects support extra management operations. `seal()` makes a bucket permanently read-only (irreversible). `addLink()` / `addBucketLink()` create link objects pointing at another object or a whole bucket. `updateMeta()` renames an object and/or replaces its metadata WITHOUT re-uploading its bytes (the stored chunks are kept by NUID).
 
+`addLink()` refuses a name that any non-link record already holds, including the tombstone of a
+deleted object (nats.go `ErrObjectAlreadyExists` parity). Re-pointing an existing link is allowed;
+freeing a name that once held a real object is not, so pick a fresh name for the link.
+
 _Verified by: [ObjectStoreBucketTest](tests/Unit/ObjectStoreBucketTest.php) (`testSeal`, `testAddLink`, `testAddBucketLink`, `testUpdateMetaRenamesPreservingNuid`, `testUpdateMetaReplacesMetadataInPlace`)._
 
 ```php
@@ -982,6 +1034,9 @@ $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
 
 $store = $client->jetStream()->objectStore('assets');
+$store->create()->await();
+$store->put('real.bin', 'payload')->await();
+$store->put('logo.txt', 'logo')->await();
 
 // Link to another object (optionally in a different bucket).
 $store->addLink('shortcut', 'real.bin')->await();
@@ -999,6 +1054,38 @@ $store->updateMeta('brand.txt', null, ['team' => 'brand'])->await();
 $store->seal()->await();
 
 $client->disconnect()->await();
+```
+
+#### Watching an Object Store bucket
+
+> 📄 **Runnable example:** [`examples/object-store-watch.php`](examples/object-store-watch.php)
+
+`watch()` reports object metadata changes (puts, deletes, link creation) as they happen. Without
+options it delivers only updates published after the watch starts; pass an `ObjectStoreWatchOptions`
+to replay the current metadata of every existing object first, take full history, or go
+updates-only. Like the KV watch it rides an ordered consumer, so a slow consumer or a reconnect
+window is replayed rather than lost, and it requests an idle heartbeat by default (tune it with
+`ObjectStoreWatchOptions::$idleHeartbeat`). Stop it with `stopOrderedConsumer()`:
+
+```php
+$store = $js->objectStore('assets');
+
+$sid = $store->watch(static function (ObjectInfo $info): void {
+	echo $info->name . ' changed' . PHP_EOL;
+}, options: new ObjectStoreWatchOptions(idleHeartbeat: 10_000_000_000))->await();
+
+// ... drive delivery with processIncoming() ...
+
+$js->stopOrderedConsumer($sid)->await();
+```
+
+Object names are base64url-encoded into the metadata subject, so a watch pattern is either `>` (all
+objects) or one exact name. A pattern containing `*` or `>` in any other position is rejected,
+because it can never match an encoded name. If an object's own name legitimately contains those
+characters, pass `exactName: true` to watch it:
+
+```php
+$sid = $store->watch($handler, 'report>2024', exactName: true)->await();
 ```
 
 ### Object Store Streaming to Callback
@@ -1240,6 +1327,14 @@ from the server but not yet dispatched to a handler are dropped without warning.
 `drain()` (whole connection) or `drainSubscription($sid)` (single subscription) as the
 lossless teardown paths: both deliver the buffered backlog first.
 
+`drain()` is bounded by roughly one `requestTimeoutMs` budget and always reaches the `Closed`
+state. It does not throw when a write fails against a dead socket: that failure is reported
+through the `errorListener` and the teardown continues, so the connection is never stranded
+mid-drain. Publishes your handlers issue while the drain is running share the same remaining
+budget rather than each getting a fresh timeout, and anything still buffered when the budget
+runs out is dropped with a "drain deadline exceeded" error naming the count. If you need the
+backlog delivered under all circumstances, drain earlier rather than relying on a longer timeout.
+
 ### Ordered Consumer
 
 > 📄 **Runnable example:** [`examples/ordered-consumer.php`](examples/ordered-consumer.php)
@@ -1279,6 +1374,30 @@ $js->deleteStream('EVENTS')->await();
 $client->disconnect()->await();
 ```
 
+`subscribeOrderedConsumer()` takes two further optional arguments. `consumerOverrides` merges extra
+consumer configuration into the created instance, for example a deliver policy; a recreate before the
+first delivery re-applies that same initial policy, so a `new` or `last_per_subject` consumer never
+replays the whole stream. `onConsumerCreated` is invoked once with the INITIAL instance's
+`ConsumerInfo` (not on recreates), which is how a watch inspects `num_pending` (via the raw payload)
+to tell that it started with nothing pending:
+
+```php
+$sid = $js->subscribeOrderedConsumer(
+	stream: 'EVENTS',
+	handler: $handler,
+	filterSubject: 'events.>',
+	idleHeartbeatNs: 5_000_000_000,
+	consumerOverrides: ['deliver_policy' => 'last_per_subject'],
+	onConsumerCreated: static function (ConsumerInfo $info): void {
+		echo 'initial instance ' . $info->name . ', pending: ' . ($info->raw['num_pending'] ?? 0) . PHP_EOL;
+	},
+)->await();
+```
+
+Always stop an ordered consumer with `stopOrderedConsumer($sid)`. A recreate rotates the internal
+subscription id, so a plain `unsubscribe($sid)` only works until the first recreate, and it leaves
+the server-side ephemeral consumer to expire on its own instead of deleting it.
+
 ### Consumer Pause/Resume
 
 > 📄 **Runnable example:** [`examples/consumer-pause-resume.php`](examples/consumer-pause-resume.php)
@@ -1300,8 +1419,10 @@ $js = $client->jetStream();
 $js->createStream('ORDERS', ['orders.>'])->await();
 $js->createConsumer('ORDERS', 'PROC', 'orders.created')->await();
 
-// Pause the consumer until a specific time (ISO 8601 format).
-$js->pauseConsumer('ORDERS', 'PROC', '2026-03-12T00:00:00Z')->await();
+// Pause the consumer until a specific time (ISO 8601 format). A time in the past resumes it
+// immediately, so build the instant relative to now rather than hardcoding a date.
+$until = (new DateTimeImmutable('+1 hour', new DateTimeZone('UTC')))->format(DATE_RFC3339);
+$js->pauseConsumer('ORDERS', 'PROC', $until)->await();
 
 // Resume the consumer immediately.
 $js->resumeConsumer('ORDERS', 'PROC')->await();
@@ -1699,7 +1820,7 @@ $client->disconnect()->await();
 
 _Verified by: [PullConsumerIteratorTest](tests/Unit/PullConsumerIteratorTest.php); [JetStreamIntegrationTest::testJetStreamPullIteratorBatching](tests/Integration/JetStreamIntegrationTest.php); [features/jetstream-core/consumer_helpers.feature](features/jetstream-core/consumer_helpers.feature)._
 
-The fluent `PullConsumerIterator` wraps `fetchBatch()` with configurable batch size, iterations, and a handler callback:
+The fluent `PullConsumerIterator` drives the pipelined pull engine: it keeps up to `setDepth()` (default 2) pull round-trips in flight while your handler processes earlier ones, preserving message order, with configurable batch size, expiry, and iteration count. `setOnError()` receives errors the engine does not treat as routine, and `stop()` / `drain()` end the run from inside the handler:
 
 ```php
 <?php
@@ -1884,15 +2005,19 @@ This repository tracks parity against the basis-company `nats.php` README exampl
 
 _Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testProcessIncomingDispatchesMsgToSubscriber`, `testProcessIncomingUpdatesServerInfoFromAsyncInfoFrame`)._
 
-`processIncoming()` reads a single transport chunk, parses all complete frames from it, and dispatches them to subscription callbacks. It is **non-blocking** - if no data is available, it returns immediately with a frame count of `0`. Because one read returns only a single chunk (and TCP may coalesce several protocol messages into one chunk), call it in a loop to process all available messages:
+`processIncoming()` reads a single transport chunk, parses all complete frames from it, and dispatches them to subscription callbacks. The read is bounded only by the optional `Cancellation` you pass: without one it suspends until a chunk arrives (or the peer closes the connection), so it is **not** a poll. Because one read returns only a single chunk (and TCP may coalesce several protocol messages into one chunk), call it in a loop, and pass a `TimeoutCancellation` when you need the loop to stay responsive on a quiet connection:
 
 ```php
-// Process all available messages for up to 1 second.
-$deadline = microtime(true) + 1.0;
-while (microtime(true) < $deadline) {
-	$frames = $client->processIncoming()->await();
-	if ($frames === 0) {
-		break;
+use Amp\CancelledException;
+use Amp\TimeoutCancellation;
+
+// Process whatever arrives for up to 1 second, without parking on an idle socket.
+$deadlineSeconds = hrtime(true) / 1e9 + 1.0;
+while (hrtime(true) / 1e9 < $deadlineSeconds) {
+	try {
+		$client->processIncoming(new TimeoutCancellation(0.25))->await();
+	} catch (CancelledException) {
+		// No frame arrived in this slice; keep polling until the deadline.
 	}
 }
 ```
@@ -1901,7 +2026,7 @@ The client also applies asynchronous `INFO` updates received after connect, so `
 
 ### Heartbeat and Request Timeouts
 
-_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testIdleConnectionStaysOpenViaHeartbeatSelfRead`, `testHeartbeatReadHandlesEmptyErrorAndFatalFrames`, `testRequestTimeoutCancelsReadAndAllowsSubsequentRequest`); live: [NatsClientIntegrationTest](tests/Integration/NatsClientIntegrationTest.php) (`testIdleConnectionStaysOpenViaHeartbeat`, `testRequestTimeoutDoesNotPoisonConnection`, `testMaxPingsOutTriggersReconnect`)._
+_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testIdleConnectionStaysOpenViaHeartbeatSelfRead`, `testHeartbeatReadHandlesEmptyErrorAndFatalFrames`, `testRequestTimeoutCancelsReadAndAllowsSubsequentRequest`, `testMaxPingsOutTriggersReconnect`); live: [NatsClientIntegrationTest](tests/Integration/NatsClientIntegrationTest.php) (`testIdleConnectionStaysOpenViaHeartbeat`, `testRequestTimeoutDoesNotPoisonConnection`)._
 
 The heartbeat timer answers its own `PONG`: after sending a `PING` it performs a short, bounded read to consume the reply (unless an application `processIncoming()` read is already in flight). Liveness detection therefore does not depend on the application continuously calling `processIncoming()`, so an otherwise idle connection (for example a pure publisher) is not closed by spurious `maxPingsOut` detection. Only an actual server `PONG` resets the outstanding-ping counter - other inbound frames (data, `INFO`, `PING`) do not - so a server that keeps sending data but stops answering `PING`s is still detected via `maxPingsOut`.
 
@@ -1909,7 +2034,7 @@ Request and pull-fetch timeouts cancel the underlying socket read rather than le
 
 ### Reconnect Behavior
 
-_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testBackoffDelayIsExponential`, `testConnectRotatesServersOnReconnectAttempts`, `testReconnectRetriesWhenResubscribeGetsFatalServerError`); live: [NatsClientIntegrationTest](tests/Integration/NatsClientIntegrationTest.php) (`testReconnectAfterTransportLossReplaysSubscriptions`, `testReconnectBackoffDelayProgression`, `testReconnectAttemptsExhaustedReturnsClosed`)._
+_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testBackoffDelayIsExponential`, `testConnectRotatesServersOnReconnectAttempts`, `testReconnectRetriesWhenResubscribeGetsFatalServerError`, `testReconnectBackoffDelayProgression`, `testReconnectAttemptsExhaustedReturnsClosed`); live: [NatsClientIntegrationTest](tests/Integration/NatsClientIntegrationTest.php) (`testSeveredLiveConnectionMidIdleReconnectsAndResumesDelivery`, `testConnectWithServerRotationFallback`)._
 
 When a connection drops and `reconnectEnabled` is `true`:
 
@@ -1929,7 +2054,11 @@ _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`test
 
 `subscribeOrderedConsumer()` tracks the JetStream **consumer** delivery sequence (which is contiguous per delivery, even for a filtered consumer over a stream that also carries non-matching subjects). If a push is missed - the consumer sequence skips - the consumer is transparently deleted and recreated starting just after the last in-order message; the out-of-order message that exposed the gap is **discarded** (not forwarded), and the recreated consumer replays the missing range in order. Delivery to your callback therefore stays in order and gap-free, with no duplicates and no recreate storm. If the restart point has been pruned/expired, recovery resumes from the next available message. If the recreate itself fails (for example the stream was deleted or a leadership change is in progress), the error is contained to this ordered consumer rather than disrupting delivery to other subscriptions on the connection.
 
-A separate idle-heartbeat watchdog covers the case the sequence-gap logic cannot: because the gap check only runs when a frame arrives, a consumer that is reaped (for example after an `inactive_threshold` lapse or a server-side ordered-consumer restart) and then stops delivering entirely would otherwise leave a live subscription to a deliver inbox nothing will ever publish to again - no data, no heartbeat, no error, forever. The ordered consumer requests a periodic `idle_heartbeat`, and if no frame (data, heartbeat, or flow-control) arrives for two intervals the watchdog transparently recreates it from the last in-order point - the same recovery the gap path uses - firing at most once per silence episode. Tune the interval with the optional `idleHeartbeatNs` argument to `subscribeOrderedConsumer()`. A caller-owned push consumer created with `idle_heartbeat` is watched too, but because the library cannot recreate a consumer it does not own, a stall there surfaces a descriptive "not active" error through the `errorListener` instead. The same watchdog protects KV watchers, which now request a default `idle_heartbeat` (tunable via `KeyWatchOptions`).
+A separate idle-heartbeat watchdog covers the case the sequence-gap logic cannot: because the gap check only runs when a frame arrives, a consumer that is reaped (for example after an `inactive_threshold` lapse or a server-side ordered-consumer restart) and then stops delivering entirely would otherwise leave a live subscription to a deliver inbox nothing will ever publish to again - no data, no heartbeat, no error, forever. The ordered consumer requests a periodic `idle_heartbeat`, and if no frame (data, heartbeat, or flow-control) arrives for two intervals the watchdog transparently recreates it from the last in-order point - the same recovery the gap path uses - firing at most once per silence episode. Tune the interval with the optional `idleHeartbeatNs` argument to `subscribeOrderedConsumer()`. If the recreate collides with a connection drop it is deferred rather than treated as terminal: the watchdog retries it with a fresh attempt budget once the connection is open again, so a reconnect blip does not kill the consumer.
+
+A caller-owned push consumer created with `idle_heartbeat` is watched too, but because the library cannot recreate a consumer it does not own, a stall there surfaces a descriptive "not active" error through the `errorListener` instead. Those consumers also get the ADR-9 heartbeat gap check: each idle heartbeat's `Nats-Last-Consumer` is compared against the sequence delivered locally, and a mismatch (including a consumer replaced server-side, which resets the sequence) is reported once per episode through the `errorListener` and the logger.
+
+The same watchdog protects KV **and Object Store** watches, which both ride ordered consumers and request a default `idle_heartbeat` (tunable via `KeyWatchOptions::$idleHeartbeat` and `ObjectStoreWatchOptions::$idleHeartbeat`), so a slow-consumer drop, a reconnect window, or a reaped watch consumer is replayed from the last seen revision instead of becoming a silent permanent gap. Stop a watch (or any ordered consumer) with `JetStreamContext::stopOrderedConsumer($sid)`, which resolves the current subscription even after recreates rotated it; a plain `unsubscribe()` only works until the first recreate.
 
 ## Production Notes and Limitations
 
@@ -2105,7 +2234,7 @@ composer fix
 composer infection
 ```
 
-`composer infection` runs [Infection](https://infection.github.io/) mutation testing against the `unit` testsuite (no Docker; needs a coverage driver - Xdebug or PCOV). It is a quality gate on top of line coverage: it makes small changes ("mutants") to `src/` and fails if the tests don't catch them. The suite scores ~93% Covered MSI and CI enforces a strict 90% floor via the dedicated `mutation` job. The strictness is overridable for local exploration, e.g. `INFECTION_MIN_MSI=0 composer infection -- --show-mutations`, and `INFECTION_DIFF_BASE=origin/main composer infection` mutates only your changed lines.
+`composer infection` runs [Infection](https://infection.github.io/) mutation testing against the `unit` testsuite (no Docker; needs a coverage driver - Xdebug or PCOV). It is a quality gate on top of line coverage: it makes small changes ("mutants") to `src/` and fails if the tests don't catch them. The suite scores ~94% Covered MSI and CI enforces a strict 90% floor via the dedicated `mutation` job. The strictness is overridable for local exploration, e.g. `INFECTION_MIN_MSI=0 composer infection -- --show-mutations`, and `INFECTION_DIFF_BASE=origin/main composer infection` mutates only your changed lines.
 
 Infection requires **PHP 8.3+** and is intentionally **not** in `require-dev` (so the library stays installable on PHP 8.2). The CI `mutation` job installs it on the fly; to run mutation testing locally, add it first: `composer require --dev infection/infection:^0.33`.
 
@@ -2216,7 +2345,7 @@ To do a quick local flake check against the compose-backed environment, run:
 composer test:integration:repeat
 ```
 
-The CI workflow also exposes a manual `workflow_dispatch` soak job named `integration-soak`. When triggered from GitHub Actions, it runs `scripts/repeat-integration.sh` with a configurable repeat count on PHP 8.5.
+CI declares a `workflow_dispatch` input (`integration-repeat-count`) reserved for a soak run, but there is currently no soak job wired to it. Repeat the integration suite locally with `composer test:integration:repeat`.
 
 ## Contributing and contributors
 
@@ -2239,8 +2368,9 @@ Many thanks for all the contributions:
 - Integration tests cover live connect/disconnect, publish-subscribe roundtrip, request-reply, connection rotation fallback, JetStream stream/consumer lifecycle with publish-ack flow, KV operations, ObjectStore operations, and service discovery.
 - Integration tests also cover local token auth, username/password auth, TLS handshake-first auth including strict peer-validation, hostname mismatch, and missing-client-cert failures, resolver-backed JWT auth, and standalone NKey auth.
 - Static analysis runs with PHPStan level 8.
-- Combined unit + integration line coverage is ~98%, enforced at a 97% floor in CI (the build fails below it).
-- Every test is catalogued with a one-line description in [TESTS.md](TESTS.md).
+- Combined unit + integration line coverage is ~99.4%, enforced at a 97% floor in CI (the build fails below it).
+- Mutation testing (Infection) scores ~94% Covered MSI, enforced at a 90% floor in CI.
+- The suite is catalogued file by file, one line per test, in [TESTS.md](TESTS.md).
 
 ## License
 

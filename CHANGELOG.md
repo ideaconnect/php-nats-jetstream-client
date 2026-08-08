@@ -15,7 +15,34 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.8.0] - 2026-08-08
+
+### Added
+
+- `[feature]` `JetStreamContext::stopOrderedConsumer(int $sid): Future` stops an ordered consumer,
+  or a KV / Object Store watch, even after automatic recreates rotated its internal subscription id,
+  and deletes the server-side ephemeral consumer instead of waiting for it to expire. A plain
+  `unsubscribe($sid)` only ever worked until the first recreate, so this is now the documented way
+  to stop any of them.
+- `[feature]` `KeyValueBucket::bind(): Future` resolves a mirrored bucket's read and write prefixes
+  from `STREAM.INFO`. It is required on any handle that did not itself run `create()` (including a
+  fresh `keyValue()` handle in the same process) before reads and write-through work correctly.
+- `[feature]` `NatsHeaders::get(array $headers, string $name): ?string` looks a header up
+  case-insensitively, preferring an exact-case match. Publishers differ in how they canonicalize
+  header names (nats.go canonicalizes on read), so an exact-case array lookup could silently miss.
+- `[feature]` `ObjectStoreBucket::watch()` gained an `exactName` parameter for watching an object
+  whose own name contains `*` or `>`, and `ObjectStoreWatchOptions` gained an `idleHeartbeat`
+  argument to tune the watch's heartbeat interval.
+- `[feature]` `JetStreamContext::subscribeOrderedConsumer()` gained `consumerOverrides` (extra
+  consumer configuration merged into the created instance) and `onConsumerCreated` (invoked once
+  with the initial instance's `ConsumerInfo`, for example to read `num_pending`).
+
+### Deprecated
+
+- `[docs]` `WebSocketFrameCodec::unmask()` is deprecated. Masked server-to-client frames are now a
+  terminal RFC 6455 violation, so the helper has no production caller left; harnesses that decode
+  client-written frames should use `decode(..., allowMasked: true)`. It still works and is still
+  covered by tests, and will be removed no earlier than the next major release.
 
 ### Fixed
 

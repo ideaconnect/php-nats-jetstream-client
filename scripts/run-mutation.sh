@@ -3,7 +3,7 @@
 #
 # Two modes:
 #   * Full run (default): mutates all unit-covered code in src/ and enforces the strict MSI gate (default
-#     90%; the suite currently scores ~93%). This is the CI quality gate. Slow (tens of minutes); the
+#     90%; the suite currently scores ~94%). This is the CI quality gate. Slow (tens of minutes); the
 #     ~90% gate leaves headroom for the small run-to-run variance from async mutants near the time budget.
 #   * Diff run (INFECTION_DIFF_BASE set): mutates only the lines changed vs the given base ref
 #     (--git-diff-lines). Fast — handy locally to check just your changes before pushing. Passes cleanly

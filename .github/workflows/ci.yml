@@ -59,7 +59,7 @@ jobs:
         run: composer coverage:clover:all
       - name: Enforce Coverage Threshold
         # Reuses the clover report above (no extra test run); threshold is defined in composer.json
-        # (coverage:check:clover) and fails the build below 97% (current combined coverage ~98.0%).
+        # (coverage:check:clover) and fails the build below 97% (current combined coverage ~99.4%).
         run: composer coverage:check:clover
       - name: Stop NATS services
         if: always()
@@ -120,6 +120,6 @@ jobs:
         run: composer require --dev "infection/infection:^0.33" -W --no-interaction
       - name: Mutation Tests (strict, >= 90% MSI)
         # Infection against the unit testsuite (no Docker). Fails below the 90% MSI / covered-MSI floor
-        # set in scripts/run-mutation.sh (the suite currently scores ~93%) — a quality gate on top of
+        # set in scripts/run-mutation.sh (the suite currently scores ~94%) — a quality gate on top of
         # line coverage that catches assertions which pass but do not actually pin behavior.
         run: composer infection

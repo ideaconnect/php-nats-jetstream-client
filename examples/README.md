@@ -24,7 +24,7 @@ NATS_URL=nats://127.0.0.1:14222 bash scripts/run-examples.sh
 CI runs this same set as a required gate (the `examples` job) with `EXAMPLES_STRICT=1`, which treats a
 skipped example as a failure - so every example must actually execute and pass.
 
-Every base example reads `NATS_URL` (default `nats://127.0.0.1:4222`). The auth/WebSocket examples read
+Every base example reads `NATS_URL` (default `nats://127.0.0.1:4222`, so pass the compose port explicitly when using this repo's stack). The auth/WebSocket examples read
 their own variant-server env vars (`NATS_TOKEN_URL`, `NATS_USERPASS_URL`, `NATS_JWT_URL`, `NATS_NKEY_URL`,
 `NATS_TLS_URL`, `NATS_WS_URL`), each defaulting to the dev docker-compose port.
 
@@ -35,7 +35,7 @@ their own variant-server env vars (`NATS_TOKEN_URL`, `NATS_USERPASS_URL`, `NATS_
 - `request-many.php` - scatter-gather: collect replies from several responders.
 - `queue-group-subscribe.php` - queue-group (load-balanced) subscription.
 - `polling-subscribe.php` - pull messages with `SubscriptionQueue` (`fetch`/`next`/`fetchAll`).
-- `headers-and-server-info.php` - publish/read message headers and read server info.
+- `headers-and-server-info.php` - publish/read message headers, case-insensitive `NatsHeaders::get()`, and read server info.
 - `connection-stats-rtt.php` - connection statistics and round-trip-time measurement.
 - `graceful-drain.php` - `drain()` flushes in-flight messages before closing.
 
@@ -58,7 +58,7 @@ their own variant-server env vars (`NATS_TOKEN_URL`, `NATS_USERPASS_URL`, `NATS_
 
 - `stream-purge-and-list.php` - purge by subject filter / fully, and list streams.
 - `stream-message-get.php` - fetch a stored message by sequence.
-- `jetstream-direct-get.php` - Direct Get by sequence and last-by-subject.
+- `jetstream-direct-get.php` - Direct Get by sequence and last-by-subject, plus batched `directGetLastForSubjects()` / `directGetBatch()`.
 - `atomic-batch-publish.php` - atomic batch publish (`$js->batch()`).
 - `scheduled-publish.php` - schedule a delayed publish (`@at`).
 - `distributed-counter.php` - CRDT distributed counter (`incrementCounter`/`counterValue`).
@@ -68,8 +68,11 @@ their own variant-server env vars (`NATS_TOKEN_URL`, `NATS_USERPASS_URL`, `NATS_
 
 ## KeyValue & Object Store
 
-- `keyvalue-bucket.php` - KV put/get/update/watch.
+- `keyvalue-bucket.php` - KV put/get/update/watch (stopped with `stopOrderedConsumer()`).
+- `keyvalue-mirror-and-sources.php` - KV sourcing bucket, KV mirror bucket, and `bind()` on a second handle.
 - `object-store-bucket.php` - Object Store put/get/info/list/delete.
+- `object-store-watch.php` - watch object metadata changes (snapshot then follow, `exactName`, `ObjectStoreWatchOptions`).
+- `object-store-links-and-meta.php` - object/bucket links, `updateMeta()` rename and re-tag without re-upload, and `seal()`.
 - `object-store-streaming-to-callback.php` - stream an object to a callback chunk-by-chunk.
 - `object-store-streaming-upload.php` - stream a large object up in chunks (`putStream`).
 

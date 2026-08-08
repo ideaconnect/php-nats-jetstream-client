@@ -4,8 +4,8 @@
  * Headers and Server Info - NATS headers + server metadata.
  *
  * Publishes a message carrying NATS headers, runs an echo responder that reflects a
- * request-id header back via requestWithHeaders(), and reads the negotiated
- * serverInfo().
+ * request-id header back via requestWithHeaders(), reads headers back with the
+ * case-insensitive NatsHeaders::get() helper, and reads the negotiated serverInfo().
  *
  * Mirrors the README "Headers and Server Info" example. Run: php examples/headers-and-server-info.php
  */
@@ -39,9 +39,15 @@ try {
         }
 
         $requestHeaders = NatsHeaders::fromWireBlock($message->rawHeaders);
-        $requestId = $requestHeaders['X-Request-Id'] ?? 'unknown';
+        // Header names travel on the wire exactly as the publisher wrote them, and publishers
+        // disagree on spelling (a Go publisher canonicalizes to "X-Request-Id"). NatsHeaders::get()
+        // matches the name case-insensitively, so a responder does not have to guess the casing;
+        // here it finds the "X-Request-Id" the request carries while asking for "x-request-id".
+        $requestId = NatsHeaders::get($requestHeaders, 'x-request-id') ?? 'unknown';
 
-        $message->respondWithHeaders($message->payload, ['X-Request-Id' => $requestId])->await();
+        // Reply with a different spelling of the same header name, the way a client with another
+        // canonicalization would hand it to us.
+        $message->respondWithHeaders($message->payload, ['X-REQUEST-ID' => $requestId])->await();
     })->await();
 
     // Ensure the SUB is registered server-side before we publish the request (avoid a 503 race).
@@ -51,9 +57,38 @@ try {
         'X-Request-Id' => 'req-123',
     ], 2000)->await();
 
+    // The responder wrote the header as "X-REQUEST-ID", so an exact-case array lookup for the
+    // spelling this side used finds nothing, while NatsHeaders::get() resolves the same header
+    // under either spelling.
+    $replyHeaders = NatsHeaders::fromWireBlock($reply->rawHeaders);
+    $exactCase = $replyHeaders['X-Request-Id'] ?? '(not found)';
+    $getWireCase = NatsHeaders::get($replyHeaders, 'X-REQUEST-ID') ?? '(not found)';
+    $getOtherCase = NatsHeaders::get($replyHeaders, 'X-Request-Id') ?? '(not found)';
+
+    if ($getWireCase !== 'req-123' || $getOtherCase !== 'req-123') {
+        throw new RuntimeException(
+            'expected both header lookups to return req-123, got "' . $getWireCase . '" and "' . $getOtherCase . '"',
+        );
+    }
+
+    // Header values go out verbatim: the encoder writes the caller's bytes untouched, so a value
+    // whose surrounding spaces are part of it (a signature, a checksum) is not silently changed.
+    // The decoder still trims surrounding whitespace on the way in, as a tolerance for publishers
+    // that pad their values.
+    $signatureLine = explode("\r\n", NatsHeaders::toWireBlock(['X-Signature' => ' sig-1 ']))[1];
+
+    if ($signatureLine !== 'X-Signature: sig-1 ') {
+        throw new RuntimeException('expected the header value to be written verbatim, got "' . $signatureLine . '"');
+    }
+
     $serverName = $client->serverInfo()?->serverName ?? '(unknown)';
 
-    echo 'OK headers-and-server-info: reply="' . $reply->payload . '" server="' . $serverName . '"' . PHP_EOL;
+    echo 'OK headers-and-server-info: reply="' . $reply->payload . '"'
+        . ', reply carries the header as X-REQUEST-ID: array["X-Request-Id"]=' . $exactCase
+        . ', get("X-REQUEST-ID")=' . $getWireCase
+        . ', get("X-Request-Id")=' . $getOtherCase
+        . ', verbatim header line="' . $signatureLine . '"'
+        . ', server="' . $serverName . '"' . PHP_EOL;
 } finally {
     $client->disconnect()->await();
 }

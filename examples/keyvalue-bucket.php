@@ -25,7 +25,8 @@ $client = new NatsClient(new NatsOptions(servers: [$url], name: 'example-keyvalu
 $client->connect()->await();
 
 $bucket = 'EX_KV_CFG';
-$kv = $client->jetStream()->keyValue($bucket);
+$js = $client->jetStream();
+$kv = $js->keyValue($bucket);
 
 try {
     $kv->create()->await();
@@ -68,7 +69,11 @@ try {
         // Watch window elapsed; we have drained whatever live updates arrived.
     }
 
-    $client->unsubscribe($watchSid)->await();
+    // A watch rides an ordered consumer, so stop it through the context rather than with
+    // $client->unsubscribe($watchSid): a recreate rotates the internal sid, which makes the sid
+    // returned by watch() stale after the first recreate. The context resolves the CURRENT sid and
+    // also deletes the server-side consumer a plain unsubscribe would strand.
+    $js->stopOrderedConsumer($watchSid)->await();
 
     echo 'OK keyvalue-bucket: stream ' . $streamName . ', updated ' . $current . '->' . $allTheme
         . ', watcher saw ' . count($observed) . " events\n";
