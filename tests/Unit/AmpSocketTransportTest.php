@@ -34,12 +34,14 @@ final class AmpSocketTransportTest extends TestCase
             self::assertSame('Transport is not connected', $e->getMessage());
         }
 
-        self::assertSame('', $transport->readLine()->await());
+        $beforeClose = $transport->readLine()->await();
+        self::assertSame('', $beforeClose);
         $transport->close()->await();
 
         // Ensure idempotent close also remains safe, and a post-close write throws the same way.
         $transport->close()->await();
-        self::assertSame('', $transport->readLine()->await());
+        $afterClose = $transport->readLine()->await();
+        self::assertSame('', $afterClose);
         $this->expectException(TransportClosedException::class);
         $transport->write("PING\r\n")->await();
     }

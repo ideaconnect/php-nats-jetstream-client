@@ -4344,7 +4344,8 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
         $connection->disconnect()->await();
 
-        self::assertSame(ConnectionState::Closed, $connection->state());
+        $stateAfterTheDisconnect = $connection->state();
+        self::assertSame(ConnectionState::Closed, $stateAfterTheDisconnect);
 
         // The race outcome: a recovery is triggered around disconnect time. It must be a no-op.
         (new \ReflectionMethod(NatsConnection::class, 'recoverConnection'))->invoke($connection);

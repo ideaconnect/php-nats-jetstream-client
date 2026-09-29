@@ -131,7 +131,8 @@ final class NatsClientIntegrationTest extends TestCase
         } catch (CancelledException) {
             // Fewer than three within the window; the assertion below reports it.
         }
-        self::assertSame(['m1', 'm2', 'm3'], $received);
+        $afterTheThirdDelivery = $received;
+        self::assertSame(['m1', 'm2', 'm3'], $afterTheThirdDelivery);
 
         // Bounded settle window: m4 must never arrive - the server stopped at the max and the client
         // dropped the subscription after the third delivery.
