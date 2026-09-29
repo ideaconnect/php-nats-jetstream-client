@@ -197,4 +197,32 @@ final class NatsClientTest extends TestCase
         $clientB->disconnect()->await();
         self::assertTrue($transportB->closed);
     }
+
+    /**
+     * drainSubscription() on the client unsubscribes one subscription, flushes so a message the server
+     * sent before it processed the UNSUB is still delivered, then removes it; the other one stays.
+     */
+    public function testDrainSubscriptionDeliversInFlightMessageThenRemovesOnlyThatSubscription(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+        $delivered = [];
+        $sid = $client->subscribe('events', static function (NatsMessage $message) use (&$delivered): void {
+            $delivered[] = $message->payload;
+        })->await();
+        $other = $client->subscribe('other', static function (NatsMessage $message): void {})->await();
+        // The flush's PONG arrives behind a message still in flight when the UNSUB went out.
+        $transport->enqueueOnWriteContaining['PING'] = ['MSG events ' . $sid . " 9\r\nin-flight\r\nPONG\r\n"];
+
+        $client->drainSubscription($sid)->await();
+
+        self::assertSame(['in-flight'], $delivered);
+        self::assertContains('UNSUB ' . $sid . "\r\n", $transport->writes);
+        self::assertFalse($client->isSubscriptionActive($sid));
+        self::assertTrue($client->isSubscriptionActive($other));
+    }
 }

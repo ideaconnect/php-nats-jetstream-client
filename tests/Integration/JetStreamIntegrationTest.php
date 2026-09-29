@@ -2233,4 +2233,71 @@ final class JetStreamIntegrationTest extends TestCase
         $js->deleteStream($stream)->await();
         $client->disconnect()->await();
     }
+
+    /**
+     * A JetStream publish issued while the client is reconnecting - its socket died and the server
+     * refused new connections for a while - waits for the reconnect and returns the stream's PubAck,
+     * instead of failing with "Connection is not open" (waitForReconnect).
+     */
+    public function testJetStreamPublishDuringReconnectWaitsForTheAckAgainstALiveServer(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITWAITPUB' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $admin->jetStream()->createStream($stream, [$subject])->await();
+        [$client, $transport] = $this->connectRecoverableClient();
+
+        try {
+            $this->takeServerDownFor($client, $transport);
+            $this->bringServerBackAfter($transport, 0.3);
+
+            $ack = $client->jetStream()->publish($subject, 'order-1')->await();
+
+            self::assertSame($stream, $ack->stream);
+            self::assertSame(1, $ack->seq);
+            self::assertSame(1, $client->statistics()->reconnects);
+        } finally {
+            $client->disconnect()->await();
+            $admin->jetStream()->deleteStream($stream)->await();
+            $admin->disconnect()->await();
+        }
+    }
+
+    /**
+     * A pull fetch issued while the client is reconnecting waits for the reconnect, then fetches the
+     * stored message through the new connection.
+     */
+    public function testJetStreamFetchDuringReconnectWaitsForItAgainstALiveServer(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITWAITFETCH' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $consumer = 'worker';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $js = $admin->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, $consumer, $subject)->await();
+        $js->publish($subject, 'order-1')->await();
+        [$client, $transport] = $this->connectRecoverableClient();
+
+        try {
+            $this->takeServerDownFor($client, $transport);
+            $this->bringServerBackAfter($transport, 0.3);
+
+            $messages = $client->jetStream()->fetchBatch($stream, $consumer, 1, 3_000)->await();
+
+            self::assertCount(1, $messages);
+            self::assertSame('order-1', $messages[0]->payload);
+            self::assertSame(1, $client->statistics()->reconnects);
+        } finally {
+            $client->disconnect()->await();
+            $js->deleteStream($stream)->await();
+            $admin->disconnect()->await();
+        }
+    }
 }

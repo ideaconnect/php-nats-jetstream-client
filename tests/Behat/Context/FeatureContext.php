@@ -11,6 +11,7 @@ use Behat\Behat\Context\Context;
 use DateTimeImmutable;
 use IDCT\NATS\Auth\CredentialsParser;
 use IDCT\NATS\Auth\NkeySeedSigner;
+use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -35,6 +36,7 @@ use IDCT\NATS\Services\BasicJsonSchemaValidator;
 use IDCT\NATS\Services\Service;
 use IDCT\NATS\Tests\Behat\Support\ScenarioState;
 use IDCT\NATS\Tests\Integration\IntegrationTestBootstrap;
+use IDCT\NATS\Tests\Support\GatedDialTransport;
 use RuntimeException;
 use Throwable;
 
@@ -69,6 +71,11 @@ final class FeatureContext implements Context
     /** @var array<string,list<string>> */
     private array $queueWorkerPayloads = [];
 
+    /** A client whose server the scenario can take down, and its transport (see connectRecoverableClient()). */
+    private ?NatsClient $recoverableClient = null;
+
+    private ?GatedDialTransport $recoverableTransport = null;
+
     public function __construct(
         private readonly ScenarioState $state = new ScenarioState(),
     ) {}
@@ -87,6 +94,8 @@ final class FeatureContext implements Context
         $this->servicePumps = [];
         $this->subscriptionQueues = [];
         $this->queueWorkerPayloads = [];
+        $this->recoverableClient = null;
+        $this->recoverableTransport = null;
     }
 
     /**
@@ -135,6 +144,14 @@ final class FeatureContext implements Context
         foreach ($this->clients as $client) {
             try {
                 $client->disconnect()->await();
+            } catch (Throwable) {
+            }
+        }
+
+        if ($this->recoverableClient !== null) {
+            $this->recoverableTransport?->acceptDials();
+            try {
+                $this->recoverableClient->disconnect()->await();
             } catch (Throwable) {
             }
         }
@@ -343,6 +360,7 @@ final class FeatureContext implements Context
 
             $this->client('secondary')->publish($message->replyTo, $payload)->await();
         })->await();
+        $this->awaitSubscriptionsOnServer($this->client('secondary'));
 
         $this->subscriptions['secondary'][] = $sid;
     }
@@ -517,6 +535,7 @@ final class FeatureContext implements Context
                 $this->client('secondary')->publish($message->replyTo, 'ok')->await();
             }
         })->await();
+        $this->awaitSubscriptionsOnServer($this->client('secondary'));
 
         $this->subscriptions['secondary'][] = $sid;
     }
@@ -592,6 +611,8 @@ final class FeatureContext implements Context
         $sidB = $this->client('secondary')->subscribe($subject, function (NatsMessage $message): void {
             $this->queueWorkerPayloads['worker-b'][] = $message->payload;
         }, 'workers')->await();
+        $this->awaitSubscriptionsOnServer($this->client('primary'));
+        $this->awaitSubscriptionsOnServer($this->client('secondary'));
 
         $this->subscriptions['primary'][] = $sidA;
         $this->subscriptions['secondary'][] = $sidB;
@@ -643,6 +664,7 @@ final class FeatureContext implements Context
     {
         $subject = $this->requireValue($this->state->subject, 'subject');
         $queue = $this->client('primary')->subscribeQueue($subject, 'workers')->await();
+        $this->awaitSubscriptionsOnServer($this->client('primary'));
         $queue->setTimeout(1.0);
         $this->subscriptionQueues['primary'] = $queue;
         $this->subscriptions['primary'][] = $queue->sid;
@@ -894,6 +916,7 @@ final class FeatureContext implements Context
             $this->state->receivedPayloads[] = $message->payload;
             $this->state->receivedSubjects[] = $message->subject;
         })->await();
+        $this->awaitSubscriptionsOnServer($this->client('secondary'));
 
         $this->subscriptions['secondary'][] = $sid;
     }
@@ -2360,6 +2383,7 @@ final class FeatureContext implements Context
         $sid = $this->client('secondary')->subscribe($subject, function (NatsMessage $message): void {
             $this->state->observedRequestCount++;
         })->await();
+        $this->awaitSubscriptionsOnServer($this->client('secondary'));
 
         $this->subscriptions['secondary'][] = $sid;
     }
@@ -2414,6 +2438,115 @@ final class FeatureContext implements Context
     {
         if ($this->state->observedRequestCount < 1) {
             throw new RuntimeException('Expected the silent responder to receive at least one request before timeout.');
+        }
+    }
+
+    /**
+     * @Given I am connected to NATS through a connection that can lose its server
+     */
+    public function iAmConnectedToNatsThroughAConnectionThatCanLoseItsServer(): void
+    {
+        [$this->recoverableClient, $this->recoverableTransport] = $this->connectRecoverableClient();
+    }
+
+    /**
+     * @When an echo responder is subscribed on my request subject
+     */
+    public function anEchoResponderIsSubscribedOnMyRequestSubject(): void
+    {
+        $subject = $this->requireValue($this->state->requestSubject, 'request subject');
+        $secondary = $this->client('secondary');
+        $sid = $secondary->subscribe($subject, static function (NatsMessage $message): void {
+            $message->respond('echo:' . $message->payload)->await();
+        })->await();
+        $this->awaitSubscriptionsOnServer($secondary);
+
+        $this->subscriptions['secondary'][] = $sid;
+    }
+
+    /**
+     * @When the server goes away from my connection and refuses new connections for :milliseconds milliseconds
+     */
+    public function theServerGoesAwayFromMyConnectionAndRefusesNewConnectionsFor(int $milliseconds): void
+    {
+        [$client, $transport] = $this->recoverable();
+        $this->takeServerDownFor($client, $transport);
+        $this->bringServerBackAfter($transport, $milliseconds / 1000);
+    }
+
+    /**
+     * @When I request :payload on my request subject during the reconnect
+     */
+    public function iRequestOnMyRequestSubjectDuringTheReconnect(string $payload): void
+    {
+        $subject = $this->requireValue($this->state->requestSubject, 'request subject');
+        [$client] = $this->recoverable();
+        $secondary = $this->client('secondary');
+        $pumpCancellation = new DeferredCancellation();
+        $pump = async(function () use ($secondary, $pumpCancellation): void {
+            $cancellation = $pumpCancellation->getCancellation();
+
+            while (!$cancellation->isRequested()) {
+                try {
+                    $secondary->processIncoming()->await($cancellation);
+                } catch (CancelledException) {
+                    break;
+                } catch (Throwable) {
+                    delay(0.02);
+                }
+            }
+        });
+
+        $start = $this->monotonic();
+        try {
+            $this->state->lastReplyPayload = $client->request($subject, $payload, 5_000)->await()->payload;
+        } catch (Throwable $e) {
+            $this->recordException($e);
+        } finally {
+            $this->state->lastRequestSeconds = $this->monotonic() - $start;
+            $pumpCancellation->cancel();
+            $pump->await();
+        }
+    }
+
+    /**
+     * @Then the request should succeed with :reply after waiting at least :milliseconds milliseconds
+     */
+    public function theRequestShouldSucceedWithAfterWaitingAtLeast(string $reply, int $milliseconds): void
+    {
+        if ($this->state->lastExceptionClass !== null) {
+            throw new RuntimeException(sprintf(
+                'Expected the request to succeed, but it failed with %s: %s',
+                $this->state->lastExceptionClass,
+                (string) $this->state->lastExceptionMessage,
+            ));
+        }
+
+        if ($this->state->lastReplyPayload !== $reply) {
+            throw new RuntimeException(sprintf('Expected the reply "%s", got "%s".', $reply, (string) $this->state->lastReplyPayload));
+        }
+
+        if ($this->state->lastRequestSeconds * 1000 < $milliseconds) {
+            throw new RuntimeException(sprintf(
+                'Expected the request to wait for the reconnect (at least %d ms), it returned after %d ms.',
+                $milliseconds,
+                (int) ($this->state->lastRequestSeconds * 1000),
+            ));
+        }
+    }
+
+    /**
+     * @Then my connection should have reconnected once
+     */
+    public function myConnectionShouldHaveReconnectedOnce(): void
+    {
+        [$client] = $this->recoverable();
+        if ($client->state() !== ConnectionState::Open || $client->statistics()->reconnects !== 1) {
+            throw new RuntimeException(sprintf(
+                'Expected the connection to be open after exactly one reconnect, it is %s after %d.',
+                $client->state()->value,
+                $client->statistics()->reconnects,
+            ));
         }
     }
 
@@ -2475,6 +2608,7 @@ final class FeatureContext implements Context
             $this->state->receivedSubjects[] = $message->subject;
             $this->state->receivedPayloads[] = $message->payload;
         })->await();
+        $this->awaitSubscriptionsOnServer($subscriber);
         $this->subscriptions['primary'][] = $sid;
 
         $publisher->publish($matchA, 'a')->await();
@@ -2787,6 +2921,20 @@ final class FeatureContext implements Context
         }
     }
 
+    /**
+     * The client from "I am connected to NATS through a connection that can lose its server".
+     *
+     * @return array{NatsClient, GatedDialTransport}
+     */
+    private function recoverable(): array
+    {
+        if ($this->recoverableClient === null || $this->recoverableTransport === null) {
+            throw new RuntimeException('Connect first with "I am connected to NATS through a connection that can lose its server".');
+        }
+
+        return [$this->recoverableClient, $this->recoverableTransport];
+    }
+
     private function client(string $alias): NatsClient
     {
         if (!isset($this->clients[$alias])) {
@@ -2916,6 +3064,18 @@ final class FeatureContext implements Context
         }
 
         return $subject;
+    }
+
+    /**
+     * Waits until the server has processed the subscriptions $client just made. A subscription is live only
+     * once the server has read its SUB, and a publish from another connection - or a message a stream
+     * republishes - can reach the server first: published right after subscribe(), it was then dropped for
+     * lack of interest, and the scenario failed now and then. The flush's PONG comes back only after the
+     * server has handled everything the client sent before its PING.
+     */
+    private function awaitSubscriptionsOnServer(NatsClient $client): void
+    {
+        $client->flush()->await();
     }
 
     private function waitFor(callable $condition, float $timeoutSeconds = 4.0): void

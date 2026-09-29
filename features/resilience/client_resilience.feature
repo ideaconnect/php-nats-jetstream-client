@@ -49,3 +49,13 @@ Feature: Live client resilience workflows
     And I publish "auto-2" to my subject
     And I publish "auto-3" to my subject
     Then I should receive exactly 2 messages
+
+  Scenario: A request issued while the client is reconnecting waits for the reconnect instead of failing
+    Given a second client is connected to NATS
+    And I have a random request subject
+    And I am connected to NATS through a connection that can lose its server
+    When an echo responder is subscribed on my request subject
+    And the server goes away from my connection and refuses new connections for 300 milliseconds
+    And I request "during-reconnect" on my request subject during the reconnect
+    Then the request should succeed with "echo:during-reconnect" after waiting at least 250 milliseconds
+    And my connection should have reconnected once

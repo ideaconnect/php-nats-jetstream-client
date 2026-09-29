@@ -69,6 +69,11 @@ Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
 - [Republish and Subject Transform](#republish-and-subject-transform)
 - [Compatibility Mapping](#compatibility-mapping)
 - [Behavior Notes](#behavior-notes)
+  - [`processIncoming()`](#processincoming)
+  - [Heartbeat and Request Timeouts](#heartbeat-and-request-timeouts)
+  - [Reconnect Behavior](#reconnect-behavior)
+  - [Slow Consumers](#slow-consumers)
+  - [Ordered Consumer Gap Recovery](#ordered-consumer-gap-recovery)
 - [Production Notes and Limitations](#production-notes-and-limitations)
 - [Configuration Option Mapping](#configuration-option-mapping)
 - [Performance Benchmark Recipe](#performance-benchmark-recipe)
@@ -113,6 +118,7 @@ Current functionality includes:
 - Typed JetStream configuration enums (RetentionPolicy, StorageBackend, DiscardPolicy, DeliverPolicy, AckPolicy, ReplayPolicy)
 - Max frame size limit in protocol parser (DoS protection)
 - Queue-based polling subscribe API (`SubscriptionQueue` with `fetch()`, `next()`, `fetchAll()`)
+- Bounded per-subscription buffers with slow-consumer policies (`DropOldest`, `DropNewest`, `Error`) - see [Slow Consumers](#slow-consumers)
 - Pull-consumer batching/iteration chain API (`PullConsumerIterator` with `setBatching()`, `setIterations()`, `handle()`)
 - Stream mirroring and sourcing configuration helpers (`StreamSource`)
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
@@ -696,6 +702,8 @@ $messages = $queue->fetchAll(limit: 10);
 $client->unsubscribe($queue->sid)->await();
 $client->disconnect()->await();
 ```
+
+A queue's buffer is bounded like its subscription's. If your application does not poll often enough, messages are dropped under the slow-consumer policy - see [Slow Consumers](#slow-consumers) for which ones, and how the loss is reported.
 
 ### JetStream Push Consumer (Durable)
 
@@ -1299,7 +1307,7 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/graceful-drain.php`](examples/graceful-drain.php)
 
-_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testDrainUnsubscribesAllAndCloses`, `testDrainDeliversBufferedMessagesBeforeClosing`); [features/resilience/client_resilience.feature](features/resilience/client_resilience.feature)._
+_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testDrainUnsubscribesAllAndCloses`, `testDrainDeliversBufferedMessagesBeforeClosing`), [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php); live: [DrainLifecycleIntegrationTest](tests/Integration/DrainLifecycleIntegrationTest.php); [features/resilience/client_resilience.feature](features/resilience/client_resilience.feature)._
 
 ```php
 <?php
@@ -1327,13 +1335,55 @@ from the server but not yet dispatched to a handler are dropped without warning.
 `drain()` (whole connection) or `drainSubscription($sid)` (single subscription) as the
 lossless teardown paths: both deliver the buffered backlog first.
 
-`drain()` is bounded by roughly one `requestTimeoutMs` budget and always reaches the `Closed`
-state. It does not throw when a write fails against a dead socket: that failure is reported
-through the `errorListener` and the teardown continues, so the connection is never stranded
-mid-drain. Publishes your handlers issue while the drain is running share the same remaining
-budget rather than each getting a fresh timeout, and anything still buffered when the budget
-runs out is dropped with a "drain deadline exceeded" error naming the count. If you need the
-backlog delivered under all circumstances, drain earlier rather than relying on a longer timeout.
+`drain()` is bounded by roughly one `requestTimeoutMs` budget and always reaches the `Closed` state. It
+does not throw when a write fails against a dead socket: that failure is reported through the
+`errorListener` and the teardown continues, so the connection is never stranded mid-drain. A handler
+that throws while the drain delivers is reported the same way, and the messages behind it - already
+queued, or still arriving during the drain's flush - are still delivered. Publishes your handlers issue
+while the drain is running share the same remaining budget rather than each getting a fresh timeout, and
+anything still buffered when the budget runs out is dropped with a "drain deadline exceeded" error
+naming the count. If you need the backlog delivered under all circumstances, drain earlier rather than
+relying on a longer timeout.
+
+A `drain()` issued while the client is reconnecting first waits for the reconnect within that same
+budget: the reconnect flushes the publishes buffered during the outage, then the new connection is
+drained as usual. If the budget runs out first, the drain still reaches `Closed` - the reconnect is
+stopped, the backlog pass runs, and the buffered publishes it discards are reported through the
+`errorListener`. A drain that cannot wait - `waitForReconnect: false`, or a drain called from a
+connection/error listener, which runs inside the reconnect - closes the connection and throws, like
+nats.go's `Drain()` while reconnecting, so the reconnect cannot reopen a connection you are shutting
+down. See [Reconnect Behavior](#reconnect-behavior).
+
+Every `drain()` ends with one `Closed` event. When the drain closes the connection itself, the event
+comes once the drain is over, so a supervisor that reconnects on `Closed` can call `connect()` straight
+from its listener. When something else closed it first - a reconnect that gave up, or a `disconnect()`
+during the drain - that path's `Closed` is the only one. While a drain runs, including while it waits
+for a reconnect, `connect()` is refused with `Cannot connect: drain in progress`, because the drain's
+teardown would close a connection opened meanwhile. A `connect()` from a `Closed` listener also fails
+at once (`Recovery was aborted before the connection opened`) while a reconnect the close stopped is
+still winding down - one listener awaiting the drain from inside that reconnect is enough - so a
+supervisor should retry shortly rather than give up. `disconnect()` after `drain()` closes quietly: the
+close is announced once.
+
+`drainSubscription($sid)` unsubscribes one subscription, flushes, and delivers what already arrived for
+it before removing it, all within one `requestTimeoutMs` budget; the UNSUB write is bounded by it too,
+so a peer that stopped reading cannot hold the call. While the client is reconnecting it waits for the
+reconnect within that budget, like `flush()`, and then drains the subscription on the new connection. A
+reconnect never re-subscribes a subscription that is being drained - but one that had already
+re-subscribed it keeps it until just before it goes live, and the server can still deliver on it until
+then (a queue group's share, say); draining on the new connection delivers those messages too. When it
+cannot wait - `waitForReconnect: false`, called from a connection/error listener, or the budget ran out
+- it delivers what already arrived and removes the subscription; messages the server sends on a
+subscription the reconnect already re-subscribed are then dropped until the reconnect's UNSUB lands.
+During a `drain()` the drain takes the subscription over: it has already unsubscribed it, its flush may
+still bring messages for it, and it delivers those and what is queued before it removes every
+subscription, so `drainSubscription()` resolves at once. Like `drain()`, it does not throw for a failed
+UNSUB or flush or for a handler that throws: those are reported through the `errorListener`, and a
+throwing handler does not cost the messages behind it, whether already queued or still arriving during
+the flush. When a delivery for the subscription is already under way - on another fiber, or it is your
+handler draining its own subscription - that delivery hands over the messages queued behind it and then
+removes the subscription, and `drainSubscription()` resolves without waiting for it. A second call for a
+subscription that is already being drained resolves at once.
 
 ### Ordered Consumer
 
@@ -2003,7 +2053,7 @@ This repository tracks parity against the basis-company `nats.php` README exampl
 
 ### `processIncoming()`
 
-_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testProcessIncomingDispatchesMsgToSubscriber`, `testProcessIncomingUpdatesServerInfoFromAsyncInfoFrame`)._
+_Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testProcessIncomingDispatchesMsgToSubscriber`, `testProcessIncomingUpdatesServerInfoFromAsyncInfoFrame`); [ConcurrentReadTest](tests/Unit/ConcurrentReadTest.php)._
 
 `processIncoming()` reads a single transport chunk, parses all complete frames from it, and dispatches them to subscription callbacks. The read is bounded only by the optional `Cancellation` you pass: without one it suspends until a chunk arrives (or the peer closes the connection), so it is **not** a poll. Because one read returns only a single chunk (and TCP may coalesce several protocol messages into one chunk), call it in a loop, and pass a `TimeoutCancellation` when you need the loop to stay responsive on a quiet connection:
 
@@ -2021,6 +2071,8 @@ while (hrtime(true) / 1e9 < $deadlineSeconds) {
 	}
 }
 ```
+
+The connection reads its socket from one fiber at a time. When another fiber is already reading - a `request()` waiting for its reply, a `flush()`, the heartbeat reading the answer to its `PING` - `processIncoming()` and `readIncoming()` wait for that read to finish, bounded by the `Cancellation` you pass, and then return without reading (`0` frames): that read delivered what it read. A loop of these calls therefore always lets the event loop run its timers and socket reads, the other fiber's read included.
 
 The client also applies asynchronous `INFO` updates received after connect, so `serverInfo()` can change during the lifetime of an open connection when the server advertises updated capabilities such as `max_payload` or cluster topology details.
 
@@ -2040,13 +2092,66 @@ When a connection drops and `reconnectEnabled` is `true`:
 
 1. **Exponential backoff**: delay is computed as `reconnectDelayMs * 2^(attempt - 1)`, capped at `reconnectMaxDelayMs`, with random jitter up to `reconnectJitterMs`.
 2. **Server rotation**: the client cycles through configured servers in order.
-3. **Subscription replay**: all active subscriptions are replayed (SUB commands resent) after reconnect.
+3. **Subscription replay**: all active subscriptions are replayed (SUB commands resent) after reconnect. A subscription removed while the reconnect is between replaying and going live - `unsubscribe()` can then only remove it locally - is unsubscribed on the new connection before it goes live, so the server does not keep delivering to it; an auto-unsubscribe max armed in that window (`unsubscribe($sid, $max)`) is sent there too, counting only what was received before the outage. A `drainSubscription()` issued in that window waits for the reconnect and drains on the new connection, so the messages the server still sends on the re-subscribed sid are delivered. _Verified by: [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testSubscriptionRemovedWhileAReconnectReplaysIsUnsubscribedBeforeTheConnectionOpens`, `testAutoUnsubscribeArmedWhileAReconnectReplaysReachesTheServer`, `testAutoUnsubscribeArmedWhileAReconnectReplaysCountsWhatWasReceivedBefore`, `testDrainSubscriptionWhileAReconnectReplaysDeliversWhatTheServerSendsBeforeItsUnsubscribe`)._
 4. **Replay validation**: reconnect does not treat replayed subscriptions as successful if the server immediately answers with a fatal `-ERR` during replay. In that case reconnect keeps retrying until a healthy server accepts the replay or attempts are exhausted.
-5. **Published messages during reconnect are buffered and replayed**: while a reconnect is in flight, publishes are held in an outbound buffer (up to `reconnectBufferSize`, default 8 MiB, matching nats.go) and flushed in order on a successful reconnect. A publish is rejected (throws) only when the buffer is full, when `reconnectBufferSize` is `0` (buffering disabled), or when the connection is closed / not reconnecting. _Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testPublishBuffersDuringReconnectAndFlushesOnReconnect`, `testPublishWithHeadersBuffersDuringReconnectAndRecordsOutbound`, `testPublishBufferOverflowThrowsDuringReconnect`)._
+5. **Published messages during reconnect are buffered and replayed**: while a reconnect is in flight, publishes are held in an outbound buffer (up to `reconnectBufferSize`, default 8 MiB, matching nats.go) and flushed in order on a successful reconnect. A publish is rejected (throws) only when the buffer is full, when `reconnectBufferSize` is `0` (buffering disabled), when the connection is closed / not reconnecting, or while `disconnect()` or `drain()` is closing it (the reconnect is stopping, so nothing would ever send the buffered bytes). _Verified by: [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testPublishBuffersDuringReconnectAndFlushesOnReconnect`, `testPublishWithHeadersBuffersDuringReconnectAndRecordsOutbound`, `testPublishBufferOverflowThrowsDuringReconnect`)._
+6. **Operations issued during a reconnect wait for it**: `request()`, `requestWithHeaders()`, `requestMany()`, `subscribe()`, `flush()`, `rtt()`, `processIncoming()`/`readIncoming()`, `SubscriptionQueue` polling, `drain()` and `drainSubscription()` wait for an in-flight reconnect within their own timeout instead of failing at once with `Connection is not open`, then run on the new connection. The timeout is one budget: a request's covers the wait, the publish and the reply; `subscribe()`, `flush()`, `rtt()`, `drain()` and `drainSubscription()` use `requestTimeoutMs`; `processIncoming()` is bounded by the cancellation you pass, and without one waits for the whole reconnect; a `SubscriptionQueue` waits within its timeout, so `fetch()`, and `next()` or `fetchAll()` without a timeout, return nothing during a reconnect instead of throwing. An operation whose wait runs out throws a `TimeoutException`. A `drain()` whose budget runs out still closes the connection, and a `drain()` that cannot wait closes it and throws - see [Graceful Drain](#graceful-drain). A reconnect that gives up surfaces its own error (for example `Reconnect attempts exhausted`), and a publish buffered during a reconnect yields one event-loop tick. The waiting is what lets a synchronous application - a queue worker or daemon that only ever awaits one operation at a time - drive a reconnect the heartbeat started in the background: a reconnect advances only while something waits on the event loop, so operations that failed on the spot used to leave it stalled until the process restarted. Operations still fail at once when no reconnect is in flight (a closed connection) and when called from a connection/error listener while the reconnect is still in flight - a `Disconnected` listener, say - since the reconnect waits for that listener. A `Reconnected` listener runs once the connection is back, and its operations run as usual. A caller whose own read is the first to notice a dead connection runs the reconnect itself and waits for all of it. Set `waitForReconnect: false` to fail fast instead. _Verified by: [WaitForReconnectTest](tests/Unit/WaitForReconnectTest.php); live: [NatsClientIntegrationTest](tests/Integration/NatsClientIntegrationTest.php) (`testRequestIssuedDuringReconnectWaitsForItAgainstALiveServer`, `testSubscribeIssuedDuringReconnectDeliversAfterItAgainstALiveServer`, `testRequestDuringReconnectFailsFastAgainstALiveServerWhenWaitingIsDisabled`, `testDrainDuringReconnectDeliversBufferedPublishesAgainstALiveServer`), [JetStreamIntegrationTest](tests/Integration/JetStreamIntegrationTest.php) (`testJetStreamPublishDuringReconnectWaitsForTheAckAgainstALiveServer`, `testJetStreamFetchDuringReconnectWaitsForItAgainstALiveServer`); [features/resilience/client_resilience.feature](features/resilience/client_resilience.feature)._
+7. **Closing stops a reconnect promptly**: `disconnect()` and `drain()` cut an in-flight reconnect's backoff delay short, so a reconnect waiting between attempts stops at once instead of when the delay ends; an attempt already dialling runs to its end first - its dial and each step of its handshake are bounded by `connectTimeoutMs`. A `connect()` right after the close therefore usually dials afresh - one issued while such a reconnect is still winding down fails at once, because the close wins. A reconnect stopped this way reports no exhaustion: the close is the caller's. A `disconnect()` also wins over a `connect()` that is still dialling or retrying its first dial, the last retry included. And a read, write or heartbeat that fails on a connection you have since closed and reopened leaves the new connection alone. A reconnect the server refuses to authenticate reports the buffered publishes it discards, as one that runs out of attempts does. Every close is announced with one `Closed` event, also when a `disconnect()` - or a `drain()` running out of time - comes while a connect or reconnect that gave up is still closing the socket: that path announces it. _Verified by: [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testConnectRightAfterADrainThatRanOutOfTimeSucceeds`, `testDisconnectDuringTheLastReconnectBackoffDoesNotReportExhaustion`, `testDrainWaitingForAReconnectThatFailsAuthenticationEndsClosedAndReportsTheDiscardedPublishes`), [CloseIntentTest](tests/Unit/CloseIntentTest.php)._
 
-Recoverable server `-ERR` frames such as `Invalid Subject` or `Permissions Violation for Publish/Subscription to ...` do not automatically close an already-open connection. Fatal connection-level errors still do.
+Recoverable server `-ERR` frames such as `Invalid Subject` or `Permissions Violation for Publish/Subscription to ...` do not automatically close an already-open connection: they are passed to the `errorListener` once the read that brought them has queued the rest of what it read. Fatal connection-level errors still close it.
 
 The initial handshake is bounded by `connectTimeoutMs`, not by a fixed number of transport reads. During bootstrap the client will also answer server `PING` frames and process async `INFO` updates while waiting for the initial `PONG`.
+
+### Slow Consumers
+
+_Verified by: [SlowConsumerErrorPolicyTest](tests/Unit/SlowConsumerErrorPolicyTest.php); [ReadReportTest](tests/Unit/ReadReportTest.php); [NatsConnectionTest](tests/Unit/NatsConnectionTest.php) (`testSlowConsumerDropOldestPolicy`, `testSlowConsumerDropNewestPolicy`, `testErrorListenerReceivesSlowConsumerDrop`, `testSlowConsumerErrorPolicyThrows`, `testSlowConsumerErrorPolicyOverflowIsASlowConsumerExceptionNamingTheSid`, `testSlowConsumerErrorPolicyOverflowSurfacesToListenerOnceNotTwice`, `testSlowConsumerErrorPolicyOverflowCountsTowardAutoUnsubAndDoesNotLeak`); [SubscriptionQueueTest](tests/Unit/SubscriptionQueueTest.php) (`testEnqueueDropOldestIncrementsDroppedCountAndNotifiesErrorListener`, `testEnqueueDropNewestIncrementsDroppedCountAndNotifiesErrorListener`, `testEnqueueThrowsOnOverflowWhenPolicyIsError`)._
+
+Each subscription buffers the messages read for it until its handler takes them, up to `maxPendingMessagesPerSubscription` (1024 by default). The inboxes the client itself uses to collect a known number of messages - JetStream fetches and pull consumers, batched Direct Get, Key/Value `keys()` and `history()` - are exempt: the request bounds what they collect. When a subscriber falls behind and its buffer is full, `slowConsumerPolicy` decides what happens to the next message:
+
+| Policy | What is dropped | How you find out |
+|---|---|---|
+| `DropOldest` (default) | the oldest buffered message, to make room | a `NatsException` ("Slow consumer on sid N: dropped oldest message") passed to the `errorListener`, and logged at debug level |
+| `DropNewest` | the new message | the same, with "dropped newest message" |
+| `Error` | the new message | a `SlowConsumerException`, thrown or passed to the `errorListener` and logged at error level - see below |
+
+Core NATS does not resend a dropped message; a JetStream consumer with acknowledgements redelivers it once its `ack_wait` expires. A dropped message still counts toward an auto-unsubscribe limit set with `unsubscribe($sid, $max)`, because the server counted it when it sent it.
+
+Whatever the policy, a read reports what it dropped once it has queued everything else it read. So an `errorListener` may react by reading on the connection - `drainSubscription()` to stop a subscriber that cannot keep up, say - without messages overtaking one another. A logger that throws on a report fails neither the read nor the delivery of the messages the policy kept.
+
+`Error` loses the message just as the drop policies do; what it adds is that the loss is hard to miss. The `SlowConsumerException` is a `ConnectionException` whose `sid` names the subscription that fell behind - the connection itself is fine. Where it surfaces depends on which read ran into the full buffer:
+
+- **Your own reads throw it.** `processIncoming()` and `readIncoming()` deliver everything else they read, then throw the exception; a second overflow in the same read is passed to the `errorListener`. Catch it and keep reading. A fatal `-ERR` in the same read is thrown in its place, and the overflow is passed to the `errorListener`.
+- **Operations report it and complete.** Many calls read the socket themselves while they wait for a result of their own: `request()`, `requestMany()` and everything built on them (JetStream publish, `ackSync()`, stream and consumer management, Key/Value and Object Store calls), `flush()`, `rtt()`, `fetchBatch()`/`fetchNext()`, `directGetBatch()`, pull consumers, Key/Value `keys()` and `history()`, and `SubscriptionQueue` polling. Such a read picks up messages for every subscription. When one of those messages overflows another subscription's buffer, the operation does not fail: the exception is passed to the `errorListener` and the operation returns its result. Only an overflow of the operation's own subscription - a `SubscriptionQueue` polling its own subject - fails it, once the rest of that read is delivered.
+- **Background reads report it.** The heartbeat's own read, a reconnect re-subscribing, and the flushes of `drain()` and `drainSubscription()` report the overflow and carry on. So does `Service::run()`, which has no caller to fail.
+
+Each of these overflows reaches you exactly once: thrown to the read, or passed to the `errorListener` and logged at error level. An overflow of another subscription found by an operation, and every overflow found in the background, is only reported, so with `Error` register an `errorListener` - one that drains the subscription that fell behind (`drainSubscription($error->sid)`) is a natural reaction:
+
+```php
+use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Exception\SlowConsumerException;
+
+$client = new NatsClient(new NatsOptions(
+    slowConsumerPolicy: SlowConsumerPolicy::Error,
+    errorListener: static function (\Throwable $error): void {
+        if ($error instanceof SlowConsumerException) {
+            // A message for subscription $error->sid was dropped: its handler cannot keep up.
+        }
+    },
+));
+$client->connect()->await();
+
+try {
+    $client->processIncoming()->await();
+} catch (SlowConsumerException $e) {
+    // The same, found by your own read; everything else it read was delivered.
+}
+```
+
+Previously an overflow failed whichever operation's read happened to run into it - even a `request()` whose reply had already arrived, or a fetch that had already collected its messages. To keep that behavior, set `slowConsumerErrorsFailOperations: true`: the operations listed above then fail with an overflow of any subscription, as `processIncoming()` does. `Service::run()` and the background reads still only report it. An overflow of a `SubscriptionQueue`'s polling buffer (below) that is thrown is then also passed to the `errorListener`, as it was before, so that code which swallows an operation's failure cannot lose it.
+
+A `SubscriptionQueue` keeps its own polling buffer on top of the subscription's, with the same limit and policy, and counts what it drops in `droppedCount()`. That buffer fills when your application does not poll the queue often enough, and its overflow follows the same rules: under `Error` it is a `SlowConsumerException` naming the queue's subscription, thrown to your own read and reported when an operation or a background read runs into it. Either way the messages behind it in the same read, for other subscriptions, are still delivered. A poll that fails on its own subscription's overflow keeps what it had already taken from the buffer: `fetchAll()` puts those messages back, in order, for the next call. Messages that arrived before `subscribeQueue()` returned the queue, and do not fit in it, are counted and reported. Under `DropOldest` and `DropNewest` its drops are reported like the subscription's.
 
 ### Ordered Consumer Gap Recovery
 
@@ -2066,7 +2171,7 @@ The same watchdog protects KV **and Object Store** watches, which both ride orde
 - **Concurrency model.** Message delivery, request replies, and JetStream pull/push consumption are driven by reads. An application must run a `processIncoming()` loop (directly, or indirectly via helpers such as `request()`, `flush()`, `SubscriptionQueue::next()`, or the consumer iterators, which pump it for you) for callbacks to fire. An idle, publisher-only connection stays alive on its own because the heartbeat timer self-reads `PONG`s - see [Heartbeat and Request Timeouts](#heartbeat-and-request-timeouts).
 - **One connection per fiber/process boundary.** A `NatsConnection` serializes its writes and owns a single socket read; share a connection within a coroutine tree, not across independent concurrent readers.
 - **Interoperability.** KeyValue and Object Store buckets use the official NATS layouts (`KV_`/`OBJ_` streams, base64url object-name encoding, `SHA-256=`-prefixed base64url digests), so buckets written by this client are readable by the `nats` CLI and other official clients, and vice-versa.
-- **Observability.** Pass a PSR-3 `LoggerInterface` via `new NatsOptions(logger: $logger)` to capture lifecycle events (connect, disconnect, reconnect, close, server discovery, lame-duck), per-attempt reconnect/backoff, and async errors. It defaults to a `NullLogger`. For structured, programmatic hooks (metrics, alerting, circuit breakers) without parsing log strings, pass typed closures instead: `connectionListener: Closure(ConnectionEvent $event, ?Throwable $error): void` is invoked on every connection-lifecycle transition, and `errorListener: Closure(Throwable $error): void` on async errors. Exceptions thrown by a listener are swallowed so a faulty hook cannot disrupt the connection. _Verified by: [NatsConnectionTest::testLoggerCapturesLifecycleEvents](tests/Unit/NatsConnectionTest.php)._
+- **Observability.** Pass a PSR-3 `LoggerInterface` via `new NatsOptions(logger: $logger)` to capture lifecycle events (connect, disconnect, reconnect, close, server discovery, lame-duck), per-attempt reconnect/backoff, and async errors. It defaults to a `NullLogger`. For structured, programmatic hooks (metrics, alerting, circuit breakers) without parsing log strings, pass typed closures instead: `connectionListener: Closure(ConnectionEvent $event, ?Throwable $error): void` is invoked on every connection-lifecycle transition, and `errorListener: Closure(Throwable $error): void` on async errors. Exceptions thrown by a listener are swallowed so a faulty hook cannot disrupt the connection; so are those a logger throws while it logs a lifecycle transition, a failed reconnect attempt, or any error it reports - and such an error still reaches the `errorListener`. _Verified by: [NatsConnectionTest::testLoggerCapturesLifecycleEvents](tests/Unit/NatsConnectionTest.php)._
 - **Server version requirements.** Newer features (per-message TTL, atomic batch publish, scheduled publish, priority groups, counters, batched Direct Get) require recent NATS servers - see [NATS Server Version Requirements](#nats-server-version-requirements).
 - **Not yet implemented.** A dedicated high-throughput fast-ingest batch publisher ([#12](https://github.com/ideaconnect/php-nats-jetstream-client/issues/12)) is tracked but blocked on an upstream reference; standard JetStream publish with in-flight pipelining is available today and is sufficient for most workloads.
 
@@ -2105,8 +2210,8 @@ The same watchdog protects KV **and Object Store** watches, which both ride orde
 | `jwt` | `?string` | `null` | JWT user credential. |
 | `nkey` | `?string` | `null` | Public NKey for JWT auth mode or standalone NKey challenge-response auth. |
 | `nonceSigner` | `?NonceSignerInterface` | `null` | Signs the server nonce for JWT or standalone NKey auth. |
-| `maxPendingMessagesPerSubscription` | `int` | `1024` | Slow consumer queue bound per SID. |
-| `slowConsumerPolicy` | `SlowConsumerPolicy` | `DropOldest` | One of `DropOldest`, `DropNewest`, `Error`. |
+| `maxPendingMessagesPerSubscription` | `int` | `1024` | Messages buffered per subscription until its handler takes them. See [Slow Consumers](#slow-consumers). |
+| `slowConsumerPolicy` | `SlowConsumerPolicy` | `DropOldest` | One of `DropOldest`, `DropNewest`, `Error`: what happens to a message that finds its subscription's buffer full, and how you learn about it. See [Slow Consumers](#slow-consumers). |
 | `connectionListener` | `?Closure(ConnectionEvent,?Throwable):void` | `null` | Typed hook for connection-lifecycle transitions (connect/disconnect/reconnect/close/discovery/lame-duck). Listener exceptions are swallowed. |
 | `errorListener` | `?Closure(Throwable):void` | `null` | Typed hook for async errors. Listener exceptions are swallowed. |
 | `jwtProvider` | `?Closure():string` | `null` | Supplies the JWT at connect time (e.g. for credential rotation), overriding `jwt`. |
@@ -2119,6 +2224,8 @@ The same watchdog protects KV **and Object Store** watches, which both ride orde
 | `webSocketCompression` | `bool` | `false` | Negotiate permessage-deflate on the WebSocket transport (requires `ext-zlib`). |
 | `logger` | `?Psr\Log\LoggerInterface` | `null` | PSR-3 logger for lifecycle/reconnect/error events; defaults to a `NullLogger`. |
 | `readChunkSizeBytes` | `int` | `131072` | Max bytes a single transport socket read may return (Amp socket chunk size), up from Amp's 8 KiB default. Larger reads divide the per-chunk syscall/fiber/parser overhead for large payloads without forcing larger reads, so small messages are unaffected. Must be at least 1. |
+| `waitForReconnect` | `bool` | `true` | While a reconnect is in flight, `request()`/`requestWithHeaders()`/`requestMany()`, `subscribe()`, `flush()`, `rtt()`, `processIncoming()`/`readIncoming()`, `drain()` and `drainSubscription()` wait for it within their own timeout instead of failing with `Connection is not open`, and a publish buffered meanwhile yields one event-loop tick - which is what lets a synchronous application drive the reconnect. `false` fails fast, except that `drain()` then closes the connection and throws, and `drainSubscription()` delivers what already arrived and removes the subscription. See [Reconnect Behavior](#reconnect-behavior). |
+| `slowConsumerErrorsFailOperations` | `bool` | `false` | With `SlowConsumerPolicy::Error`: `true` lets an overflow of any subscription fail the operation whose read ran into it - even a `request()` whose reply had already arrived - as before this option existed. By default such an operation reports the overflow through the `errorListener` and completes. `Service::run()` reports it either way. See [Slow Consumers](#slow-consumers). |
 
 ## Performance Benchmark Recipe
 

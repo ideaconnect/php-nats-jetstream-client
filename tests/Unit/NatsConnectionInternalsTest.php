@@ -280,7 +280,7 @@ final class NatsConnectionInternalsTest extends TestCase
         $second->getFuture()->ignore();
         $this->setPrivate($connection, 'pongWaiters', [$first, $second]);
 
-        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(type: ProtocolFrameType::Pong));
+        $this->handleFrame($connection, new ProtocolFrame(type: ProtocolFrameType::Pong));
 
         // Any PONG resets the liveness watchdog, but flush completion is FIFO per PING (#117):
         // the oldest slot completes and later slots keep waiting for their own pongs.
@@ -296,14 +296,14 @@ final class NatsConnectionInternalsTest extends TestCase
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Server sent error frame');
-        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(type: ProtocolFrameType::Err, error: 'boom'));
+        $this->handleFrame($connection, new ProtocolFrame(type: ProtocolFrameType::Err, error: 'boom'));
     }
 
     public function testHandleFrameInfoUpdatesServerInfo(): void
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
 
-        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(
+        $this->handleFrame($connection, new ProtocolFrame(
             type: ProtocolFrameType::Info,
             infoPayload: '{"server_id":"S2","server_name":"n2","version":"2.12.1","jetstream":true,"max_payload":2048,"headers":true}',
         ));
@@ -319,19 +319,23 @@ final class NatsConnectionInternalsTest extends TestCase
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
         $this->setPrivate($connection, 'state', ConnectionState::Open);
 
-        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(
+        $reports = $this->handleFrame($connection, new ProtocolFrame(
             type: ProtocolFrameType::Err,
             error: "'Permissions Violation for Publish to updates'",
         ));
 
         self::assertSame(ConnectionState::Open, $connection->state());
+        // Reported once the chunk is queued (dispatchFrames), at error level.
+        self::assertCount(1, $reports);
+        self::assertSame("Server sent recoverable error frame: 'Permissions Violation for Publish to updates'", $reports[0][0]->getMessage());
+        self::assertSame('error', $reports[0][1]);
     }
 
     public function testHandleFrameIgnoresUnknownSubscriptionSid(): void
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
 
-        $this->invokePrivate($connection, 'handleFrame', new ProtocolFrame(
+        $this->handleFrame($connection, new ProtocolFrame(
             type: ProtocolFrameType::Msg,
             subject: 'updates',
             sid: 42,
@@ -484,10 +488,56 @@ final class NatsConnectionInternalsTest extends TestCase
         self::assertSame([], $this->getPrivate($connection, 'pendingMessages'));
     }
 
+    /**
+     * An operation waiting for a reconnect waits again when, by the time it resumes, another reconnect
+     * is in flight and the connection is still not open. (Through the public API the waiter always
+     * resumes before a follow-up reconnect can start, so the state is set up directly.)
+     */
+    public function testAwaitOpenConnectionWaitsAgainWhenAnotherReconnectFollows(): void
+    {
+        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        /** @var DeferredFuture<void> $first */
+        $first = new DeferredFuture();
+        /** @var DeferredFuture<void> $second */
+        $second = new DeferredFuture();
+        $this->setPrivate($connection, 'state', ConnectionState::Connecting);
+        $this->setPrivate($connection, 'reconnecting', $first);
+
+        $waiter = async(function () use ($connection): void {
+            $this->invokePrivate($connection, 'awaitOpenConnection', null, null);
+        });
+        delay(0.01);
+
+        // The first reconnect ends with the next one already in flight.
+        $this->setPrivate($connection, 'reconnecting', $second);
+        $first->complete();
+        delay(0.01);
+        self::assertFalse($waiter->isComplete(), 'waiting for the second reconnect');
+
+        $this->setPrivate($connection, 'state', ConnectionState::Open);
+        $this->setPrivate($connection, 'reconnecting', null);
+        $second->complete();
+        $waiter->await();
+    }
+
     private function invokePrivate(object $object, string $method, mixed ...$args): mixed
     {
         $ref = new \ReflectionMethod($object, $method);
         return $ref->invoke($object, ...$args);
+    }
+
+    /**
+     * Handles one frame the way dispatchFrames() does, and returns what the frame reported, with its log
+     * level.
+     *
+     * @return list<array{\Throwable, string}>
+     */
+    private function handleFrame(NatsConnection $connection, ProtocolFrame $frame): array
+    {
+        $reports = [];
+        (new \ReflectionMethod($connection, 'handleFrame'))->invokeArgs($connection, [$frame, &$reports]);
+
+        return $reports;
     }
 
     private function setPrivate(object $object, string $property, mixed $value): void

@@ -33,6 +33,9 @@ final class ScenarioState
 
     public ?string $lastReplyPayload = null;
 
+    /** How long the last timed request took, in seconds (monotonic). */
+    public float $lastRequestSeconds = 0.0;
+
     public ?string $lastExceptionMessage = null;
 
     public ?string $lastExceptionClass = null;
@@ -158,6 +161,7 @@ final class ScenarioState
         $this->secondarySubject = null;
         $this->consumerName = null;
         $this->lastReplyPayload = null;
+        $this->lastRequestSeconds = 0.0;
         $this->lastExceptionMessage = null;
         $this->lastExceptionClass = null;
         $this->lastConnectionError = null;

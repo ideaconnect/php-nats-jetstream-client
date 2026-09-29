@@ -11,6 +11,7 @@ use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Protocol\ServerInfo;
 use IDCT\NATS\Services\Service;
@@ -72,6 +73,12 @@ final class NatsClient
     /**
      * Gracefully drains all subscriptions, flushes pending messages, and closes.
      *
+     * While a reconnect is in flight it first waits for it within its budget
+     * ({@see NatsOptions::$waitForReconnect}), so the publishes buffered during the outage are flushed;
+     * if the budget runs out first it still closes. When it cannot wait it closes the connection and
+     * throws. Every drain ends with one {@see \IDCT\NATS\Connection\Enum\ConnectionEvent::Closed}
+     * event, and connect() is refused until it is over.
+     *
      * @return Future<void>
      */
     public function drain(): Future
@@ -122,6 +129,9 @@ final class NatsClient
 
     /**
      * Registers a subscription handler and returns its SID.
+     *
+     * While a reconnect is in flight it first waits for it within the request timeout
+     * ({@see NatsOptions::$waitForReconnect}).
      *
      * @param callable(NatsMessage):void $handler
      * @return Future<int>
@@ -191,9 +201,16 @@ final class NatsClient
                 $this->options->slowConsumerPolicy,
             );
 
-            // Replay through enqueue() so the cap and slow-consumer policy apply as usual.
+            // Replay through enqueue() so the cap and slow-consumer policy apply as usual. A message that does
+            // not fit (SlowConsumerPolicy::Error) is counted and reported: the caller does not have the queue
+            // yet, so there is nobody to throw it to, and failing here would leave the subscription feeding a
+            // queue nobody holds.
             while (!$early->isEmpty()) {
-                $subscriptionQueue->enqueue($early->dequeue());
+                try {
+                    $subscriptionQueue->enqueue($early->dequeue());
+                } catch (SlowConsumerException $overflow) {
+                    $this->connection->emitError($overflow);
+                }
             }
 
             return $subscriptionQueue;
@@ -235,6 +252,11 @@ final class NatsClient
      * Drains a single subscription: stops new deliveries (UNSUB), flushes so in-flight messages are
      * dispatched to the handler, then removes the subscription. Mirrors per-subscription Drain().
      *
+     * One budget (~requestTimeoutMs) covers it all. While reconnecting it waits for the reconnect, like
+     * flush(), and then drains on the new connection; a reconnect never re-subscribes a subscription being
+     * drained. During a drain() the drain takes the subscription over. Failures, and messages it cannot
+     * deliver, are reported through the error listener.
+     *
      * @return Future<void>
      */
     public function drainSubscription(int $sid): Future
@@ -243,7 +265,10 @@ final class NatsClient
     }
 
     /**
-     * Processes a single incoming transport chunk and dispatches parsed frames.
+     * Processes a single incoming transport chunk and dispatches parsed frames. While a reconnect is in
+     * flight it first waits for it, bounded by the cancellation ({@see NatsOptions::$waitForReconnect}).
+     * When another fiber is reading the socket (a request waiting for its reply, the heartbeat), it waits
+     * for that read to finish, bounded by the cancellation, and returns 0: that read delivered what it read.
      *
      * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read.
      * @return Future<int>
@@ -258,7 +283,7 @@ final class NatsClient
      * frame count and whether the read consumed bytes off the wire. A wait loop uses the latter to
      * skip its 1 ms idle sleep on partial-frame progress (a large payload arriving in socket-sized
      * chunks) and yield only on a genuinely idle read (#119). {@see processIncoming()} is the
-     * frame-count-only view of the same cycle.
+     * frame-count-only view of the same cycle, and waits for another fiber's read the same way.
      *
      * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read.
      * @return Future<IncomingChunkResult>
@@ -266,6 +291,24 @@ final class NatsClient
     public function readIncoming(?Cancellation $cancellation = null): Future
     {
         return $this->connection->readIncoming($cancellation);
+    }
+
+    /**
+     * {@see readIncoming()} for an operation that reads while it waits for a result of its own: under
+     * SlowConsumerPolicy::Error, another subscription's overflow is reported instead of failing it
+     * ({@see NatsOptions::$slowConsumerErrorsFailOperations}).
+     *
+     * @internal For the library's own operations (JetStream, Key/Value, polling queues, services); not
+     *           part of the supported API.
+     *
+     * @param int|null $ownSid The operation's own subscription, whose overflow still fails the operation.
+     * @param bool $alwaysReport Report every overflow, whatever the option says: for a read whose caller
+     *        would only swallow it, such as a serving loop.
+     * @return Future<IncomingChunkResult>
+     */
+    public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
+    {
+        return $this->connection->readIncomingForOperation($cancellation, $ownSid, $alwaysReport);
     }
 
     /**
@@ -282,7 +325,8 @@ final class NatsClient
     /**
      * Flushes outbound writes and waits for the server's PONG, confirming the server has processed
      * everything sent so far (e.g. a SUBSCRIBE before a dependent request). Bounded by the request
-     * timeout.
+     * timeout, one budget for the whole flush. While a reconnect is in flight it first waits for it
+     * within that budget ({@see NatsOptions::$waitForReconnect}).
      *
      * @return Future<void>
      */
@@ -300,7 +344,9 @@ final class NatsClient
     }
 
     /**
-     * Sends a request and resolves with the first reply message.
+     * Sends a request and resolves with the first reply message. One timeout bounds the whole request.
+     * While a reconnect is in flight it first waits for it within its timeout
+     * ({@see NatsOptions::$waitForReconnect}).
      *
      * @param Cancellation|null $cancellation Optional external cancellation token.
      * @return Future<NatsMessage>
@@ -315,7 +361,9 @@ final class NatsClient
     }
 
     /**
-     * Sends a request with headers and resolves with the first reply message.
+     * Sends a request with headers and resolves with the first reply message. One timeout bounds the
+     * whole request. While a reconnect is in flight it first waits for it within that timeout
+     * ({@see NatsOptions::$waitForReconnect}).
      *
      * @param array<string,string> $headers
      * @param Cancellation|null $cancellation Optional external cancellation token.
@@ -334,7 +382,9 @@ final class NatsClient
     /**
      * Sends one request and collects multiple replies (scatter-gather), terminating on the first of:
      * {@see $maxResponses} replies, a no-responders sentinel, the per-message {@see $stallMs} gap, or
-     * the total timeout. Mirrors nats.go `RequestMany` / nats.java `Connection.requestMany`.
+     * the total timeout. Mirrors nats.go `RequestMany` / nats.java `Connection.requestMany`. While a
+     * reconnect is in flight it first waits for it within the total timeout
+     * ({@see NatsOptions::$waitForReconnect}).
      *
      * @param array<string,string>|null $headers Optional request headers (null = plain request).
      * @param int|null $maxResponses Stop after this many replies (null = time-bounded only).
@@ -405,7 +455,9 @@ final class NatsClient
     }
 
     /**
-     * Measures the round-trip time to the server (PING/PONG), in seconds.
+     * Measures the round-trip time to the server (PING/PONG), in seconds. While a reconnect is in flight
+     * it first waits for it within the request timeout ({@see NatsOptions::$waitForReconnect}); the wait
+     * is not part of the measured time.
      *
      * @return Future<float>
      */

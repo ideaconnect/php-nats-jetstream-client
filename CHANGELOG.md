@@ -15,6 +15,252 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- An operation whose wait for a reconnect runs out (see `waitForReconnect` below) fails with a
+  `TimeoutException`, for example `Subscribe to "orders" timed out waiting for the connection to be
+  re-established`, where it used to fail at once with `Connection is not open`. `TimeoutException` is not
+  a `ConnectionException`, so a `catch (ConnectionException)` around `subscribe()`, `flush()`, `rtt()`,
+  `request()`, `requestWithHeaders()` or `requestMany()` no longer catches that case.
+- `processIncoming()` and `readIncoming()` without a `Cancellation` now wait for a reconnect in flight to
+  end, and for another fiber's socket read to end, instead of returning or failing at once. Pass a
+  `Cancellation` to bound them.
+- `SubscriptionQueue::fetch()`, and `next()` without a timeout, return `null` during a reconnect instead of
+  throwing `Connection is not open`; `next()` and `fetchAll()` with a timeout wait for the reconnect within
+  it. A reconnect that gives up still throws its error.
+- `drain()` now emits `ConnectionEvent::Closed`, so a listener that reconnects on every `Closed` now also
+  reconnects after a graceful `drain()`.
+- Under `SlowConsumerPolicy::Error`, an overflow that an operation's read runs into is reported through
+  the error listener, logged at error level, instead of failing that operation. With no `errorListener`
+  and no logger it is visible nowhere: register an `errorListener`, or set
+  `slowConsumerErrorsFailOperations: true` to have operations fail as before.
+
+### Added
+
+- `[feature]` `NatsOptions::$waitForReconnect` (default `true`). While a reconnect is in flight,
+  `request()`, `requestWithHeaders()`, `requestMany()`, `subscribe()`, `flush()`, `rtt()`, `drain()`,
+  `drainSubscription()` and the reads - `processIncoming()` / `readIncoming()` and `SubscriptionQueue`
+  polling - wait for it instead of failing at once with `Connection is not open`, then run on the new
+  connection. An operation waits within its own timeout; a read within the `Cancellation` passed to it,
+  and without one until the reconnect ends. A reconnect that gives up surfaces its own error (e.g.
+  `Reconnect attempts exhausted`). Operations still fail at once when no reconnect is in flight, and
+  when called from a connection/error listener while the reconnect is in flight (it runs inside the
+  reconnect, which waits for it). Set `false` to fail
+  fast again, except that `drain()` then closes the connection and throws, and `drainSubscription()`
+  delivers what already arrived and removes the subscription.
+- `[feature]` `SlowConsumerException`, thrown under `SlowConsumerPolicy::Error` when a message arrives
+  for a subscription whose queue is full, carries the subscription's `sid`. It extends
+  `ConnectionException`, which the overflow was thrown as before, with the same message, so existing
+  handlers still catch it; a caller can now tell a subscriber that fell behind from a failed connection.
+- `[feature]` `NatsOptions::$slowConsumerErrorsFailOperations` (default `false`): set `true` to keep the
+  behavior from before the change below, where under `SlowConsumerPolicy::Error` an overflow of any
+  subscription fails whichever operation's read ran into it. An overflow of a `SubscriptionQueue`'s
+  polling buffer that is thrown is then also reported, as it was before. `Service::run()` reports
+  overflows either way.
+
+### Changed
+
+- `[bugfix]` Under `SlowConsumerPolicy::Error`, an operation that reads the socket while it waits for a
+  result of its own no longer fails with another subscription's overflow. It used to throw the overflow
+  (a `ConnectionException`) of whichever subscription's queue its read happened to overflow: a `request()`
+  failed although its reply had arrived (a retry could repeat the work, a JetStream publish could be
+  stored twice), a fetch discarded the messages it had collected (redelivered late, or lost with
+  `max_deliver=1`), and which operation failed was down to chance. Now the overflow is reported through
+  the error listener and the operation completes. This covers `request()`, `requestMany()` and what is
+  built on them (JetStream publish, `ackSync()`, stream and consumer management, Key/Value and Object
+  Store calls), `flush()`, `rtt()`, `fetchBatch()`/`fetchNext()`, `directGetBatch()`, pull consumers
+  (`consumePipelined()`), Key/Value `keys()` and `history()`, and `SubscriptionQueue` polling;
+  `Service::run()`, which used to swallow the overflow without reporting it, now reports it. An overflow
+  of the operation's own subscription (a `SubscriptionQueue`'s) still fails it, once the rest of the read
+  is delivered, and `processIncoming()` / `readIncoming()`, the reads an application makes itself, still
+  throw. `slowConsumerErrorsFailOperations` restores the old behavior. A reported overflow is logged at
+  error level. The README's new Slow Consumers section describes the whole behavior.
+- `[bugfix]` The same now holds for a `SubscriptionQueue`'s own polling buffer, which fills when the
+  application does not poll the queue: under `SlowConsumerPolicy::Error` its overflow is a
+  `SlowConsumerException` naming the queue's subscription - it was a plain `NatsException`, so a
+  `catch (ConnectionException)` now catches it too - thrown to the application's own read and reported
+  when another operation or a background read runs into it. It used to be thrown from whichever read
+  delivered the message, so a `request()` failed although its reply had arrived, and it cut that
+  delivery short: the messages behind it, for other subscriptions too - an operation's reply among them -
+  waited for the next read, and `drain()` discarded them at its deadline. They are now delivered in the
+  same pass. It used to be reported as well as thrown, logged at debug level; now each overflow reaches
+  the application once, and a reported one is logged at error level like any other overflow under
+  `Error` (with `slowConsumerErrorsFailOperations`, one that is thrown is still reported as well).
+- `[bugfix]` `drain()` now emits `ConnectionEvent::Closed` when it closes the connection - once, after
+  the drain is over, so a `Closed` listener can `connect()` again straight away. It used to close the
+  connection without any event; nats.go likewise calls its closed handler after `Drain()`. When
+  something else closed the connection during the drain - a reconnect that gave up, or `disconnect()` -
+  that path's `Closed` is the only one. A listener that reconnects on every `Closed` now also does so
+  after `drain()`, as it already did after `disconnect()`. Every close is now announced once:
+  `disconnect()` of a connection already closed and announced (after `drain()`, after a reconnect that
+  gave up, a second `disconnect()`) closes it again without a second `Closed` event. The same holds when
+  a `disconnect()` - or a `drain()` running out of time - comes while a connect or reconnect that gave up
+  is still closing the socket (a TLS or WebSocket close takes a while): that path's `Closed`, with its
+  error, is the only one. A `disconnect()` there used to announce the close a second time.
+
+### Fixed
+
+- `[bugfix]` A synchronous application could leave a reconnect stalled until the process restarted.
+  A reconnect only advances while something waits on the event loop, and awaiting an operation that
+  fails at once never lets the loop run its dials and backoff timers. So when the heartbeat started a
+  reconnect in the background (a hung server, a dropped connection noticed between operations), a
+  queue worker or daemon whose operations all failed that way stayed `Connecting` and failed every
+  operation from then on. With `waitForReconnect` the first operation waits and so drives the
+  reconnect. A publish buffered during a reconnect now also yields one event-loop tick, so a process that
+  only publishes moves the reconnect along, one tick per publish.
+- `[bugfix]` A request, pull fetch or `processIncoming()` whose socket read failed - or brought a corrupt
+  chunk - while another fiber (typically the heartbeat) was already reconnecting waited for the whole
+  reconnect, ignoring its own timeout - up to the full backoff schedule during a long outage. It now
+  gives up at its own deadline while the reconnect carries on.
+- `[bugfix]` One timeout now covers a whole request: the request timeout (and `requestMany()`'s total
+  timeout) starts when the request is issued, so the wait for a reconnect, the reply-inbox set-up and the
+  publish all count against it, and the reply wait gets what is left. It used to start only after the
+  publish. A request with a
+  non-positive timeout is now rejected before anything is published.
+- `[bugfix]` `flush()` and `rtt()` honor the single `requestTimeoutMs` budget they document: the PING
+  write and the PONG wait used to get a full budget each, so a backpressured flush could take twice
+  as long. `rtt()` does not count a wait for a reconnect as round-trip time.
+- `[bugfix]` `drain()` during a reconnect threw `Connection is not open` without closing anything, so
+  the reconnect could reopen - with every subscription replayed - the connection the application was
+  shutting down, and the publishes buffered during the outage were lost when it fell back to
+  `disconnect()`. `drain()` now waits for the reconnect within its budget, so those publishes are
+  flushed before the drain. If the budget runs out it stops the reconnect at once, bounds its backlog
+  pass by the same budget, and reports the buffered publishes it discards through the error listener;
+  `connect()` is refused (`Cannot connect: drain in progress`) until the drain is over, because the
+  drain's teardown would close a connection opened meanwhile. When it cannot wait (`waitForReconnect`
+  disabled, or called from a connection/error listener) it closes the connection, reports what it
+  discards - the buffered publishes and the messages received but not yet delivered - and throws
+  `Cannot drain while reconnecting: the connection was closed instead`, matching nats.go's `Drain()`.
+- `[bugfix]` `drainSubscription()` could leave the subscription alive on the server. When the
+  connection was lost during its flush, the reconnect re-subscribed the sid and `drainSubscription()`
+  then removed it only locally: the server kept delivering to a sid nothing handles, and for a queue
+  group that member silently took its share of the group's messages. A subscription being drained is
+  no longer re-subscribed.
+- `[bugfix]` A subscription removed while a reconnect was between re-subscribing and going live -
+  `unsubscribe()` and `drainSubscription()` can then only remove it locally - stayed subscribed on the
+  server, with the same effect. It is now unsubscribed on the new connection before that goes live, and
+  so is an auto-unsubscribe max armed in that window, which used to leave the server delivering past
+  the max.
+- `[bugfix]` `drainSubscription()` while reconnecting, or during `drain()`, dropped the messages already
+  received for the subscription without delivering or reporting them. While reconnecting it now waits for
+  the reconnect within its budget, like `flush()`, and drains on the new connection - so it also delivers
+  what the server sends on a subscription the reconnect had already re-subscribed before its UNSUB lands;
+  when it cannot wait (`waitForReconnect` disabled, a listener inside the reconnect, the budget spent) it
+  delivers what arrived. During a `drain()` it leaves the subscription to the drain, whose flush may still
+  bring messages for it: removing it at once dropped those. Its UNSUB write is bounded by its budget like
+  `drain()`'s writes; a peer that stopped reading held it forever. A handler that throws during it is
+  reported through the error listener and delivery goes on, like in `drain()`: a handler failing inside
+  its flush was swallowed without a trace,
+  and one failing in its final delivery made it throw and keep the subscription. When a delivery for the
+  subscription is already under way - a handler draining its own subscription included - that delivery
+  now hands over the messages queued behind it and then removes the subscription; the handler that
+  drained itself used to lose them. An UNSUB that fails because the connection just dropped no longer
+  makes it throw and keep the subscription: it still delivers and removes it. A second call for a sid
+  that is already being drained now resolves at once, instead of sending a second UNSUB.
+- `[bugfix]` `disconnect()` during a reconnect let the reconnect run on until its current backoff delay
+  ended, so a `connect()` right after the close joined it and failed with `Recovery was aborted before
+  the connection opened`, and a close during the backoff after the last attempt was reported as
+  `Reconnect attempts exhausted` with a second `Closed` event. Closing now cuts the backoff short, so a
+  reconnect waiting between attempts stops at once (an attempt already dialling finishes first), and it
+  stops without reporting exhaustion - also when its attempt then fails authentication, which used to
+  announce the close a second time. A `connect()` issued while such a reconnect is still winding down
+  now fails at once instead of waiting for it: it could never open the connection, and when the
+  `connect()` came from a `Closed` listener that the reconnect itself was waiting on, the wait never
+  ended.
+- `[bugfix]` `disconnect()` while `connect()` was still dialling, or retrying a failed first dial
+  (`retryOnFailedInitialConnect`), was overridden: the dial went `Open` behind the announced close, with
+  close intent still set, so nothing would recover that connection later. `connect()` now fails with
+  `Connect was aborted before the connection opened`, and the retries' backoff is cut short. A
+  `disconnect()` during the last retry, whose dial then failed too, no longer makes `connect()` report
+  that dial's error and announce the close a second time.
+- `[bugfix]` A read, write or heartbeat that failed on a connection the application had since closed and
+  reopened - for example from an error listener that reconnects - started a reconnect of the new,
+  healthy connection. Failures are now tied to the connection they happened on.
+- `[bugfix]` `drain()` whose connection died while it waited for its flush `PONG` read the dead socket
+  until its budget ran out; it now ends the flush at once. A server `PING` answered during a drain is
+  bounded by the drain budget like the drain's own writes, so a stalled socket cannot hold it past it.
+- `[bugfix]` A publish issued while `disconnect()` was closing the connection during a reconnect was
+  accepted into the reconnect buffer and reported success, then discarded silently. Publishes are
+  refused once a close is under way.
+- `[bugfix]` A reconnect the server refused to authenticate discarded the publishes buffered during the
+  outage without reporting them. It now reports them as an exhausted reconnect does (`Reconnect failed
+  authentication: N bytes of buffered publishes were discarded`).
+- `[bugfix]` A logger that threw while an exhausted reconnect reported the publishes it discarded
+  aborted the cleanup: the connection kept its subscriptions and no `Closed` event was emitted. A
+  logger that threw on a reconnect's "attempt failed" line ended the reconnect, leaving the connection
+  `Connecting` for good, and one that threw while a lifecycle event was logged kept that event from the
+  connection listener. A logger that threw on a failed read skipped the reconnect: the connection stayed
+  `Open` on a dead socket and every later read failed with the logger's exception. And one that threw on
+  an error the heartbeat's own read picked up (a fatal `-ERR`, a corrupt stream) escaped into the event
+  loop. All of these are now contained.
+- `[bugfix]` Under `SlowConsumerPolicy::Error`, a subscriber that could not keep up made the connection
+  close for good on its next reconnect. With its queue full - nothing delivers while a reconnect runs -
+  the first message the server sent after the reconnect re-subscribed it overflowed the queue, and the
+  overflow failed the attempt like a fatal server error; every attempt failed the same way until the
+  reconnect gave up, closed the connection and discarded the queued messages. The overflow now drops
+  that message and is reported through the error listener, as the policy says, and the reconnect carries
+  on; a fatal `-ERR` in the same read still fails the attempt. An overflow among the frames read just
+  before a corrupt one was not reported at all; it is now.
+- `[bugfix]` The flushes of `drain()` and `drainSubscription()` ended early when one of their reads
+  overflowed a subscription's queue under `SlowConsumerPolicy::Error`, or when a handler threw while they
+  delivered, and the messages still in flight were then lost without a trace: `drain()` closed the socket
+  on them, and for `drainSubscription()` they arrived after the subscription was removed. The overflow or
+  the handler's failure is reported through the error listener and the flush reads on to its `PONG`.
+- `[bugfix]` Under `SlowConsumerPolicy::Error`, the application's own read that met a subscription's
+  overflow and then a fatal `-ERR` threw the overflow and only reported the `-ERR`, so the caller took a
+  failed connection for a subscriber that fell behind. The `-ERR` is now thrown and the overflow reported.
+- `[bugfix]` Under `SlowConsumerPolicy::Error`, a read that ended in a corrupt frame could lose an
+  overflow: a second overflow in that read replaced the first, which was then neither thrown nor
+  reported - as did the failure of a connection that could not recover from that frame. Each overflow now
+  reaches the application once.
+- `[bugfix]` Under `SlowConsumerPolicy::Error`, an error listener that reacted to an overflow by reading on
+  the connection - `drainSubscription($error->sid)`, say - could have messages delivered out of order: the
+  overflow was reported before the rest of its read was queued, and the listener's read delivered the
+  next read's messages ahead of it. An overflow is now reported once its read is queued.
+- `[bugfix]` A handler that threw while the heartbeat's own read delivered was swallowed without a trace,
+  and the messages behind it waited for the next read. A handler that threw while a reconnect's handshake
+  delivered (the server had sent a frame right behind its `PONG`) failed that reconnect attempt. Both are
+  now reported through the error listener, and delivery goes on.
+- `[bugfix]` `SubscriptionQueue::fetchAll()` that failed - on an overflow of its own subscription under
+  `SlowConsumerPolicy::Error`, say - lost the messages it had already taken from the queue's buffer:
+  neither returned nor counted. They are now put back, in order, for the next call.
+- `[bugfix]` `subscribeQueue()` threw when the messages that arrived before its queue existed did not fit
+  in it under `SlowConsumerPolicy::Error`: the rest of those messages were lost, and the subscription stayed
+  registered, feeding a queue nobody held. The overflow is now counted and reported, and the queue is
+  returned.
+- `[bugfix]` Key/Value `keys()` and `history()` could return a cut-short list as if it were complete (under
+  the default `DropOldest`), or fail (under `Error`), when one read brought more records than
+  `maxPendingMessagesPerSubscription` - possible once `readChunkSizeBytes` is raised. Their replay
+  subscriptions are now exempt from that bound, like the JetStream fetch inboxes: the listing bounds
+  them.
+- `[bugfix]` Under `SlowConsumerPolicy::DropOldest` and `DropNewest`, a message the policy discarded was
+  reported in the middle of the read that brought it, as were a recoverable `-ERR` and a malformed async
+  `INFO`: an error listener that read on the connection then had the next read's messages delivered ahead
+  of the rest of that one. They are now reported once the read has queued everything it read, like the
+  `Error` overflows. A logger that threw on one of these reports failed the read - under `DropOldest` after
+  the oldest message was gone but before the new one was queued, so that one was lost too - and so did one
+  that threw on a `SubscriptionQueue`'s own drop report. A logger that throws on any report is now
+  contained, and the error listener still gets the report: a handler's failure after a reconnect and a
+  JetStream push consumer's status used to be kept from it.
+- `[bugfix]` A `processIncoming()` or `readIncoming()` loop could freeze the process at 100% CPU. When
+  another fiber held the socket read - a request waiting for its reply, or the heartbeat reading the
+  answer to its `PING` (a handler that awaits something is enough to let it start) - the call returned `0`
+  at once without handing the event loop control, so no timer or socket read ran again, that other read's
+  included. It now waits for that read to finish, bounded by its cancellation, and then returns `0`. A
+  loop over `SubscriptionQueue::fetch()`, or `next()` without a timeout, spun the same way and is fixed
+  with it.
+- `[bugfix]` A request made by a handler of a message that arrived during a reconnect timed out, and
+  `drain()` called from a `Reconnected` listener waited out its whole budget before closing. The read whose
+  failure started the reconnect held the socket read until the reconnect was over, so nothing called from
+  inside the reconnect could read. That read now lets go of the socket before it reconnects.
+- `[bugfix]` A reconnect with a large `maxReconnectAttempts` crashed after about 60 attempts instead of
+  backing off at `reconnectMaxDelayMs`: `reconnectDelayMs * 2^(attempt - 1)` left the int range, and
+  casting the out-of-range float gave a garbage, possibly negative, delay that `delay()` rejected
+  ("Delay must be greater than or equal to zero"; PHP 8.5 also warns that the float is not
+  representable as an int). The delay is now capped before the cast.
+
 ## [2.8.0] - 2026-08-08
 
 ### Added

@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit\Mutation;
 
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
@@ -439,7 +441,7 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         self::assertSame([], self::getProp($connection, 'pongWaiters'));
     }
 
-    // kills ReturnRemoval @ line 629 (concurrent-read guard returns 0 without reading)
+    // kills ReturnRemoval @ the concurrent-read guard (it waits for the other read, then returns 0 without reading)
     public function testProcessIncomingReturnsZeroWhenReadAlreadyInProgress(): void
     {
         $connection = $this->openConnection(["MSG updates 1 5\r\nhello\r\n"], transport: $transport);
@@ -451,13 +453,18 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         // Pretend a concurrent read owns the socket.
         self::setProp($connection, 'readInProgress', true);
 
-        // Guard must short-circuit to 0 WITHOUT consuming the queued frame.
-        $frames = $connection->processIncoming()->await();
-        self::assertSame(0, $frames);
+        // The guard waits for that read instead of starting a second one...
+        $frames = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.01);
+        self::assertFalse($frames->isComplete());
+
+        // ...and once it ends, returns 0 WITHOUT consuming the queued frame.
+        self::setProp($connection, 'readInProgress', false);
+        (new \ReflectionMethod($connection, 'signalReadSlotFree'))->invoke($connection);
+        self::assertSame(0, $frames->await());
         self::assertSame([], $received);
 
-        // Release the guard: the still-queued frame is now read and dispatched.
-        self::setProp($connection, 'readInProgress', false);
+        // The still-queued frame is read and dispatched by the next call.
         self::assertSame(1, $connection->processIncoming()->await());
         self::assertSame(['hello'], $received);
     }
@@ -469,8 +476,11 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();
 
-        // Read #1 enters the blocking socket read; it must set readInProgress = true.
-        $read1 = async(static fn(): int => $connection->processIncoming()->await());
+        // Read #1 enters the blocking socket read; it must set readInProgress = true. The gate keeps it
+        // parked on a live timer, as a socket watcher would, until the test lets it go: a read parked on
+        // nothing at all would be collected with its fiber once the event loop runs out of work.
+        $gate = new DeferredCancellation();
+        $read1 = async(static fn(): int => $connection->processIncoming($gate->getCancellation())->await());
         // Cooperatively let read1 enter readLine() and latch the in-progress flag.
         while ($transport->startedReads < 1) {
             delay(0.001);
@@ -478,12 +488,23 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
 
         self::assertTrue(self::getProp($connection, 'readInProgress'), 'first read must latch readInProgress');
 
-        // Read #2 must be excluded by the guard and return 0 immediately. If 632 set the flag false,
-        // read2 would instead enter a second blocking read and its bounded cancellation would throw.
-        $read2 = $connection->processIncoming(new TimeoutCancellation(1.0))->await();
-        self::assertSame(0, $read2);
+        // Read #2 must be excluded by the guard: it waits for read #1 until its own cancellation instead of
+        // starting a second socket read, which it would if 632 set the flag false.
+        try {
+            $connection->processIncoming(new TimeoutCancellation(0.05))->await();
+            self::fail('expected read #2 to wait for read #1 until its cancellation');
+        } catch (CancelledException) {
+            // Expected: read #1 still owns the socket.
+        }
 
-        $read1->ignore();
+        self::assertSame(1, $transport->startedReads, 'read #2 did not start a second socket read');
+
+        $gate->cancel();
+        try {
+            $read1->await();
+        } catch (CancelledException) {
+            // Read #1 let go.
+        }
     }
 
     // kills MethodCallRemoval @ line 643 (read failure surfaces to the error listener)

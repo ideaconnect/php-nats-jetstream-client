@@ -96,6 +96,31 @@ final class NatsOptions
       *        the per-chunk syscall + fiber-spawn + parser-push overhead for large payloads (e.g. an
       *        ObjectStore download) without forcing larger reads: the socket still returns only what is
       *        available, so small messages are unaffected (#119). Must be at least 1.
+      * @param bool $waitForReconnect While a reconnect is in flight, operations that need an open
+      *        connection - request()/requestWithHeaders()/requestMany(), subscribe(), flush(), rtt(),
+      *        processIncoming()/readIncoming(), drain() and drainSubscription() - wait for it within their
+      *        own timeout (or cancellation) instead of failing at once with "Connection is not open", and a
+      *        publish buffered during the reconnect yields one event-loop tick. The wait is also what lets
+      *        a synchronous application drive the reconnect: the reconnect only advances while something
+      *        waits on the event loop, so a caller that only ever issued operations failing on the spot
+      *        would starve it forever. Set `false` to fail fast instead (the behavior before this option
+      *        existed), except that drain() then closes the connection and throws rather than leaving the
+      *        reconnect to reopen a connection being shut down, and drainSubscription() delivers what
+      *        already arrived and removes the subscription at once.
+      * @param bool $slowConsumerErrorsFailOperations Under {@see SlowConsumerPolicy::Error}: whether a full
+      *        subscription queue fails whichever operation's read ran into it. Operations read the socket
+      *        themselves while they wait for a result of their own - request()/requestMany(), flush(),
+      *        rtt(), JetStream fetches, directGetBatch() and consumePipelined(), Key/Value keys() and
+      *        history(), SubscriptionQueue polling - and so pick up messages for every subscription. By
+      *        default an overflow of another subscription is reported through the error listener and the
+      *        operation completes: that subscriber fell behind, the operation did not (an overflow of the
+      *        operation's own subscription still fails it). Set `true` for the behavior before this
+      *        option existed: any overflow fails the operation that read it, even a request whose reply
+      *        had already arrived - and an overflow of a SubscriptionQueue's polling buffer that is thrown
+      *        is reported as well, as it was then, so that code swallowing the failure cannot lose it.
+      *        processIncoming() and readIncoming() throw an overflow either way. Service::run(), which has
+      *        no caller to fail, the heartbeat, a reconnect and drain()/drainSubscription() report it
+      *        either way. A SubscriptionQueue's own polling buffer follows the same rules.
      */
     public function __construct(
         public readonly array $servers = [self::DEFAULT_SERVER],
@@ -141,6 +166,8 @@ final class NatsOptions
         public readonly bool $webSocketCompression = false,
         public readonly ?LoggerInterface $logger = null,
         public readonly int $readChunkSizeBytes = 131_072,
+        public readonly bool $waitForReconnect = true,
+        public readonly bool $slowConsumerErrorsFailOperations = false,
     ) {
         // Fail fast on values that have no valid meaning, rather than misbehaving later. Note that
         // pingIntervalSeconds <= 0 (disables the heartbeat) and an empty servers list (falls back to
