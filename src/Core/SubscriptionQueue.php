@@ -9,6 +9,7 @@ use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\SlowConsumerException;
 use SplQueue;
 
 use function Amp\delay;
@@ -64,8 +65,8 @@ final class SubscriptionQueue
             // A drop must never be silent (#134): this queue is where connection-level drains land
             // for polling consumers, so overflow here is the real slow-consumer signal. Count it and
             // route it through the client's error listener exactly like the connection layer does
-            // for its own queue (same message shape, same debug level - drops are a per-message hot
-            // path and must not flood error logs).
+            // for its own queue (same message shape; the drop policies' reports log at debug level -
+            // drops are a per-message hot path and must not flood error logs).
             if ($this->slowConsumerPolicy === SlowConsumerPolicy::DropOldest) {
                 $this->messages->dequeue();
                 $this->droppedCount++;
@@ -76,15 +77,17 @@ final class SubscriptionQueue
 
                 return;
             } else {
-                // Error policy: the overflowing message is dropped and the loss is surfaced loudly.
-                // The drop must still be observable and counted, exactly like DropOldest/DropNewest,
-                // so droppedCount()/the error listener never miss it (#134/#159); the throw then
-                // propagates the failure to the caller.
+                // Error policy: the overflowing message is dropped and counted, like DropOldest and
+                // DropNewest (#134/#159), and the loss is surfaced as a SlowConsumerException for this
+                // queue's subscription. The connection's read that delivered the message decides where it
+                // goes, as for an overflow of the subscription itself: the application's own read and this
+                // queue's own poll throw it; another operation, the heartbeat, a reconnect or a drain
+                // reports it through the error listener, logged at error level. Each overflow reaches the
+                // application once - except that with NatsOptions::$slowConsumerErrorsFailOperations one
+                // that is thrown is reported as well, as it was before that option existed.
                 $this->droppedCount++;
-                $overflow = new NatsException('Subscription queue overflow for sid ' . $this->sid);
-                $this->client->emitError($overflow, 'debug');
 
-                throw $overflow;
+                throw new SlowConsumerException($this->sid);
             }
         }
 
@@ -158,7 +161,7 @@ final class SubscriptionQueue
         $cancellation = new TimeoutCancellation(self::NON_BLOCKING_TIMEOUT);
 
         try {
-            $this->client->processIncoming($cancellation)->await();
+            $this->client->readIncomingForOperation($cancellation, $this->sid)->await();
         } catch (CancelledException) {
             // Nothing was immediately available; honor the non-blocking contract.
         }
@@ -184,7 +187,7 @@ final class SubscriptionQueue
             $cancellation = new TimeoutCancellation(self::NON_BLOCKING_TIMEOUT);
 
             try {
-                $this->client->processIncoming($cancellation)->await();
+                $this->client->readIncomingForOperation($cancellation, $this->sid)->await();
             } catch (CancelledException) {
                 // Nothing was immediately available.
             }
@@ -199,7 +202,7 @@ final class SubscriptionQueue
 
         try {
             do {
-                $read = $this->client->readIncoming($cancellation)->await();
+                $read = $this->client->readIncomingForOperation($cancellation, $this->sid)->await();
 
                 if ($this->messages->count() > 0) {
                     break;
@@ -250,7 +253,21 @@ final class SubscriptionQueue
 
         try {
             while ($limit === null || count($collected) < $limit) {
-                $read = $this->client->readIncoming($cancellation)->await();
+                try {
+                    $read = $this->client->readIncomingForOperation($cancellation, $this->sid)->await();
+                } catch (CancelledException $cancelled) {
+                    throw $cancelled;
+                } catch (\Throwable $failure) {
+                    // The read failed - an overflow of this queue's own subscription, say. The messages this
+                    // call already took from the buffer go back to its front, in order, for the next call:
+                    // failing must not lose them.
+                    for ($i = count($collected) - 1; $i >= 0; $i--) {
+                        $this->messages->unshift($collected[$i]);
+                    }
+
+                    throw $failure;
+                }
+
                 $frames = $read->frames;
 
                 while (!$this->messages->isEmpty() && ($limit === null || count($collected) < $limit)) {

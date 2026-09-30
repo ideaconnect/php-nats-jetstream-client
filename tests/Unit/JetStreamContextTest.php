@@ -9141,7 +9141,14 @@ final class JetStreamContextTest extends TestCase
             }
         };
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000, logger: $logger), $transport);
+        $errors = [];
+        $client = new NatsClient(new NatsOptions(
+            requestTimeoutMs: 1000,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
+            },
+            logger: $logger,
+        ), $transport);
         $client->connect()->await();
 
         $received = [];
@@ -9158,6 +9165,8 @@ final class JetStreamContextTest extends TestCase
 
         self::assertGreaterThanOrEqual(1, $logger->errorLogAttempts, 'precondition: the throwing error-log path must actually have fired');
         self::assertSame(['hello'], $received, 'a throwing logger must never break the dispatch loop');
+        // Nor does it keep the surfaced status from the error listener.
+        self::assertCount($logger->errorLogAttempts, $errors, 'every error the logger threw on still reached the listener: ' . json_encode($errors));
     }
 
     /**

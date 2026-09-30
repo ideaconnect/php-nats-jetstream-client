@@ -105,7 +105,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $this->setPrivate($connection, 'unboundedSids', [$sid => true]);
 
         for ($i = 0; $i < 5; $i++) {
-            $this->invokePrivate($connection, 'enqueueMessage', $sid, $this->message('_INBOX.base.a'));
+            $this->enqueueMessage($connection, $sid, $this->message('_INBOX.base.a'));
         }
 
         /** @var array<int, \SplQueue<NatsMessage>> $pending */
@@ -128,7 +128,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Subscription queue overflow for sid ' . $sid);
-        $this->invokePrivate($connection, 'enqueueMessage', $sid, $this->message('c'));
+        $this->enqueueMessage($connection, $sid, $this->message('c'));
     }
 
     /** A terminal close resets all mux state so the next connect() starts a fresh epoch. */
@@ -164,6 +164,20 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $ref = new \ReflectionMethod($object, $method);
 
         return $ref->invoke($object, ...$args);
+    }
+
+    /**
+     * Queues a message through the real intake path, the way handleFrame() does, and returns what the
+     * intake reported (a drop policy's report).
+     *
+     * @return list<array{\Throwable, string}>
+     */
+    private function enqueueMessage(NatsConnection $connection, int $sid, NatsMessage $message): array
+    {
+        $reports = [];
+        (new \ReflectionMethod($connection, 'enqueueMessage'))->invokeArgs($connection, [$sid, $message, &$reports]);
+
+        return $reports;
     }
 
     private function setPrivate(object $object, string $property, mixed $value): void

@@ -121,5 +121,17 @@ final class NatsOptionsTest extends TestCase
         self::assertFalse($options->webSocketCompression);
         self::assertNull($options->logger);
         self::assertSame(131072, $options->readChunkSizeBytes);
+        self::assertTrue($options->waitForReconnect);
+        self::assertFalse($options->slowConsumerErrorsFailOperations);
+    }
+
+    public function testWaitForReconnectCanBeDisabled(): void
+    {
+        self::assertFalse((new NatsOptions(waitForReconnect: false))->waitForReconnect);
+    }
+
+    public function testSlowConsumerErrorsCanBeMadeToFailOperations(): void
+    {
+        self::assertTrue((new NatsOptions(slowConsumerErrorsFailOperations: true))->slowConsumerErrorsFailOperations);
     }
 }

@@ -21,7 +21,11 @@ enum ConnectionEvent
     /** A reconnect attempt succeeded and subscriptions were replayed. */
     case Reconnected;
 
-    /** The connection was closed permanently (explicit disconnect or reconnect attempts exhausted). */
+    /**
+     * The connection was closed for good: by disconnect(), by drain() - once, when the drain is over -
+     * or because connecting or reconnecting gave up (attempts exhausted, credentials refused, or the
+     * connection was lost with reconnect disabled).
+     */
     case Closed;
 
     /** The server advertised additional cluster endpoints in an async INFO (`connect_urls`). */

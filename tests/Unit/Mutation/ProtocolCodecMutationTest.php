@@ -99,11 +99,11 @@ final class ProtocolCodecMutationTest extends \PHPUnit\Framework\TestCase
     /**
      * When Composer's InstalledVersions metadata is available (as it is in this test run), the
      * resolved client version must be the package's installed pretty-version, NOT the in-source
-     * FALLBACK_CLIENT_VERSION constant ('2.4.0').
+     * FALLBACK_CLIENT_VERSION constant.
      *
      * This single behaviour distinguishes the real code from every clientVersion() mutant that
      * forces the fallback path: the IfNegation @ 121, the NotIdentical/LogicalAnd*-Negation
-     * variants @ 124, and the ReturnRemoval @ 125 all return '2.4.0' instead of the installed
+     * variants @ 124, and the ReturnRemoval @ 125 all return the fallback instead of the installed
      * version.
      */
     public function testConnectAdvertisesInstalledVersionNotFallback(): void
@@ -116,14 +116,16 @@ final class ProtocolCodecMutationTest extends \PHPUnit\Framework\TestCase
         self::assertNotNull($installed);
         self::assertNotSame('', $installed);
         // Guard against an accidental coincidence where the installed version equals the fallback.
-        self::assertNotSame('2.4.0', $installed, 'Installed version must differ from the fallback for this test to discriminate.');
+        $fallback = (new \ReflectionClassConstant(ProtocolCodec::class, 'FALLBACK_CLIENT_VERSION'))->getValue();
+        self::assertIsString($fallback);
+        self::assertNotSame($fallback, $installed, 'Installed version must differ from the fallback for this test to discriminate.');
 
         $result = (new ProtocolCodec())->encodeConnect(new NatsOptions());
 
         // kills IfNegation @ 121, NotIdentical @ 124 (=== null), NotIdentical @ 124 (=== ''),
         // LogicalAndAllSubExprNegation @ 124, LogicalAndNegation @ 124, ReturnRemoval @ 125.
         self::assertStringContainsString('"version":' . json_encode($installed), $result);
-        self::assertStringNotContainsString('"version":"2.4.0"', $result);
+        self::assertStringNotContainsString('"version":' . json_encode($fallback), $result);
     }
 
     /**

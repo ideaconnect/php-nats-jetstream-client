@@ -901,7 +901,7 @@ final class JetStreamContext
 
                     $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
                     try {
-                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
                         if (!$read->consumedBytes) {
                             // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
                             // completed no frame yet (a chunked batch payload) loops immediately so the
@@ -1608,8 +1608,9 @@ final class JetStreamContext
                     // connection dropping DURING the reap awaits is a disconnect collision too.
                     if ($sawNotOpen || $this->client->state() !== ConnectionState::Open) {
                         // The CONNECTION dropped mid-recreate - this is not a terminal consumer
-                        // failure (requests fail fast while not Open, so all attempts burn in
-                        // milliseconds during a reconnect window). Do NOT tear the consumer down:
+                        // failure (while not Open a request either fails fast or waits out its budget
+                        // for the reconnect, so the attempts cannot rebuild the consumer during a
+                        // reconnect window that outlasts them). Do NOT tear the consumer down:
                         // release the never-adopted fresh inbox and defer to the heartbeat watchdog,
                         // which rebases its silence clock while the connection is down and fires
                         // again once it is Open - retrying with a fresh attempt budget (nats.go
@@ -2458,7 +2459,7 @@ final class JetStreamContext
 
                     $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
                     try {
-                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
                         if (!$read->consumedBytes) {
                             // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
                             // completed no frame yet (a chunked batch payload) loops immediately so the
@@ -2938,7 +2939,7 @@ final class JetStreamContext
 
                     $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
                     try {
-                        $read = $this->client->readIncoming($waitCancellation)->await();
+                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
                         if (!$read->consumedBytes) {
                             // A genuinely idle read yields 1 ms; a read that consumed bytes but completed no
                             // frame yet (a chunked payload) loops immediately to drain the rest (#119).

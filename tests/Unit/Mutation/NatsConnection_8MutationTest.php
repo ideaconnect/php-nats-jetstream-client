@@ -15,6 +15,7 @@ use IDCT\NATS\Tests\Support\FakeTransport;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
+use function Amp\delay;
 use function Amp\Future\await;
 
 /**
@@ -44,12 +45,13 @@ final class NatsConnection_8MutationTest extends TestCase
     }
 
     /**
-     * When another fiber already owns the socket read ($readInProgress), a second readIncoming() must
-     * report a GENUINELY IDLE result (consumedBytes=false) so a wait loop yields 1 ms rather than
-     * spinning against a read it never actually performed.
+     * When another fiber already owns the socket read ($readInProgress), a second readIncoming() waits for
+     * that read to finish and then reports a GENUINELY IDLE result (consumedBytes=false), so a wait loop
+     * yields 1 ms rather than spinning against a read it never actually performed.
      *
-     * kills FalseValue @ line 1365: mutation returns IncomingChunkResult(0, true) here, which would
-     * tell a wait loop it "made wire progress" while another fiber holds the socket - a busy spin.
+     * kills FalseValue @ the concurrent-read guard: mutation returns IncomingChunkResult(0, true) there,
+     * which would tell a wait loop it "made wire progress" while another fiber holds the socket - a busy
+     * spin.
      */
     public function testReadInProgressReportsIdleNotConsumed(): void
     {
@@ -64,25 +66,27 @@ final class NatsConnection_8MutationTest extends TestCase
         $parkedRead = $connection->readIncoming($gate->getCancellation());
         $parkedRead->ignore();
 
-        try {
-            // The second read observes $readInProgress and takes the early-return branch at line 1365.
-            $result = $connection->readIncoming()->await();
+        // The second read observes $readInProgress and waits for the first one to finish.
+        $secondRead = $connection->readIncoming();
+        delay(0.01);
+        self::assertFalse($secondRead->isComplete(), 'it waits for the read that owns the socket');
 
-            self::assertInstanceOf(IncomingChunkResult::class, $result);
-            self::assertSame(0, $result->frames, 'a skipped read completes no frames');
-            self::assertFalse(
-                $result->consumedBytes,
-                'a read skipped because another fiber owns the socket is idle, not wire progress',
-            );
-        } finally {
-            // Unwind the parked first read so no fiber is left suspended past the test.
-            $gate->cancel();
-            try {
-                $parkedRead->await();
-            } catch (\Throwable) {
-                // Cancelled read: expected on teardown.
-            }
+        // The first read ends (cancelled); the second then returns without reading.
+        $gate->cancel();
+        try {
+            $parkedRead->await();
+        } catch (\Throwable) {
+            // Cancelled read: expected.
         }
+
+        $result = $secondRead->await();
+        self::assertInstanceOf(IncomingChunkResult::class, $result);
+        self::assertSame(0, $result->frames, 'a skipped read completes no frames');
+        self::assertFalse(
+            $result->consumedBytes,
+            'a read skipped because another fiber owns the socket is idle, not wire progress',
+        );
+        self::assertSame(1, $transport->startedReads, 'no second socket read was started');
     }
 
     /**

@@ -117,7 +117,7 @@ final class DrainScanPendingDirtyTest extends TestCase
         }
 
         // Enqueue a message for sid 2 only, through the real intake path.
-        $this->invokePrivate($connection, 'enqueueMessage', 2, new NatsMessage('two', 2, null, 'm'));
+        $this->enqueueMessage($connection, 2, new NatsMessage('two', 2, null, 'm'));
 
         // Dirty set holds ONLY sid 2 - not all three subscriptions.
         self::assertSame([2 => true], $this->getPrivate($connection, 'pendingDirty'));
@@ -148,7 +148,7 @@ final class DrainScanPendingDirtyTest extends TestCase
 
         self::assertFalse($this->invokePrivate($connection, 'hasUndeliveredDrainBacklog'));
 
-        $this->invokePrivate($connection, 'enqueueMessage', 7, new NatsMessage('s', 7, null, 'x'));
+        $this->enqueueMessage($connection, 7, new NatsMessage('s', 7, null, 'x'));
         self::assertTrue($this->invokePrivate($connection, 'hasUndeliveredDrainBacklog'));
 
         $this->invokePrivate($connection, 'drainAllPending');
@@ -169,6 +169,20 @@ final class DrainScanPendingDirtyTest extends TestCase
     private function invokePrivate(object $object, string $method, mixed ...$args): mixed
     {
         return (new \ReflectionMethod($object, $method))->invoke($object, ...$args);
+    }
+
+    /**
+     * Queues a message through the real intake path, the way handleFrame() does, and returns what the
+     * intake reported (a drop policy's report).
+     *
+     * @return list<array{\Throwable, string}>
+     */
+    private function enqueueMessage(NatsConnection $connection, int $sid, NatsMessage $message): array
+    {
+        $reports = [];
+        (new \ReflectionMethod($connection, 'enqueueMessage'))->invokeArgs($connection, [$sid, $message, &$reports]);
+
+        return $reports;
     }
 
     private function setPrivate(object $object, string $property, mixed $value): void

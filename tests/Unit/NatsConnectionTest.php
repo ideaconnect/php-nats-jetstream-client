@@ -23,11 +23,13 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\ProtocolException;
+use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FixedNonceSigner;
 use IDCT\NATS\Tests\Support\FlakyTransport;
+use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
@@ -1162,8 +1164,8 @@ final class NatsConnectionTest extends TestCase
         self::assertStringContainsString('UNSUB ' . $sid . "\r\n", $writes);
         self::assertStringContainsString("PING\r\n", $writes);
 
-        // The subscription is gone: a further frame for that sid is ignored.
-        self::assertSame(0, $connection->processIncoming()->await());
+        // The subscription is gone.
+        self::assertFalse($connection->isSubscriptionActive($sid));
     }
 
     /**
@@ -1743,6 +1745,8 @@ final class NatsConnectionTest extends TestCase
         $transport = new class ($info, $release) implements TransportInterface {
             /** @var list<string> */
             public array $writes = [];
+            /** @var (\Closure(): void)|null Called on every write (see the seal check below). */
+            public ?\Closure $onWrite = null;
             private int $connects = 0;
             /** @var list<list<string>> */
             private array $reads;
@@ -1779,6 +1783,9 @@ final class NatsConnectionTest extends TestCase
                 // PoC modelled, which re-fills the buffer under an unbounded flush loop.
                 return async(function () use ($bytes): void {
                     $this->writes[] = $bytes;
+                    if ($this->onWrite !== null) {
+                        ($this->onWrite)();
+                    }
                 });
             }
 
@@ -1801,7 +1808,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        // waitForReconnect off: a publish buffered during the reconnect then returns without yielding, so
+        // the publisher below re-fills the buffer during every flush write - the pressure the seal exists
+        // for. (With the one-tick yield the flush drains the buffer before it can be re-filled.)
+        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, waitForReconnect: false), $transport);
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -1818,6 +1828,12 @@ final class NatsConnectionTest extends TestCase
         // stop a failing run from spinning forever.
         $published = 0;
         $hardCap = 2000;
+        // The flush's last writes happen with the buffer sealed: record whether it ever was.
+        $sealed = false;
+        $gate = new \ReflectionProperty(NatsConnection::class, 'reconnectFlushGate');
+        $transport->onWrite = static function () use ($connection, $gate, &$sealed): void {
+            $sealed = $sealed || $gate->getValue($connection) !== null;
+        };
         $publisher = async(function () use ($connection, &$published, $hardCap): void {
             while ($published < $hardCap && $connection->state() !== ConnectionState::Open) {
                 try {
@@ -1837,6 +1853,7 @@ final class NatsConnectionTest extends TestCase
             $connection->state(),
             'recovery must reach Open despite sustained publish pressure (#165)',
         );
+        self::assertTrue($sealed, 'the publisher kept re-filling the buffer until the flush sealed it');
         self::assertLessThan(
             100,
             $published,
@@ -2223,10 +2240,50 @@ final class NatsConnectionTest extends TestCase
     /**
      * A user read racing the recovery's own replay read (the post-SUB poll for prompt -ERR
      * frames) must not start an overlapping transport read - on a real socket that is Amp's
-     * PendingReadError, aborting an otherwise-successful reconnect (#148). The user read is
-     * refused (connection not open) until the replay completes.
+     * PendingReadError, aborting an otherwise-successful reconnect (#148). The user read waits for
+     * the recovery (waitForReconnect, the default) and only then reads - from the new socket, after
+     * the replay completed and the connection flipped Open.
      */
     public function testUserReadDuringReplayWindowDoesNotOverlapRecoveryRead(): void
+    {
+        $scenario = $this->runUserReadDuringReplayWindow(waitForReconnect: true);
+
+        self::assertSame(
+            1,
+            $scenario['maxConcurrentReads'],
+            'a user read during the replay window must not overlap the recovery\'s own read',
+        );
+        self::assertSame(
+            0,
+            $scenario['outcome'],
+            'a user read during the replay window waits for the recovery, then reads the (idle) new socket',
+        );
+        // The failed publish was retried onto the new socket after recovery.
+        self::assertContains("PUB t.fail 1\r\nx\r\n", $scenario['writes']);
+    }
+
+    /**
+     * With waitForReconnect disabled the same user read is refused (connection not open) until the
+     * replay completes - still without overlapping the recovery's own read (#148).
+     */
+    public function testUserReadDuringReplayWindowIsRefusedWhenWaitingIsDisabled(): void
+    {
+        $scenario = $this->runUserReadDuringReplayWindow(waitForReconnect: false);
+
+        self::assertSame(1, $scenario['maxConcurrentReads']);
+        self::assertInstanceOf(ConnectionException::class, $scenario['outcome']);
+        self::assertSame('Connection is not open', $scenario['outcome']->getMessage());
+        self::assertContains("PUB t.fail 1\r\nx\r\n", $scenario['writes']);
+    }
+
+    /**
+     * Starts a recovery from a failed publish write, holds its replay poll open, lands a user read
+     * mid-replay, then releases the replay. Returns the peak concurrent transport reads, the user
+     * read's result (frames read, or the exception it threw) and the transport writes.
+     *
+     * @return array{maxConcurrentReads: int, outcome: int|\Throwable, writes: list<string>}
+     */
+    private function runUserReadDuringReplayWindow(bool $waitForReconnect): array
     {
         $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
         $drainGate = new DeferredFuture();
@@ -2307,7 +2364,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, waitForReconnect: $waitForReconnect),
+            $transport,
+        );
         $connection->connect()->await();
         $connection->subscribe('s.x', static function (): void {})->await();
 
@@ -2324,22 +2384,17 @@ final class NatsConnectionTest extends TestCase
         $pubFuture->await();
         self::assertSame(ConnectionState::Open, $connection->state());
 
-        self::assertSame(
-            1,
-            $transport->maxConcurrentReads,
-            'a user read during the replay window must not overlap the recovery\'s own read',
-        );
-
-        $threw = null;
         try {
-            $userRead->await();
+            $outcome = $userRead->await(new TimeoutCancellation(5));
         } catch (ConnectionException $e) {
-            $threw = $e;
+            $outcome = $e;
         }
-        self::assertNotNull($threw, 'a user read during the replay window is refused: the connection is not open yet');
 
-        // The failed publish was retried onto the new socket after recovery.
-        self::assertContains("PUB t.fail 1\r\nx\r\n", $transport->writes);
+        return [
+            'maxConcurrentReads' => $transport->maxConcurrentReads,
+            'outcome' => $outcome,
+            'writes' => $transport->writes,
+        ];
     }
 
     /**
@@ -2588,6 +2643,35 @@ final class NatsConnectionTest extends TestCase
         $this->expectExceptionMessage('Subscription queue overflow');
 
         $connection->processIncoming()->await();
+    }
+
+    /**
+     * The overflow is a SlowConsumerException naming the subscription - still a ConnectionException, as it
+     * always was, with the same message - so a caller can tell a subscriber that fell behind apart from a
+     * connection that failed.
+     */
+    public function testSlowConsumerErrorPolicyOverflowIsASlowConsumerExceptionNamingTheSid(): void
+    {
+        $transport = new FakeTransport([
+            self::HANDSHAKE_INFO,
+            "PONG\r\n",
+            "MSG updates 1 5\r\nfirst\r\nMSG updates 1 6\r\nsecond\r\n",
+        ]);
+        $connection = new NatsConnection(
+            new NatsOptions(maxPendingMessagesPerSubscription: 1, slowConsumerPolicy: SlowConsumerPolicy::Error),
+            $transport,
+        );
+        $connection->connect()->await();
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
+
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the overflow to surface');
+        } catch (SlowConsumerException $e) {
+            self::assertSame($sid, $e->sid);
+            self::assertSame('Subscription queue overflow for sid ' . $sid, $e->getMessage());
+            self::assertInstanceOf(ConnectionException::class, $e);
+        }
     }
 
     /**
@@ -4260,7 +4344,8 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
         $connection->disconnect()->await();
 
-        self::assertSame(ConnectionState::Closed, $connection->state());
+        $stateAfterTheDisconnect = $connection->state();
+        self::assertSame(ConnectionState::Closed, $stateAfterTheDisconnect);
 
         // The race outcome: a recovery is triggered around disconnect time. It must be a no-op.
         (new \ReflectionMethod(NatsConnection::class, 'recoverConnection'))->invoke($connection);
@@ -4766,12 +4851,16 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        $errors = [];
         $connection = new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
+                errorListener: static function (\Throwable $error) use (&$errors): void {
+                    $errors[] = $error->getMessage();
+                },
                 logger: $throwingLogger,
             ),
             $transport,
@@ -4786,6 +4875,8 @@ final class NatsConnectionTest extends TestCase
 
         self::assertSame(ConnectionState::Open, $connection->state(), 'a throwing logger must not fail a successful recovery');
         self::assertCount(2, $transport->connectCalls);
+        // The throwing logger does not keep the handler's failure from the error listener either.
+        self::assertContains('handler failed on boom!', $errors);
     }
 
     /**
@@ -6425,6 +6516,26 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
+     * Past ~60 attempts base * 2^(attempt - 1) leaves the int range: the delay must stay at the cap
+     * instead of becoming the garbage (possibly negative) result of an out-of-range float-to-int cast,
+     * which delay() rejects - a long reconnect loop (a large maxReconnectAttempts) crashed instead of
+     * backing off.
+     */
+    public function testBackoffDelayStaysAtTheCapForVeryHighAttemptNumbers(): void
+    {
+        $connection = new NatsConnection(
+            new NatsOptions(reconnectDelayMs: 100, reconnectMaxDelayMs: 5000, reconnectJitterMs: 0),
+            new FakeTransport(),
+        );
+
+        $method = new \ReflectionMethod($connection, 'backoffDelayMs');
+
+        foreach ([57, 58, 60, 64, 65, 100, 1_000, 5_000] as $attempt) {
+            self::assertSame(5000, $method->invoke($connection, $attempt), 'attempt ' . $attempt);
+        }
+    }
+
+    /**
      * Verifies requestWithHeaders uses HPUB and returns first reply message.
      */
     public function testRequestWithHeadersReturnsReply(): void
@@ -7325,7 +7436,7 @@ final class NatsConnectionTest extends TestCase
         $connection->disconnect()->await();
     }
 
-    public function testProcessIncomingSkipsWhenAnotherReadIsInProgress(): void
+    public function testProcessIncomingWaitsWhenAnotherReadIsInProgress(): void
     {
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -7338,8 +7449,15 @@ final class NatsConnectionTest extends TestCase
         // Simulate a read already owning the socket (e.g. the heartbeat self-read).
         (new \ReflectionProperty($connection, 'readInProgress'))->setValue($connection, true);
 
-        // processIncoming() must not start a second overlapping read; it reports zero frames.
-        self::assertSame(0, $connection->processIncoming()->await());
+        // processIncoming() must not start a second overlapping read: it waits for that read to finish...
+        $frames = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.01);
+        self::assertFalse($frames->isComplete());
+
+        // ...and then reports zero frames.
+        (new \ReflectionProperty($connection, 'readInProgress'))->setValue($connection, false);
+        (new \ReflectionMethod($connection, 'signalReadSlotFree'))->invoke($connection);
+        self::assertSame(0, $frames->await());
     }
 
     public function testHeartbeatReadSkippedWhenAnotherReadIsInProgress(): void
@@ -7975,9 +8093,12 @@ final class NatsConnectionTest extends TestCase
         // drainSubscription() sends UNSUB then flush(); flush times out (no PONG in queue) -> swallowed.
         $connection->drainSubscription($sid)->await();
 
-        // Subscription state must be gone after the (failed) flush.
-        $meta = (new \ReflectionProperty(NatsConnection::class, 'subscriptionMeta'))->getValue($connection);
-        self::assertArrayNotHasKey($sid, $meta);
+        // The subscription is gone after the (failed) flush: its handler and queue too, not only the
+        // replay entry drainSubscription() removes before it even writes the UNSUB.
+        self::assertFalse($connection->isSubscriptionActive($sid));
+        $pending = (new \ReflectionProperty(NatsConnection::class, 'pendingMessages'))->getValue($connection);
+        self::assertIsArray($pending);
+        self::assertArrayNotHasKey($sid, $pending);
     }
 
     /**
@@ -9194,8 +9315,9 @@ final class NatsConnectionTest extends TestCase
         try {
             $connection->connect()->await();
             self::fail('expected ConnectionException for connect() during drain');
-        } catch (ConnectionException) {
+        } catch (ConnectionException $e) {
             // Drain in progress: connect() must refuse rather than dial into the teardown.
+            self::assertSame('Cannot connect: drain in progress', $e->getMessage());
         }
 
         self::assertCount(1, $transport->connectCalls, 'connect() during drain must not dial');
@@ -11337,6 +11459,80 @@ final class NatsConnectionTest extends TestCase
         $connects = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'CONNECT '));
         self::assertCount(2, $connects, 'the recovery must complete a second CONNECT handshake');
         self::assertSame(ConnectionState::Open, $connection->state(), 'the recovered connection must be Open');
+    }
+
+    /**
+     * A failed read is reported before its recovery runs, and a throwing user-supplied logger must not skip
+     * that recovery: processIncoming() rejected with the logger's exception, and the connection stayed
+     * Open on a dead socket, every later read failing the same way.
+     */
+    public function testReadFailureRecoveryRunsEvenWhenLoggerThrows(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                logger: new ThrowingLogger('Socket closed by peer'),
+            ),
+            $transport,
+        );
+        $connection->connect()->await();
+
+        $transport->throwOnNextRead = new TransportClosedException('Socket closed by peer (EOF)');
+        // Reconnect handshake material for the recovery the failed read must trigger.
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
+
+        $connection->processIncoming()->await(new TimeoutCancellation(5.0));
+
+        self::assertCount(2, $transport->connectCalls, 'the recovery ran although the logger threw');
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(1, $connection->statistics()->reconnects);
+    }
+
+    /**
+     * A fatal frame the heartbeat's own read picks up is reported from the event-loop timer: a throwing
+     * user-supplied logger must not escape into the loop through that report.
+     */
+    public function testHeartbeatReadReportsAFatalFrameWithoutEscapingWhenLoggerThrows(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0, logger: new ThrowingLogger('Server sent error frame')),
+            $transport,
+        );
+        $connection->connect()->await();
+        $transport->pushReadChunk("-ERR 'Unknown Protocol Operation'\r\n");
+
+        // On regression the logger's RuntimeException escapes this call - the timer-callback path.
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(ConnectionState::Open, $connection->state(), 'escalation stays with the next read or tick');
+    }
+
+    /** The same for a corrupt stream the heartbeat's read finds; what parsed before it is still delivered. */
+    public function testHeartbeatReadReportsACorruptStreamWithoutEscapingWhenLoggerThrows(): void
+    {
+        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(
+            new NatsOptions(pingIntervalSeconds: 0, logger: new ThrowingLogger('Unsupported control frame')),
+            $transport,
+        );
+        $connection->connect()->await();
+        $received = [];
+        $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+            $received[] = $message->payload;
+        })->await();
+        $transport->pushReadChunk("MSG updates 1 5\r\nhello\r\nBOGUS\r\n");
+
+        // On regression the logger's RuntimeException escapes this call - the timer-callback path.
+        (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
+
+        self::assertSame(['hello'], $received);
     }
 
     /**
