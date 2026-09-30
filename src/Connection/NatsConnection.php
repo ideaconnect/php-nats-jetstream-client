@@ -1982,10 +1982,10 @@ final class NatsConnection
                 // unsubscribe has what it asked for. Not thrown, exactly as on a connection that is not open:
                 // unsubscribe() runs in finally-based clean-up, where an error would mask the caller's own
                 // (#116). The next operation that needs the socket recovers the connection.
-            } finally {
-                // Dropped even when the write failed, so that recovery does not subscribe the sid again (#116).
-                $this->dropSubscriptionState($sid);
             }
+
+            // Dropped even when the write failed, so that recovery does not subscribe the sid again (#116).
+            $this->dropSubscriptionState($sid);
         });
     }
 

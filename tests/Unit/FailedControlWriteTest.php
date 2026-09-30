@@ -20,6 +20,8 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
+use function Amp\delay;
+
 /**
  * A control frame - a SUB, an UNSUB, the PING of flush() or rtt() - whose write finds the socket dead is a
  * connection failure, as a failed publish write already was: the connection recovers from it, or closes for
@@ -156,12 +158,43 @@ final class FailedControlWriteTest extends TestCase
             self::fail('expected ConnectionException');
         } catch (ConnectionException $e) {
             self::assertSame('Connection is not open', $e->getMessage());
+            self::assertSame(0, $e->getCode());
             self::assertInstanceOf(TransportClosedException::class, $e->getPrevious());
         }
 
         self::assertLessThan(0.1, $this->secondsSince($start));
         $this->waitUntil(static fn(): bool => $transport->epoch() === 1 && $connection->state() === ConnectionState::Open);
         self::assertNull($transport->sidFor('orders'));
+    }
+
+    /**
+     * With waiting disabled nothing waits for the recovery the failed write started. With reconnect off it
+     * closes the connection and fails with "Reconnect is disabled" - on its own fiber, where that failure
+     * must not escape to the event loop as an unhandled error, which would stop the application's loop.
+     */
+    public function testRecoveryThatNothingWaitsForFailsWithoutAnUnhandledError(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = new NatsConnection(
+            new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0, waitForReconnect: false),
+            $transport,
+        );
+        $this->opened[] = $connection;
+        $connection->connect()->await();
+        $transport->failNextWriteContaining('SUB orders');
+
+        try {
+            $connection->subscribe('orders', static function (): void {})->await();
+            self::fail('expected ConnectionException');
+        } catch (ConnectionException $e) {
+            self::assertSame('Connection is not open', $e->getMessage());
+        }
+
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Closed);
+        // The recovery's future is collected once its fiber is done: an unhandled error would surface here.
+        gc_collect_cycles();
+        delay(0.05);
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /**
@@ -183,6 +216,7 @@ final class FailedControlWriteTest extends TestCase
             self::fail('expected ConnectionException');
         } catch (ConnectionException $e) {
             self::assertSame('Connection is not open', $e->getMessage());
+            self::assertSame(0, $e->getCode());
             self::assertInstanceOf(TransportClosedException::class, $e->getPrevious());
         }
 
@@ -209,6 +243,8 @@ final class FailedControlWriteTest extends TestCase
             self::fail('expected ConnectionException');
         } catch (ConnectionException $e) {
             self::assertSame('Subscribe to "orders" failed: the connection was closed', $e->getMessage());
+            self::assertSame(0, $e->getCode());
+            self::assertInstanceOf(TransportClosedException::class, $e->getPrevious());
         }
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -321,6 +357,7 @@ final class FailedControlWriteTest extends TestCase
             self::fail('expected ConnectionException');
         } catch (ConnectionException $e) {
             self::assertSame('Connection lost before the server answered the PING', $e->getMessage());
+            self::assertSame(0, $e->getCode());
             self::assertInstanceOf(TransportClosedException::class, $e->getPrevious());
         }
 

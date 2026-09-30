@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2327 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2328 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -221,6 +221,7 @@ A control frame - a SUB, an UNSUB, the PING of flush() or rtt() - whose write fi
 - `testSubscribeWhoseSubWriteFindsTheSocketDeadWithReconnectOffClosesTheConnection` - With reconnect off, subscribe() fails with `Reconnect is disabled`, the connection is Closed and a Closed event was emitted.
 - `testSubscribeGivesUpAtItsOwnTimeoutWhenTheReconnectOutlastsIt` - With dials refused, subscribe() throws `Subscribe to "orders" timed out waiting for the connection to be re-established` after its 0.2 s timeout; once the reconnect succeeds the subscription is not replayed, the next subscribe gets sid 2, and a frame for sid 1 is discarded (#116).
 - `testSubscribeWithWaitingDisabledFailsAtOnceWhileTheConnectionRecovers` - With waitForReconnect off, subscribe() fails within 0.1 s with `Connection is not open` (the socket's error as its previous), and the connection still reconnects, without the subscription.
+- `testRecoveryThatNothingWaitsForFailsWithoutAnUnhandledError` - With waiting disabled and reconnect off, subscribe() fails at once and the recovery nothing waits for closes the connection; its "Reconnect is disabled" does not escape to the event loop as an unhandled error (checked after the recovery's future is collected).
 - `testSubscribeWaitingForTheRecoveryFailsWhenTheUserClosesTheConnection` - disconnect() while subscribe() waits for the reconnect: subscribe() fails with `Connection is not open`, and the connection is Closed.
 - `testSubscribeWhoseWriteFailsAfterTheConnectionWasReplacedFails` - A SUB write that fails only after the application closed the connection and opened a new one: subscribe() fails with `...failed: the connection was closed`, and the new connection is left alone (no reconnect, nothing subscribed).
 - `testJetStreamFetchWhoseInboxSubscriptionFindsTheSocketDeadFetchesOnTheNewConnection` - The messenger's case: a fetchBatch() whose inbox SUB finds the socket dead returns the message served on the new connection.
