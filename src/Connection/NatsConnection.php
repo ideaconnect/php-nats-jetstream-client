@@ -1010,21 +1010,19 @@ final class NatsConnection
         $timer = EventLoop::delay($this->options->connectTimeoutMs / 1000, static function () use ($bound): void {
             $bound->cancel();
         });
-        try {
-            foreach ($stopped as [$deferred, $fiber]) {
-                if ($caller !== null && $caller === $fiber) {
-                    continue;
-                }
-
-                try {
-                    $deferred->getFuture()->await($bound->getCancellation());
-                } catch (\Throwable) {
-                    // However it ended, or if it is still running at the bound, the close stands.
-                }
+        foreach ($stopped as [$deferred, $fiber]) {
+            if ($caller !== null && $caller === $fiber) {
+                continue;
             }
-        } finally {
-            EventLoop::cancel($timer);
+
+            try {
+                $deferred->getFuture()->await($bound->getCancellation());
+            } catch (\Throwable) {
+                // However it ended, or if it is still running at the bound, the close stands.
+            }
         }
+
+        EventLoop::cancel($timer);
     }
 
     /**

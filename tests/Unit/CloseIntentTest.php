@@ -301,6 +301,70 @@ final class CloseIntentTest extends TestCase
     }
 
     /**
+     * disconnect() overtaking a connect() whose dial it cannot stop waits for that connect() to end, so the
+     * next connect() dials afresh instead of joining it.
+     */
+    public function testDisconnectWaitsForAConnectWhoseDialItCannotStop(): void
+    {
+        $inner = new ReconnectingTransport();
+        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), new UncancellableDialTransport($inner));
+        $this->opened[] = $connection;
+        $inner->holdNextDial();
+        $first = $connection->connect();
+        $first->ignore();
+        $this->waitUntil(static fn(): bool => count($inner->connectCalls) === 1);
+        EventLoop::delay(0.1, static function () use ($inner): void {
+            $inner->releaseDial();
+        });
+
+        $start = hrtime(true);
+        $connection->disconnect()->await(new TimeoutCancellation(2));
+
+        self::assertGreaterThanOrEqual(0.08, $this->secondsSince($start), 'it waited for the connect()');
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * disconnect() called from a fiber of the application's own - not from inside the reconnect - waits for
+     * the reconnect it stopped, as it does from the main fiber.
+     */
+    public function testDisconnectFromAnotherFiberWaitsForTheReconnectItStopped(): void
+    {
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
+        EventLoop::delay(0.1, static function () use ($inner): void {
+            $inner->releaseDial();
+        });
+
+        $start = hrtime(true);
+        async(static fn() => $connection->disconnect()->await())->await(new TimeoutCancellation(2));
+
+        self::assertGreaterThanOrEqual(0.08, $this->secondsSince($start), 'it waited for the reconnect');
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $reader->await(new TimeoutCancellation(1));
+    }
+
+    /**
+     * disconnect() leaves no timer of its wait behind: a referenced timer would keep the event loop - and a
+     * script that has just closed its connection - running until the connect timeout.
+     */
+    public function testDisconnectLeavesNoTimerOfItsWaitBehind(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $baseline = self::referencedWatchers();
+        $reader = $this->startRecoveryHeldMidDial($connection, $transport);
+
+        $connection->disconnect()->await();
+        $reader->await(new TimeoutCancellation(1));
+
+        self::assertSame($baseline, self::referencedWatchers());
+    }
+
+    /**
      * A reconnect that disconnect() stops does not deliver what is queued on its way out: disconnect()
      * discards it (nats.go Close() parity). The stopped reconnect used to deliver it, after disconnect() had
      * released the connection - and now that a close stops a reconnect at once, it would have every time.
@@ -981,5 +1045,14 @@ final class CloseIntentTest extends TestCase
         $this->opened[] = $connection;
 
         return $connection;
+    }
+
+    /** The enabled watchers that keep the event loop running. */
+    private static function referencedWatchers(): int
+    {
+        return count(array_filter(
+            EventLoop::getIdentifiers(),
+            static fn(string $id): bool => EventLoop::isEnabled($id) && EventLoop::isReferenced($id),
+        ));
     }
 }

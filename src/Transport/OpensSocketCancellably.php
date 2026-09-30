@@ -26,10 +26,6 @@ trait OpensSocketCancellably
      */
     private function openSocket(string $uri, ConnectContext $context, ?Cancellation $cancellation): Socket
     {
-        if ($cancellation === null) {
-            return connect($uri, $context);
-        }
-
         $dial = async(static fn(): Socket => connect($uri, $context, $cancellation));
         try {
             return $dial->await($cancellation);
