@@ -19,6 +19,7 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
+use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -1705,13 +1706,14 @@ final class DrainLifecycleTest extends TestCase
 
     /**
      * drain() while disconnect() is still closing the transport during a reconnect finds nothing to drain:
-     * the connection is not open, and the user is closing it.
+     * the connection is not open, and the user is closing it. (A transport that cannot stop its dial keeps
+     * the reconnect in flight through the close; a built-in one's reconnect would already have ended.)
      */
     public function testDrainWhileADisconnectIsClosingTheTransportFailsWithNothingToDrain(): void
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = $this->connect($transport, connectionListener: $recorder->connectionListener());
+        $connection = $this->connect(new UncancellableDialTransport($transport), connectionListener: $recorder->connectionListener());
         $reader = $this->startRecoveryHeldMidDial($connection, $transport);
         $transport->closeDelay = 0.1;
         $disconnect = $connection->disconnect();
@@ -1725,10 +1727,11 @@ final class DrainLifecycleTest extends TestCase
             self::assertSame('Connection is not open', $e->getMessage());
         }
 
-        $disconnect->await();
-        self::assertSame(1, $recorder->closedEvents());
+        // disconnect() waits for the reconnect it stopped: the dial it could not stop ends first.
         $transport->closeDelay = 0.0;
         $transport->releaseDial();
+        $disconnect->await();
+        self::assertSame(1, $recorder->closedEvents());
         $reader->await();
     }
 

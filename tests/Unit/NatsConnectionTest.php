@@ -9352,6 +9352,9 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
+                // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends
+                // only when the test releases it, after disconnect() has returned.
+                connectTimeoutMs: 100,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
                 maxReconnectAttempts: 5,
@@ -9856,6 +9859,9 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
+                // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends
+                // only when the test releases it, after disconnect() has returned.
+                connectTimeoutMs: 100,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
                 maxReconnectAttempts: 5,
@@ -10975,6 +10981,11 @@ final class NatsConnectionTest extends TestCase
         $events = [];
         $connection = new NatsConnection(
             new NatsOptions(
+                // The close below is awaited from inside the fake transport's write, on a fiber the recovery
+                // itself waits for; disconnect() waits for the recovery it stopped, so here only until the
+                // connect timeout. (A real transport writes on the caller's fiber: the recovery's own, whose
+                // close does not wait for it.)
+                connectTimeoutMs: 100,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
                 reconnectDelayMs: 1,
@@ -11026,6 +11037,11 @@ final class NatsConnectionTest extends TestCase
         $events = [];
         $connection = new NatsConnection(
             new NatsOptions(
+                // The close below is awaited from inside the fake transport's write, on a fiber the recovery
+                // itself waits for; disconnect() waits for the recovery it stopped, so here only until the
+                // connect timeout. (A real transport writes on the caller's fiber: the recovery's own, whose
+                // close does not wait for it.)
+                connectTimeoutMs: 100,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
                 reconnectDelayMs: 1,
@@ -11789,8 +11805,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
+        // when the test releases it, after disconnect() has returned.
         $connection = new NatsConnection(
-            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
         );
 
@@ -12162,8 +12180,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
+        // when the test releases it, after disconnect() has returned.
         $connection = new NatsConnection(
-            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
         );
         $connection->connect()->await();
@@ -12256,8 +12276,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
+        // when the test releases it, after disconnect() has returned.
         $connection = new NatsConnection(
-            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
         );
         $connection->connect()->await();

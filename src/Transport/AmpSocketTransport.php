@@ -13,14 +13,14 @@ use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 
 use function Amp\async;
-use function Amp\Socket\connect;
 
 /**
  * Amp-based socket transport implementation for NATS connections.
  */
-final class AmpSocketTransport implements TlsAwareTransportInterface
+final class AmpSocketTransport implements TlsAwareTransportInterface, CancellableDialTransportInterface
 {
     use AssemblesClientTlsContext;
+    use OpensSocketCancellably;
 
     private ?Socket $socket = null;
 
@@ -44,10 +44,13 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
      * When TLS is required the TLS context is always configured on the socket, but the handshake is
      * performed immediately only for handshake-first connections. Otherwise the handshake is
      * deferred to {@see upgradeTls()} so the standard "read INFO, then upgrade" flow is supported.
+     *
+     * @param Cancellation|null $cancellation Stops the dial at once, Amp's retry pauses included, and leaves no
+     *        socket behind ({@see CancellableDialTransportInterface}).
      */
-    public function connect(string $dsn, int $timeoutMs): Future
+    public function connect(string $dsn, int $timeoutMs, ?Cancellation $cancellation = null): Future
     {
-        return async(function () use ($dsn, $timeoutMs): void {
+        return async(function () use ($dsn, $timeoutMs, $cancellation): void {
             // Amp expects timeout in seconds, while options use milliseconds.
             $this->lastConnectTimeoutMs = max(1, $timeoutMs);
             $this->tlsEstablished = false;
@@ -60,7 +63,7 @@ final class AmpSocketTransport implements TlsAwareTransportInterface
             $context = $this->withTlsContext($context, $dsn);
             $this->tlsContextConfigured = $context->getTlsContext() !== null;
 
-            $this->socket = connect($this->normalizeSocketUri($dsn), $context);
+            $this->socket = $this->openSocket($this->normalizeSocketUri($dsn), $context, $cancellation);
             $this->applyReadChunkSize();
 
             if ($this->tlsContextConfigured && $this->options->tlsHandshakeFirst) {

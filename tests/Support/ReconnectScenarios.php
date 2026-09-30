@@ -40,7 +40,7 @@ trait ReconnectScenarios
     }
 
     private function connect(
-        ReconnectingTransport $transport,
+        ReconnectingTransport|UncancellableDialTransport $transport,
         bool $waitForReconnect = true,
         int $requestTimeoutMs = 2_000,
         int $maxReconnectAttempts = 1_000,

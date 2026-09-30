@@ -16,10 +16,13 @@ use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
+use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
+use Revolt\EventLoop;
 
+use function Amp\async;
 use function Amp\delay;
 
 /**
@@ -228,29 +231,73 @@ final class CloseIntentTest extends TestCase
     }
 
     /**
-     * connect() while a reconnect that disconnect() stopped is still finishing an attempt fails at once:
-     * that reconnect can never open the connection, so there is nothing to wait for.
+     * disconnect() stops a reconnect that is dialling - the dial included - and returns once that reconnect
+     * has ended, so a connect() issued after it dials afresh. The reconnect used to go on dialling after
+     * disconnect() returned, and that connect() failed with "Recovery was aborted before the connection
+     * opened". In a synchronous application the reconnect never got the event-loop time to end at all, and
+     * every connect() failed that way.
      */
-    public function testConnectWhileAStoppedReconnectWindsDownFailsAtOnce(): void
+    public function testConnectAfterDisconnectDialsAfreshWhileTheReconnectItStoppedWasDialling(): void
     {
         $transport = new ReconnectingTransport();
         $connection = $this->connect($transport);
         $reader = $this->startRecoveryHeldMidDial($connection, $transport);
-        $connection->disconnect()->await();
 
         $start = hrtime(true);
+        $connection->disconnect()->await();
+
+        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertSame(1, $transport->dialsCancelled, 'the dial was stopped');
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $reader->await(new TimeoutCancellation(1));
+    }
+
+    /** drain() waits for a dial it cannot stop too, so a connect() issued after it dials afresh. */
+    public function testDrainWaitsForTheDialOfATransportThatCannotStopIt(): void
+    {
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner), requestTimeoutMs: 100);
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
+        // Released after the drain's budget has run out and it has closed the connection.
+        EventLoop::delay(0.2, static function () use ($inner): void {
+            $inner->releaseDial();
+        });
+
         try {
-            $connection->connect()->await(new TimeoutCancellation(0.5));
-            self::fail('expected ConnectionException');
-        } catch (ConnectionException $e) {
-            self::assertSame('Recovery was aborted before the connection opened', $e->getMessage());
+            $connection->drain()->await(new TimeoutCancellation(2));
+        } catch (ConnectionException) {
+            // However the drain reports its budget running out, it closes the connection.
         }
 
-        self::assertLessThan(0.1, $this->secondsSince($start));
-        $transport->releaseDial();
-        $reader->await();
-        $connection->connect()->await();
-        self::assertSame(ConnectionState::Open, $connection->state(), 'once it has ended, connect() dials afresh');
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $reader->await(new TimeoutCancellation(1));
+    }
+
+    /**
+     * A close that comes while a reconnect attempt is still closing the previous socket stops the attempt
+     * before it dials: nothing dials after the close.
+     */
+    public function testReconnectDoesNotDialAfterACloseThatCameWhileItClosedThePreviousSocket(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $transport->closeDelay = 0.1;
+        $transport->dropConnection();
+        $reader = async(static fn(): int => $connection->processIncoming()->await());
+        $reader->ignore();
+        // The reconnect's first attempt is closing the dead socket now.
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
+        $dials = count($transport->connectCalls);
+
+        $connection->disconnect()->await(new TimeoutCancellation(2));
+        delay(0.2);
+
+        $transport->closeDelay = 0.0;
+        self::assertSame($dials, count($transport->connectCalls), 'no dial after the close');
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /**
@@ -292,6 +339,160 @@ final class CloseIntentTest extends TestCase
         $reader->await(new TimeoutCancellation(1));
 
         self::assertSame(['o1'], $received->payloads);
+    }
+
+    /**
+     * A transport that cannot stop its dial: disconnect() waits for the dial to end, so a connect() issued
+     * after it still dials afresh.
+     */
+    public function testDisconnectWaitsForTheDialOfATransportThatCannotStopIt(): void
+    {
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
+        EventLoop::delay(0.1, static function () use ($inner): void {
+            $inner->releaseDial();
+        });
+
+        $start = hrtime(true);
+        $connection->disconnect()->await(new TimeoutCancellation(2));
+
+        self::assertGreaterThanOrEqual(0.08, $this->secondsSince($start), 'it waited for the dial');
+        self::assertSame(0, $inner->dialsCancelled);
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $reader->await(new TimeoutCancellation(1));
+    }
+
+    /** The wait for a dial that cannot be stopped is bounded by the connect timeout (500 ms here). */
+    public function testDisconnectStopsWaitingForADialThatCannotBeStoppedAtTheConnectTimeout(): void
+    {
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
+
+        $start = hrtime(true);
+        $connection->disconnect()->await(new TimeoutCancellation(3));
+        $elapsed = $this->secondsSince($start);
+
+        self::assertGreaterThanOrEqual(0.45, $elapsed);
+        self::assertLessThan(1.5, $elapsed);
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        $inner->releaseDial();
+        $reader->await(new TimeoutCancellation(1));
+    }
+
+    /**
+     * A connect() racing a close still fails at once (#145): issued while disconnect() waits for the
+     * reconnect it stopped, it cannot join that reconnect, which will never open the connection. Once
+     * disconnect() has returned, connect() dials afresh.
+     */
+    public function testConnectRacingADisconnectThatWaitsForTheStoppedReconnectFailsAtOnce(): void
+    {
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
+        $disconnect = $connection->disconnect();
+        delay(0.02);
+
+        $start = hrtime(true);
+        try {
+            $connection->connect()->await(new TimeoutCancellation(0.5));
+            self::fail('expected ConnectionException');
+        } catch (ConnectionException $e) {
+            self::assertSame('Recovery was aborted before the connection opened', $e->getMessage());
+        }
+
+        self::assertLessThan(0.1, $this->secondsSince($start));
+        $inner->releaseDial();
+        $disconnect->await(new TimeoutCancellation(1));
+        $reader->await(new TimeoutCancellation(1));
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state(), 'once disconnect() has returned, connect() dials afresh');
+    }
+
+    /**
+     * disconnect() called from a listener that runs inside the reconnect does not wait for that reconnect,
+     * which waits for the listener to return: it would wait out its whole bound.
+     */
+    public function testDisconnectFromAListenerInsideTheReconnectDoesNotWaitForIt(): void
+    {
+        $transport = new ReconnectingTransport();
+        $holder = new class {
+            public ?NatsConnection $connection = null;
+            public ?float $disconnectSeconds = null;
+        };
+        $listener = static function (ConnectionEvent $event) use ($holder): void {
+            $connection = $holder->connection;
+            if ($event !== ConnectionEvent::Disconnected || $connection === null) {
+                return;
+            }
+
+            $start = hrtime(true);
+            $connection->disconnect()->await(new TimeoutCancellation(2));
+            $holder->disconnectSeconds = (hrtime(true) - $start) / 1e9;
+        };
+        $connection = $this->connect($transport, connectionListener: $listener);
+        $holder->connection = $connection;
+        $transport->refuseDials();
+        $transport->dropConnection();
+
+        $connection->processIncoming()->await(new TimeoutCancellation(2));
+
+        self::assertNotNull($holder->disconnectSeconds);
+        self::assertLessThan(0.2, $holder->disconnectSeconds);
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * disconnect() overtaking a connect() that is still dialling stops that dial too, and returns once that
+     * connect() has ended - with "Connect was aborted before the connection opened" - so the next connect()
+     * dials afresh instead of joining it.
+     */
+    public function testConnectAfterADisconnectThatOvertookADiallingConnectDialsAfresh(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport);
+        $this->opened[] = $connection;
+        $transport->holdNextDial();
+        $first = $connection->connect();
+        $this->waitUntil(static fn(): bool => count($transport->connectCalls) === 1);
+
+        $connection->disconnect()->await(new TimeoutCancellation(2));
+
+        try {
+            $first->await(new TimeoutCancellation(1));
+            self::fail('expected ConnectionException');
+        } catch (ConnectionException $e) {
+            self::assertSame('Connect was aborted before the connection opened', $e->getMessage());
+        }
+
+        self::assertSame(1, $transport->dialsCancelled);
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * A drain() whose budget runs out while the reconnect is dialling stops that reconnect too, and a
+     * connect() issued after it dials afresh.
+     */
+    public function testConnectAfterADrainThatStoppedADiallingReconnectDialsAfresh(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport, requestTimeoutMs: 200);
+        $reader = $this->startRecoveryHeldMidDial($connection, $transport);
+
+        try {
+            $connection->drain()->await(new TimeoutCancellation(2));
+        } catch (ConnectionException) {
+            // However the drain reports its budget running out, it closes the connection.
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(1, $transport->dialsCancelled);
+        $connection->connect()->await(new TimeoutCancellation(1));
+        self::assertSame(ConnectionState::Open, $connection->state());
+        $reader->await(new TimeoutCancellation(1));
     }
 
     /**

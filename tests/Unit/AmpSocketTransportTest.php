@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Unit;
 
 use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Socket\ConnectContext;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
@@ -12,6 +13,7 @@ use IDCT\NATS\Transport\AmpSocketTransport;
 use IDCT\NATS\Transport\TlsRequiredException;
 use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
@@ -359,5 +361,46 @@ final class AmpSocketTransportTest extends TestCase
         }
 
         self::assertTrue($threw, 'upgradeTls() without TLS materials must throw TlsRequiredException');
+    }
+
+    /**
+     * A dial stopped while Amp's retry connector pauses between attempts - 2 s after a refused first attempt -
+     * ends at once, and leaves no socket behind, even once the pause is over and the port answers again. The
+     * pause ignores the cancellation, and used to hold the dial, and a close waiting for it, for its length.
+     */
+    public function testDialStoppedDuringTheRetryPauseEndsAtOnceAndLeavesNoSocket(): void
+    {
+        // A port nothing listens on.
+        $probe = listen('tcp://127.0.0.1:0');
+        $address = (string) $probe->getAddress();
+        $probe->close();
+
+        $transport = new AmpSocketTransport(new NatsOptions());
+        $stop = new DeferredCancellation();
+        EventLoop::delay(0.1, static function () use ($stop): void {
+            $stop->cancel();
+        });
+
+        $start = hrtime(true);
+        try {
+            $transport->connect('nats://' . $address, 1_000, $stop->getCancellation())->await();
+            self::fail('expected CancelledException');
+        } catch (CancelledException) {
+            // Stopped.
+        }
+
+        self::assertLessThan(0.5, (hrtime(true) - $start) / 1e9);
+
+        // The port answers again before Amp's pause is over: its next attempt leaves no socket installed.
+        $server = listen('tcp://' . $address);
+        delay(2.5);
+        $server->close();
+
+        try {
+            $transport->write("PING\r\n")->await();
+            self::fail('expected TransportClosedException');
+        } catch (TransportClosedException) {
+            // No socket.
+        }
     }
 }

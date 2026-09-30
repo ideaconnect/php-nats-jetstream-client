@@ -17,6 +17,13 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Added
+
+- `[feature]` `CancellableDialTransportInterface`, a transport whose dial can be stopped: its `connect()`
+  takes a cancellation that fires when the application closes the connection while a connect or a
+  reconnect is dialling. Both built-in transports implement it. A custom transport that implements only
+  `TransportInterface` works as before, and a close waits for its dial to end, up to `connectTimeoutMs`.
+
 ### Fixed
 
 - `[bugfix]` A `subscribe()`, `flush()` or `rtt()` whose write found the socket dead failed with the
@@ -34,6 +41,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   connection - as it already did not on a connection that is not open, and the next operation that needs
   the socket reconnects.
 
+- `[bugfix]` `disconnect()` or `drain()` during a reconnect that was dialling left that reconnect running
+  after they returned: they cut its backoff short but not its dial, which with Amp's retry pauses takes
+  some 6 s against a refused port. A `connect()` issued after the close met the stopped reconnect still
+  winding down and failed with `Recovery was aborted before the connection opened`. In a synchronous
+  application the reconnect never got the event-loop time to end, so every later `connect()` failed that
+  way and the connection could not be reopened until the process restarted (found while reviewing
+  symfony-nats-messenger PR #45, where a transport's `close()` then broke every later dispatch). A close
+  now stops the dial - Amp's retry pauses included, for a transport that implements
+  `CancellableDialTransportInterface` - and waits, bounded by `connectTimeoutMs`, for the reconnect or
+  `connect()` it stopped to end before it returns, so a `connect()` issued after it dials afresh. A
+  `connect()` racing the close still fails at once. A reconnect attempt that finds a close came while it
+  was closing the previous socket no longer dials.
 - `[bugfix]` A reconnect that a close stopped delivered the messages queued on the connection on its way
   out: after `disconnect()`, which discards them, or beside `drain()`'s own delivery and past the rules it
   keeps. It now leaves them to the close.

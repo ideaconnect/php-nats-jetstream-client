@@ -28,6 +28,7 @@ use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Protocol\ProtocolFrame;
 use IDCT\NATS\Protocol\ProtocolParser;
 use IDCT\NATS\Protocol\ServerInfo;
+use IDCT\NATS\Transport\CancellableDialTransportInterface;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\TransportInterface;
@@ -291,6 +292,13 @@ final class NatsConnection
      * instead of when its current delay ends ({@see setCloseIntent()}).
      */
     private ?DeferredCancellation $reconnectBackoff = null;
+
+    /**
+     * Stops the dial in progress - a connect()'s or a reconnect's - when the user closes the connection
+     * ({@see setCloseIntent()}), for a transport that can stop its dial
+     * ({@see CancellableDialTransportInterface}).
+     */
+    private ?DeferredCancellation $dialStop = null;
     /**
      * Counts the connections this client has made: bumped by every handshake attempt. A read, write or
      * heartbeat captures it before its I/O and hands it to {@see recoverConnection()} when that I/O
@@ -906,7 +914,11 @@ final class NatsConnection
      */
     public function disconnect(): Future
     {
-        return async(function (): void {
+        // Captured on the CALLER's fiber, as connect() does: a disconnect() issued from a listener inside the
+        // reconnect it stops must not wait for that reconnect ({@see awaitStoppedDials()}).
+        $caller = \Fiber::getCurrent();
+
+        return async(function () use ($caller): void {
             // A close already announced - by a drain(), a reconnect that gave up, an earlier (or a
             // concurrent) disconnect() - is not announced again: this closes quietly (drain() then
             // disconnect() is a common shutdown idiom).
@@ -915,6 +927,7 @@ final class NatsConnection
             // Signal close-intent BEFORE closing the socket so an in-flight reconnect/heartbeat read
             // cannot race to re-open the connection after the user asked to close it (#84).
             $this->setCloseIntent();
+            $stopped = $this->stoppedDials();
             // This disconnect announces the close below: a drain() it interrupts must not announce it
             // again when it ends, even if it ends first.
             $this->closedAnnounced = true;
@@ -929,6 +942,8 @@ final class NatsConnection
             if ($announce) {
                 $this->emitEvent(ConnectionEvent::Closed);
             }
+
+            $this->awaitStoppedDials($stopped, $caller);
         });
     }
 
@@ -936,12 +951,80 @@ final class NatsConnection
      * Records the user's close-intent (disconnect()/drain()): an in-flight reconnect stops at its next
      * check instead of reopening the connection (#84), and its backoff delay is cut short so it stops at
      * once - rather than keep running, and keep a connect() that joins it waiting, until the delay ends.
+     * The dial in progress, a reconnect's or a connect()'s, is stopped too where the transport can stop
+     * it ({@see dialTransport()}).
      */
     private function setCloseIntent(): void
     {
         $this->closing = true;
         $this->cancelPingTimer();
         $this->reconnectBackoff?->cancel();
+        $this->dialStop?->cancel();
+    }
+
+    /**
+     * The reconnect and the connect() in progress, each with the fiber that runs it: what a close that has
+     * just set close-intent stops, for {@see awaitStoppedDials()}. Taken before the close announces itself,
+     * so the wait is not for a connect() that a Closed listener starts.
+     *
+     * @return list<array{DeferredFuture<void>, ?\Fiber<mixed, mixed, mixed, mixed>}>
+     */
+    private function stoppedDials(): array
+    {
+        $stopped = [];
+        if ($this->reconnecting !== null) {
+            $stopped[] = [$this->reconnecting, $this->recoveryFiber];
+        }
+
+        if ($this->connecting !== null) {
+            $stopped[] = [$this->connecting, $this->connectFiber];
+        }
+
+        return $stopped;
+    }
+
+    /**
+     * Waits for the reconnect or the connect() that a close stopped to end, so that disconnect() and drain()
+     * resolve with nothing they stopped still running. A connect() issued after the close then dials afresh.
+     * It used to meet the stopped reconnect still dialling, and fail with "Recovery was aborted before the
+     * connection opened"; in a synchronous application that reconnect never got the event-loop time to end,
+     * and every connect() failed that way.
+     *
+     * Bounded by the connect timeout, which is how long a transport that cannot stop its dial may take to
+     * end it ({@see CancellableDialTransportInterface}); a connection listener could take any time at all.
+     * Skipped for the fiber that runs what was stopped: a close called from a connection/error listener runs
+     * inside it, and waiting there would await what only that suspended fiber can complete (#145).
+     *
+     * @param list<array{DeferredFuture<void>, ?\Fiber<mixed, mixed, mixed, mixed>}> $stopped From {@see stoppedDials()}.
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called the close.
+     */
+    private function awaitStoppedDials(array $stopped, ?\Fiber $caller): void
+    {
+        if ($stopped === []) {
+            return;
+        }
+
+        // A referenced timer, unlike a TimeoutCancellation's: what the stopped dial waits for may hold no watcher
+        // that keeps the event loop running, and the close must still return at the bound.
+        $bound = new DeferredCancellation();
+        $timer = EventLoop::delay($this->options->connectTimeoutMs / 1000, static function () use ($bound): void {
+            $bound->cancel();
+        });
+        try {
+            foreach ($stopped as [$deferred, $fiber]) {
+                if ($caller !== null && $caller === $fiber) {
+                    continue;
+                }
+
+                try {
+                    $deferred->getFuture()->await($bound->getCancellation());
+                } catch (\Throwable) {
+                    // However it ended, or if it is still running at the bound, the close stands.
+                }
+            }
+        } finally {
+            EventLoop::cancel($timer);
+        }
     }
 
     /**
@@ -1008,11 +1091,12 @@ final class NatsConnection
     }
 
     /**
-     * Best-effort transport close for terminal failure exits, mirroring disconnect(). connectOnce()
-     * opens the socket before the handshake can fail, so every path that gives up (terminal connect
-     * failure, exhausted or auth-aborted recovery) must close it - otherwise the fd stays pinned by
-     * the transport until the client object itself is GC'd (#133). Close failures are irrelevant
-     * here: the socket may already be gone, and the terminal state transition is what matters.
+     * Best-effort transport close for terminal failure exits, mirroring disconnect(), and before each
+     * reconnect attempt dials. connectOnce() opens the socket before the handshake can fail, so every
+     * path that gives up (terminal connect failure, exhausted or auth-aborted recovery) must close it -
+     * otherwise the fd stays pinned by the transport until the client object itself is GC'd (#133).
+     * Close failures are irrelevant here: the socket may already be gone, and the terminal state
+     * transition, or the next attempt, is what matters.
      */
     private function closeTransportBestEffort(): void
     {
@@ -1091,12 +1175,16 @@ final class NatsConnection
                 $this->drainConnection($caller);
             } finally {
                 $this->drainInProgress = false;
+                // A reconnect the drain stopped, when its budget ran out before the reconnect was done.
+                $stopped = $this->stoppedDials();
                 // Announced once the drain is over, so a Closed listener may connect() again at once - and
                 // not a second time when the path that closed the connection already announced it. The
                 // connection is Closed here however drainConnection() ended: every exit closes it.
                 if (!$this->closedAnnounced) {
                     $this->emitEvent(ConnectionEvent::Closed);
                 }
+
+                $this->awaitStoppedDials($stopped, $caller);
             }
         });
     }
@@ -3117,6 +3205,30 @@ final class NatsConnection
     }
 
     /**
+     * Dials $dsn so that a close stops the dial ({@see setCloseIntent()}), when the transport can stop it: a
+     * close no longer leaves a reconnect or a connect() dialling after it returned - with Amp's retry pauses,
+     * some 6 s against a refused port. A transport that cannot stop its dial is dialled as before, and the
+     * close waits for the dial to end ({@see awaitStoppedDials()}).
+     */
+    private function dialTransport(string $dsn): void
+    {
+        $transport = $this->transport;
+        if (!$transport instanceof CancellableDialTransportInterface) {
+            $transport->connect($dsn, $this->options->connectTimeoutMs)->await();
+
+            return;
+        }
+
+        $stop = new DeferredCancellation();
+        $this->dialStop = $stop;
+        try {
+            $transport->connect($dsn, $this->options->connectTimeoutMs, $stop->getCancellation())->await();
+        } finally {
+            $this->dialStop = null;
+        }
+    }
+
+    /**
      * Establishes a fresh connection against the next available server.
      *
      * Leaves state Connecting: the caller flips Open via {@see markConnectionOpen()}. The initial
@@ -3145,7 +3257,7 @@ final class NatsConnection
         $this->connectedServer = $server;
         $urlCredentials = $this->extractUrlCredentials($server);
         $dsn = $this->normalizeDsn($server);
-        $this->transport->connect($dsn, $this->options->connectTimeoutMs)->await();
+        $this->dialTransport($dsn);
 
         $this->serverInfo = $this->awaitServerInfo();
 
@@ -3499,10 +3611,13 @@ final class NatsConnection
                 return;
             }
 
-            try {
-                $this->transport->close()->await();
-            } catch (\Throwable) {
-                // Ignore close failures during reconnect transitions.
+            $this->closeTransportBestEffort();
+
+            // A close that came while the previous socket was closing: do not dial again.
+            if ($this->closing) {
+                $this->state = ConnectionState::Closed;
+
+                return;
             }
 
             try {

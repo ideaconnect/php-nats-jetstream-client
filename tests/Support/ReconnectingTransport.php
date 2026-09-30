@@ -5,10 +5,11 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Support;
 
 use Amp\Cancellation;
+use Amp\CancelledException;
 use Amp\DeferredFuture;
 use Amp\Future;
+use IDCT\NATS\Transport\CancellableDialTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
-use IDCT\NATS\Transport\TransportInterface;
 use Revolt\EventLoop;
 
 use function Amp\async;
@@ -42,12 +43,18 @@ use function Amp\delay;
  * reply on the sid the client subscribed for the reply subject on the live session (an exact subject,
  * or a "<base>.*" wildcard such as the mux request inbox).
  */
-final class ReconnectingTransport implements TransportInterface
+final class ReconnectingTransport implements CancellableDialTransportInterface
 {
     public const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /** @var list<string> Every dial attempt, refused ones included. */
     public array $connectCalls = [];
+
+    /**
+     * Dials the connection stopped (see {@see CancellableDialTransportInterface}): a held dial ends when the
+     * cancellation the connection passed fires, as a built-in transport's dial does, and opens nothing.
+     */
+    public int $dialsCancelled = 0;
 
     /** @var list<array{epoch: int, bytes: string}> Every write a live session accepted, with its epoch. */
     public array $writes = [];
@@ -139,9 +146,9 @@ final class ReconnectingTransport implements TransportInterface
         $this->wake = new DeferredFuture();
     }
 
-    public function connect(string $dsn, int $timeoutMs): Future
+    public function connect(string $dsn, int $timeoutMs, ?Cancellation $cancellation = null): Future
     {
-        return async(function () use ($dsn, $timeoutMs): void {
+        return async(function () use ($dsn, $timeoutMs, $cancellation): void {
             $this->connectCalls[] = $dsn . '|' . $timeoutMs;
             $this->refuseDialIfRefusing();
 
@@ -153,7 +160,12 @@ final class ReconnectingTransport implements TransportInterface
                 // A referenced keep-alive stands in for a real dial's socket watcher, as for parked reads.
                 $keepAlive = EventLoop::delay(30.0, static function (): void {});
                 try {
-                    $held->getFuture()->await();
+                    $held->getFuture()->await($cancellation);
+                } catch (CancelledException $stopped) {
+                    $this->heldDial = null;
+                    $this->dialsCancelled++;
+
+                    throw $stopped;
                 } finally {
                     EventLoop::cancel($keepAlive);
                 }

@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Unit;
 
 use Amp\ByteStream\ClosedException;
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Socket\BindContext;
 use Amp\Socket\Certificate;
 use Amp\Socket\ConnectException as AmpConnectException;
@@ -22,6 +24,7 @@ use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\WebSocketFrameCodec;
 use IDCT\NATS\Transport\WebSocketTransport;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
@@ -1943,5 +1946,33 @@ final class WebSocketTransportTest extends TestCase
         (new \ReflectionProperty(WebSocketTransport::class, 'socket'))->setValue($transport, $clientSocket);
 
         return [$transport, $server, $serverSocket];
+    }
+
+    /**
+     * A dial stopped while Amp's retry connector pauses between attempts ends at once, as for the socket
+     * transport ({@see AmpSocketTransportTest::testDialStoppedDuringTheRetryPauseEndsAtOnceAndLeavesNoSocket()}).
+     */
+    public function testDialStoppedDuringTheRetryPauseEndsAtOnce(): void
+    {
+        // A port nothing listens on.
+        $probe = listen('tcp://127.0.0.1:0');
+        $address = (string) $probe->getAddress();
+        $probe->close();
+
+        $transport = new WebSocketTransport(new NatsOptions());
+        $stop = new DeferredCancellation();
+        EventLoop::delay(0.1, static function () use ($stop): void {
+            $stop->cancel();
+        });
+
+        $start = hrtime(true);
+        try {
+            $transport->connect('ws://' . $address, 1_000, $stop->getCancellation())->await();
+            self::fail('expected CancelledException');
+        } catch (CancelledException) {
+            // Stopped.
+        }
+
+        self::assertLessThan(0.5, (hrtime(true) - $start) / 1e9);
     }
 }
