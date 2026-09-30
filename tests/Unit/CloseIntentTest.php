@@ -10,6 +10,7 @@ use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
@@ -250,6 +251,47 @@ final class CloseIntentTest extends TestCase
         $reader->await();
         $connection->connect()->await();
         self::assertSame(ConnectionState::Open, $connection->state(), 'once it has ended, connect() dials afresh');
+    }
+
+    /**
+     * A reconnect that disconnect() stops does not deliver what is queued on its way out: disconnect()
+     * discards it (nats.go Close() parity). The stopped reconnect used to deliver it, after disconnect() had
+     * released the connection - and now that a close stops a reconnect at once, it would have every time.
+     */
+    public function testReconnectStoppedByDisconnectDoesNotDeliverWhatIsQueued(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $received = new class {
+            /** @var list<string> */
+            public array $payloads = [];
+        };
+        $sid = $connection->subscribe('orders', static function (NatsMessage $message) use ($received): void {
+            $received->payloads[] = $message->payload;
+            if ($message->payload === 'o1') {
+                throw new \RuntimeException('handler failed on o1');
+            }
+        })->await();
+        // One chunk: the failure on o1 leaves o2 and o3 queued.
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('orders', $sid, 'o1')
+            . ReconnectingTransport::msgFrame('orders', $sid, 'o2')
+            . ReconnectingTransport::msgFrame('orders', $sid, 'o3'),
+        );
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler failed on o1', $e->getMessage());
+        }
+
+        // Backing off between refused dials: disconnect() cuts the backoff short, and the reconnect ends
+        // while disconnect() closes the socket, before it discards what is queued.
+        $reader = $this->startRecoveryInBackground($connection, $transport);
+        $connection->disconnect()->await();
+        $reader->await(new TimeoutCancellation(1));
+
+        self::assertSame(['o1'], $received->payloads);
     }
 
     /**

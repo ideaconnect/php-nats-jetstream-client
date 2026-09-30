@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2304 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2314 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -74,6 +74,7 @@ A close wins over what is still in flight on the connection: a connect() racing 
 - `testDisconnectDuringTheInitialDialWinsOverAnAuthenticationFailure` - The same when the server then refuses the credentials: connect() fails with the abort, and the close is announced once.
 - `testDisconnectDuringTheInitialConnectRetriesWinsAtOnce` - disconnect() while connect() waits to retry a refused first dial (retryOnFailedInitialConnect, reconnect disabled, 1 s backoff) ends it within 0.2 s with the abort, without another dial, announced once.
 - `testConnectWhileAStoppedReconnectWindsDownFailsAtOnce` - connect() while a reconnect that disconnect() stopped is still held mid-dial fails at once with "Recovery was aborted before the connection opened"; once that reconnect has ended, connect() dials afresh.
+- `testReconnectStoppedByDisconnectDoesNotDeliverWhatIsQueued` - o2 and o3 stay queued behind a handler failure on o1; a reconnect backing off between refused dials is stopped by disconnect(), and neither is delivered (it used to deliver them on its way out, after disconnect()).
 - `testAuthenticationFailureOfAStoppedReconnectIsNotAnnouncedAgain` - A reconnect that disconnect() stopped mid-dial and whose handshake is then refused ends quietly: the reader resolves, one Closed event, no authentication error reported.
 - `testCloseWhileTheReconnectLogIsWrittenStillStopsTheReconnectAtOnce` - disconnect() while a suspending logger writes the reconnect's "attempt failed" line stops the reconnect within 0.3 s instead of after its 1 s backoff.
 - `testReconnectOutlivesALoggerThatThrowsOnEveryAttempt` - With a logger throwing on every "reconnect attempt" line the reconnect keeps backing off and reopens the connection once dials are accepted.

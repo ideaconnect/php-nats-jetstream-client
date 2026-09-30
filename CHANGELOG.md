@@ -34,6 +34,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   connection - as it already did not on a connection that is not open, and the next operation that needs
   the socket reconnects.
 
+- `[bugfix]` A reconnect that a close stopped delivered the messages queued on the connection on its way
+  out: after `disconnect()`, which discards them, or beside `drain()`'s own delivery and past the rules it
+  keeps. It now leaves them to the close.
+
 ## [2.9.0] - 2026-09-30
 
 ### Upgrade notes

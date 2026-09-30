@@ -3361,12 +3361,20 @@ final class NatsConnection
             }
         }
 
+        // A reconnect that a close stopped returns without reopening the connection. What is queued is then
+        // the close's: drain() delivers it within its budget, and disconnect() discards it. Delivered here as
+        // well, it reached handlers after disconnect(), or beside drain()'s own delivery and past the rules
+        // that one keeps.
+        if ($this->state !== ConnectionState::Open) {
+            return;
+        }
+
         // Deliver any messages buffered during subscription replay now that recovery has finished and
         // we are OUT of the critical section: `reconnecting` is cleared, so a callback that publishes
         // and hits a write failure starts a fresh recovery instead of deadlocking on the in-progress
-        // one, and the per-sid dispatch guard keeps it non-reentrant. (Only reached on success; the
-        // catch above rethrows on failure.) A full SubscriptionQueue is reported without cutting the
-        // delivery short.
+        // one, and the per-sid dispatch guard keeps it non-reentrant. (Only reached when the recovery
+        // reopened the connection; the catch above rethrows on failure.) A full SubscriptionQueue is
+        // reported without cutting the delivery short.
         try {
             $this->deliverPending(reportOverflows: true);
         } catch (\Throwable $handlerError) {
