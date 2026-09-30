@@ -730,6 +730,44 @@ final class NatsConnection
     }
 
     /**
+     * Recovers a connection whose socket failed the write of a control frame - a SUB, or the PING of
+     * flush() or rtt() - and waits for it the way an operation waits for a recovery already in flight
+     * ({@see awaitOpenConnection()}): within the caller's own budget, and not at all when waiting is
+     * disabled. A recovery that outlasts the budget carries on without the caller.
+     *
+     * Such a write used to leave the connection Open on the dead socket, its raw error reaching the caller,
+     * and every operation that wrote a control frame failed the same way until the heartbeat noticed. A
+     * publish recovers inline and sends again; these hand the recovery to its own fiber, as the heartbeat
+     * does, so that a caller with a budget keeps to it. It joins a recovery another fiber already runs, and
+     * starts none for a connection since replaced ({@see recoverConnection()}). With reconnect off it closes
+     * the connection for good, and the caller gets its "Reconnect is disabled".
+     *
+     * @param int $generation The {@see $connectionGeneration} the failed write ran on.
+     *
+     * @throws ConnectionException When the connection does not come back, or at once when waiting is disabled.
+     * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
+     */
+    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation): void
+    {
+        $recovery = async(function () use ($generation): void {
+            $this->recoverConnection(failedGeneration: $generation);
+        });
+        // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
+        $recovery->ignore();
+
+        if (!$this->options->waitForReconnect) {
+            throw new ConnectionException('Connection is not open', 0, $writeError);
+        }
+
+        $recovery->await($cancellation);
+
+        // No recovery ran: the user is closing the connection, or a connect() owns the dial.
+        if ($this->state !== ConnectionState::Open) {
+            throw new ConnectionException('Connection is not open', 0, $writeError);
+        }
+    }
+
+    /**
      * Runs one user-initiated connect - dial + handshake with the standing failure policy (auth
      * failures fail fast; other failures hand off to recovery or the initial-connect retry loop;
      * otherwise the connection closes terminally). Serialized by {@see connect()}.
@@ -1731,14 +1769,31 @@ final class NatsConnection
         $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
         $this->pendingMessages[$sid] = new SplQueue();
 
+        $generation = $this->connectionGeneration;
         try {
             $this->transport->write($this->codec->encodeSubscribe($subject, $sid, $queue))->await();
-        } catch (\Throwable $e) {
-            // The SUB never reached the wire; roll back so the registry does not retain an entry
-            // whose sid the caller never learns (and resubscribeAll() cannot revive it) (#116).
-            $this->dropSubscriptionState($sid);
+        } catch (\Throwable $writeError) {
+            // The socket is dead. The subscription stays registered while the connection recovers, so the
+            // reconnect subscribes it on the new connection; it is rolled back only when the connection does
+            // not come back in time, so that the registry does not keep an entry whose sid the caller never
+            // learns (#116).
+            try {
+                $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000));
+            } catch (CancelledException) {
+                $this->dropSubscriptionState($sid);
 
-            throw $e;
+                throw new TimeoutException(sprintf('Subscribe to "%s" timed out waiting for the connection to be re-established', $subject));
+            } catch (\Throwable $recoveryError) {
+                $this->dropSubscriptionState($sid);
+
+                throw $recoveryError;
+            }
+
+            // A terminal close released it, and a connect() opened a fresh connection since: nothing
+            // subscribed it there.
+            if (!isset($this->subscriptionMeta[$sid])) {
+                throw new ConnectionException(sprintf('Subscribe to "%s" failed: the connection was closed', $subject), 0, $writeError);
+            }
         }
 
         return $sid;
@@ -1807,9 +1862,14 @@ final class NatsConnection
                 $this->autoUnsubMax[$sid] = $maxMessages;
 
                 if ($this->state === ConnectionState::Open) {
-                    // On a broken connection the server cannot be told now; recovery re-arms it. A write
-                    // failure propagates but leaves the arm state intact for that recovery.
-                    $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+                    // On a broken connection the server cannot be told now; recovery re-arms it.
+                    try {
+                        $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+                    } catch (\Throwable) {
+                        // The socket is dead: the arm stays recorded for the recovery that the next operation
+                        // needing the socket starts, which arms it on the new connection. Not thrown, as on a
+                        // connection that is not open.
+                    }
                 }
 
                 // Already satisfied (max <= messages already received) with nothing left to deliver:
@@ -1829,9 +1889,13 @@ final class NatsConnection
 
             try {
                 $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+            } catch (\Throwable) {
+                // The socket is dead, and the server dropped the subscription with the connection, so this
+                // unsubscribe has what it asked for. Not thrown, exactly as on a connection that is not open:
+                // unsubscribe() runs in finally-based clean-up, where an error would mask the caller's own
+                // (#116). The next operation that needs the socket recovers the connection.
             } finally {
-                // Drop local state even when the UNSUB write fails: the connection is heading into
-                // recovery anyway, and retaining the entry would leak it and re-SUB it later (#116).
+                // Dropped even when the write failed, so that recovery does not subscribe the sid again (#116).
                 $this->dropSubscriptionState($sid);
             }
         });
@@ -2015,6 +2079,7 @@ final class NatsConnection
         // (heartbeat or timed-out) PING completes that PING's slot, never this one, and a
         // concurrent flush timing out cannot release this waiter.
         $slot = $this->enqueuePongSlot();
+        $generation = $this->connectionGeneration;
         try {
             // The WAIT is bounded (the write itself cannot be cancelled): flush() documents a
             // request-timeout bound, but a backpressure-suspended write held it forever before
@@ -2030,7 +2095,15 @@ final class NatsConnection
             // wire order (nats.go removePongFromList parity).
             $this->discardPongSlot($slot);
 
-            throw $writeError;
+            // The socket is dead. The connection recovers within this flush's budget, and the flush fails
+            // anyway, as when its PONG dies with the socket: what it was to confirm went to the dead one.
+            try {
+                $this->recoverAfterFailedWrite($generation, $writeError, $this->remainingBudgetCancellation($deadline));
+            } catch (CancelledException) {
+                throw new TimeoutException('Flush timed out waiting for the connection to be re-established');
+            }
+
+            throw new ConnectionException('Connection lost before the server answered the PING', 0, $writeError);
         }
 
         $cancellation = $this->remainingBudgetCancellation($deadline);

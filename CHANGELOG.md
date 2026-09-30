@@ -15,6 +15,25 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A `subscribe()`, `flush()` or `rtt()` whose write found the socket dead failed with the
+  socket's own error (for example `Amp\ByteStream\StreamException` "Broken pipe") and left the connection
+  Open on that socket, so every operation that wrote a control frame failed the same way until the
+  heartbeat noticed. A JetStream fetch subscribes its inbox first: after a server restart the application
+  had not seen yet, a fetch threw "Broken pipe", and a consumer built on it exited. Such a write is now a
+  connection failure, as a failed publish write already was. The connection reconnects, and the operation
+  waits for it within its own timeout, the way it waits for a reconnect already in flight; a
+  `subscribe()` then runs on the new connection, while a `flush()` or `rtt()` fails anyway, with
+  `Connection lost before the server answered the PING`, since what it was to confirm went to the dead
+  connection. With reconnect off the connection closes for good and the operation fails with
+  `Reconnect is disabled`; with `waitForReconnect: false` it fails at once with `Connection is not open`.
+  `unsubscribe()` no longer throws on a dead socket either - the server dropped the subscription with the
+  connection - as it already did not on a connection that is not open, and the next operation that needs
+  the socket reconnects.
+
 ## [2.9.0] - 2026-09-30
 
 ### Upgrade notes
