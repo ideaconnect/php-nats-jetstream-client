@@ -482,49 +482,7 @@ final class NatsConnectionTest extends TestCase
         self::assertSame($expectedReplay, $transport->writes[11]);
     }
 
-    public function testSubscribeRollsBackStateWhenSubWriteFails(): void
-    {
-        $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-            "PONG\r\n",
-            "MSG updates 1 2\r\nxx\r\n",
-            "MSG other 2 2\r\nyy\r\n",
-        ]);
-
-        $connection = new NatsConnection(new NatsOptions(), $transport);
-        $connection->connect()->await();
-
-        $firstReceived = [];
-        $transport->throwOnWriteContaining = 'SUB updates';
-
-        try {
-            $connection->subscribe('updates', static function (NatsMessage $message) use (&$firstReceived): void {
-                $firstReceived[] = $message->payload;
-            })->await();
-            self::fail('subscribe() must rethrow the transport write failure');
-        } catch (TransportClosedException) {
-            // Expected: the SUB write failed.
-        }
-
-        $transport->throwOnWriteContaining = null;
-
-        $otherReceived = [];
-        $sid = $connection->subscribe('other', static function (NatsMessage $message) use (&$otherReceived): void {
-            $otherReceived[] = $message->payload;
-        })->await();
-
-        // The failed attempt consumed sid 1 but rolled its registry entry back (#116): a frame for
-        // sid 1 is discarded rather than dispatched to the never-established subscription.
-        self::assertSame(2, $sid);
-
-        $connection->processIncoming()->await();
-        $connection->processIncoming()->await();
-
-        self::assertSame([], $firstReceived);
-        self::assertSame(['yy'], $otherReceived);
-    }
-
-    public function testUnsubscribeDropsLocalStateWhenUnsubWriteFails(): void
+    public function testUnsubscribeDropsLocalStateWithoutThrowingWhenUnsubWriteFails(): void
     {
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -542,12 +500,9 @@ final class NatsConnectionTest extends TestCase
 
         $transport->throwOnWriteContaining = 'UNSUB';
 
-        try {
-            $connection->unsubscribe($sid)->await();
-            self::fail('unsubscribe() must rethrow the transport write failure');
-        } catch (TransportClosedException) {
-            // Expected: the UNSUB write failed.
-        }
+        // Not thrown: a failed write means a dead socket, whose server-side subscription went with it, and
+        // unsubscribe() runs in finally-based clean-up, where an error would mask the caller's own (#116).
+        $connection->unsubscribe($sid)->await();
 
         // Local state must be gone regardless (#116): the entry would otherwise leak forever and
         // resubscribeAll() would revive it as a ghost subscription after the next recovery.
@@ -714,8 +669,9 @@ final class NatsConnectionTest extends TestCase
 
     public function testAutoUnsubscribeArmWriteFailureKeepsSubscriptionArmedForRecovery(): void
     {
-        // If the arming UNSUB write fails, the error propagates but the arm state is kept so the next
-        // recovery re-arms it - the subscription must not be silently torn down (#112/#116).
+        // If the arming UNSUB write fails, the arm state is kept so the next recovery re-arms it - the
+        // subscription must not be silently torn down (#112/#116) - and, as for a plain unsubscribe on a
+        // dead socket, nothing is thrown.
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -728,12 +684,7 @@ final class NatsConnectionTest extends TestCase
 
         $transport->throwOnWriteContaining = 'UNSUB';
 
-        try {
-            $connection->unsubscribe($sid, 3)->await();
-            self::fail('the failing UNSUB write must propagate');
-        } catch (TransportClosedException) {
-            // Expected.
-        }
+        $connection->unsubscribe($sid, 3)->await();
 
         $meta = (new \ReflectionProperty($connection, 'subscriptionMeta'))->getValue($connection);
         self::assertArrayHasKey($sid, $meta, 'a failed arm write must not tear down the subscription');
@@ -9401,6 +9352,9 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
+                // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends
+                // only when the test releases it, after disconnect() has returned.
+                connectTimeoutMs: 100,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
                 maxReconnectAttempts: 5,
@@ -9905,6 +9859,9 @@ final class NatsConnectionTest extends TestCase
 
         $connection = new NatsConnection(
             new NatsOptions(
+                // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends
+                // only when the test releases it, after disconnect() has returned.
+                connectTimeoutMs: 100,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
                 maxReconnectAttempts: 5,
@@ -10788,34 +10745,26 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * flush(): a PING write that FAILS outright (dead socket - distinct from the wedged/timeout
-     * path) must rethrow the write error to the caller AND discard the failed PING's pong slot
-     * (nats.go removePongFromList parity). The discard is observable: the next flush's PONG must
-     * complete THAT flush - a stale head slot would consume it and time the second flush out.
+     * flush(): a PING write that FAILS outright (dead socket - distinct from the wedged/timeout path) is a
+     * connection failure. With reconnect off it closes the connection for good, and the flush fails with
+     * that close - not with the socket's error, and not as a successful flush. With reconnect on the
+     * connection recovers first (FailedControlWriteTest).
      */
-    public function testFlushRethrowsPingWriteFailureAndKeepsPongCorrelationAligned(): void
+    public function testFlushWhosePingWriteFailsWithReconnectOffFailsWithTheClose(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 300), $transport);
+        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0, requestTimeoutMs: 300), $transport);
         $connection->connect()->await();
 
         $transport->throwOnWriteContaining = 'PING';
         try {
             $connection->flush()->await();
             self::fail('a failed PING write must surface, not report a successful flush');
-        } catch (TransportClosedException $e) {
-            self::assertSame('Simulated write failure', $e->getMessage());
+        } catch (ConnectionException $e) {
+            self::assertSame('Reconnect is disabled', $e->getMessage());
         }
-        self::assertSame(ConnectionState::Open, $connection->state(), 'a failed flush write is not terminal');
 
-        $transport->throwOnWriteContaining = null;
-        $transport->enqueueOnWriteContaining = ['PING' => ["PONG\r\n"]];
-        // Regression detector: a stale (undiscarded) slot at the queue head would eat this PONG
-        // and turn this bounded flush into a TimeoutException.
-        $connection->flush()->await(new TimeoutCancellation(5.0));
-
-        $pings = array_filter($transport->writes, static fn(string $w): bool => $w === "PING\r\n");
-        self::assertCount(2, $pings, 'only the handshake PING and the second flush PING reached the wire');
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /**
@@ -10868,56 +10817,6 @@ final class NatsConnectionTest extends TestCase
         self::assertSame(['hello'], $received, 'the recovered frame must be delivered before reconnecting');
         self::assertCount(2, $transport->connectCalls, 'recovery must run even though the logger threw during emitError');
         self::assertSame(ConnectionState::Open, $connection->state());
-    }
-
-    /**
-     * A mux-inbox establishment whose SUB write fails must surface the transport error through the
-     * request AND roll back cleanly (the serialization deferred is errored and cleared): the next
-     * request must re-attempt the establishment and succeed, instead of joining a dead setup or
-     * silently timing out (#118).
-     */
-    public function testRequestRetriesMuxInboxEstablishmentAfterFailedSubWrite(): void
-    {
-        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
-        $connection->connect()->await();
-
-        $transport->throwOnWriteContaining = 'SUB ';
-        try {
-            $connection->request('svc.echo', 'x', 100)->await();
-            self::fail('a failed mux-inbox SUB write must fail the request');
-        } catch (TransportClosedException $e) {
-            self::assertSame('Simulated write failure', $e->getMessage());
-        }
-        self::assertSame(ConnectionState::Open, $connection->state());
-
-        // Heal the transport and serve the retried establishment: echo a reply for the PUB on the
-        // (client-chosen) mux sid captured from the retried SUB.
-        $transport->throwOnWriteContaining = null;
-        $muxSid = null;
-        $transport->onWrite = static function (string $bytes) use (&$muxSid): array {
-            $head = strtok($bytes, "\r\n");
-            if ($head === false) {
-                return [];
-            }
-            if (str_starts_with($head, 'SUB _INBOX.')) {
-                $muxSid = (int) (explode(' ', $head)[2] ?? 0);
-
-                return [];
-            }
-            if (!str_starts_with($head, 'PUB svc.echo ') || $muxSid === null) {
-                return [];
-            }
-            $replyTo = explode(' ', $head)[2] ?? '';
-
-            return $replyTo === '' ? [] : [sprintf("MSG %s %d 5\r\nhello\r\n", $replyTo, $muxSid)];
-        };
-
-        $reply = $connection->request('svc.echo', 'x', 500)->await(new TimeoutCancellation(5.0));
-
-        self::assertSame('hello', $reply->payload, 'the retried mux establishment must serve replies');
-        $inboxSubs = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'SUB _INBOX.'));
-        self::assertCount(1, $inboxSubs, 'only the successful (retried) mux SUB reached the wire');
     }
 
     /**
@@ -11082,6 +10981,11 @@ final class NatsConnectionTest extends TestCase
         $events = [];
         $connection = new NatsConnection(
             new NatsOptions(
+                // The close below is awaited from inside the fake transport's write, on a fiber the recovery
+                // itself waits for; disconnect() waits for the recovery it stopped, so here only until the
+                // connect timeout. (A real transport writes on the caller's fiber: the recovery's own, whose
+                // close does not wait for it.)
+                connectTimeoutMs: 100,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
                 reconnectDelayMs: 1,
@@ -11133,6 +11037,11 @@ final class NatsConnectionTest extends TestCase
         $events = [];
         $connection = new NatsConnection(
             new NatsOptions(
+                // The close below is awaited from inside the fake transport's write, on a fiber the recovery
+                // itself waits for; disconnect() waits for the recovery it stopped, so here only until the
+                // connect timeout. (A real transport writes on the caller's fiber: the recovery's own, whose
+                // close does not wait for it.)
+                connectTimeoutMs: 100,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
                 reconnectDelayMs: 1,
@@ -11896,8 +11805,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
+        // when the test releases it, after disconnect() has returned.
         $connection = new NatsConnection(
-            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
         );
 
@@ -12269,8 +12180,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
+        // when the test releases it, after disconnect() has returned.
         $connection = new NatsConnection(
-            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
         );
         $connection->connect()->await();
@@ -12363,8 +12276,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
+        // when the test releases it, after disconnect() has returned.
         $connection = new NatsConnection(
-            new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
+            new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
         );
         $connection->connect()->await();

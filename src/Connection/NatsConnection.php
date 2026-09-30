@@ -28,6 +28,7 @@ use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Protocol\ProtocolFrame;
 use IDCT\NATS\Protocol\ProtocolParser;
 use IDCT\NATS\Protocol\ServerInfo;
+use IDCT\NATS\Transport\CancellableDialTransportInterface;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\TransportInterface;
@@ -291,6 +292,13 @@ final class NatsConnection
      * instead of when its current delay ends ({@see setCloseIntent()}).
      */
     private ?DeferredCancellation $reconnectBackoff = null;
+
+    /**
+     * Stops the dial in progress - a connect()'s or a reconnect's - when the user closes the connection
+     * ({@see setCloseIntent()}), for a transport that can stop its dial
+     * ({@see CancellableDialTransportInterface}).
+     */
+    private ?DeferredCancellation $dialStop = null;
     /**
      * Counts the connections this client has made: bumped by every handshake attempt. A read, write or
      * heartbeat captures it before its I/O and hands it to {@see recoverConnection()} when that I/O
@@ -730,6 +738,44 @@ final class NatsConnection
     }
 
     /**
+     * Recovers a connection whose socket failed the write of a control frame - a SUB, or the PING of
+     * flush() or rtt() - and waits for it the way an operation waits for a recovery already in flight
+     * ({@see awaitOpenConnection()}): within the caller's own budget, and not at all when waiting is
+     * disabled. A recovery that outlasts the budget carries on without the caller.
+     *
+     * Such a write used to leave the connection Open on the dead socket, its raw error reaching the caller,
+     * and every operation that wrote a control frame failed the same way until the heartbeat noticed. A
+     * publish recovers inline and sends again; these hand the recovery to its own fiber, as the heartbeat
+     * does, so that a caller with a budget keeps to it. It joins a recovery another fiber already runs, and
+     * starts none for a connection since replaced ({@see recoverConnection()}). With reconnect off it closes
+     * the connection for good, and the caller gets its "Reconnect is disabled".
+     *
+     * @param int $generation The {@see $connectionGeneration} the failed write ran on.
+     *
+     * @throws ConnectionException When the connection does not come back, or at once when waiting is disabled.
+     * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
+     */
+    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation): void
+    {
+        $recovery = async(function () use ($generation): void {
+            $this->recoverConnection(failedGeneration: $generation);
+        });
+        // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
+        $recovery->ignore();
+
+        if (!$this->options->waitForReconnect) {
+            throw new ConnectionException('Connection is not open', 0, $writeError);
+        }
+
+        $recovery->await($cancellation);
+
+        // No recovery ran: the user is closing the connection, or a connect() owns the dial.
+        if ($this->state !== ConnectionState::Open) {
+            throw new ConnectionException('Connection is not open', 0, $writeError);
+        }
+    }
+
+    /**
      * Runs one user-initiated connect - dial + handshake with the standing failure policy (auth
      * failures fail fast; other failures hand off to recovery or the initial-connect retry loop;
      * otherwise the connection closes terminally). Serialized by {@see connect()}.
@@ -868,7 +914,11 @@ final class NatsConnection
      */
     public function disconnect(): Future
     {
-        return async(function (): void {
+        // Captured on the CALLER's fiber, as connect() does: a disconnect() issued from a listener inside the
+        // reconnect it stops must not wait for that reconnect ({@see awaitStoppedDials()}).
+        $caller = \Fiber::getCurrent();
+
+        return async(function () use ($caller): void {
             // A close already announced - by a drain(), a reconnect that gave up, an earlier (or a
             // concurrent) disconnect() - is not announced again: this closes quietly (drain() then
             // disconnect() is a common shutdown idiom).
@@ -877,6 +927,7 @@ final class NatsConnection
             // Signal close-intent BEFORE closing the socket so an in-flight reconnect/heartbeat read
             // cannot race to re-open the connection after the user asked to close it (#84).
             $this->setCloseIntent();
+            $stopped = $this->stoppedDials();
             // This disconnect announces the close below: a drain() it interrupts must not announce it
             // again when it ends, even if it ends first.
             $this->closedAnnounced = true;
@@ -891,6 +942,8 @@ final class NatsConnection
             if ($announce) {
                 $this->emitEvent(ConnectionEvent::Closed);
             }
+
+            $this->awaitStoppedDials($stopped, $caller);
         });
     }
 
@@ -898,12 +951,78 @@ final class NatsConnection
      * Records the user's close-intent (disconnect()/drain()): an in-flight reconnect stops at its next
      * check instead of reopening the connection (#84), and its backoff delay is cut short so it stops at
      * once - rather than keep running, and keep a connect() that joins it waiting, until the delay ends.
+     * The dial in progress, a reconnect's or a connect()'s, is stopped too where the transport can stop
+     * it ({@see dialTransport()}).
      */
     private function setCloseIntent(): void
     {
         $this->closing = true;
         $this->cancelPingTimer();
         $this->reconnectBackoff?->cancel();
+        $this->dialStop?->cancel();
+    }
+
+    /**
+     * The reconnect and the connect() in progress, each with the fiber that runs it: what a close that has
+     * just set close-intent stops, for {@see awaitStoppedDials()}. Taken before the close announces itself,
+     * so the wait is not for a connect() that a Closed listener starts.
+     *
+     * @return list<array{DeferredFuture<void>, ?\Fiber<mixed, mixed, mixed, mixed>}>
+     */
+    private function stoppedDials(): array
+    {
+        $stopped = [];
+        if ($this->reconnecting !== null) {
+            $stopped[] = [$this->reconnecting, $this->recoveryFiber];
+        }
+
+        if ($this->connecting !== null) {
+            $stopped[] = [$this->connecting, $this->connectFiber];
+        }
+
+        return $stopped;
+    }
+
+    /**
+     * Waits for the reconnect or the connect() that a close stopped to end, so that disconnect() and drain()
+     * resolve with nothing they stopped still running. A connect() issued after the close then dials afresh.
+     * It used to meet the stopped reconnect still dialling, and fail with "Recovery was aborted before the
+     * connection opened"; in a synchronous application that reconnect never got the event-loop time to end,
+     * and every connect() failed that way.
+     *
+     * Bounded by the connect timeout, which is how long a transport that cannot stop its dial may take to
+     * end it ({@see CancellableDialTransportInterface}); a connection listener could take any time at all.
+     * Skipped for the fiber that runs what was stopped: a close called from a connection/error listener runs
+     * inside it, and waiting there would await what only that suspended fiber can complete (#145).
+     *
+     * @param list<array{DeferredFuture<void>, ?\Fiber<mixed, mixed, mixed, mixed>}> $stopped From {@see stoppedDials()}.
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called the close.
+     */
+    private function awaitStoppedDials(array $stopped, ?\Fiber $caller): void
+    {
+        if ($stopped === []) {
+            return;
+        }
+
+        // A referenced timer, unlike a TimeoutCancellation's: what the stopped dial waits for may hold no watcher
+        // that keeps the event loop running, and the close must still return at the bound.
+        $bound = new DeferredCancellation();
+        $timer = EventLoop::delay($this->options->connectTimeoutMs / 1000, static function () use ($bound): void {
+            $bound->cancel();
+        });
+        foreach ($stopped as [$deferred, $fiber]) {
+            if ($caller !== null && $caller === $fiber) {
+                continue;
+            }
+
+            try {
+                $deferred->getFuture()->await($bound->getCancellation());
+            } catch (\Throwable) {
+                // However it ended, or if it is still running at the bound, the close stands.
+            }
+        }
+
+        EventLoop::cancel($timer);
     }
 
     /**
@@ -970,11 +1089,12 @@ final class NatsConnection
     }
 
     /**
-     * Best-effort transport close for terminal failure exits, mirroring disconnect(). connectOnce()
-     * opens the socket before the handshake can fail, so every path that gives up (terminal connect
-     * failure, exhausted or auth-aborted recovery) must close it - otherwise the fd stays pinned by
-     * the transport until the client object itself is GC'd (#133). Close failures are irrelevant
-     * here: the socket may already be gone, and the terminal state transition is what matters.
+     * Best-effort transport close for terminal failure exits, mirroring disconnect(), and before each
+     * reconnect attempt dials. connectOnce() opens the socket before the handshake can fail, so every
+     * path that gives up (terminal connect failure, exhausted or auth-aborted recovery) must close it -
+     * otherwise the fd stays pinned by the transport until the client object itself is GC'd (#133).
+     * Close failures are irrelevant here: the socket may already be gone, and the terminal state
+     * transition, or the next attempt, is what matters.
      */
     private function closeTransportBestEffort(): void
     {
@@ -1053,12 +1173,16 @@ final class NatsConnection
                 $this->drainConnection($caller);
             } finally {
                 $this->drainInProgress = false;
+                // A reconnect the drain stopped, when its budget ran out before the reconnect was done.
+                $stopped = $this->stoppedDials();
                 // Announced once the drain is over, so a Closed listener may connect() again at once - and
                 // not a second time when the path that closed the connection already announced it. The
                 // connection is Closed here however drainConnection() ended: every exit closes it.
                 if (!$this->closedAnnounced) {
                     $this->emitEvent(ConnectionEvent::Closed);
                 }
+
+                $this->awaitStoppedDials($stopped, $caller);
             }
         });
     }
@@ -1731,14 +1855,31 @@ final class NatsConnection
         $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
         $this->pendingMessages[$sid] = new SplQueue();
 
+        $generation = $this->connectionGeneration;
         try {
             $this->transport->write($this->codec->encodeSubscribe($subject, $sid, $queue))->await();
-        } catch (\Throwable $e) {
-            // The SUB never reached the wire; roll back so the registry does not retain an entry
-            // whose sid the caller never learns (and resubscribeAll() cannot revive it) (#116).
-            $this->dropSubscriptionState($sid);
+        } catch (\Throwable $writeError) {
+            // The socket is dead. The subscription stays registered while the connection recovers, so the
+            // reconnect subscribes it on the new connection; it is rolled back only when the connection does
+            // not come back in time, so that the registry does not keep an entry whose sid the caller never
+            // learns (#116).
+            try {
+                $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000));
+            } catch (CancelledException) {
+                $this->dropSubscriptionState($sid);
 
-            throw $e;
+                throw new TimeoutException(sprintf('Subscribe to "%s" timed out waiting for the connection to be re-established', $subject));
+            } catch (\Throwable $recoveryError) {
+                $this->dropSubscriptionState($sid);
+
+                throw $recoveryError;
+            }
+
+            // A terminal close released it, and a connect() opened a fresh connection since: nothing
+            // subscribed it there.
+            if (!isset($this->subscriptionMeta[$sid])) {
+                throw new ConnectionException(sprintf('Subscribe to "%s" failed: the connection was closed', $subject), 0, $writeError);
+            }
         }
 
         return $sid;
@@ -1807,9 +1948,14 @@ final class NatsConnection
                 $this->autoUnsubMax[$sid] = $maxMessages;
 
                 if ($this->state === ConnectionState::Open) {
-                    // On a broken connection the server cannot be told now; recovery re-arms it. A write
-                    // failure propagates but leaves the arm state intact for that recovery.
-                    $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+                    // On a broken connection the server cannot be told now; recovery re-arms it.
+                    try {
+                        $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
+                    } catch (\Throwable) {
+                        // The socket is dead: the arm stays recorded for the recovery that the next operation
+                        // needing the socket starts, which arms it on the new connection. Not thrown, as on a
+                        // connection that is not open.
+                    }
                 }
 
                 // Already satisfied (max <= messages already received) with nothing left to deliver:
@@ -1829,11 +1975,15 @@ final class NatsConnection
 
             try {
                 $this->transport->write($this->codec->encodeUnsubscribe($sid, $maxMessages))->await();
-            } finally {
-                // Drop local state even when the UNSUB write fails: the connection is heading into
-                // recovery anyway, and retaining the entry would leak it and re-SUB it later (#116).
-                $this->dropSubscriptionState($sid);
+            } catch (\Throwable) {
+                // The socket is dead, and the server dropped the subscription with the connection, so this
+                // unsubscribe has what it asked for. Not thrown, exactly as on a connection that is not open:
+                // unsubscribe() runs in finally-based clean-up, where an error would mask the caller's own
+                // (#116). The next operation that needs the socket recovers the connection.
             }
+
+            // Dropped even when the write failed, so that recovery does not subscribe the sid again (#116).
+            $this->dropSubscriptionState($sid);
         });
     }
 
@@ -2015,6 +2165,7 @@ final class NatsConnection
         // (heartbeat or timed-out) PING completes that PING's slot, never this one, and a
         // concurrent flush timing out cannot release this waiter.
         $slot = $this->enqueuePongSlot();
+        $generation = $this->connectionGeneration;
         try {
             // The WAIT is bounded (the write itself cannot be cancelled): flush() documents a
             // request-timeout bound, but a backpressure-suspended write held it forever before
@@ -2030,7 +2181,15 @@ final class NatsConnection
             // wire order (nats.go removePongFromList parity).
             $this->discardPongSlot($slot);
 
-            throw $writeError;
+            // The socket is dead. The connection recovers within this flush's budget, and the flush fails
+            // anyway, as when its PONG dies with the socket: what it was to confirm went to the dead one.
+            try {
+                $this->recoverAfterFailedWrite($generation, $writeError, $this->remainingBudgetCancellation($deadline));
+            } catch (CancelledException) {
+                throw new TimeoutException('Flush timed out waiting for the connection to be re-established');
+            }
+
+            throw new ConnectionException('Connection lost before the server answered the PING', 0, $writeError);
         }
 
         $cancellation = $this->remainingBudgetCancellation($deadline);
@@ -3044,6 +3203,30 @@ final class NatsConnection
     }
 
     /**
+     * Dials $dsn so that a close stops the dial ({@see setCloseIntent()}), when the transport can stop it: a
+     * close no longer leaves a reconnect or a connect() dialling after it returned - with Amp's retry pauses,
+     * some 6 s against a refused port. A transport that cannot stop its dial is dialled as before, and the
+     * close waits for the dial to end ({@see awaitStoppedDials()}).
+     */
+    private function dialTransport(string $dsn): void
+    {
+        $transport = $this->transport;
+        if (!$transport instanceof CancellableDialTransportInterface) {
+            $transport->connect($dsn, $this->options->connectTimeoutMs)->await();
+
+            return;
+        }
+
+        $stop = new DeferredCancellation();
+        $this->dialStop = $stop;
+        try {
+            $transport->connect($dsn, $this->options->connectTimeoutMs, $stop->getCancellation())->await();
+        } finally {
+            $this->dialStop = null;
+        }
+    }
+
+    /**
      * Establishes a fresh connection against the next available server.
      *
      * Leaves state Connecting: the caller flips Open via {@see markConnectionOpen()}. The initial
@@ -3072,7 +3255,7 @@ final class NatsConnection
         $this->connectedServer = $server;
         $urlCredentials = $this->extractUrlCredentials($server);
         $dsn = $this->normalizeDsn($server);
-        $this->transport->connect($dsn, $this->options->connectTimeoutMs)->await();
+        $this->dialTransport($dsn);
 
         $this->serverInfo = $this->awaitServerInfo();
 
@@ -3288,12 +3471,20 @@ final class NatsConnection
             }
         }
 
+        // A reconnect that a close stopped returns without reopening the connection. What is queued is then
+        // the close's: drain() delivers it within its budget, and disconnect() discards it. Delivered here as
+        // well, it reached handlers after disconnect(), or beside drain()'s own delivery and past the rules
+        // that one keeps.
+        if ($this->state !== ConnectionState::Open) {
+            return;
+        }
+
         // Deliver any messages buffered during subscription replay now that recovery has finished and
         // we are OUT of the critical section: `reconnecting` is cleared, so a callback that publishes
         // and hits a write failure starts a fresh recovery instead of deadlocking on the in-progress
-        // one, and the per-sid dispatch guard keeps it non-reentrant. (Only reached on success; the
-        // catch above rethrows on failure.) A full SubscriptionQueue is reported without cutting the
-        // delivery short.
+        // one, and the per-sid dispatch guard keeps it non-reentrant. (Only reached when the recovery
+        // reopened the connection; the catch above rethrows on failure.) A full SubscriptionQueue is
+        // reported without cutting the delivery short.
         try {
             $this->deliverPending(reportOverflows: true);
         } catch (\Throwable $handlerError) {
@@ -3418,10 +3609,13 @@ final class NatsConnection
                 return;
             }
 
-            try {
-                $this->transport->close()->await();
-            } catch (\Throwable) {
-                // Ignore close failures during reconnect transitions.
+            $this->closeTransportBestEffort();
+
+            // A close that came while the previous socket was closing: do not dial again.
+            if ($this->closing) {
+                $this->state = ConnectionState::Closed;
+
+                return;
             }
 
             try {

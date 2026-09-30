@@ -17,7 +17,6 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\ProtocolException;
 
 use function Amp\async;
-use function Amp\Socket\connect;
 
 /**
  * NATS-over-WebSocket transport (`ws://` / `wss://`).
@@ -28,9 +27,10 @@ use function Amp\Socket\connect;
  * control frames handled transparently. TLS for `wss://` is negotiated during {@see connect()}, so
  * {@see upgradeTls()} is a no-op (there is no separate post-INFO upgrade for WebSocket).
  */
-final class WebSocketTransport implements TlsAwareTransportInterface
+final class WebSocketTransport implements TlsAwareTransportInterface, CancellableDialTransportInterface
 {
     use AssemblesClientTlsContext;
+    use OpensSocketCancellably;
 
     /** Hard cap on a reassembled fragmented message, bounding memory against a hostile/buggy server (#89). */
     private const DEFAULT_MAX_MESSAGE_BYTES = 64 * 1024 * 1024;
@@ -148,10 +148,14 @@ final class WebSocketTransport implements TlsAwareTransportInterface
 
     /**
      * Connects to a `ws://` or `wss://` NATS endpoint and completes the WebSocket upgrade handshake.
+     *
+     * @param Cancellation|null $cancellation Stops the TCP dial at once, Amp's retry pauses included, and leaves
+     *        no socket behind ({@see CancellableDialTransportInterface}). The TLS and upgrade handshakes that
+     *        follow are bounded by the connect timeout, and end at once when the transport is closed.
      */
-    public function connect(string $dsn, int $timeoutMs): Future
+    public function connect(string $dsn, int $timeoutMs, ?Cancellation $cancellation = null): Future
     {
-        return async(function () use ($dsn, $timeoutMs): void {
+        return async(function () use ($dsn, $timeoutMs, $cancellation): void {
             $this->lastConnectTimeoutMs = max(1, $timeoutMs);
             $this->tlsEstablished = false;
             $this->readBuffer = '';
@@ -190,7 +194,7 @@ final class WebSocketTransport implements TlsAwareTransportInterface
                 $context = $context->withTlsContext($this->buildTlsContext($host));
             }
 
-            $socket = connect("tcp://{$host}:{$port}", $context);
+            $socket = $this->openSocket("tcp://{$host}:{$port}", $context, $cancellation);
             $this->socket = $socket;
             $this->applyReadChunkSize();
 

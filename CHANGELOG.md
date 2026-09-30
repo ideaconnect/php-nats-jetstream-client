@@ -15,6 +15,62 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.10.0] - 2026-09-30
+
+### Upgrade notes
+
+- A `subscribe()`, `flush()` or `rtt()` whose write finds the socket dead no longer throws the socket's own
+  error (for example `Amp\ByteStream\StreamException`): it starts the reconnect and waits for it within
+  its own timeout, as it waits for a reconnect already in flight. `subscribe()` then returns; `flush()`
+  and `rtt()` throw a `ConnectionException` (`Connection lost before the server answered the PING`). A wait
+  that runs out throws a `TimeoutException`, and with reconnect off they throw a `ConnectionException`
+  (`Reconnect is disabled`). Code that caught the transport's exception there should catch those instead.
+- `unsubscribe()` no longer throws when its write finds the socket dead.
+- `disconnect()` and `drain()` now return only once the reconnect or `connect()` they stopped has ended.
+  With the built-in transports that is at once; a custom transport that implements only
+  `TransportInterface` can hold them up to `connectTimeoutMs`. Implement `CancellableDialTransportInterface`
+  to let a close stop its dial.
+
+### Added
+
+- `[feature]` `CancellableDialTransportInterface`, a transport whose dial can be stopped: its `connect()`
+  takes a cancellation that fires when the application closes the connection while a connect or a
+  reconnect is dialling. Both built-in transports implement it. A custom transport that implements only
+  `TransportInterface` works as before, and a close waits for its dial to end, up to `connectTimeoutMs`.
+
+### Fixed
+
+- `[bugfix]` A `subscribe()`, `flush()` or `rtt()` whose write found the socket dead failed with the
+  socket's own error (for example `Amp\ByteStream\StreamException` "Broken pipe") and left the connection
+  Open on that socket, so every operation that wrote a control frame failed the same way until the
+  heartbeat noticed. A JetStream fetch subscribes its inbox first: after a server restart the application
+  had not seen yet, a fetch threw "Broken pipe", and a consumer built on it exited. Such a write is now a
+  connection failure, as a failed publish write already was. The connection reconnects, and the operation
+  waits for it within its own timeout, the way it waits for a reconnect already in flight; a
+  `subscribe()` then runs on the new connection, while a `flush()` or `rtt()` fails anyway, with
+  `Connection lost before the server answered the PING`, since what it was to confirm went to the dead
+  connection. With reconnect off the connection closes for good and the operation fails with
+  `Reconnect is disabled`; with `waitForReconnect: false` it fails at once with `Connection is not open`.
+  `unsubscribe()` no longer throws on a dead socket either - the server dropped the subscription with the
+  connection - as it already did not on a connection that is not open, and the next operation that needs
+  the socket reconnects.
+
+- `[bugfix]` `disconnect()` or `drain()` during a reconnect that was dialling left that reconnect running
+  after they returned: they cut its backoff short but not its dial, which with Amp's retry pauses takes
+  some 6 s against a refused port. A `connect()` issued after the close met the stopped reconnect still
+  winding down and failed with `Recovery was aborted before the connection opened`. In a synchronous
+  application the reconnect never got the event-loop time to end, so every later `connect()` failed that
+  way and the connection could not be reopened until the process restarted (found while reviewing
+  symfony-nats-messenger PR #45, where a transport's `close()` then broke every later dispatch). A close
+  now stops the dial - Amp's retry pauses included, for a transport that implements
+  `CancellableDialTransportInterface` - and waits, bounded by `connectTimeoutMs`, for the reconnect or
+  `connect()` it stopped to end before it returns, so a `connect()` issued after it dials afresh. A
+  `connect()` racing the close still fails at once. A reconnect attempt that finds a close came while it
+  was closing the previous socket no longer dials.
+- `[bugfix]` A reconnect that a close stopped delivered the messages queued on the connection on its way
+  out: after `disconnect()`, which discards them, or beside `drain()`'s own delivery and past the rules it
+  keeps. It now leaves them to the close.
+
 ## [2.9.0] - 2026-09-30
 
 ### Upgrade notes
