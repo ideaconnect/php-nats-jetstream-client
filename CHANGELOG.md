@@ -15,7 +15,21 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.10.0] - 2026-09-30
+
+### Upgrade notes
+
+- A `subscribe()`, `flush()` or `rtt()` whose write finds the socket dead no longer throws the socket's own
+  error (for example `Amp\ByteStream\StreamException`): it starts the reconnect and waits for it within
+  its own timeout, as it waits for a reconnect already in flight. `subscribe()` then returns; `flush()`
+  and `rtt()` throw a `ConnectionException` (`Connection lost before the server answered the PING`). A wait
+  that runs out throws a `TimeoutException`, and with reconnect off they throw a `ConnectionException`
+  (`Reconnect is disabled`). Code that caught the transport's exception there should catch those instead.
+- `unsubscribe()` no longer throws when its write finds the socket dead.
+- `disconnect()` and `drain()` now return only once the reconnect or `connect()` they stopped has ended.
+  With the built-in transports that is at once; a custom transport that implements only
+  `TransportInterface` can hold them up to `connectTimeoutMs`. Implement `CancellableDialTransportInterface`
+  to let a close stop its dial.
 
 ### Added
 
