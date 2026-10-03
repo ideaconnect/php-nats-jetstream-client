@@ -776,6 +776,56 @@ final class NatsConnection
     }
 
     /**
+     * Whether a frame whose dispatch failed means the connection is finished: a fatal -ERR, which the server
+     * sends right before it closes the socket, or a PONG the socket would not take. A full subscription queue
+     * does not: one subscriber fell behind, and the connection is fine.
+     */
+    private function frameFailureEndsConnection(\Throwable $failure): bool
+    {
+        return !$failure instanceof SlowConsumerException;
+    }
+
+    /**
+     * Recovers a connection that a frame said was finished ({@see frameFailureEndsConnection()}), so that the
+     * read that met the frame is the only operation to fail (#171). Left Open, the connection had the next
+     * operation write into the socket the server had closed, where it failed as well, or with reconnect on
+     * waited out its whole timeout first.
+     *
+     * The recovery runs in its own fiber, like the one a failed control write starts, and the read waits for
+     * it only within its own budget, the way it waits for a reconnect already in flight. With reconnect off
+     * the recovery just closes the connection for good, so the caller's next operation finds it Closed. With
+     * reconnect on, a read that may not wait for a reconnect ({@see NatsOptions::$waitForReconnect}) does
+     * not wait for this one: the recovery has left Open before any later operation runs, since it was queued
+     * first. It joins a recovery another fiber already runs, and starts none for a connection since replaced
+     * or one the user is closing ({@see recoverConnection()}).
+     *
+     * The read then fails with the frame's own error, which says why the connection ended. How the recovery
+     * ends - reopened, closed because reconnect is off, given up - is announced by the connection events.
+     *
+     * @param int $generation The {@see $connectionGeneration} the frame was read on.
+     */
+    private function recoverAfterEndingFrame(int $generation, ?Cancellation $cancellation): void
+    {
+        $recovery = async(function () use ($generation): void {
+            $this->recoverConnection(failedGeneration: $generation);
+        });
+        // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
+        $recovery->ignore();
+
+        if ($this->options->reconnectEnabled && !$this->options->waitForReconnect) {
+            return;
+        }
+
+        try {
+            $recovery->await($cancellation);
+        } catch (\Throwable) {
+            // Closed for good (reconnect off, attempts used up, credentials refused), or the read's own
+            // deadline ended the wait while the recovery carries on: either way the caller gets the frame's
+            // error.
+        }
+    }
+
+    /**
      * Runs one user-initiated connect - dial + handshake with the standing failure policy (auth
      * failures fail fast; other failures hand off to recovery or the initial-connect retry loop;
      * otherwise the connection closes terminally). Serialized by {@see connect()}.
@@ -2242,6 +2292,11 @@ final class NatsConnection
      * fails while another fiber already runs the recovery likewise waits for it only until
      * $cancellation fires.
      *
+     * A frame that ends the connection - a fatal -ERR, which the server sends right before it closes the
+     * socket, or a PONG the socket would not take - recovers it before its error reaches the caller: with
+     * reconnect off the connection is then Closed, and with reconnect on the read waits for the reconnect
+     * within $cancellation, as it would for one in flight, or not at all with waiting disabled (#171).
+     *
      * Under {@see SlowConsumerPolicy::Error}, a full subscription queue this read runs into - whichever
      * subscription's - is thrown as a {@see SlowConsumerException}.
      *
@@ -2443,7 +2498,7 @@ final class NatsConnection
             } catch (\Throwable $e) {
                 // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
                 // delivery, #128) before this fatal frame error (a server -ERR / PONG-write failure)
-                // escalates to the caller below.
+                // recovers the connection and reaches the caller below.
                 $dispatchError = $e;
             }
 
@@ -2466,6 +2521,13 @@ final class NatsConnection
             }
 
             if ($dispatchError !== null) {
+                // A frame that ends the connection recovers it before its error reaches the caller, as a
+                // failed read does (#171). During drain() the close intent keeps that recovery from
+                // reconnecting: drain() reports the error and closes, as it does when the socket fails.
+                if ($this->frameFailureEndsConnection($dispatchError)) {
+                    $this->recoverAfterEndingFrame($generation, $cancellation);
+                }
+
                 throw $dispatchError;
             }
 
@@ -4841,10 +4903,19 @@ final class NatsConnection
 
         if ($dispatchError !== null) {
             // Previously a fatal frame (e.g. a server -ERR) observed during the heartbeat read was
-            // swallowed whole. Surface it through the error listener (#128); escalation still
-            // belongs to the next user read / tick, not to the event-loop timer - which a throwing
-            // user logger must not reach either.
+            // swallowed whole. Surface it through the error listener (#128) - safely, since a throwing
+            // user logger must not reach the event-loop timer.
             $this->emitErrorSafely($dispatchError);
+
+            // A frame that ends the connection recovers it here as well, like a socket the peer closed
+            // (#171): left Open until the next tick, the connection failed whichever operation came first.
+            if ($this->frameFailureEndsConnection($dispatchError)) {
+                try {
+                    $this->recoverConnection(failedGeneration: $generation);
+                } catch (\Throwable) {
+                    $this->state = ConnectionState::Closed;
+                }
+            }
         }
     }
 

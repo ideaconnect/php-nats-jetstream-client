@@ -6553,12 +6553,18 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Permissions Violation'\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
         $connection->connect()->await();
 
-        $this->expectException(ConnectionException::class);
-        $this->expectExceptionMessage('Server sent error frame');
-        $connection->processIncoming()->await();
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected ConnectionException');
+        } catch (ConnectionException $e) {
+            self::assertStringStartsWith('Server sent error frame', $e->getMessage());
+        }
+
+        // The fatal -ERR ended the connection, which reconnect off closes for good (#171).
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     public function testConnectUsesDefaultServerWhenListEmpty(): void
@@ -7492,11 +7498,14 @@ final class NatsConnectionTest extends TestCase
         $transport->mode = 'throw';
         $invoke->invoke($connection); // a transient read error is swallowed
 
-        $transport->mode = 'fatal';
-        $invoke->invoke($connection); // a fatal -ERR frame is swallowed rather than thrown out of the timer
-
-        // None of these escalate out of the heartbeat read or close the connection.
+        // Neither escalates out of the heartbeat read or closes the connection.
         self::assertSame(ConnectionState::Open, $connection->state());
+
+        $transport->mode = 'fatal';
+        $invoke->invoke($connection); // a fatal -ERR frame is not thrown out of the timer either...
+
+        // ...but it ends the connection, which reconnect off closes for good (#171).
+        self::assertSame(ConnectionState::Closed, $connection->state());
 
         $connection->disconnect()->await();
     }
@@ -11405,22 +11414,35 @@ final class NatsConnectionTest extends TestCase
 
     /**
      * A fatal frame the heartbeat's own read picks up is reported from the event-loop timer: a throwing
-     * user-supplied logger must not escape into the loop through that report.
+     * user-supplied logger must not escape into the loop through that report, nor skip the recovery the
+     * frame calls for (#171).
      */
     public function testHeartbeatReadReportsAFatalFrameWithoutEscapingWhenLoggerThrows(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $connection = new NatsConnection(
-            new NatsOptions(pingIntervalSeconds: 0, logger: new ThrowingLogger('Server sent error frame')),
+            new NatsOptions(
+                reconnectEnabled: true,
+                maxReconnectAttempts: 3,
+                reconnectDelayMs: 1,
+                reconnectJitterMs: 0,
+                pingIntervalSeconds: 0,
+                logger: new ThrowingLogger('Server sent error frame'),
+            ),
             $transport,
         );
         $connection->connect()->await();
         $transport->pushReadChunk("-ERR 'Unknown Protocol Operation'\r\n");
+        // Reconnect handshake material for the recovery the fatal frame triggers.
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
 
         // On regression the logger's RuntimeException escapes this call - the timer-callback path.
         (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
 
-        self::assertSame(ConnectionState::Open, $connection->state(), 'escalation stays with the next read or tick');
+        self::assertCount(2, $transport->connectCalls, 'the recovery ran although the logger threw');
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(1, $connection->statistics()->reconnects);
     }
 
     /** The same for a corrupt stream the heartbeat's read finds; what parsed before it is still delivered. */
@@ -11448,7 +11470,8 @@ final class NatsConnectionTest extends TestCase
      * A heartbeat-read chunk whose parsed head is a fatal -ERR plus a MSG and whose tail is corrupt
      * exercises BOTH containments at once (#147/#128): the recovered MSG is still delivered, and
      * both failures - the parse error AND the fatal frame error raised while dispatching the
-     * recovered frames - surface via the error listener without escaping the timer.
+     * recovered frames - surface via the error listener without escaping the timer. The fatal -ERR
+     * then recovers the connection (#171).
      */
     public function testHeartbeatReadSurfacesFatalErrRecoveredFromMidChunkParseFailure(): void
     {
@@ -11475,6 +11498,9 @@ final class NatsConnectionTest extends TestCase
         })->await();
 
         $transport->pushReadChunk("-ERR 'Unknown Protocol Operation'\r\nMSG updates 1 5\r\nhello\r\nBOGUS\r\n");
+        // Reconnect handshake material for the recovery the fatal frame triggers.
+        $transport->pushReadChunk(self::HANDSHAKE_INFO);
+        $transport->pushReadChunk("PONG\r\n");
 
         (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
 
@@ -11489,8 +11515,9 @@ final class NatsConnectionTest extends TestCase
             array_filter($errors, static fn(string $m): bool => str_contains($m, 'Server sent error frame')),
             'the fatal -ERR dispatched from the recovered frames must surface too',
         );
-        self::assertSame(ConnectionState::Open, $connection->state(), 'escalation stays with the watchdog/user read, not the timer');
-        self::assertCount(1, $transport->connectCalls, 'the timer read itself must not trigger a recovery here');
+        self::assertCount(2, $transport->connectCalls, 'the fatal -ERR recovered the connection');
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(1, $connection->statistics()->reconnects);
     }
 
     /**
