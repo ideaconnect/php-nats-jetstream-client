@@ -166,6 +166,22 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * What a server sends when it drops the client in the middle of a request - a fatal -ERR - followed by
+     * the INFO and PONG that answer the client's reconnect handshake. A fatal -ERR ends the connection
+     * (#171), so the request fails with it only after the client has reconnected.
+     *
+     * @return list<string>
+     */
+    private static function serverDropsConnectionThenAcceptsReconnect(): array
+    {
+        return [
+            "-ERR 'Stale Connection'\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ];
+    }
+
+    /**
      * Installs a mux-aware server for ordered/push consumer recreate tests. Pre-#118 each request owned
      * a per-request SUB, so a CONSUMER.CREATE/DELETE reply routed by a fixed sid and the rotated deliver
      * inbox landed at a sid shifted by those per-request subs (2,4,7,...). Post-#118 all requests share
@@ -5097,11 +5113,11 @@ final class JetStreamContextTest extends TestCase
             'config' => ['deliver_subject' => 'deliver.ord', 'ack_policy' => 'none'],
         ], JSON_THROW_ON_ERROR);
 
-        // Mux inbox (#118): the DELETE reply wait reads a fatal -ERR frame, which handleFrame() raises
-        // as a ConnectionException out of deleteConsumer() without closing the connection; the create-
-        // retry loop still runs and succeeds as ORD2. Replies echo on captured reply-tos; the single
-        // recreate's rotated deliver SUB is sid 3 (no per-request subs), and msg4 rides the successful
-        // create reply (the re-adopt point).
+        // Mux inbox (#118): the DELETE reply wait reads a fatal -ERR frame - the server drops the
+        // connection - so deleteConsumer() fails with a ConnectionException once the client has reconnected
+        // (#171); the create-retry loop still runs and succeeds as ORD2. Replies echo on captured reply-tos;
+        // the single recreate's rotated deliver SUB is sid 3 (no per-request subs), and msg4 rides the
+        // successful create reply (the re-adopt point).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -5115,7 +5131,7 @@ final class JetStreamContextTest extends TestCase
                     "MSG deliver.ord 3 \$JS.ACK.EVENTS.ORD2.1.4.1.0.0 4\r\nmsg4\r\n",
                 ],
             ],
-            onDelete: [static fn (string $rt): array => ["-ERR 'Stale Connection'\r\n"]],
+            onDelete: [static fn (string $rt): array => self::serverDropsConnectionThenAcceptsReconnect()],
             deliverEpochs: [
                 static fn (int $sid): array => [
                     "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
@@ -7465,8 +7481,9 @@ final class JetStreamContextTest extends TestCase
         $deleteReply = '{"success":true}';
 
         // Mux inbox (#118): replies echo on captured reply-tos; deliver1 is sid 2. The recreate deletes
-        // ORD1, create attempt 1's reply is "lost" (a -ERR raised as ConnectionException), attempt 2
-        // succeeds as ORD2, then the orphaned attempt-1 name is best-effort-reaped (a second DELETE).
+        // ORD1, create attempt 1's reply is "lost" (the server drops the connection with a -ERR, raised as
+        // ConnectionException once the client has reconnected), attempt 2 succeeds as ORD2, then the
+        // orphaned attempt-1 name is best-effort-reaped (a second DELETE).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -7476,7 +7493,7 @@ final class JetStreamContextTest extends TestCase
             onCreate: [
                 static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
                 // Attempt 1: a -ERR (ConnectionException) - the reply is lost, the consumer may exist.
-                static fn (string $rt): array => ["-ERR 'Stale Connection'\r\n"],
+                static fn (string $rt): array => self::serverDropsConnectionThenAcceptsReconnect(),
                 // Attempt 2 succeeds as ORD2 and is adopted.
                 static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
             ],

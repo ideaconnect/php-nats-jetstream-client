@@ -15,6 +15,31 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- After a fatal `-ERR` from the server, the connection is no longer left Open: with reconnect off it is
+  Closed by the time the read that met the `-ERR` throws, and with reconnect on that read first waits for
+  the reconnect within its own timeout (a `processIncoming()` without a cancellation waits for the whole
+  reconnect, as it already did after a failed read). The read still throws the same
+  `ConnectionException` (`Server sent error frame: ...`). The same holds for a server PING whose PONG the
+  socket would not take; that read still throws the socket's own error.
+
+### Fixed
+
+- `[bugfix]` A fatal `-ERR` from the server - the error it sends right before it closes the connection,
+  such as `Stale Connection` for a client that stopped answering its pings - failed the operation that
+  read it but left the connection Open (#171). The next operation then wrote into the socket the server had
+  closed and failed as well: with reconnect off with `Reconnect is disabled`, with reconnect on only after
+  waiting out its whole timeout, since its request had gone to the dead socket. A synchronous application
+  that sat idle for a few minutes - between requests in a worker-mode runtime, say - met this on its next
+  two calls. Such a frame, and a PONG the socket would not take, now ends the connection like a failed
+  read: it reconnects, or with reconnect off closes for good, and the read that met it fails with the
+  server's error once the connection is Closed or, with reconnect on, once the reconnect is done or the
+  read's own timeout runs out (not waiting at all with `waitForReconnect: false`). The heartbeat's read
+  does the same. A full subscription queue still does not end the connection.
+
 ## [2.10.0] - 2026-09-30
 
 ### Upgrade notes
