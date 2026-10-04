@@ -49,6 +49,18 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * The same before each test: in random order, as Infection runs the suite, the first test of this
+     * class can follow another class whose clients left callbacks registered, and a test that counts the
+     * watchdog timers must count only its own.
+     */
+    protected function setUp(): void
+    {
+        foreach (EventLoop::getIdentifiers() as $id) {
+            EventLoop::cancel($id);
+        }
+    }
+
+    /**
      * Counts EventLoop repeat timers currently registered (the watchdog is one). Used by the
      * teardown-leak regression to probe watchdog arm/cancel without reaching into private state.
      */
