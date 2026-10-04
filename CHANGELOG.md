@@ -15,6 +15,24 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.10.2] - 2026-10-04
+
+### Upgrade notes
+
+- With reconnect off, `Reconnect is disabled` now carries the error that ended the connection as its
+  previous exception (`getPrevious()`). Its message and code are unchanged.
+
+### Fixed
+
+- `[bugfix]` With reconnect off, `Reconnect is disabled` did not say why the connection ended (#172), so
+  the operator saw what reads like a configuration problem and had nothing to go on. The error that ended
+  the connection is now chained as its previous exception (`getPrevious()`): the socket error of a failed
+  read or write, the `ProtocolException` of a stream that could not be parsed, a server `-ERR` such as
+  `Stale Connection`, or why the heartbeat gave up (`The server did not answer the last 2 PINGs`, its PING
+  write failing, or the socket closing or breaking during its read). That holds for the operation that
+  failed and for any operation that joined the recovery. The message is unchanged, so code that matches it
+  keeps working.
+
 ## [2.10.1] - 2026-10-03
 
 ### Upgrade notes

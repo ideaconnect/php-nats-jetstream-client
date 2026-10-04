@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2342 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2352 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -2178,6 +2178,14 @@ What a read reports to the error listener about the frames it brought - a messag
 - `testLoggerThrowingOnTheReportNeitherFailsTheReadNorCostsAMessage` - With a logger that throws on the report, the read completes, the error listener still gets the report once, the other subscription's message is delivered, and the slow subscription gets the messages its policy keeps (s2, s3 under DropOldest; s1, s2 under DropNewest). The read used to fail with the logger's exception, and under DropOldest s3 was lost.
 - `testLoggerThrowingOnAQueueDropNeitherFailsTheReadNorCostsAMessage` - (DropOldest / DropNewest) The same for a SubscriptionQueue's own buffer, full because nobody polled it: with a logger that throws on its drop report, the read that delivers the next job completes, the report reaches the error listener once, the drop is counted, another subscription's message is delivered, and the queue holds what its policy keeps (j2, j3 / j1, j2). The read used to fail with the logger's exception, and under DropOldest j3 was lost.
 - `testReportIsLoggedAtItsLevel` - The report is logged once: a drop policy's at debug level, the recoverable -ERR's and the malformed INFO's at error level.
+
+### tests/Unit/ReconnectDisabledCauseTest.php
+- `testAReadThatFailsSaysWhyTheConnectionEnded` - With reconnect off, a processIncoming() whose read hits EOF fails with "Reconnect is disabled" whose previous exception is the read's TransportClosedException ("Socket closed by peer (EOF)"). Before #172 it carried no cause.
+- `testAPublishWhoseWriteFailsSaysWhyTheConnectionEnded` - A publish whose write fails gets "Reconnect is disabled" with the write's error as its previous exception.
+- `testAControlWriteThatFailsSaysWhyTheConnectionEnded` - A subscribe whose SUB write fails waits for the recovery that write started and gets "Reconnect is disabled" with the write's error as its previous exception.
+- `testAStreamThatCannotBeParsedSaysWhyTheConnectionEnded` - A read of an unparseable control line gets "Reconnect is disabled" with the parser's ProtocolException ("Unsupported control frame: BOGUS") as its previous exception.
+- `testAnOperationJoiningARecoveryTheHeartbeatStartedLearnsWhyTheConnectionEnded` - Data provider (unanswered PINGs, PING write failure, socket closed during the PONG read, protocol violation during it, fatal -ERR during it): with the recovery the heartbeat started held in its socket close, an operation that joins it gets "Reconnect is disabled" with the heartbeat's reason as its previous exception, e.g. "The server did not answer the last 2 PINGs".
+- `testAnOperationJoiningTheRecoveryAFatalErrStartedLearnsTheServersError` - An operation that joins the recovery a fatal -ERR started gets "Reconnect is disabled" with the server's error as its previous exception, while the read that met the -ERR still fails with the server's error itself (#171).
 
 ### tests/Unit/RepublishAndTransformTest.php
 - `testRepublishMinimal` - Asserts Republish::create(src, dest)->toArray() yields exactly ['src','dest'] with no headers_only key.
