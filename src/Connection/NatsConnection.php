@@ -4679,9 +4679,14 @@ final class NatsConnection
      */
     private function decodeServerInfoPayload(string $infoPayload): ServerInfo
     {
-        /** @var array<string,mixed> $data */
         $data = json_decode($infoPayload, true, 512, JSON_THROW_ON_ERROR);
+        if (!is_array($data)) {
+            // Valid JSON that is not an object, such as "INFO 1", is as malformed as broken JSON; it used to
+            // reach fromInfoPayload() and fail the read with a TypeError.
+            throw new \JsonException('INFO payload is not a JSON object');
+        }
 
+        /** @var array<string,mixed> $data */
         return ServerInfo::fromInfoPayload($data);
     }
 
