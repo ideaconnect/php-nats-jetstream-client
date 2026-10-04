@@ -22,9 +22,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - With reconnect off, the `Closed` event of a connection that was lost now carries the error that ended it,
   as the event of a reconnect that gave up already did, and the logger records it at warning level instead
   of info. A failed read is therefore logged twice: as the read's error, and with the `Closed` event.
-- An `INFO` that is valid JSON but no object (`INFO 1`) is treated as broken JSON: an async one is reported
-  to the error listener instead of failing the read with a `TypeError`, and at connect the
-  `ConnectionException` says `INFO payload is not a JSON object` instead of wrapping a `TypeError`.
+- An `INFO` that is valid JSON but no object (`INFO 1`, `INFO [1]`) is treated as broken JSON. An async one
+  is reported to the error listener, where a number failed the read with a `TypeError` and an array replaced
+  the server info with defaults. At connect the `ConnectionException` says `INFO payload is not a JSON
+  object`, where a number gave one wrapping a `TypeError` and an array connected with that default info.
 
 ### Fixed
 

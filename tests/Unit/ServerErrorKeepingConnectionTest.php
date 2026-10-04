@@ -94,13 +94,15 @@ final class ServerErrorKeepingConnectionTest extends TestCase
 
     /**
      * An INFO that is valid JSON but no object is reported like broken JSON, without failing the read or
-     * touching the connection. It used to reach the INFO parser and fail the read with a TypeError, which
-     * 2.10.1 then took for a connection failure.
+     * touching the connection or what it knows of the server. A number used to reach the INFO parser and fail
+     * the read with a TypeError, which 2.10.1 then took for a connection failure; an array replaced the
+     * server info with defaults, after which a publish with headers was refused.
      */
-    public function testAnInfoThatIsNotAJsonObjectIsReportedWithoutFailingTheRead(): void
+    #[DataProvider('infoPayloadsThatAreNoObject')]
+    public function testAnInfoThatIsNotAJsonObjectIsReportedWithoutFailingTheRead(string $payload): void
     {
         $recorder = new LifecycleRecorder();
-        $transport = new FakeTransport([self::INFO, "PONG\r\n", "INFO 1\r\n"]);
+        $transport = new FakeTransport([self::INFO, "PONG\r\n", "INFO {$payload}\r\n"]);
         $connection = new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
@@ -113,17 +115,28 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         self::assertNotSame([], $recorder->errorsContaining('Discarding malformed async INFO frame: INFO payload is not a JSON object'));
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertFalse($transport->closed);
+        self::assertSame('S1', $connection->serverInfo()?->serverId);
+        self::assertTrue($connection->serverInfo()->headersSupported);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function infoPayloadsThatAreNoObject(): iterable
+    {
+        yield 'a number' => ['1'];
+        yield 'an array' => ['[1,2]'];
+        yield 'an empty array' => ['[]'];
     }
 
     /**
      * At connect such an INFO fails the connect as broken JSON does, with an error that says what is wrong
      * instead of one that wraps the TypeError.
      */
-    public function testAnInitialInfoThatIsNotAJsonObjectFailsTheConnectAsBrokenJsonDoes(): void
+    #[DataProvider('infoPayloadsThatAreNoObject')]
+    public function testAnInitialInfoThatIsNotAJsonObjectFailsTheConnectAsBrokenJsonDoes(string $payload): void
     {
         $connection = new NatsConnection(
             new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0),
-            new FakeTransport(["INFO 1\r\n", "PONG\r\n"]),
+            new FakeTransport(["INFO {$payload}\r\n", "PONG\r\n"]),
         );
 
         try {

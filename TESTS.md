@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2378 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2382 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -2210,8 +2210,8 @@ What a read reports to the error listener about the frames it brought - a messag
 ### tests/Unit/ServerErrorKeepingConnectionTest.php
 - `testAnErrTheServerKeepsTheConnectionOpenForFailsTheReadButLeavesItOpen` - Data provider ('maximum subscriptions exceeded', 'Permissions Violation for Publish with Reply of ...', 'Invalid Publish Subject', a bare 'Permissions Violation'; reconnect off and on): the read fails with the server's error, as before 2.10.1, and the connection stays Open on the same socket, nothing reconnects, and a publish still goes out. Since 2.10.1 these ended the connection.
 - `testAnErrTheServerClosesTheConnectionAfterStillEndsIt` - Guard, data provider ('Stale Connection', 'Authorization Violation', 'Maximum Payload Violation'): an -ERR the server closes the connection after still closes it with reconnect off (#171).
-- `testAnInfoThatIsNotAJsonObjectIsReportedWithoutFailingTheRead` - An async `INFO 1` (valid JSON, no object) is reported to the error listener ("INFO payload is not a JSON object") without failing the read, and the connection stays Open. It used to fail the read with a TypeError, which 2.10.1 took for a connection failure.
-- `testAnInitialInfoThatIsNotAJsonObjectFailsTheConnectAsBrokenJsonDoes` - An initial `INFO 1` fails the connect with a ConnectionException "INFO payload is not a JSON object" over a JsonException, as broken JSON does, instead of one wrapping a TypeError.
+- `testAnInfoThatIsNotAJsonObjectIsReportedWithoutFailingTheRead` - Data provider (a number, an array, an empty array): an async INFO that is valid JSON but no object is reported to the error listener ("INFO payload is not a JSON object") without failing the read; the connection stays Open and the server info is unchanged. A number used to fail the read with a TypeError, which 2.10.1 took for a connection failure, and an array replaced the server info with defaults.
+- `testAnInitialInfoThatIsNotAJsonObjectFailsTheConnectAsBrokenJsonDoes` - Data provider (a number, an array, an empty array): such an initial INFO fails the connect with a ConnectionException "INFO payload is not a JSON object" over a JsonException, as broken JSON does. A number gave one wrapping a TypeError, and an array connected with default server info.
 - `testAReadForAServingLoopReportsAnErrTheServerKeepsTheConnectionOpenFor` - readIncomingForOperation() with alwaysReport (a service's loop) reports 'maximum subscriptions exceeded' to the error listener and returns the frame it read (1 frame, bytes consumed); the connection stays Open.
 - `testAReadForAServingLoopStillThrowsAnErrThatEndsTheConnection` - The same read still throws 'Stale Connection', and the connection is Closed (reconnect off).
 - `testAFatalErrAfterANonClosingOneInTheSameChunkEndsTheConnection` - One chunk with 'maximum subscriptions exceeded' then 'Stale Connection': the read fails with the fatal one, the connection Closes (reconnect off), and the rejection is reported. Before, the first failure held, and the connection stayed Open on the closed socket.

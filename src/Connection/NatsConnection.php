@@ -4690,9 +4690,10 @@ final class NatsConnection
     private function decodeServerInfoPayload(string $infoPayload): ServerInfo
     {
         $data = json_decode($infoPayload, true, 512, JSON_THROW_ON_ERROR);
-        if (!is_array($data)) {
-            // Valid JSON that is not an object, such as "INFO 1", is as malformed as broken JSON; it used to
-            // reach fromInfoPayload() and fail the read with a TypeError.
+        // Valid JSON that is not an object is as malformed as broken JSON. A number ("INFO 1") used to fail
+        // the read with a TypeError in fromInfoPayload(), and an array ("INFO [1]"), which decodes to a PHP
+        // array like an object does, replaced the server info with defaults. The parser has trimmed the payload.
+        if (!str_starts_with($infoPayload, '{')) {
             throw new \JsonException('INFO payload is not a JSON object');
         }
 
