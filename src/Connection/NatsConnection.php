@@ -757,8 +757,8 @@ final class NatsConnection
      */
     private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation): void
     {
-        $recovery = async(function () use ($generation): void {
-            $this->recoverConnection(failedGeneration: $generation);
+        $recovery = async(function () use ($generation, $writeError): void {
+            $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
         });
         // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
         $recovery->ignore();
@@ -803,11 +803,12 @@ final class NatsConnection
      * ends - reopened, closed because reconnect is off, given up - is announced by the connection events.
      *
      * @param int $generation The {@see $connectionGeneration} the frame was read on.
+     * @param \Throwable $frameError The frame's error, the cause of the recovery's own failure (#172).
      */
-    private function recoverAfterEndingFrame(int $generation, ?Cancellation $cancellation): void
+    private function recoverAfterEndingFrame(int $generation, \Throwable $frameError, ?Cancellation $cancellation): void
     {
-        $recovery = async(function () use ($generation): void {
-            $this->recoverConnection(failedGeneration: $generation);
+        $recovery = async(function () use ($generation, $frameError): void {
+            $this->recoverConnection(failedGeneration: $generation, cause: $frameError);
         });
         // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
         $recovery->ignore();
@@ -1749,7 +1750,7 @@ final class NatsConnection
             $generation = $this->connectionGeneration;
             try {
                 $this->transport->write($frame)->await();
-            } catch (\Throwable) {
+            } catch (\Throwable $writeError) {
                 // The direct write failed mid-flight: recover, then re-send on the fresh socket. The
                 // re-send stays AFTER recovery (it is NOT seeded into the flush) on purpose: recovery
                 // success must be independent of this frame - a persistently rejected publish would
@@ -1760,7 +1761,7 @@ final class NatsConnection
                 // consequence documented on publish() (#121). Per-publisher order still holds: this
                 // publish() does not return until the frame is (re-)written, so the same publisher's
                 // next frame follows it on the wire.
-                $this->recoverConnection(failedGeneration: $generation);
+                $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
                 $this->transport->write($frame)->await();
             }
 
@@ -2412,7 +2413,7 @@ final class NatsConnection
                     // A recovery another fiber already runs (typically the heartbeat's) is joined only
                     // until this read's own cancellation fires: a request whose read failed must not
                     // outlive its timeout waiting for the whole backoff schedule.
-                    $this->recoverConnection(joinCancellation: $cancellation, failedGeneration: $generation);
+                    $this->recoverConnection(joinCancellation: $cancellation, failedGeneration: $generation, cause: $readError);
                 } else {
                     // ...and end it now: the PONG the flush waits for died with the socket, so the flush
                     // would otherwise keep reading a dead socket until drain()'s budget ran out.
@@ -2466,7 +2467,7 @@ final class NatsConnection
                 try {
                     // A recovery another fiber already runs is joined only until this read's own cancellation
                     // fires, as on the read-failure path above.
-                    $this->recoverConnection(joinCancellation: $cancellation, failedGeneration: $generation);
+                    $this->recoverConnection(joinCancellation: $cancellation, failedGeneration: $generation, cause: $parseError);
                 } catch (CancelledException $cancelled) {
                     // The read's deadline ended the wait; a failure already on its way still wins.
                     if ($failure === null) {
@@ -2525,7 +2526,7 @@ final class NatsConnection
                 // failed read does (#171). During drain() the close intent keeps that recovery from
                 // reconnecting: drain() reports the error and closes, as it does when the socket fails.
                 if ($this->frameFailureEndsConnection($dispatchError)) {
-                    $this->recoverAfterEndingFrame($generation, $cancellation);
+                    $this->recoverAfterEndingFrame($generation, $dispatchError, $cancellation);
                 }
 
                 throw $dispatchError;
@@ -3453,11 +3454,15 @@ final class NatsConnection
      *                             calling fiber and is not bounded by it.
      * @param int|null $failedGeneration The {@see $connectionGeneration} the failed read or write ran on;
      *                             a failure from a connection since replaced starts no recovery.
+     * @param \Throwable|null $cause The error that ended the connection. With reconnect off it is chained to
+     *                             the "Reconnect is disabled" error, so that the caller, and any operation
+     *                             that joins the recovery, learns why the connection ended (#172).
      */
     private function recoverConnection(
         bool $ownedByConnect = false,
         ?Cancellation $joinCancellation = null,
         ?int $failedGeneration = null,
+        ?\Throwable $cause = null,
     ): void {
         // The user asked to close (disconnect/drain): never start or join a reconnect that would
         // re-open the connection (#84).
@@ -3512,7 +3517,7 @@ final class NatsConnection
         $this->recoveryFiber = \Fiber::getCurrent();
 
         try {
-            $this->performRecovery();
+            $this->performRecovery($cause);
             $deferred->complete();
         } catch (\Throwable $e) {
             $deferred->error($e);
@@ -3622,8 +3627,10 @@ final class NatsConnection
 
     /**
      * Performs the actual reconnect + subscription replay, serialized by {@see recoverConnection()}.
+     *
+     * @param \Throwable|null $cause The error that ended the connection, chained to "Reconnect is disabled".
      */
-    private function performRecovery(): void
+    private function performRecovery(?\Throwable $cause = null): void
     {
         // User close-intent set before/while recovery began: do not re-open (#84).
         if ($this->closing) {
@@ -3641,7 +3648,8 @@ final class NatsConnection
             $this->reportDiscardedInboundBacklog();
             $this->releaseRuntimeState();
             $this->emitEvent(ConnectionEvent::Closed);
-            throw new ConnectionException('Reconnect is disabled');
+            // The message stays as it was, for code that matches it; the cause says why (#172).
+            throw new ConnectionException('Reconnect is disabled', 0, $cause);
         }
 
         // A FAILED initial connect() hands off here (ownedByConnect) before the connection was ever
@@ -4692,8 +4700,10 @@ final class NatsConnection
      * From the heartbeat timer: cancel the ping timer and attempt recovery, forcing the connection
      * Closed if recovery itself throws. Shared by the missed-PONG (maxPingsOut) and PING-write-failure
      * paths of pingTimerTick().
+     *
+     * @param \Throwable $cause Why the heartbeat gave up on the connection (#172).
      */
-    private function recoverFromHeartbeatFailure(int $generation): void
+    private function recoverFromHeartbeatFailure(int $generation, \Throwable $cause): void
     {
         // The failure came from a connection since replaced (the application closed and reopened it while
         // this tick's PING write was suspended): the new connection, and its own heartbeat, are healthy.
@@ -4704,7 +4714,7 @@ final class NatsConnection
         $this->cancelPingTimer();
 
         try {
-            $this->recoverConnection();
+            $this->recoverConnection(cause: $cause);
         } catch (\Throwable) {
             $this->state = ConnectionState::Closed;
         }
@@ -4724,7 +4734,9 @@ final class NatsConnection
         $this->outstandingPings++;
 
         if ($this->outstandingPings > $this->options->maxPingsOut) {
-            $this->recoverFromHeartbeatFailure($generation);
+            $this->recoverFromHeartbeatFailure($generation, new ConnectionException(
+                sprintf('The server did not answer the last %d PINGs', $this->options->maxPingsOut),
+            ));
 
             return;
         }
@@ -4737,11 +4749,11 @@ final class NatsConnection
 
         try {
             $this->transport->write($this->codec->encodePing())->await();
-        } catch (\Throwable) {
+        } catch (\Throwable $pingError) {
             // The PING never hit the wire: drop its slot so correlation stays aligned (the
             // recovery below clears the rest on the epoch change anyway).
             $this->discardPongSlot($slot);
-            $this->recoverFromHeartbeatFailure($generation);
+            $this->recoverFromHeartbeatFailure($generation, $pingError);
 
             return;
         }
@@ -4802,14 +4814,14 @@ final class NatsConnection
 
         $this->readInProgress = true;
 
-        $closed = false;
+        $closedError = null;
         $protocolViolation = null;
         try {
             $chunk = $this->transport->readLine(new TimeoutCancellation($timeoutSeconds))->await();
-        } catch (TransportClosedException) {
+        } catch (TransportClosedException $peerClosed) {
             // The peer closed the socket during the heartbeat read. Recover, but only after the
             // finally clears readInProgress (recoverConnection -> connectOnce reads the socket).
-            $closed = true;
+            $closedError = $peerClosed;
             $chunk = '';
         } catch (ProtocolException $violation) {
             // A transport-level protocol violation surfaced on the TIMER's read. Some of these are
@@ -4836,7 +4848,7 @@ final class NatsConnection
             // corrupt stream running as Open (#150 containment).
             $this->emitErrorSafely($protocolViolation);
             try {
-                $this->recoverConnection(failedGeneration: $generation);
+                $this->recoverConnection(failedGeneration: $generation, cause: $protocolViolation);
             } catch (\Throwable) {
                 $this->state = ConnectionState::Closed;
             }
@@ -4844,9 +4856,9 @@ final class NatsConnection
             return;
         }
 
-        if ($closed) {
+        if ($closedError !== null) {
             try {
-                $this->recoverConnection(failedGeneration: $generation);
+                $this->recoverConnection(failedGeneration: $generation, cause: $closedError);
             } catch (\Throwable) {
                 $this->state = ConnectionState::Closed;
             }
@@ -4911,7 +4923,7 @@ final class NatsConnection
             // (#171): left Open until the next tick, the connection failed whichever operation came first.
             if ($this->frameFailureEndsConnection($dispatchError)) {
                 try {
-                    $this->recoverConnection(failedGeneration: $generation);
+                    $this->recoverConnection(failedGeneration: $generation, cause: $dispatchError);
                 } catch (\Throwable) {
                     $this->state = ConnectionState::Closed;
                 }
