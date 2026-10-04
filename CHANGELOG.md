@@ -15,6 +15,36 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- With reconnect off, the `Closed` event of a connection that was lost now carries the error that ended it,
+  as the event of a reconnect that gave up already did, and the logger records it at warning level instead
+  of info. A failed read is therefore logged twice: as the read's error, and with the `Closed` event.
+
+### Fixed
+
+- `[bugfix]` Since 2.10.1 an `-ERR` the server sends while keeping the connection open ended the
+  connection: `maximum subscriptions exceeded`, `Permissions Violation for Publish with Reply of ...` and
+  `Invalid Publish Subject`. A healthy connection closed, and with reconnect on every attempt replayed the
+  rejected SUB, failed again, and the reconnect gave up and closed the connection. Such an `-ERR` fails the
+  read that brought it, as before 2.10.1, and leaves the connection open (when an account's subscription
+  limit is lowered below what a client holds, the server closes the connection after `maximum subscriptions
+  exceeded` anyway, and the EOF ends it). Only an `-ERR` the server closes the connection after (`Stale
+  Connection`, `Authorization Violation`, `Maximum Payload Violation`, ...) and a `PONG` the socket would not
+  take end the connection, and nothing else a frame raises does. Such a failure also outranks any other met
+  in the same read, so a fatal `-ERR` read together with a rejected SUB's still ends the connection.
+- `[bugfix]` A reconnect whose replayed SUB the server rejected for exceeding the maximum subscriptions
+  failed, and so did every attempt after it, until the reconnect gave up and closed the connection. Any
+  failure of the replay that does not end the connection is now reported to the error listener instead, and
+  the reconnect completes; one that ends it still fails the attempt.
+- `[bugfix]` With reconnect off, a connection the heartbeat gave up on (unanswered PINGs, a failed PING
+  write, the socket closing or breaking during its read) closed without saying why: `Reconnect is disabled`
+  and its cause (#172) reached only an operation that joined the recovery. The `Closed` event now carries
+  the cause, so that the connection listener and the log learn it. The reason for unanswered PINGs reads
+  "the last PING" when `maxPingsOut` is 1.
+
 ## [2.10.2] - 2026-10-04
 
 ### Upgrade notes

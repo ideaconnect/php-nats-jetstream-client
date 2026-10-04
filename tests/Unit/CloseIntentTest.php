@@ -811,7 +811,8 @@ final class CloseIntentTest extends TestCase
     {
         yield 'reconnect attempts exhausted' => ['reconnect exhausted', true];
         yield 'reconnect refused authentication' => ['reconnect auth', true];
-        yield 'connection lost with reconnect disabled' => ['reconnect disabled', false];
+        // With the error that ended the connection since 2.10.3 (#172): the dropped socket's EOF.
+        yield 'connection lost with reconnect disabled' => ['reconnect disabled', true];
         yield 'first connect failed' => ['connect failed', true];
         yield 'first connect refused authentication' => ['connect auth', true];
         yield 'initial connect retries ran out' => ['retries exhausted', true];

@@ -323,6 +323,15 @@ final class NatsConnection
      */
     private \WeakMap $reportedOverflows;
     /**
+     * The failures of frames that end the connection ({@see frameFailureEndsConnection()}): a fatal -ERR, which
+     * the server sends right before it closes the connection, and a PONG the socket would not take. Marked
+     * where they are raised, so that no other failure a frame raises can end the connection. Weak: an entry
+     * goes away with its exception.
+     *
+     * @var \WeakMap<\Throwable, true>
+     */
+    private \WeakMap $connectionEndingFailures;
+    /**
      * Publish callback bound onto every delivered {@see NatsMessage} so it can reply to its own
      * reply subject via {@see NatsMessage::respond()}. Built once and reused for all messages.
      *
@@ -403,6 +412,7 @@ final class NatsConnection
     ) {
         $this->parser = new ProtocolParser();
         $this->reportedOverflows = new \WeakMap();
+        $this->connectionEndingFailures = new \WeakMap();
         $this->readSlotReleased = new DeferredFuture();
         $this->readSlotReleased->getFuture()->ignore();
 
@@ -777,12 +787,15 @@ final class NatsConnection
 
     /**
      * Whether a frame whose dispatch failed means the connection is finished: a fatal -ERR, which the server
-     * sends right before it closes the socket, or a PONG the socket would not take. A full subscription queue
-     * does not: one subscriber fell behind, and the connection is fine.
+     * sends right before it closes the socket, or a PONG the socket would not take. Nothing else does: not an
+     * -ERR the server sends while keeping the connection open, such as the one rejecting a SUB beyond the
+     * maximum subscriptions ({@see isServerErrorKeepingTheConnectionOpen()}), which since 2.10.1 had ended
+     * healthy connections; not a full subscription queue, where one subscriber fell behind; not anything
+     * else a frame throws.
      */
     private function frameFailureEndsConnection(\Throwable $failure): bool
     {
-        return !$failure instanceof SlowConsumerException;
+        return ($this->connectionEndingFailures[$failure] ?? false) === true;
     }
 
     /**
@@ -2498,8 +2511,8 @@ final class NatsConnection
                 $this->dispatchFrames($frames, $reportOverflows, $ownSid);
             } catch (\Throwable $e) {
                 // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
-                // delivery, #128) before this fatal frame error (a server -ERR / PONG-write failure)
-                // recovers the connection and reaches the caller below.
+                // delivery, #128) before this frame error reaches the caller below, recovering the
+                // connection first when it ends it (a fatal -ERR, a failed PONG write).
                 $dispatchError = $e;
             }
 
@@ -2560,10 +2573,11 @@ final class NatsConnection
      * Dispatches parsed frames, containing per-frame failures so one frame cannot abort delivery
      * of the frames parsed from the same chunk: the parser has already consumed the bytes, so an
      * undispatched trailing frame is unrecoverable (core NATS does not resend, and a reconnect
-     * replays SUBs, not missed messages) (#128). The first failure is rethrown after every frame
-     * has been dispatched, preserving fatal -ERR / write-failure semantics for the caller - except that a
-     * failure of the connection itself outranks a full subscription queue met earlier in the chunk: the
-     * caller's escalation needs the -ERR, and the overflow is reported instead.
+     * replays SUBs, not missed messages) (#128). One failure is rethrown after every frame has been
+     * dispatched, the one that matters most to the caller ({@see dispatchFailureRank()}): a failure that
+     * ends the connection (a fatal -ERR, a failed PONG write) outranks any other met earlier in the chunk,
+     * which outranks a full subscription queue; among equals the first wins. The caller decides from it what
+     * happens to the connection, and the others are reported instead.
      *
      * @param list<ProtocolFrame> $frames
      * @param bool $reportOverflows Report a full subscription queue ({@see SlowConsumerException})
@@ -2584,10 +2598,11 @@ final class NatsConnection
                 $this->handleFrame($frame, $reports);
             } catch (\Throwable $e) {
                 $reportable = $reportOverflows && $e instanceof SlowConsumerException && $e->sid !== $ownSid;
-                if (!$reportable && ($firstError === null || ($firstError instanceof SlowConsumerException && !$e instanceof SlowConsumerException))) {
-                    // The first failure, or a failure of the connection itself (a fatal -ERR, a failed PONG
-                    // write) after an overflow: an overflow only says that a subscriber fell behind, so it is
-                    // the one reported.
+                if (!$reportable && ($firstError === null || $this->dispatchFailureRank($e) > $this->dispatchFailureRank($firstError))) {
+                    // The first failure, or one that matters more than the one held: a fatal -ERR after a
+                    // non-closing one, which the server sends ahead of closing, say, when a rejected SUB's
+                    // answer sat unread; any failure after an overflow, which only says that a subscriber fell
+                    // behind. The one held is reported instead.
                     if ($firstError !== null) {
                         $reports[] = [$firstError, 'error'];
                     }
@@ -2618,6 +2633,19 @@ final class NatsConnection
         if ($firstError !== null) {
             throw $firstError;
         }
+    }
+
+    /**
+     * How much a failure met while dispatching a chunk matters to the caller ({@see dispatchFrames()}): one
+     * that ends the connection most, a full subscription queue least.
+     */
+    private function dispatchFailureRank(\Throwable $failure): int
+    {
+        if ($this->frameFailureEndsConnection($failure)) {
+            return 2;
+        }
+
+        return $failure instanceof SlowConsumerException ? 0 : 1;
     }
 
     /**
@@ -3647,7 +3675,9 @@ final class NatsConnection
             // Name any parsed inbound backlog being discarded, mirroring the outbound path (#123/#158).
             $this->reportDiscardedInboundBacklog();
             $this->releaseRuntimeState();
-            $this->emitEvent(ConnectionEvent::Closed);
+            // With the cause, so that the connection listener and the log learn why the connection ended even
+            // when nobody waits for this recovery, as when the heartbeat started it (#172).
+            $this->emitEvent(ConnectionEvent::Closed, $cause);
             // The message stays as it was, for code that matches it; the cause says why (#172).
             throw new ConnectionException('Reconnect is disabled', 0, $cause);
         }
@@ -3981,9 +4011,9 @@ final class NatsConnection
         // (#136) - the same path flushReconnectBuffer() takes.
         $this->transport->write($buffer)->await();
 
-        // One bounded poll for the whole replay so prompt -ERR responses (e.g. permission
-        // violations) still abort this reconnect attempt instead of leaving silently rejected
-        // subscriptions (#137 keeps the detection, drops the per-sid latency floor).
+        // One bounded poll for the whole replay, so that the server's prompt answers to it are seen: an -ERR
+        // that ends the connection aborts this reconnect attempt, and one the server keeps the connection open
+        // for, such as a rejected SUB, is reported (#137 keeps the detection, drops the per-sid latency floor).
         $this->drainImmediateServerFrames();
 
         return $replayed;
@@ -3992,8 +4022,9 @@ final class NatsConnection
     /**
      * Polls for any immediate frames emitted by the server after a protocol write.
      *
-     * This is primarily used during reconnect subscription replay so prompt `-ERR`
-     * responses do not leave the connection open with silently rejected subscriptions.
+     * This is primarily used during reconnect subscription replay, so that a prompt `-ERR` is seen: one
+     * that ends the connection fails the attempt, and one the server keeps the connection open for, such as
+     * a rejected SUB, is reported.
      *
      * It deliberately does NOT drain message deliveries to user callbacks: this runs inside the
      * reconnect critical section (state still Connecting, `reconnecting` set), and a callback that
@@ -4024,8 +4055,8 @@ final class NatsConnection
                 return;
             }
 
-            // Per-frame containment (#128): a prompt -ERR still aborts this reconnect attempt (the
-            // first failure rethrows after the loop), but sibling MSG frames from the same chunk
+            // Per-frame containment (#128): a prompt -ERR that ends the connection still aborts this reconnect
+            // attempt (rethrown after the loop), but sibling MSG frames from the same chunk
             // are enqueued first instead of being discarded. handleFrame() ignores +OK frames.
             // A message for a subscription whose queue is full (SlowConsumerPolicy::Error) is dropped
             // and reported instead of failing the attempt: nothing delivers while the reconnect runs,
@@ -4046,6 +4077,16 @@ final class NatsConnection
                 }
 
                 throw $parseError;
+            } catch (\Throwable $frameFailure) {
+                // A failure that does not end the connection does not fail the attempt either: the server
+                // rejecting a replayed SUB beyond the maximum subscriptions would otherwise fail every
+                // attempt the same way, until the reconnect gave up and closed the connection. Reported
+                // instead, as the overflow above is.
+                if ($this->frameFailureEndsConnection($frameFailure)) {
+                    throw $frameFailure;
+                }
+
+                $this->emitErrorSafely($frameFailure);
             }
         }
     }
@@ -4280,7 +4321,14 @@ final class NatsConnection
                 return;
             }
 
-            $this->transport->write($this->codec->encodePong())->await();
+            try {
+                $this->transport->write($this->codec->encodePong())->await();
+            } catch (\Throwable $pongError) {
+                // A socket that will not take the PONG is gone (#171).
+                $this->connectionEndingFailures[$pongError] = true;
+
+                throw $pongError;
+            }
 
             return;
         }
@@ -4361,7 +4409,14 @@ final class NatsConnection
                 return;
             }
 
-            throw new ConnectionException('Server sent error frame: ' . $error);
+            $serverError = new ConnectionException('Server sent error frame: ' . $error);
+            // The read fails with it either way, as it always did; only an -ERR the server closes the
+            // connection after ends the connection here (#171).
+            if (!$this->isServerErrorKeepingTheConnectionOpen($error)) {
+                $this->connectionEndingFailures[$serverError] = true;
+            }
+
+            throw $serverError;
         }
 
         if ($frame->type === ProtocolFrameType::Msg || $frame->type === ProtocolFrameType::HMsg) {
@@ -4468,13 +4523,13 @@ final class NatsConnection
             } else {
                 // Error policy: the overflowing message is dropped (core NATS will not resend it) and
                 // the loss is surfaced loudly by THROWING - the single surfacing point. dispatchFrames()
-                // decides where it goes: the application's own read is thrown the first one and reports
-                // any later one (#158), and a read that must not fail on it - an operation's read of
-                // another subscription's overflow, a reconnect, the heartbeat, a drain - reports it. An
-                // extra emitError() here would report the SAME exception twice. The intake count charged
-                // above is deliberately NOT rolled back: the server already counted this message toward
-                // the auto-unsub max, so it must count here too or completeAutoUnsubIfSatisfied() never
-                // fires and the subscription leaks (#159/#112).
+                // decides where it goes: the application's own read is thrown the first one, unless another
+                // failure in the chunk outranks it, and reports any later one (#158), and a read that must
+                // not fail on it - an operation's read of another subscription's overflow, a reconnect,
+                // the heartbeat, a drain - reports it. An extra emitError() here would report the SAME
+                // exception twice. The intake count charged above is deliberately NOT rolled back: the
+                // server already counted this message toward the auto-unsub max, so it must count here too
+                // or completeAutoUnsubIfSatisfied() never fires and the subscription leaks (#159/#112).
                 throw new SlowConsumerException($sid);
             }
         }
@@ -4663,6 +4718,25 @@ final class NatsConnection
     }
 
     /**
+     * Returns true for a server -ERR the server sends while keeping the connection open: any permissions
+     * violation (for a publish, a publish with a reply subject, or a subscription), a SUB beyond the maximum
+     * subscriptions, and an invalid publish subject. nats-server sends these without closing the connection,
+     * where it closes it after every other -ERR (Stale Connection, Authorization Violation, Maximum Payload
+     * Violation, ...). The recoverable ones ({@see isRecoverableServerError()}, which also takes an invalid
+     * subject) never fail a read and do not get here. One exception: when an account's subscription limit is
+     * lowered below what a client holds, the server sends 'maximum subscriptions exceeded' and then closes
+     * the connection, which the EOF that follows ends.
+     */
+    private function isServerErrorKeepingTheConnectionOpen(string $error): bool
+    {
+        $normalized = strtolower(trim($error, " '\t\r\n\0\x0B"));
+
+        return str_starts_with($normalized, 'permissions violation')
+            || $normalized === 'maximum subscriptions exceeded'
+            || $normalized === 'invalid publish subject';
+    }
+
+    /**
      * Starts the periodic ping timer based on configured interval.
      */
     private function startPingTimer(): void
@@ -4735,7 +4809,11 @@ final class NatsConnection
 
         if ($this->outstandingPings > $this->options->maxPingsOut) {
             $this->recoverFromHeartbeatFailure($generation, new ConnectionException(
-                sprintf('The server did not answer the last %d PINGs', $this->options->maxPingsOut),
+                match ($this->options->maxPingsOut) {
+                    0 => 'The heartbeat allows no unanswered PING (maxPingsOut is 0)',
+                    1 => 'The server did not answer the last PING',
+                    default => sprintf('The server did not answer the last %d PINGs', $this->options->maxPingsOut),
+                },
             ));
 
             return;
