@@ -273,6 +273,48 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     }
 
     /**
+     * The read of a serving loop, which would only swallow what it throws (readIncomingForOperation() with
+     * alwaysReport), reports such an -ERR and returns what it read, so the loop reads on.
+     */
+    public function testAReadForAServingLoopReportsAnErrTheServerKeepsTheConnectionOpenFor(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR 'maximum subscriptions exceeded'\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+
+        $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
+
+        self::assertSame(1, $read->frames);
+        self::assertTrue($read->consumedBytes);
+        self::assertSame(["Server sent error frame: 'maximum subscriptions exceeded'"], $recorder->errors);
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * That read still throws an -ERR that ends the connection, once the connection has ended.
+     */
+    public function testAReadForAServingLoopStillThrowsAnErrThatEndsTheConnection(): void
+    {
+        $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR 'Stale Connection'\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+
+        try {
+            $connection->readIncomingForOperation(alwaysReport: true)->await();
+            self::fail('expected the read to fail with the fatal error');
+        } catch (ConnectionException $e) {
+            self::assertSame("Server sent error frame: 'Stale Connection'", $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
      * A reconnect replays every subscription, including one the server rejected for exceeding the maximum
      * subscriptions. The server rejects it again, and that used to fail the attempt, and every one after it,
      * until the reconnect gave up and closed the connection. The rejection is reported instead and the

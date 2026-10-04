@@ -302,8 +302,9 @@ final class NatsClient
      *           part of the supported API.
      *
      * @param int|null $ownSid The operation's own subscription, whose overflow still fails the operation.
-     * @param bool $alwaysReport Report every overflow, whatever the option says: for a read whose caller
-     *        would only swallow it, such as a serving loop.
+     * @param bool $alwaysReport Report every overflow, whatever the option says, and an -ERR the server keeps
+     *        the connection open for: for a read whose caller would only swallow them, such as a serving
+     *        loop. A failure that ends the connection is still thrown, once the connection has recovered.
      * @return Future<IncomingChunkResult>
      */
     public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future

@@ -2093,6 +2093,37 @@ final class ServiceTest extends TestCase
     }
 
     /**
+     * run(): an -ERR the server keeps the connection open for, such as its answer to a SUB beyond the
+     * maximum subscriptions, is reported to the error listener, and the loop serves on. The loop's catch
+     * would only swallow it, and nothing said why an endpoint got no requests.
+     */
+    public function testRunReportsAnErrTheServerKeepsTheConnectionOpenForAndServesOn(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "-ERR 'maximum subscriptions exceeded'\r\n",
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+        $client = new NatsClient(new NatsOptions(
+            pingIntervalSeconds: 0,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
+            },
+        ), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => 'run:' . $message->payload);
+
+        $service->run(0.1)->await();
+
+        self::assertContains("Server sent error frame: 'maximum subscriptions exceeded'", $errors);
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertStringContainsString('run:hello', implode('', $transport->writes), 'the loop serves the request after the -ERR');
+    }
+
+    /**
      * run(): cancelling while the loop is in the dispatch-error BACKOFF must exit promptly - the
      * backed-off loop still honors cancellation and stops the service. A queue of poison frames
      * means an uncancelled loop would keep erroring/backing off (~20 ms each); the immediate cancel

@@ -37,7 +37,9 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   exceeded` anyway, and the EOF ends it). Only an `-ERR` the server closes the connection after (`Stale
   Connection`, `Authorization Violation`, `Maximum Payload Violation`, ...) and a `PONG` the socket would not
   take end the connection, and nothing else a frame raises does. Such a failure also outranks any other met
-  in the same read, so a fatal `-ERR` read together with a rejected SUB's still ends the connection.
+  in the same read, so a fatal `-ERR` read together with a rejected SUB's still ends the connection. A
+  service's `run()` reports such an `-ERR` to the error listener and serves on, since its loop has nobody to
+  throw it to.
 - `[bugfix]` A reconnect whose replayed SUB the server rejected for exceeding the maximum subscriptions
   failed, and so did every attempt after it, until the reconnect gave up and closed the connection. Any
   failure of the replay that does not end the connection is now reported to the error listener instead, and

@@ -2339,8 +2339,9 @@ final class NatsConnection
      *           applications read with {@see readIncoming()} or {@see processIncoming()}.
      *
      * @param int|null $ownSid The operation's own subscription, whose overflow still fails the operation.
-     * @param bool $alwaysReport Report every overflow, whatever the option says: for a read whose caller
-     *        would only swallow it, such as a serving loop.
+     * @param bool $alwaysReport Report every overflow, whatever the option says, and an -ERR the server keeps
+     *        the connection open for: for a read whose caller would only swallow them, such as a serving
+     *        loop. A failure that ends the connection is still thrown, once the connection has recovered.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2352,6 +2353,7 @@ final class NatsConnection
             \Fiber::getCurrent(),
             reportOverflows: $alwaysReport || !$this->options->slowConsumerErrorsFailOperations,
             ownSid: $ownSid,
+            reportFailuresKeepingTheConnection: $alwaysReport,
         );
     }
 
@@ -2363,6 +2365,9 @@ final class NatsConnection
      *        it, except one of $ownSid ({@see dispatchFrames()}).
      * @param bool $reportHandlerFailures Report a handler that throws while the read delivers, and deliver
      *        the rest, instead of throwing its exception ({@see deliverPending()}): for a drain.
+     * @param bool $reportFailuresKeepingTheConnection Report a frame's failure that leaves the connection open,
+     *        such as an -ERR the server keeps it open for, instead of throwing it: for a read whose caller would
+     *        only swallow it ({@see readIncomingForOperation()}).
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2373,8 +2378,9 @@ final class NatsConnection
         bool $reportOverflows,
         ?int $ownSid = null,
         bool $reportHandlerFailures = false,
+        bool $reportFailuresKeepingTheConnection = false,
     ): Future {
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures): IncomingChunkResult {
+        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection): IncomingChunkResult {
             if ($this->state !== ConnectionState::Open && $this->state !== ConnectionState::Draining) {
                 // The recovery future resolves only once the recovery has finalized the state, so a
                 // reader waiting here still never touches the new socket during the subscription
@@ -2540,6 +2546,10 @@ final class NatsConnection
                 // reconnecting: drain() reports the error and closes, as it does when the socket fails.
                 if ($this->frameFailureEndsConnection($dispatchError)) {
                     $this->recoverAfterEndingFrame($generation, $dispatchError, $cancellation);
+                } elseif ($reportFailuresKeepingTheConnection) {
+                    $this->emitErrorSafely($dispatchError);
+
+                    return new IncomingChunkResult(count($frames), true);
                 }
 
                 throw $dispatchError;

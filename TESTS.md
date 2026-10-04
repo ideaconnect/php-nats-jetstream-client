@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2375 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2378 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -2212,6 +2212,8 @@ What a read reports to the error listener about the frames it brought - a messag
 - `testAnErrTheServerClosesTheConnectionAfterStillEndsIt` - Guard, data provider ('Stale Connection', 'Authorization Violation', 'Maximum Payload Violation'): an -ERR the server closes the connection after still closes it with reconnect off (#171).
 - `testAnInfoThatIsNotAJsonObjectIsReportedWithoutFailingTheRead` - An async `INFO 1` (valid JSON, no object) is reported to the error listener ("INFO payload is not a JSON object") without failing the read, and the connection stays Open. It used to fail the read with a TypeError, which 2.10.1 took for a connection failure.
 - `testAnInitialInfoThatIsNotAJsonObjectFailsTheConnectAsBrokenJsonDoes` - An initial `INFO 1` fails the connect with a ConnectionException "INFO payload is not a JSON object" over a JsonException, as broken JSON does, instead of one wrapping a TypeError.
+- `testAReadForAServingLoopReportsAnErrTheServerKeepsTheConnectionOpenFor` - readIncomingForOperation() with alwaysReport (a service's loop) reports 'maximum subscriptions exceeded' to the error listener and returns the frame it read (1 frame, bytes consumed); the connection stays Open.
+- `testAReadForAServingLoopStillThrowsAnErrThatEndsTheConnection` - The same read still throws 'Stale Connection', and the connection is Closed (reconnect off).
 - `testAFatalErrAfterANonClosingOneInTheSameChunkEndsTheConnection` - One chunk with 'maximum subscriptions exceeded' then 'Stale Connection': the read fails with the fatal one, the connection Closes (reconnect off), and the rejection is reported. Before, the first failure held, and the connection stayed Open on the closed socket.
 - `testANonClosingErrOutranksAnOverflowInTheSameChunk` (data sets: the overflow first, the -ERR first) - One chunk with a full subscription queue (`SlowConsumerPolicy::Error`) and 'maximum subscriptions exceeded': the read fails with the -ERR whichever came first, the overflow is reported once, and the connection stays Open. Before, the first failure held, so an overflow ahead of the -ERR hid it.
 - `testAReconnectWhoseReplayMeetsAFatalErrAfterARejectedSubFails` - A replay answered by a rejected SUB and then 'Authorization Violation' fails the attempt, so the one allowed attempt ends Closed: the rejection does not hide the fatal -ERR.
@@ -2293,6 +2295,7 @@ What a read reports to the error listener about the frames it brought - a messag
 - `testValidationErrorReplyPublishFailureIsContained` - Asserts a failing VALIDATION_ERROR reply publish stays contained inside the dispatch callback: the frame still completes, the handler never runs, the endpoint records one error with `last_error` "bad input", and the terminal request_end still fires (#97).
 - `testStopSwallowsUnsubscribeWriteFailureAndStillFiresDone` - Asserts stop() swallows per-SID unsubscribe write failures, still clears subscriptionSids and the started flag, fires the onDone handler once, and leaves the service restartable.
 - `testRunBacksOffAndKeepsReadingAfterDispatchError` - Asserts a dispatch-level handler failure on the shared open connection does not kill run(): the loop backs off and reads again, then exits cleanly on cancellation with the connection still Open and the service stopped (UNSUB emitted).
+- `testRunReportsAnErrTheServerKeepsTheConnectionOpenForAndServesOn` - A `-ERR 'maximum subscriptions exceeded'` read by run() reaches the error listener, the connection stays Open, and the request after it is still served. Before, the loop's catch swallowed it without a trace.
 - `testRunCancellationDuringDispatchErrorBackoffStopsService` - Asserts cancelling run() while it sits in the dispatch-error backoff exits promptly instead of draining every queued poison frame, leaving the connection Open and the service stopped (UNSUB emitted).
 - `testEndpointRejectsClassStringNotImplementingHandlerInterface` - Asserts a class-string endpoint handler that does not implement ServiceEndpointHandlerInterface is rejected at registration with a message naming both the class and the required interface, rather than being wrapped into a handler that fails at request time.
 

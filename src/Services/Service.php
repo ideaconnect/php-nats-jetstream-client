@@ -510,8 +510,9 @@ final class Service
                         // Thread the cancellation INTO processIncoming (not just the outer await) so
                         // the underlying socket read is actually bounded and torn down on cancel -
                         // otherwise an idle read is orphaned and leaves the shared connection wedged.
-                        // Reported whatever slowConsumerErrorsFailOperations says: this loop has no caller to fail,
-                        // and its catch below would only swallow an overflow.
+                        // An overflow is reported whatever slowConsumerErrorsFailOperations says, and so is an -ERR
+                        // the server keeps the connection open for, such as its answer to a SUB beyond the maximum
+                        // subscriptions: this loop has no caller to fail, and its catch below would only swallow them.
                         $read = $this->client->readIncomingForOperation($effectiveCancellation, alwaysReport: true)->await($effectiveCancellation);
                         if (!$read->consumedBytes) {
                             // Yield briefly to avoid a tight loop when the transport is idle. A read
