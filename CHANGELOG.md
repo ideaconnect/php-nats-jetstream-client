@@ -15,7 +15,12 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.10.2] - 2026-10-04
+
+### Upgrade notes
+
+- With reconnect off, `Reconnect is disabled` now carries the error that ended the connection as its
+  previous exception (`getPrevious()`). Its message and code are unchanged.
 
 ### Fixed
 
