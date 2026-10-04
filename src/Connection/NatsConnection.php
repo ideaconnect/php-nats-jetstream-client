@@ -4081,9 +4081,11 @@ final class NatsConnection
                 // attempt-failure semantics stay unchanged.
                 try {
                     $this->dispatchFrames($this->parser->takeParsedFrames(), reportOverflows: true);
-                } catch (\Throwable) {
+                } catch (\Throwable $recoveredFailure) {
                     // The rethrow below already fails this attempt; dispatchFrames() enqueued the
-                    // recovered MSG frames per frame before rethrowing (#128).
+                    // recovered MSG frames per frame before rethrowing (#128). What they raised is reported,
+                    // as below, so that the server's rejection of a replayed SUB is not lost with the attempt.
+                    $this->emitErrorSafely($recoveredFailure);
                 }
 
                 throw $parseError;

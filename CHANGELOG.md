@@ -44,7 +44,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[bugfix]` A reconnect whose replayed SUB the server rejected for exceeding the maximum subscriptions
   failed, and so did every attempt after it, until the reconnect gave up and closed the connection. Any
   failure of the replay that does not end the connection is now reported to the error listener instead, and
-  the reconnect completes; one that ends it still fails the attempt.
+  the reconnect completes; one that ends it still fails the attempt. A rejection read ahead of a line that
+  does not parse is reported as well, though that attempt fails on the parse error.
 - `[bugfix]` With reconnect off, a connection the heartbeat gave up on (unanswered PINGs, a failed PING
   write, the socket closing or breaking during its read) closed without saying why: `Reconnect is disabled`
   and its cause (#172) reached only an operation that joined the recovery. The `Closed` event now carries

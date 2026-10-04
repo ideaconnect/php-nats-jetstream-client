@@ -328,6 +328,38 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     }
 
     /**
+     * A replay chunk that brings the server's rejection of a SUB and then a line that does not parse fails
+     * that attempt on the parse error, and the rejection is reported instead of being lost with the attempt.
+     */
+    public function testARejectionTheReplayReadsAheadOfAParseErrorIsReported(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new FakeTransport([
+            self::INFO, "PONG\r\n",
+            FakeTransport::EOF,                                         // the connection drops
+            self::INFO, "PONG\r\n",                                    // the first attempt's handshake
+            "-ERR 'maximum subscriptions exceeded'\r\nBOGUS LINE\r\n",  // its replay's answer, then garbage
+            self::INFO, "PONG\r\n",                                    // the second attempt, clean
+        ]);
+        $connection = new NatsConnection(new NatsOptions(
+            reconnectEnabled: true,
+            maxReconnectAttempts: 3,
+            reconnectDelayMs: 1,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+        $connection->subscribe('first', static function (): void {})->await();
+
+        $connection->processIncoming()->await();
+
+        self::assertNotSame([], $recorder->errorsContaining('maximum subscriptions exceeded'), 'the rejection is reported');
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(3, $transport->connectCalls, 'the first attempt failed on the parse error, the second succeeded');
+    }
+
+    /**
      * A reconnect replays every subscription, including one the server rejected for exceeding the maximum
      * subscriptions. The server rejects it again, and that used to fail the attempt, and every one after it,
      * until the reconnect gave up and closed the connection. The rejection is reported instead and the

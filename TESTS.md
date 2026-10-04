@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2382 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2383 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -2217,6 +2217,7 @@ What a read reports to the error listener about the frames it brought - a messag
 - `testAFatalErrAfterANonClosingOneInTheSameChunkEndsTheConnection` - One chunk with 'maximum subscriptions exceeded' then 'Stale Connection': the read fails with the fatal one, the connection Closes (reconnect off), and the rejection is reported. Before, the first failure held, and the connection stayed Open on the closed socket.
 - `testANonClosingErrOutranksAnOverflowInTheSameChunk` (data sets: the overflow first, the -ERR first) - One chunk with a full subscription queue (`SlowConsumerPolicy::Error`) and 'maximum subscriptions exceeded': the read fails with the -ERR whichever came first, the overflow is reported once, and the connection stays Open. Before, the first failure held, so an overflow ahead of the -ERR hid it.
 - `testAReconnectWhoseReplayMeetsAFatalErrAfterARejectedSubFails` - A replay answered by a rejected SUB and then 'Authorization Violation' fails the attempt, so the one allowed attempt ends Closed: the rejection does not hide the fatal -ERR.
+- `testARejectionTheReplayReadsAheadOfAParseErrorIsReported` - A replay chunk with 'maximum subscriptions exceeded' and then a line that does not parse: that attempt fails on the parse error, the next one succeeds (Open, 3 connects), and the rejection reaches the error listener. Before, it was dropped with the attempt.
 - `testTheHeartbeatsReadEndsTheConnectionOnlyOnAFatalErr` - Data provider: the heartbeat's read of a rejected SUB leaves the connection Open, and of a rejected SUB then 'Stale Connection' Closes it.
 - `testAReconnectWhoseReplayedSubTheServerRejectsCompletes` - After the server rejected a SUB for exceeding the maximum subscriptions, a reconnect replays it, the server rejects it again, and the reconnect still completes (one reconnect, Open) with the rejection reported to the error listener. Before, every attempt failed until the reconnect gave up.
 - `testTheClosedEventOfAHeartbeatThatGaveUpCarriesTheReason` - Data provider (maxPingsOut 0, 1 and 2): with reconnect off, the heartbeat giving up on unanswered PINGs closes the connection with one Closed event carrying the reason ("The heartbeat allows no unanswered PING (maxPingsOut is 0)" / "The server did not answer the last PING" / "... the last 2 PINGs") (#172).
