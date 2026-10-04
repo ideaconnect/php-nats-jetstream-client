@@ -45,12 +45,13 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   failed, and so did every attempt after it, until the reconnect gave up and closed the connection. Any
   failure of the replay that does not end the connection is now reported to the error listener instead, and
   the reconnect completes; one that ends it still fails the attempt. A rejection read ahead of a line that
-  does not parse is reported as well, though that attempt fails on the parse error.
+  does not parse is reported as well, though that attempt fails on the parse error. A rejection that arrives
+  after the replay's short poll fails the read that brings it instead, and the connection stays open.
 - `[bugfix]` With reconnect off, a connection the heartbeat gave up on (unanswered PINGs, a failed PING
   write, the socket closing or breaking during its read) closed without saying why: `Reconnect is disabled`
   and its cause (#172) reached only an operation that joined the recovery. The `Closed` event now carries
   the cause, so that the connection listener and the log learn it. The reason for unanswered PINGs reads
-  "the last PING" when `maxPingsOut` is 1.
+  "the last PING" when `maxPingsOut` is 1, and says that the heartbeat allows no unanswered PING when it is 0.
 
 ## [2.10.2] - 2026-10-04
 

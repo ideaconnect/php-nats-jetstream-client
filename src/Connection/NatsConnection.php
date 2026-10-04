@@ -1434,8 +1434,8 @@ final class NatsConnection
             // unusable, so skip the flush phase - drain()'s teardown closes it, which errors the
             // abandoned write's fiber out. The drain bound now covers the write phase too (#149).
         } catch (\Throwable $flushError) {
-            // A failed drain write (dead socket), a fatal frame (e.g. a server -ERR), or a handler
-            // that threw/published while the flush-phase read delivered backlog surfaced here.
+            // A failed drain write (dead socket), a frame's failure (a server -ERR, fatal or not), or a
+            // handler that threw/published while the flush-phase read delivered backlog surfaced here.
             // Route it to the error listener (a swallowed failure during the lossless path was
             // invisible before) and return to drain()'s cleanup so it still closes
             // rather than leaving the connection wedged in Draining with the socket open (#150).
@@ -2622,11 +2622,11 @@ final class NatsConnection
                     continue;
                 }
 
-                // Only the FIRST failure is rethrown (below) for the caller's escalation. A 2nd+ failure
-                // from the same chunk would otherwise vanish - neither thrown nor observable - hiding the
-                // corresponding message loss from the error listener and from tests. Surface it (contained
-                // so a throwing logger cannot mask the first error being rethrown) (#158), like an overflow
-                // this caller reports instead of throwing.
+                // Only one failure is rethrown (below): the one that matters most, the first among equals.
+                // Any other failure from the same chunk would otherwise vanish - neither thrown nor observable -
+                // hiding the corresponding message loss from the error listener and from tests. Surface it
+                // (contained so a throwing logger cannot mask the error being rethrown) (#158), like an
+                // overflow this caller reports instead of throwing.
                 $reports[] = [$e, 'error'];
             }
         }
@@ -3405,11 +3405,12 @@ final class NatsConnection
         // async INFO with connect_urls/lame-duck, an -ERR, or MSGs for a replayed subscription): their
         // bytes are already consumed, so dropping them would lose them permanently (#157). Routed through
         // the normal enqueue/dispatch+drain path so an INFO updates the discovered pool and a MSG reaches
-        // its handler; a fatal -ERR here surfaces as a connect failure the caller's policy then handles.
+        // its handler; an -ERR here surfaces as a connect failure the caller's policy then handles.
         if ($trailingFrames !== []) {
             // A full queue - a subscription's or a SubscriptionQueue's - or a handler that throws is reported,
-            // not a failed attempt, as in the replay poll and the delivery after a reconnect (#144); a fatal
-            // frame still fails it.
+            // not a failed attempt, as in the replay poll and the delivery after a reconnect (#144). Any other
+            // failure still fails it, an -ERR the server keeps the connection open for included, which the
+            // replay poll reports instead: a conforming server sends nothing it could reject ahead of the PONG.
             $dispatchError = null;
             try {
                 $this->dispatchFrames($trailingFrames, reportOverflows: true);
