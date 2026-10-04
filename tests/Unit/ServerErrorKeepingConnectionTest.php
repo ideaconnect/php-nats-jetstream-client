@@ -31,7 +31,16 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     public function testAnErrTheServerKeepsTheConnectionOpenForFailsTheReadButLeavesItOpen(string $error, bool $reconnect): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR '{$error}'\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: $reconnect, pingIntervalSeconds: 0), $transport);
+        // One quick reconnect attempt: a regression that ends the connection fails at once instead of after
+        // the default ten attempts with their backoff.
+        $connection = new NatsConnection(new NatsOptions(
+            reconnectEnabled: $reconnect,
+            maxReconnectAttempts: 1,
+            reconnectDelayMs: 1,
+            reconnectMaxDelayMs: 1,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+        ), $transport);
         $connection->connect()->await();
 
         try {
@@ -222,16 +231,20 @@ final class ServerErrorKeepingConnectionTest extends TestCase
 
     /**
      * A replay whose answers carry a fatal -ERR after a rejected SUB fails the attempt, as a fatal -ERR alone
-     * does: the rejection does not hide it.
+     * does: the rejection does not hide it, whether the two come in one chunk or the poll reads on after it
+     * reported the rejection.
+     *
+     * @param list<string> $answers The replay's answers, one chunk each.
      */
-    public function testAReconnectWhoseReplayMeetsAFatalErrAfterARejectedSubFails(): void
+    #[DataProvider('replayAnswersWithAFatalErrAfterARejection')]
+    public function testAReconnectWhoseReplayMeetsAFatalErrAfterARejectedSubFails(array $answers): void
     {
         $transport = new FakeTransport([
             self::INFO, "PONG\r\n",
-            "-ERR 'maximum subscriptions exceeded'\r\n",                                  // the second SUB, rejected
-            FakeTransport::EOF,                                                             // the connection drops
-            self::INFO, "PONG\r\n",                                                        // the reconnect's handshake
-            "-ERR 'maximum subscriptions exceeded'\r\n-ERR 'Authorization Violation'\r\n", // the replay's answers
+            "-ERR 'maximum subscriptions exceeded'\r\n", // the second SUB, rejected
+            FakeTransport::EOF,                          // the connection drops
+            self::INFO, "PONG\r\n",                     // the reconnect's handshake
+            ...$answers,
         ]);
         $connection = new NatsConnection(new NatsOptions(
             reconnectEnabled: true,
@@ -257,6 +270,13 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         }
 
         self::assertSame(ConnectionState::Closed, $connection->state(), 'the one attempt failed on the fatal -ERR');
+    }
+
+    /** @return iterable<string, array{list<string>}> */
+    public static function replayAnswersWithAFatalErrAfterARejection(): iterable
+    {
+        yield 'in one chunk' => [["-ERR 'maximum subscriptions exceeded'\r\n-ERR 'Authorization Violation'\r\n"]];
+        yield 'in two chunks' => [["-ERR 'maximum subscriptions exceeded'\r\n", "-ERR 'Authorization Violation'\r\n"]];
     }
 
     /**
