@@ -1235,6 +1235,63 @@ final class ServiceTest extends TestCase
         self::assertStringContainsString('"correlation_id":"req-123"', $writes);
     }
 
+    /** @return iterable<string, array{bool}> */
+    public static function requestsWithAnIntegerHeaderName(): iterable
+    {
+        yield 'with an observer, the handler answering' => [true];
+        yield 'without an observer, the handler throwing' => [false];
+    }
+
+    /**
+     * A request header whose name is a decimal integer ("1: x"), which any requester can send, no longer
+     * breaks the endpoint: the request is answered, and its correlation id still comes from the other
+     * headers. PHP keeps such a name as an int key, which building the observer context lowercased under
+     * strict types: a TypeError thrown out of the endpoint into the read that delivered the request, and no
+     * reply. That context is built for observers and for error replies, so an observer, or a handler that
+     * threw, was enough.
+     */
+    #[DataProvider('requestsWithAnIntegerHeaderName')]
+    public function testRequestWithAnIntegerHeaderNameIsStillAnswered(bool $observer): void
+    {
+        $headers = "NATS/1.0\r\n1: x\r\nX-Request-Id:req-1\r\n\r\n";
+        $payload = 'hello';
+        $headerBytes = strlen($headers);
+        $totalBytes = $headerBytes + strlen($payload);
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$headers}{$payload}\r\n",
+        ]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $seen = [];
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static function (NatsMessage $message) use ($observer): string {
+                if (!$observer) {
+                    throw new \RuntimeException('handler failed');
+                }
+
+                return 'echo:' . $message->payload;
+            });
+        if ($observer) {
+            $service->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$seen): void {
+                $seen[] = [$event, $context['correlation_id'] ?? null];
+            });
+        }
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        if ($observer) {
+            self::assertStringContainsString('echo:hello', $writes);
+            self::assertSame([['request_start', 'req-1'], ['request_end', 'req-1']], $seen);
+        } else {
+            self::assertStringContainsString('"code":"HANDLER_ERROR"', $writes);
+            self::assertStringContainsString('"correlation_id":"req-1"', $writes);
+        }
+    }
+
     /**
      * Verifies object handler adapters implementing ServiceEndpointHandlerInterface are supported.
      */

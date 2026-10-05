@@ -765,7 +765,10 @@ final class Service
         $normalizedHeaders = [];
 
         foreach ($headers as $name => $value) {
-            $normalizedHeaders[strtolower($name)] = $value;
+            // Cast: a header name that is a decimal integer ("1: x", which any requester can send) is an int
+            // key, as PHP stores such array keys, and strtolower() rejected it under strict types: a TypeError
+            // thrown out of the endpoint into the read that delivered the request, which went unanswered.
+            $normalizedHeaders[strtolower((string) $name)] = $value;
         }
 
         return [

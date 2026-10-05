@@ -405,7 +405,7 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/headers-and-server-info.php`](examples/headers-and-server-info.php)
 
-_Verified by: [NatsClientTest::testClientPublishWithHeadersAndRequestWithHeaders](tests/Unit/NatsClientTest.php), [NatsClientTest::testClientConnectAndPublishDelegatesToConnection](tests/Unit/NatsClientTest.php); [features/core/headers_queueing.feature](features/core/headers_queueing.feature)._
+_Verified by: [NatsClientTest::testClientPublishWithHeadersAndRequestWithHeaders](tests/Unit/NatsClientTest.php), [NatsClientTest::testClientConnectAndPublishDelegatesToConnection](tests/Unit/NatsClientTest.php), [NatsHeadersTest::testAHeaderNameThatIsADecimalIntegerComesBackAsAnIntKey](tests/Unit/NatsHeadersTest.php); [features/core/headers_queueing.feature](features/core/headers_queueing.feature)._
 
 ```php
 <?php
@@ -449,7 +449,10 @@ Values are written to the wire **verbatim**: surrounding whitespace is preserved
 The decoder still trims surrounding whitespace when reading, as an inbound tolerance. Use
 `NatsHeaders::fromWireBlock()` to decode a delivered `rawHeaders` block (`fromWireBlockMulti()`
 keeps repeated names) and `NatsHeaders::get()` for case-insensitive lookups; an exact-case match
-always wins over a case-insensitive one.
+always wins over a case-insensitive one. A header name that is a decimal integer, such as `1`, comes
+back as an int key, as PHP stores such array keys, so cast a name to string before passing it to a
+string function: whoever publishes a message chooses its headers. Both decoders declare their keys
+as `int|string`, so static analysis points out such a call.
 
 ### JetStream Stream and Durable Consumer
 

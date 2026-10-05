@@ -42,6 +42,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   the service either: it is reported like any other failure, and the service serves on. A handler that awaits
   the cancellation passed to `run()` reports its `CancelledException` when that cancellation stops the
   service.
+- `NatsHeaders::fromWireBlock()` and `fromWireBlockMulti()` declare their keys as `int|string`, since a header
+  name that is a decimal integer comes back as an int key. Static analysis now reports code that hands such a
+  key to a function taking a string, and code that passes the whole map where string keys are declared, such
+  as Symfony Messenger's `SerializerInterface::decode()`. `NatsHeaders::get()` takes such a map.
 
 ### Fixed
 
@@ -108,6 +112,13 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   throws: a `HANDLER_ERROR` reply without the exception's text, an error counted with the text as
   `last_error`, and `request_error` and `request_end` for the observers. A `ServiceError` it throws is sent as
   chosen, as a handler's is.
+- `[bugfix]` A request header whose name is a decimal integer, such as `1`, which any requester can send,
+  made a service endpoint throw a `TypeError` into the read that delivered the request, and the request went
+  unanswered, whenever the endpoint had an observer or its handler threw: `NatsHeaders::fromWireBlock()`
+  returns such a name as an int key, as PHP stores such array keys, and the endpoint lowercased it under
+  strict types. The endpoint now answers such a request like any other. `fromWireBlock()` and
+  `fromWireBlockMulti()` now declare their keys as `int|string`, so static analysis reports such a call in
+  your code too.
 
 ## [2.10.2] - 2026-10-04
 

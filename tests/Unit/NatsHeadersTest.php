@@ -133,6 +133,27 @@ final class NatsHeadersTest extends TestCase
     }
 
     /**
+     * A header name that is a decimal integer comes back from both decoders as an int key, as PHP stores such
+     * array keys, and their declared key type says so; "007" stays a string, and get() still finds the name.
+     * PHPStan analyses this test: should the decoders declare string keys again, it reports the assertIsInt()
+     * calls as always false, and stops reporting code that hands such a key to a function taking a string, as
+     * Service::buildObserverContext() did with strtolower().
+     */
+    public function testAHeaderNameThatIsADecimalIntegerComesBackAsAnIntKey(): void
+    {
+        $raw = "NATS/1.0\r\n1:x\r\n007:y\r\n1:z\r\n\r\n";
+
+        $single = NatsHeaders::fromWireBlock($raw);
+        $multi = NatsHeaders::fromWireBlockMulti($raw);
+
+        self::assertIsInt(array_key_first($single));
+        self::assertIsInt(array_key_first($multi));
+        self::assertSame([1 => 'z', '007' => 'y'], $single);
+        self::assertSame([1 => ['x', 'z'], '007' => ['y']], $multi);
+        self::assertSame('z', NatsHeaders::get($single, '1'));
+    }
+
+    /**
      * Verifies toWireBlock throws when a header value contains a CR character.
      */
     public function testToWireBlockRejectsHeaderValueWithCarriageReturn(): void
