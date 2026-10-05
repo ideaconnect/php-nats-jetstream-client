@@ -2158,6 +2158,119 @@ final class DrainLifecycleTest extends TestCase
     }
 
     /**
+     * drain() alongside an application's processIncoming() loop that stopped at a throwing handler, with the
+     * message read behind it still queued, ends once the server has answered its PING and that message's
+     * handler, which awaits, has run. A flush that delivered such a message before it read would wait out its
+     * whole budget: while the handler awaited, the loop's read would take the PONG and park the loop's next
+     * read, and the flush would then wait for that read, on a socket with nothing more to come.
+     */
+    public function testDrainEndsPromptlyAlongsideALoopThatLeftAMessageQueuedBehindAThrowingHandler(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $seen = [];
+        $sidA = $client->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'a:' . $message->payload;
+            throw new \RuntimeException('handler a');
+        })->await();
+        $sidB = $client->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+            delay(0.05);
+            $seen[] = 'b:' . $message->payload;
+        })->await();
+        $stop = new DeferredCancellation();
+        $loop = async(static function () use ($client, $stop): void {
+            while (!$stop->isCancelled() && $client->state() !== ConnectionState::Closed) {
+                try {
+                    $client->processIncoming($stop->getCancellation())->await();
+                } catch (\Throwable) {
+                    // The handler's failure; the loop reads on.
+                }
+            }
+        });
+        $transport->pushFrame(ReconnectingTransport::msgFrame('a', $sidA, 'x') . ReconnectingTransport::msgFrame('b', $sidB, 'y'));
+        $this->waitUntil(static function () use (&$seen): bool {
+            return $seen === ['a:x'];
+        });
+        // The loop is parked in its next read, b's message queued.
+        delay(0.02);
+        $this->answerTheNextPingAfter($transport, 0.01);
+
+        $start = hrtime(true);
+        $client->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(['a:x', 'b:y'], $seen);
+        $stop->cancel();
+        $loop->await(new TimeoutCancellation(1));
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function drainsWhileAServiceLoopDelivers(): iterable
+    {
+        yield 'Service::drain()' => ['service'];
+        yield 'NatsClient::drain()' => ['client'];
+        yield 'NatsClient::drainSubscription()' => ['subscription'];
+    }
+
+    /**
+     * A drain called while a service's run() delivers a read - a handler that awaits, and a message queued
+     * behind it whose handler awaits longer - ends once the server has answered its PING and both handlers
+     * have run. A flush that delivered the queued message before it read, as the loop's read does with what an
+     * earlier read left queued, would wait out its whole budget: while that handler awaited, the loop would
+     * read the PONG and park its next read, and the flush would then wait for that read.
+     */
+    #[DataProvider('drainsWhileAServiceLoopDelivers')]
+    public function testADrainEndsPromptlyWhileAServiceLoopDeliversARead(string $drain): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $done = [];
+        $sidSlow = $client->subscribe('slow', static function () use (&$done): void {
+            delay(0.05);
+            $done[] = 'slow';
+        })->await();
+        $sidSlower = $client->subscribe('slower', static function () use (&$done): void {
+            delay(0.15);
+            $done[] = 'slower';
+        })->await();
+        $sidOther = $client->subscribe('other', static function (): void {})->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload);
+        $stop = new DeferredCancellation();
+        $runner = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        $this->waitUntil(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        // The loop is parked in its read of the idle socket when both messages arrive.
+        delay(0.02);
+        $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $sidSlow, 'x') . ReconnectingTransport::msgFrame('slower', $sidSlower, 'y'));
+        delay(0.01);
+        $this->answerTheNextPingAfter($transport, 0.01);
+
+        $start = hrtime(true);
+        match ($drain) {
+            'service' => $service->drain()->await(),
+            'client' => $client->drain()->await(),
+            default => $client->drainSubscription($sidOther)->await(),
+        };
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(['slow', 'slower'], $done);
+        $stop->cancel();
+        $runner->await(new TimeoutCancellation(1));
+    }
+
+    /**
      * A server PING while drain() waits for its flush PONG is answered with a write bounded by the drain
      * budget, like drain()'s own writes: a PONG stuck behind a stalled socket cannot hold it past that.
      */
@@ -2614,6 +2727,18 @@ final class DrainLifecycleTest extends TestCase
         $connection->processIncoming()->await();
         self::assertSame(['m1', 'bad', 'm2'], $handled->payloads);
         self::assertFalse($connection->isSubscriptionActive($sid));
+    }
+
+    /** Makes the server answer the next PING written after $seconds instead of at once. */
+    private function answerTheNextPingAfter(ReconnectingTransport $transport, float $seconds): void
+    {
+        $transport->answerPings = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport, $seconds): void {
+            if ($bytes === "PING\r\n") {
+                $transport->afterWrite = null;
+                EventLoop::delay($seconds, static fn() => $transport->pushFrame("PONG\r\n"));
+            }
+        };
     }
 
     /** Delivers the frames pushed so far, whose first handler fails: the rest stay queued behind it. */

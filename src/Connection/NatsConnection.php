@@ -2213,10 +2213,35 @@ final class NatsConnection
     }
 
     /**
-     * Body of {@see flush()} and {@see rtt()}, and the flush of {@see drainSubscription()}. One monotonic
-     * deadline bounds every phase - the wait for an in-flight reconnect, the PING write and the PONG wait -
-     * so the flush honours the single request-timeout bound it documents (the write and read phases used
-     * to get a full budget each).
+     * {@see flush()} for a caller that would only swallow what the flush's reads meet: a full subscription
+     * queue, a handler that throws while they deliver and an -ERR the server keeps the connection open for are
+     * reported through the error listener, and the flush reads on to its PONG, as drainSubscription()'s does.
+     * A failure that ends the connection, and the timeout, still fail it.
+     *
+     * @internal For the service framework's drain(); not part of the supported API.
+     *
+     * @return Future<void>
+     */
+    public function flushReportingFailures(): Future
+    {
+        $caller = \Fiber::getCurrent();
+
+        return async(function () use ($caller): void {
+            $this->flushWithin(
+                $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000),
+                $caller,
+                reportOverflows: true,
+                reportHandlerFailures: true,
+                reportFailuresKeepingTheConnection: true,
+            );
+        });
+    }
+
+    /**
+     * Body of {@see flush()}, {@see flushReportingFailures()} and {@see rtt()}, and the flush of
+     * {@see drainSubscription()}. One monotonic deadline bounds every phase - the wait for an in-flight
+     * reconnect, the PING write and the PONG wait - so the flush honours the single request-timeout bound it
+     * documents (the write and read phases used to get a full budget each).
      *
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called flush()/rtt().
      * @param bool $reportOverflows Report a full queue of a subscription that one of the flush's reads runs
@@ -2224,11 +2249,12 @@ final class NatsConnection
      *        flush() and rtt(), which wait for a PONG of their own ({@see readIncomingForOperation()}), and
      *        for drainSubscription(), which needs the messages still in flight before the PONG.
      * @param bool $reportHandlerFailures Report a handler that throws while the flush delivers, and read on,
-     *        instead of ending the flush with it: for drainSubscription(), for the same reason.
+     *        instead of ending the flush with it: for drainSubscription(), for the same reason, and for
+     *        flushReportingFailures(), whose caller would only swallow it.
      * @param bool $reportFailuresKeepingTheConnection Report a frame's failure that leaves the connection open,
      *        such as an -ERR the server keeps it open for, and read on, instead of ending the flush with it: for
-     *        drainSubscription(), for the same reason. flush() and rtt() still fail with it: the server rejected
-     *        something their caller sent, and they are to confirm what was sent.
+     *        drainSubscription() and flushReportingFailures(), for the same reasons. flush() and rtt() still fail
+     *        with it: the server rejected something their caller sent, and they are to confirm what was sent.
      */
     private function flushWithin(
         float $deadline,
@@ -2367,9 +2393,11 @@ final class NatsConnection
      *           applications read with {@see readIncoming()} or {@see processIncoming()}.
      *
      * @param int|null $ownSid The operation's own subscription, whose overflow still fails the operation.
-     * @param bool $alwaysReport Report every overflow, whatever the option says, and an -ERR the server keeps
-     *        the connection open for: for a read whose caller would only swallow them, such as a serving
-     *        loop. A failure that ends the connection is still thrown, once the connection has recovered.
+     * @param bool $alwaysReport Report every overflow, whatever the option says, an -ERR the server keeps the
+     *        connection open for, and a handler that throws while the read delivers, whose messages behind it
+     *        are still delivered: for a read whose caller would only swallow them, such as a serving loop. Such
+     *        a read also delivers what an earlier read left queued. A failure that ends the connection is still
+     *        thrown, once the connection has recovered.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2381,7 +2409,9 @@ final class NatsConnection
             \Fiber::getCurrent(),
             reportOverflows: $alwaysReport || !$this->options->slowConsumerErrorsFailOperations,
             ownSid: $ownSid,
+            reportHandlerFailures: $alwaysReport,
             reportFailuresKeepingTheConnection: $alwaysReport,
+            deliverLeftovers: $alwaysReport,
         );
     }
 
@@ -2392,11 +2422,17 @@ final class NatsConnection
      * @param bool $reportOverflows Report a full subscription queue the read runs into instead of throwing
      *        it, except one of $ownSid ({@see dispatchFrames()}).
      * @param bool $reportHandlerFailures Report a handler that throws while the read delivers, and deliver
-     *        the rest, instead of throwing its exception ({@see deliverPending()}): for a drain.
+     *        the rest, instead of throwing its exception ({@see deliverPending()}): for a drain, and for a read
+     *        whose caller would only swallow it ({@see readIncomingForOperation()}).
      * @param bool $reportFailuresKeepingTheConnection Report a frame's failure that leaves the connection open,
      *        such as an -ERR the server keeps it open for, instead of throwing it: for a read whose caller would
      *        only swallow it ({@see readIncomingForOperation()}), and for the flushes of drain() and
      *        drainSubscription(), which read on to their PONG.
+     * @param bool $deliverLeftovers Deliver what an earlier read left queued, before reading and after waiting
+     *        for another fiber's read: for a serving loop's read ({@see readIncomingForOperation()}), since
+     *        nothing else would deliver it until the server sent more. Not for a flush: a handler it ran there
+     *        could suspend while another fiber took the flush's PONG and started its next read, which the flush
+     *        would then wait for until its deadline. A drain delivers that backlog itself.
      * @param DeferredFuture<null>|null $pongSlot The pong slot of the flush this read is for. When it is complete
      *        by the time the read would take the read slot, or wait for another fiber's read, the read returns
      *        without reading. The flush checks its slot before each read, but the read runs on a fiber of its own,
@@ -2413,13 +2449,29 @@ final class NatsConnection
         ?int $ownSid = null,
         bool $reportHandlerFailures = false,
         bool $reportFailuresKeepingTheConnection = false,
+        bool $deliverLeftovers = false,
         ?DeferredFuture $pongSlot = null,
     ): Future {
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $pongSlot): IncomingChunkResult {
+        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot): IncomingChunkResult {
             if ($this->state !== ConnectionState::Open && $this->state !== ConnectionState::Draining) {
                 // The recovery future resolves only once the recovery has finalized the state, so a
                 // reader waiting here still never touches the new socket during the subscription
                 // replay window (#148).
+                $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
+            }
+
+            // A serving loop's read first delivers what an earlier read left queued: one that stopped at a
+            // throwing handler, another fiber's that did, or the delivery after a reconnect. A read that finds
+            // nothing new delivers nothing, so that would otherwise wait for the server to send more. Done before
+            // the check below, so that a handler that suspends cannot leave two fibers reading at once. Such a
+            // handler can outlast the connection, too: a recovery started meanwhile is waited for, as above,
+            // before the socket is read, or this read would take the replies to the recovery's handshake.
+            while ($deliverLeftovers && $this->pendingDirty !== []) {
+                $this->deliverPending($reportOverflows, $ownSid, $reportHandlerFailures);
+                if ($this->state === ConnectionState::Open || $this->state === ConnectionState::Draining) {
+                    break;
+                }
+
                 $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
             }
 
@@ -2436,6 +2488,11 @@ final class NatsConnection
                 // which never hand the event loop control: no timer or socket read ran again, that other
                 // read's included, and the process spun at 100% CPU.
                 $this->readSlotReleased->getFuture()->await($cancellation);
+
+                // Unless it stopped at a throwing handler: what it left queued is delivered here, as above.
+                if ($deliverLeftovers && $this->pendingDirty !== []) {
+                    $this->deliverPending($reportOverflows, $ownSid, $reportHandlerFailures);
+                }
 
                 return new IncomingChunkResult(0, false);
             }
@@ -4621,9 +4678,9 @@ final class NatsConnection
      * SubscriptionQueue's overflow always was before that option existed: code that swallows an
      * operation's failure must not make it vanish. A handler that fails otherwise ends the delivery and
      * propagates, ahead of any held overflow - unless $reportHandlerFailures (a drain, a read nobody
-     * awaits), which reports it at once and delivers the rest. Reports are made as the delivery goes, so a
-     * drain's deadline, checked before each delivery, counts the time they take, and nothing restarts the
-     * pass (#149).
+     * awaits, a serving loop's read), which reports it at once and delivers the rest. Reports are made as
+     * the delivery goes, so a drain's deadline, checked before each delivery, counts the time they take,
+     * and nothing restarts the pass (#149).
      */
     private function deliverPending(bool $reportOverflows, ?int $ownSid = null, bool $reportHandlerFailures = false): void
     {

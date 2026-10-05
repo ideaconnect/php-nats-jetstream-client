@@ -1255,6 +1255,25 @@ $service->stop()->await();
 $client->disconnect()->await();
 ```
 
+`run()` reads the client's shared connection, so its loop delivers the messages of every subscription on it,
+not only the service's. A handler that throws during such a read - another subscription's - is reported
+through the `errorListener` and logged at error level, the messages the read brought behind it are still
+delivered, and the loop serves on without backing off. The same goes for a handler that throws a
+`CancelledException`: only `run()`'s own timeout or cancellation stops the loop, or a connection closed for
+good. A handler that awaits the very cancellation you pass to `run()`, and is still waiting when it fires,
+therefore reports that `CancelledException` too. An endpoint handler's own exception never gets this far: it
+becomes a `HANDLER_ERROR` reply. The loop's read also delivers what another read left queued - another
+fiber's read that stopped at a throwing handler, or the delivery after a reconnect - instead of waiting for
+the server to send more. `drain()` reports such a handler as well, and its flush reads on to the `PONG` that
+confirms the server has processed the `UNSUB`s.
+
+A known limitation: the read of an operation - a `request()`, a JetStream call, a polling queue - still
+fails with another subscription's handler exception, as `processIncoming()` does. A `request()` that an
+endpoint handler makes can therefore fail with it, and the endpoint then answers its requester with a
+`HANDLER_ERROR` reply and records that exception as its `last_error`.
+
+_Verified by: [ServiceTest](tests/Unit/ServiceTest.php) (`testRunReportsASubscriptionHandlerThatThrowsAndReadsOn`, `testRunAnswersARequestReadBehindAMessageWhoseHandlerThrows`, `testRunDoesNotBackOffAfterAHandlerFails`, `testRunReportsAHandlerThatThrowsACancelledExceptionAndServesOn`, `testRunAnswersARequestAnotherFibersReadLeftQueuedBehindAThrowingHandler`, `testRunAnswersARequestTheDeliveryAfterAReconnectLeftQueuedBehindAThrowingHandler`, `testRunStoppedWhileAHandlerAwaitsTheSameCancellationReportsThatHandlersCancelledException`, `testDrainReportsAHandlerThatThrowsDuringItsFlushAndReadsOnToItsPong`), [WaitForReconnectTest](tests/Unit/WaitForReconnectTest.php) (`testAServingReadDeliveringWhatAnEarlierReadLeftQueuedLeavesTheHandshakeToTheRecovery`)._
+
 ### Services: SCHEMA Discovery
 
 > 📄 **Runnable example:** [`examples/services-schema-discovery.php`](examples/services-schema-discovery.php)
@@ -1393,7 +1412,7 @@ handler draining its own subscription - that delivery hands over the messages qu
 removes the subscription, and `drainSubscription()` resolves without waiting for it. A second call for a
 subscription that is already being drained resolves at once.
 
-_Verified by: [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testDrainFlushReportsAnErrTheServerKeepsTheConnectionOpenForAndReadsOnToTheMessagesStillInFlight`, `testDrainFlushReadsOnPastANonClosingErrButEndsAtAFatalOneAfterIt`, `testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself`, `testDrainEndsPromptlyWhileAnotherFiberReads`, `testDrainIssuedRightAfterARequestEndsPromptly`, `testFlushEndsPromptlyWheneverAnotherFibersReadStartsAroundIt`)._
+_Verified by: [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testDrainFlushReportsAnErrTheServerKeepsTheConnectionOpenForAndReadsOnToTheMessagesStillInFlight`, `testDrainFlushReadsOnPastANonClosingErrButEndsAtAFatalOneAfterIt`, `testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself`, `testDrainEndsPromptlyWhileAnotherFiberReads`, `testDrainIssuedRightAfterARequestEndsPromptly`, `testFlushEndsPromptlyWheneverAnotherFibersReadStartsAroundIt`, `testDrainEndsPromptlyAlongsideALoopThatLeftAMessageQueuedBehindAThrowingHandler`, `testADrainEndsPromptlyWhileAServiceLoopDeliversARead`)._
 
 ### Ordered Consumer
 
@@ -2183,6 +2202,7 @@ The same watchdog protects KV **and Object Store** watches, which both ride orde
 - **Interoperability.** KeyValue and Object Store buckets use the official NATS layouts (`KV_`/`OBJ_` streams, base64url object-name encoding, `SHA-256=`-prefixed base64url digests), so buckets written by this client are readable by the `nats` CLI and other official clients, and vice-versa.
 - **Observability.** Pass a PSR-3 `LoggerInterface` via `new NatsOptions(logger: $logger)` to capture lifecycle events (connect, disconnect, reconnect, close, server discovery, lame-duck), per-attempt reconnect/backoff, and async errors. It defaults to a `NullLogger`. For structured, programmatic hooks (metrics, alerting, circuit breakers) without parsing log strings, pass typed closures instead: `connectionListener: Closure(ConnectionEvent $event, ?Throwable $error): void` is invoked on every connection-lifecycle transition, and `errorListener: Closure(Throwable $error): void` on async errors. Exceptions thrown by a listener are swallowed so a faulty hook cannot disrupt the connection; so are those a logger throws while it logs a lifecycle transition, a failed reconnect attempt, or any error it reports - and such an error still reaches the `errorListener`. _Verified by: [NatsConnectionTest::testLoggerCapturesLifecycleEvents](tests/Unit/NatsConnectionTest.php)._
 - **Server version requirements.** Newer features (per-message TTL, atomic batch publish, scheduled publish, priority groups, counters, batched Direct Get) require recent NATS servers - see [NATS Server Version Requirements](#nats-server-version-requirements).
+- **Another subscription's failing handler can fail an operation.** An operation's read (a `request()`, a JetStream call, a polling queue) delivers messages for every subscription on the connection and fails with a handler's exception, as `processIncoming()` does, even when its own result has arrived; a service's `run()` reports such a failure instead. See [Services Framework](#services-framework).
 - **Not yet implemented.** A dedicated high-throughput fast-ingest batch publisher ([#12](https://github.com/ideaconnect/php-nats-jetstream-client/issues/12)) is tracked but blocked on an upstream reference; standard JetStream publish with in-flight pipelining is available today and is sufficient for most workloads.
 
 ## Configuration Option Mapping

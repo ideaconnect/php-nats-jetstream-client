@@ -8,11 +8,16 @@ use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
+use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\async;
+use function Amp\delay;
 
 /**
  * Only a frame that says the connection is finished ends it (#171): a fatal -ERR, which the server sends
@@ -364,6 +369,124 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     }
 
     /**
+     * The read of a serving loop also reports a handler that throws while it delivers, and delivers the rest of
+     * what it read: the failing subscription's messages behind it, and another subscription's.
+     */
+    public function testAReadForAServingLoopReportsAHandlerThatThrowsAndDeliversTheRest(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $seen = [];
+        $connection = $this->connectionWithAFailingHandler($recorder, $seen);
+
+        $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
+
+        self::assertSame(3, $read->frames);
+        self::assertTrue($read->consumedBytes);
+        self::assertSame(['a:x', 'a:y', 'b:z'], $seen);
+        self::assertSame(['handler a'], $recorder->errors);
+        self::assertSame(ConnectionState::Open, $connection->state());
+    }
+
+    /**
+     * Guard: an operation's read, such as a request's, still throws such a handler's failure, and leaves the
+     * rest queued.
+     */
+    public function testAnOperationsReadStillThrowsAHandlerThatThrows(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $seen = [];
+        $connection = $this->connectionWithAFailingHandler($recorder, $seen);
+
+        try {
+            $connection->readIncomingForOperation()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a', $e->getMessage());
+        }
+
+        self::assertSame(['a:x'], $seen);
+        self::assertSame([], $recorder->errors);
+    }
+
+    /**
+     * The read of a serving loop first delivers what an earlier read left queued - one that stopped at a
+     * throwing handler - although the socket has nothing more to give it. Those messages used to wait for the
+     * server's next bytes, since a read that finds nothing new delivers nothing.
+     */
+    public function testAReadForAServingLoopDeliversWhatAnEarlierReadLeftQueued(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $seen = [];
+        $connection = $this->connectionWithAFailingHandler($recorder, $seen);
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a', $e->getMessage());
+        }
+        self::assertSame(['a:x'], $seen);
+
+        $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
+
+        self::assertSame(['a:x', 'a:y', 'b:z'], $seen);
+        self::assertFalse($read->consumedBytes, 'nothing more was read');
+        self::assertSame([], $recorder->errors);
+    }
+
+    /**
+     * The same once it has waited for another fiber's read that stopped at a throwing handler: it delivers what
+     * that read left queued before it returns, instead of leaving it to its own next read, which a loop that is
+     * stopping never makes.
+     */
+    public function testAReadForAServingLoopThatWaitedForAnotherFibersReadDeliversWhatThatReadLeftQueued(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new ReconnectingTransport();
+        $connection = new NatsConnection(new NatsOptions(
+            connectTimeoutMs: 500,
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+        $seen = [];
+        $sidA = $connection->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'a:' . $message->payload;
+            if ($message->payload === 'x') {
+                throw new \RuntimeException('handler a');
+            }
+        })->await();
+        $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'b:' . $message->payload;
+        })->await();
+        // Another fiber's read takes the idle socket first, and the serving read waits for it.
+        $other = async(static fn(): int => $connection->processIncoming()->await());
+        delay(0.01);
+        $serving = $connection->readIncomingForOperation(alwaysReport: true);
+        delay(0.01);
+
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('a', $sidA, 'x')
+            . ReconnectingTransport::msgFrame('a', $sidA, 'y')
+            . ReconnectingTransport::msgFrame('b', $sidB, 'z'),
+        );
+        $read = $serving->await();
+        // Awaited before the assertions below: had one of them failed first, this read's failure would be reported
+        // in whichever test ran next.
+        try {
+            $other->await();
+            self::fail('expected the other read to fail with the handler\'s exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a', $e->getMessage());
+        }
+
+        self::assertFalse($read->consumedBytes, 'the other fiber read the socket');
+        self::assertSame(['a:x', 'a:y', 'b:z'], $seen, 'what that read left queued was delivered before this one returned');
+        self::assertSame([], $recorder->errors);
+        $connection->disconnect()->await();
+    }
+
+    /**
      * flush() and rtt() still fail with an -ERR the server keeps the connection open for, read before their
      * PONG, where the flushes of drain() and drainSubscription() report it and read on: the server rejected
      * something sent before the PING whose answer they are to confirm. The connection stays open.
@@ -534,5 +657,33 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         yield 'no PING' => [0, 'The heartbeat allows no unanswered PING (maxPingsOut is 0)'];
         yield 'one PING' => [1, 'The server did not answer the last PING'];
         yield 'two PINGs' => [2, 'The server did not answer the last 2 PINGs'];
+    }
+
+    /**
+     * A connection whose next read brings two messages for "a", whose handler throws on the first, and one
+     * for "b".
+     *
+     * @param list<string> $seen Collects what the handlers got, as "<subject>:<payload>".
+     */
+    private function connectionWithAFailingHandler(LifecycleRecorder $recorder, array &$seen): NatsConnection
+    {
+        $transport = new FakeTransport([self::INFO, "PONG\r\n", "MSG a 1 1\r\nx\r\nMSG a 1 1\r\ny\r\nMSG b 2 1\r\nz\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+        $connection->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'a:' . $message->payload;
+            if ($message->payload === 'x') {
+                throw new \RuntimeException('handler a');
+            }
+        })->await();
+        $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'b:' . $message->payload;
+        })->await();
+
+        return $connection;
     }
 }

@@ -302,9 +302,11 @@ final class NatsClient
      *           part of the supported API.
      *
      * @param int|null $ownSid The operation's own subscription, whose overflow still fails the operation.
-     * @param bool $alwaysReport Report every overflow, whatever the option says, and an -ERR the server keeps
-     *        the connection open for: for a read whose caller would only swallow them, such as a serving
-     *        loop. A failure that ends the connection is still thrown, once the connection has recovered.
+     * @param bool $alwaysReport Report every overflow, whatever the option says, an -ERR the server keeps the
+     *        connection open for, and a handler that throws while the read delivers, whose messages behind it
+     *        are still delivered: for a read whose caller would only swallow them, such as a serving loop. Such
+     *        a read also delivers what an earlier read left queued. A failure that ends the connection is still
+     *        thrown, once the connection has recovered.
      * @return Future<IncomingChunkResult>
      */
     public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
@@ -334,6 +336,20 @@ final class NatsClient
     public function flush(): Future
     {
         return $this->connection->flush();
+    }
+
+    /**
+     * {@see flush()} that reports what its reads meet - a full subscription queue, a handler that throws, an
+     * -ERR the server keeps the connection open for - through the error listener and reads on to its PONG,
+     * instead of failing with it.
+     *
+     * @internal For the service framework's drain(); not part of the supported API.
+     *
+     * @return Future<void>
+     */
+    public function flushReportingFailures(): Future
+    {
+        return $this->connection->flushReportingFailures();
     }
 
     /**

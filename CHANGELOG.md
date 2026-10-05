@@ -35,6 +35,13 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   ends, which can be longer than its `requestTimeoutMs` budget; with reconnect off it reports `Reconnect is
   disabled` and the connection is Closed. It used to resolve at once and leave the dead connection Open for
   the next operation.
+- A service's `run()` now reports a handler that throws while its loop reads - any subscription's on the
+  client's connection - to the error listener, and the logger records it at error level, once per failure,
+  where the loop used to swallow it: a subscription whose handler throws on every message is logged for every
+  message. A handler that throws a `CancelledException` (one of its own waits ran out, say) no longer stops
+  the service either: it is reported like any other failure, and the service serves on. A handler that awaits
+  the cancellation passed to `run()` reports its `CancelledException` when that cancellation stops the
+  service.
 
 ### Fixed
 
@@ -81,6 +88,20 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   round trip: another fiber's read could take the `PONG` just before the flush's own read started, which
   then waited on the idle socket. A flush now looks for its `PONG` before every read, and its read looks
   again before it takes the socket.
+- `[bugfix]` A service's `run()` swallowed the exception of a handler that threw while its loop read, another
+  subscription's on the same connection: nothing reported it, the loop backed off 20 ms, and the messages that
+  read brought behind the failing one, for any subscription, stayed queued until the server sent something
+  else. A request read behind it waited up to the heartbeat interval, and was lost when the service stopped
+  first, and a subscription failing on two or more messages per read starved the service's endpoints for
+  good. Such a failure is now reported to the error listener, the rest of the read is delivered, and the loop
+  reads on without backing off, as `drain()` treats a throwing handler. The loop's read also delivers what
+  another read left queued - another fiber's that stopped at a throwing handler, or the delivery after a
+  reconnect - instead of leaving it for the server's next bytes. A known limitation remains: the read of an
+  operation, such as a `request()` an endpoint handler makes, still fails with another subscription's handler
+  exception, and the endpoint then answers its requester with a `HANDLER_ERROR` reply.
+- `[bugfix]` A service's `drain()` swallowed what its flush met, such as another subscription's handler that
+  threw, and returned before the `PONG` that confirms the server has processed the `UNSUB`s. The flush now
+  reports it to the error listener and reads on to that `PONG`.
 
 ## [2.10.2] - 2026-10-04
 
