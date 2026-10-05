@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
@@ -20,8 +21,8 @@ use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
-use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
+use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -1978,6 +1979,182 @@ final class DrainLifecycleTest extends TestCase
         self::assertLessThan(0.5, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(0, $connection->statistics()->reconnects);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function otherReaders(): iterable
+    {
+        yield "an application's processIncoming() loop" => ['loop'];
+        yield "a service's run()" => ['service'];
+    }
+
+    /**
+     * drain() against a server that answers its PING at once ends at once while another fiber reads the
+     * connection. That fiber's read can take the drain's PONG before the drain's flush first reads, and the
+     * flush then waited for that fiber's next read, on a socket with nothing more to come, until its whole
+     * budget had run out.
+     */
+    #[DataProvider('otherReaders')]
+    public function testDrainEndsPromptlyWhileAnotherFiberReads(string $reader): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $stop = new DeferredCancellation();
+        if ($reader === 'loop') {
+            $client->subscribe('orders', static function (): void {})->await();
+            $background = async(static function () use ($client, $stop): void {
+                while (!$stop->isCancelled() && $client->state() !== ConnectionState::Closed) {
+                    try {
+                        $client->processIncoming($stop->getCancellation())->await();
+                    } catch (\Throwable) {
+                        return;
+                    }
+                }
+            });
+        } else {
+            $service = $client->service('echo', '1.0.0')
+                ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload);
+            $background = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        }
+        // The other fiber is parked in its read of the idle socket.
+        delay(0.05);
+
+        $start = hrtime(true);
+        $client->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(ConnectionState::Closed, $client->state());
+        $stop->cancel();
+        $background->await(new TimeoutCancellation(1));
+    }
+
+    /**
+     * drain() issued right after a request(), in the same tick, against a server that answers its PING at once
+     * ends at once - a common shutdown. The request's read took the drain's PONG after the drain's flush had
+     * checked for it, in the hop before the flush's own read started, and that read then waited on a socket with
+     * nothing more to come until the drain's whole budget had run out.
+     */
+    public function testDrainIssuedRightAfterARequestEndsPromptly(): void
+    {
+        $transport = new ReconnectingTransport();
+        $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'warm' && $replyTo !== null
+            ? $transport->replyFrame($replyTo, 'ok')
+            : [];
+        $connection = $this->connect($transport, requestTimeoutMs: 2_000);
+        // The reply inbox is in place, so the request below writes only its PUB.
+        $connection->request('warm', 'x')->await();
+
+        $request = $connection->request('svc', 'unanswered', 5_000);
+        $start = hrtime(true);
+        $connection->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        try {
+            $request->await();
+        } catch (\Throwable) {
+            // The drain closed the connection under the request.
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function flushes(): iterable
+    {
+        yield 'drain()' => ['drain'];
+        yield 'drainSubscription()' => ['drainSubscription'];
+        yield 'flush()' => ['flush'];
+        yield 'rtt()' => ['rtt'];
+    }
+
+    /**
+     * A flush ends as soon as the server has answered its PING, whenever another fiber's read starts around it: a
+     * request() reading for its reply, or a processIncoming(). The flush checks for its PONG before each read, and
+     * its read runs on a fiber of its own; another fiber's read that started just before that fiber took the PONG
+     * and freed the read slot, and the flush's read then waited on a socket with nothing more to come until the
+     * flush's deadline. flush() and rtt() share drainSubscription()'s flush. Where the window falls depends on how
+     * many event-loop hops each call takes, so the other call is made after each of 0 to 16 hops, before the flush
+     * and after it.
+     */
+    #[DataProvider('flushes')]
+    public function testFlushEndsPromptlyWheneverAnotherFibersReadStartsAroundIt(string $flush): void
+    {
+        foreach (['request', 'processIncoming'] as $reader) {
+            for ($hops = -16; $hops <= 16; $hops++) {
+                $transport = new ReconnectingTransport();
+                $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'warm' && $replyTo !== null
+                    ? $transport->replyFrame($replyTo, 'ok')
+                    : [];
+                $connection = $this->connect($transport, requestTimeoutMs: 1_000);
+                $connection->request('warm', 'x')->await();
+                // Only where it is needed: every subscription adds a write to a drain, and moves the window.
+                $sid = $flush === 'drainSubscription' ? $connection->subscribe('orders', static function (): void {})->await() : 0;
+
+                $calls = [
+                    'flush' => static fn(): Future => self::startFlush($flush, $connection, $sid),
+                    'reader' => static fn(): Future => $reader === 'request'
+                        ? $connection->request('svc', 'unanswered', 3_000)
+                        : $connection->processIncoming(new TimeoutCancellation(3)),
+                ];
+                // A negative count makes the flush first and the other read $hops hops after it.
+                [$first, $second] = $hops < 0 ? ['flush', 'reader'] : ['reader', 'flush'];
+                $start = hrtime(true);
+                /** @var array<string, Future<mixed>> $futures */
+                $futures = [$first => $calls[$first]()];
+                $made = new DeferredFuture();
+                self::afterHops(abs($hops), static function () use (&$futures, $calls, $second, $made): void {
+                    $futures[$second] = $calls[$second]();
+                    $made->complete();
+                });
+                $made->getFuture()->await();
+                $futures['reader']->ignore();
+                $futures['flush']->await();
+
+                self::assertLessThan(
+                    0.5,
+                    $this->secondsSince($start),
+                    sprintf('%s with a %s %d hop(s) %s it waited out its 1 s budget', $flush, $reader, abs($hops), $hops < 0 ? 'after' : 'before'),
+                );
+                $connection->disconnect()->await();
+            }
+        }
+    }
+
+    /**
+     * Starts the flush that {@see flushes()} names.
+     *
+     * @return Future<mixed>
+     */
+    private static function startFlush(string $flush, NatsConnection $connection, int $sid): Future
+    {
+        if ($flush === 'drain') {
+            return $connection->drain();
+        }
+
+        if ($flush === 'drainSubscription') {
+            return $connection->drainSubscription($sid);
+        }
+
+        return $flush === 'rtt' ? $connection->rtt() : $connection->flush();
+    }
+
+    /** Makes $call after $hops event-loop hops: a callback queued that many times in a row. */
+    private static function afterHops(int $hops, \Closure $call): void
+    {
+        if ($hops === 0) {
+            $call();
+
+            return;
+        }
+
+        EventLoop::queue(static function () use ($hops, $call): void {
+            self::afterHops($hops - 1, $call);
+        });
     }
 
     /**

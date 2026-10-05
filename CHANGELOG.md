@@ -72,6 +72,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `-ERR` and a `PONG` the socket would not take still end the flush at once, and `flush()` and `rtt()` still
   fail with such an `-ERR`. A service's `run()` likewise reports an `-ERR` read ahead of a line that does not
   parse, which its read used to throw after the reconnect, for the loop to swallow.
+- `[bugfix]` A `drain()` waited out its whole budget (`requestTimeoutMs`, 10 s by default) against a healthy
+  server while another fiber read the connection, such as an application's `processIncoming()` loop or a
+  service's `run()`: that fiber's read took the `PONG` of the drain's flush before the flush first read, and
+  the flush then waited for that fiber's next read, on a socket with nothing more to come. A `drain()` issued
+  right after a `request()` did the same, and so could `flush()`, `rtt()`, `drainSubscription()` and a
+  service's `drain()`, which then returned only when their budget ran out, `rtt()` reporting that wait as the
+  round trip: another fiber's read could take the `PONG` just before the flush's own read started, which
+  then waited on the idle socket. A flush now looks for its `PONG` before every read, and its read looks
+  again before it takes the socket.
 
 ## [2.10.2] - 2026-10-04
 

@@ -1395,12 +1395,17 @@ final class NatsConnection
             }
 
             // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
-            // the slot), bounded by the REMAINING drain budget (shared with drain()'s backlog wait)
+            // the slot, or a concurrent teardown errors it - drain()'s close-and-clean-up is right
+            // either way), bounded by the REMAINING drain budget (shared with drain()'s backlog wait)
             // so a slow/wedged server cannot hang drain() forever. A partial chunk (0 complete frames
-            // yet) must NOT end the flush early - only the PONG or the deadline does.
+            // yet) must NOT end the flush early - only the PONG or the deadline does. The slot is checked
+            // before every read, the first included: another fiber's read (an application's
+            // processIncoming() loop, a service's run()) can take the PONG before this loop starts, and
+            // a read then waited for that fiber's next one, on a socket with nothing more to come, until
+            // the budget ran out.
             $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
             try {
-                while (!$flushCancellation->isRequested()) {
+                while (!$flushSlot->isComplete() && !$flushCancellation->isRequested()) {
                     // A full subscription queue, a throwing handler or an -ERR the server keeps the connection
                     // open for (its answer to a SUB beyond the maximum subscriptions, say) is reported, not
                     // thrown: ending the flush on it would close the socket on the deliveries still in flight,
@@ -1411,13 +1416,8 @@ final class NatsConnection
                         reportOverflows: true,
                         reportHandlerFailures: true,
                         reportFailuresKeepingTheConnection: true,
+                        pongSlot: $flushSlot,
                     )->await();
-
-                    if ($flushSlot->isComplete()) {
-                        // The PONG answering the drain PING arrived (or a concurrent teardown
-                        // errored the slot - drain()'s close-and-clean-up is right either way).
-                        break;
-                    }
 
                     if (!$read->consumedBytes) {
                         // Genuinely idle read (empty socket, or another fiber owns the read). Yield so
@@ -1425,7 +1425,7 @@ final class NatsConnection
                         // would busy-spin and starve the timer forever. A read that consumed bytes but
                         // did not complete this drain PONG frame (a large payload arriving in chunks)
                         // loops immediately: the rest is already buffered, so no idle sleep is paid per
-                        // partial chunk (#119).
+                        // partial chunk (#119). A slot completed during any read ends the loop at its head.
                         delay(0.001, cancellation: $flushCancellation);
                     }
                 }
@@ -2286,6 +2286,7 @@ final class NatsConnection
                     $reportOverflows,
                     reportHandlerFailures: $reportHandlerFailures,
                     reportFailuresKeepingTheConnection: $reportFailuresKeepingTheConnection,
+                    pongSlot: $slot,
                 )->await();
 
                 // Only a genuinely idle read yields: without it the loop would busy-spin and
@@ -2396,6 +2397,11 @@ final class NatsConnection
      *        such as an -ERR the server keeps it open for, instead of throwing it: for a read whose caller would
      *        only swallow it ({@see readIncomingForOperation()}), and for the flushes of drain() and
      *        drainSubscription(), which read on to their PONG.
+     * @param DeferredFuture<null>|null $pongSlot The pong slot of the flush this read is for. When it is complete
+     *        by the time the read would take the read slot, or wait for another fiber's read, the read returns
+     *        without reading. The flush checks its slot before each read, but the read runs on a fiber of its own,
+     *        and before that fiber starts another fiber's read can take the PONG and free the read slot: the read
+     *        then waited on a socket with nothing more to come until the flush's deadline.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2407,13 +2413,19 @@ final class NatsConnection
         ?int $ownSid = null,
         bool $reportHandlerFailures = false,
         bool $reportFailuresKeepingTheConnection = false,
+        ?DeferredFuture $pongSlot = null,
     ): Future {
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection): IncomingChunkResult {
+        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $pongSlot): IncomingChunkResult {
             if ($this->state !== ConnectionState::Open && $this->state !== ConnectionState::Draining) {
                 // The recovery future resolves only once the recovery has finalized the state, so a
                 // reader waiting here still never touches the new socket during the subscription
                 // replay window (#148).
                 $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
+            }
+
+            // The flush's PONG is already in: another fiber's read took it after the flush last checked.
+            if ($pongSlot?->isComplete() ?? false) {
+                return new IncomingChunkResult(0, false);
             }
 
             if ($this->readInProgress) {

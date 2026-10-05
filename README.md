@@ -1336,17 +1336,18 @@ from the server but not yet dispatched to a handler are dropped without warning.
 lossless teardown paths: both deliver the buffered backlog first.
 
 `drain()` is bounded by roughly one `requestTimeoutMs` budget and always reaches the `Closed` state. It
-does not throw when a write fails against a dead socket: that failure is reported through the
-`errorListener` and the teardown continues, so the connection is never stranded mid-drain. A handler
-that throws while the drain delivers is reported the same way, and the messages behind it - already
-queued, or still arriving during the drain's flush - are still delivered. So is an `-ERR` the server
-sends while keeping the connection open (`maximum subscriptions exceeded`, say) during the flush: it is
-reported, and the flush reads on to its `PONG`, so the messages behind it are delivered too; a fatal
-`-ERR` ends the flush. Publishes your handlers issue
-while the drain is running share the same remaining budget rather than each getting a fresh timeout, and
-anything still buffered when the budget runs out is dropped with a "drain deadline exceeded" error
-naming the count. If you need the backlog delivered under all circumstances, drain earlier rather than
-relying on a longer timeout.
+ends as soon as the server answers its flush, also when another fiber - a `processIncoming()` loop, a
+service's `run()`, a `request()` issued just before - reads the connection and takes that answer. It does
+not throw when a write fails against a dead socket: that failure is reported through the `errorListener`
+and the teardown continues, so the connection is never stranded mid-drain. A handler that throws while
+the drain delivers is reported the same way, and the messages behind it - already queued, or still
+arriving during the drain's flush - are still delivered. So is an `-ERR` the server sends while keeping
+the connection open (`maximum subscriptions exceeded`, say) during the flush: it is reported, and the
+flush reads on to its `PONG`, so the messages behind it are delivered too; a fatal `-ERR` ends the flush.
+Publishes your handlers issue while the drain is running share the same remaining budget rather than each
+getting a fresh timeout, and anything still buffered when the budget runs out is dropped with a "drain
+deadline exceeded" error naming the count. If you need the backlog delivered under all circumstances,
+drain earlier rather than relying on a longer timeout.
 
 A `drain()` issued while the client is reconnecting first waits for the reconnect within that same
 budget: the reconnect flushes the publishes buffered during the outage, then the new connection is
@@ -1392,7 +1393,7 @@ handler draining its own subscription - that delivery hands over the messages qu
 removes the subscription, and `drainSubscription()` resolves without waiting for it. A second call for a
 subscription that is already being drained resolves at once.
 
-_Verified by: [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testDrainFlushReportsAnErrTheServerKeepsTheConnectionOpenForAndReadsOnToTheMessagesStillInFlight`, `testDrainFlushReadsOnPastANonClosingErrButEndsAtAFatalOneAfterIt`, `testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself`)._
+_Verified by: [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testDrainFlushReportsAnErrTheServerKeepsTheConnectionOpenForAndReadsOnToTheMessagesStillInFlight`, `testDrainFlushReadsOnPastANonClosingErrButEndsAtAFatalOneAfterIt`, `testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself`, `testDrainEndsPromptlyWhileAnotherFiberReads`, `testDrainIssuedRightAfterARequestEndsPromptly`, `testFlushEndsPromptlyWheneverAnotherFibersReadStartsAroundIt`)._
 
 ### Ordered Consumer
 
@@ -2081,7 +2082,7 @@ while (hrtime(true) / 1e9 < $deadlineSeconds) {
 }
 ```
 
-The connection reads its socket from one fiber at a time. When another fiber is already reading - a `request()` waiting for its reply, a `flush()`, the heartbeat reading the answer to its `PING` - `processIncoming()` and `readIncoming()` wait for that read to finish, bounded by the `Cancellation` you pass, and then return without reading (`0` frames): that read delivered what it read. A loop of these calls therefore always lets the event loop run its timers and socket reads, the other fiber's read included.
+The connection reads its socket from one fiber at a time. When another fiber is already reading - a `request()` waiting for its reply, a `flush()`, the heartbeat reading the answer to its `PING` - `processIncoming()` and `readIncoming()` wait for that read to finish, bounded by the `Cancellation` you pass, and then return without reading (`0` frames): that read delivered what it read. A loop of these calls therefore always lets the event loop run its timers and socket reads, the other fiber's read included. A flush - `flush()`, `rtt()`, `drain()`, `drainSubscription()` - ends as soon as the server answers its `PING`, whichever fiber's read takes the answer.
 
 The client also applies asynchronous `INFO` updates received after connect, so `serverInfo()` can change during the lifetime of an open connection when the server advertises updated capabilities such as `max_payload` or cluster topology details.
 
