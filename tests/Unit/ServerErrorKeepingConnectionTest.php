@@ -387,15 +387,34 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         self::assertSame(ConnectionState::Open, $connection->state());
     }
 
+    /** @return iterable<string, array{bool}> */
+    public static function handlerFailuresFailingOperationsOrNot(): iterable
+    {
+        yield 'operations report handler failures (default)' => [false];
+        yield 'handler failures fail operations' => [true];
+    }
+
     /**
-     * Guard: an operation's read, such as a request's, still throws such a handler's failure, and leaves the
-     * rest queued.
+     * An operation's read, such as a request's, reports a handler that throws and delivers the rest, as a serving
+     * loop's read does (#173). With handlerErrorsFailOperations it still throws the handler's failure and leaves
+     * the rest queued, as every operation's read did before that option.
      */
-    public function testAnOperationsReadStillThrowsAHandlerThatThrows(): void
+    #[DataProvider('handlerFailuresFailingOperationsOrNot')]
+    public function testAnOperationsReadReportsAHandlerThatThrowsUnlessConfiguredToFail(bool $failOperations): void
     {
         $recorder = new LifecycleRecorder();
         $seen = [];
-        $connection = $this->connectionWithAFailingHandler($recorder, $seen);
+        $connection = $this->connectionWithAFailingHandler($recorder, $seen, $failOperations);
+
+        if (!$failOperations) {
+            $read = $connection->readIncomingForOperation()->await();
+
+            self::assertTrue($read->consumedBytes);
+            self::assertSame(['a:x', 'a:y', 'b:z'], $seen);
+            self::assertSame(['handler a'], $recorder->errors);
+
+            return;
+        }
 
         try {
             $connection->readIncomingForOperation()->await();
@@ -665,13 +684,14 @@ final class ServerErrorKeepingConnectionTest extends TestCase
      *
      * @param list<string> $seen Collects what the handlers got, as "<subject>:<payload>".
      */
-    private function connectionWithAFailingHandler(LifecycleRecorder $recorder, array &$seen): NatsConnection
+    private function connectionWithAFailingHandler(LifecycleRecorder $recorder, array &$seen, bool $handlerFailuresFailOperations = false): NatsConnection
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "MSG a 1 1\r\nx\r\nMSG a 1 1\r\ny\r\nMSG b 2 1\r\nz\r\n"]);
         $connection = new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
+            handlerErrorsFailOperations: $handlerFailuresFailOperations,
         ), $transport);
         $connection->connect()->await();
         $connection->subscribe('a', static function (NatsMessage $message) use (&$seen): void {

@@ -72,8 +72,9 @@ final class NatsOptions
       *        loss, though a Closed still is.
       * @param (\Closure(\Throwable):void)|null $errorListener Optional callback invoked on asynchronous
       *        errors that do not surface to a specific caller, such as slow-consumer drops, server `-ERR`
-      *        frames, a handler that throws during a drain or a service's run() loop, and transport read
-      *        failures that trigger reconnect. Exceptions thrown by the listener are swallowed.
+      *        frames, a handler that throws while a drain, a service's run() loop or an operation's read
+      *        delivers to it ({@see $handlerErrorsFailOperations}), and transport read failures that trigger
+      *        reconnect. Exceptions thrown by the listener are swallowed.
       * @param (\Closure():?string)|null $jwtProvider Optional callback returning the user JWT, invoked on
       *        every (re)connect. Takes precedence over the static {@see $jwt} when set, so short-lived or
       *        rotated JWTs are picked up on reconnect without rebuilding the client. Pair with a
@@ -130,6 +131,19 @@ final class NatsOptions
       *        processIncoming() and readIncoming() throw an overflow either way. Service::run(), which has
       *        no caller to fail, the heartbeat, a reconnect and drain()/drainSubscription() report it
       *        either way. A SubscriptionQueue's own polling buffer follows the same rules.
+      * @param bool $handlerErrorsFailOperations Whether a subscription handler that throws fails whichever
+      *        operation's read delivered to it. Operations read the socket themselves while they wait for a
+      *        result of their own (the same ones as above) and so deliver messages for every subscription.
+      *        By default the exception of another subscription's handler is reported through the error
+      *        listener, the rest of the read is still delivered, and the operation completes: that handler
+      *        failed, the operation did not. A request() made inside a service endpoint, for instance, no
+      *        longer fails with it, so the endpoint no longer answers with a HANDLER_ERROR for it. A handler
+      *        of the operation's own subscription that throws still fails it. Set `true` for the behavior
+      *        before this option existed: any handler's exception fails the operation whose read delivered
+      *        to it, even a request whose reply had already arrived, and a handler's CancelledException can
+      *        end an operation's wait early, as it did then. processIncoming() and readIncoming() throw a
+      *        handler's exception either way. Service::run(), the heartbeat, a reconnect and
+      *        drain()/drainSubscription() report it either way.
      */
     public function __construct(
         public readonly array $servers = [self::DEFAULT_SERVER],
@@ -177,6 +191,7 @@ final class NatsOptions
         public readonly int $readChunkSizeBytes = 131_072,
         public readonly bool $waitForReconnect = true,
         public readonly bool $slowConsumerErrorsFailOperations = false,
+        public readonly bool $handlerErrorsFailOperations = false,
     ) {
         // Fail fast on values that have no valid meaning, rather than misbehaving later. Note that
         // pingIntervalSeconds <= 0 (disables the heartbeat) and an empty servers list (falls back to

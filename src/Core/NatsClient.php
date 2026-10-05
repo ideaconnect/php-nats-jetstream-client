@@ -296,15 +296,17 @@ final class NatsClient
     /**
      * {@see readIncoming()} for an operation that reads while it waits for a result of its own: under
      * SlowConsumerPolicy::Error, another subscription's overflow is reported instead of failing it
-     * ({@see NatsOptions::$slowConsumerErrorsFailOperations}).
+     * ({@see NatsOptions::$slowConsumerErrorsFailOperations}), and so is a handler of another subscription
+     * that throws ({@see NatsOptions::$handlerErrorsFailOperations}).
      *
      * @internal For the library's own operations (JetStream, Key/Value, polling queues, services); not
      *           part of the supported API.
      *
-     * @param int|null $ownSid The operation's own subscription, whose overflow still fails the operation.
-     * @param bool $alwaysReport Report every overflow, whatever the option says, an -ERR the server keeps the
-     *        connection open for, and a handler that throws while the read delivers, whose messages behind it
-     *        are still delivered: for a read whose caller would only swallow them, such as a serving loop. Such
+     * @param int|null $ownSid The operation's own subscription, whose overflow or failing handler still fails
+     *        the operation.
+     * @param bool $alwaysReport Report every overflow and every handler that throws while the read delivers,
+     *        whatever the options say, the messages behind it still delivered, and an -ERR the server keeps the
+     *        connection open for: for a read whose caller would only swallow them, such as a serving loop. Such
      *        a read also delivers what an earlier read left queued, unless a disconnect() is closing the connection,
      *        which discards it. A read that receives anything during the close still delivers it with what it
      *        received, as any read does. A failure that ends the connection is still thrown, once the connection
