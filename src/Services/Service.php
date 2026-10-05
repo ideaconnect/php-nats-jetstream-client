@@ -160,6 +160,10 @@ final class Service
     /**
      * Enables opt-in request validation for endpoints with a declared schema.
      *
+     * The validator returns null to accept a request, or the reason it rejects it, sent as a VALIDATION_ERROR
+     * reply. A validator that throws is answered like a handler that throws: a HANDLER_ERROR reply that keeps
+     * the exception's text to the endpoint's stats (or, for a ServiceError, the reply it chose).
+     *
      * @param callable(NatsMessage,array<string,mixed>):(null|string) $validator
      */
     public function withRequestValidator(callable $validator): self
@@ -229,8 +233,19 @@ final class Service
 
                             $this->notifyObservers('request_start', $endpoint, $message, $resolveContext);
 
+                            $validatorFailure = null;
                             if ($endpoint->schema !== null && $this->requestValidator !== null) {
-                                $validationError = ($this->requestValidator)($message, $endpoint->schema);
+                                try {
+                                    $validationError = ($this->requestValidator)($message, $endpoint->schema);
+                                } catch (\Throwable $e) {
+                                    // A validator that throws has not rejected the request, it has failed: the
+                                    // request is answered as when the handler throws, below. The exception used to
+                                    // escape into the read that delivered the request, so the requester got no
+                                    // reply and no error was counted.
+                                    $validationError = null;
+                                    $validatorFailure = $e;
+                                }
+
                                 if ($validationError !== null) {
                                     $duration = (int) max(0, hrtime(true) - $started);
                                     $endpoint->errors++;
@@ -274,11 +289,16 @@ final class Service
                             $errorHeaders = null;
 
                             try {
+                                if ($validatorFailure !== null) {
+                                    // Handled by the catches below, which answer a handler's failure.
+                                    throw $validatorFailure;
+                                }
+
                                 $response = ($this->handlers[$subject])($message);
                             } catch (ServiceError $serviceError) {
-                                // The handler explicitly chose to fail with a custom code/description
-                                // (and optional body). Honor it verbatim - this is a deliberate error
-                                // reply, not an internal fault, so the chosen detail IS sent to the caller.
+                                // The handler (or the request validator) explicitly chose to fail with a custom
+                                // code/description (and optional body). Honor it verbatim - this is a deliberate
+                                // error reply, not an internal fault, so the chosen detail IS sent to the caller.
                                 $endpoint->errors++;
                                 $endpoint->lastError = $serviceError->description;
                                 $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [
@@ -452,6 +472,10 @@ final class Service
      * delivering new requests, while in-flight handlers (already dispatched on the event loop) run to
      * completion, then clears state. Mirrors nats.go / nats.java micro `Stop()` drain semantics (#51).
      *
+     * The flush reads the client's shared connection: a handler of another subscription that throws while
+     * it delivers, a full subscription queue or an -ERR the server keeps the connection open for is reported
+     * through the error listener, and the flush reads on to its PONG.
+     *
      * @return Future<void>
      */
     public function drain(): Future
@@ -469,8 +493,10 @@ final class Service
                 if ($this->started) {
                     try {
                         // Flush so the UNSUBs are processed server-side before we consider the drain
-                        // complete (no new request will be delivered after this resolves).
-                        $this->client->flush()->await();
+                        // complete (no new request will be delivered after this resolves). What its reads
+                        // meet, such as another subscription's handler that throws, is reported and does not
+                        // end it before its PONG: the catch below would only swallow it.
+                        $this->client->flushReportingFailures()->await();
                     } catch (\Throwable) {
                         // Best effort: a closed connection needs no flush.
                     }
@@ -488,6 +514,12 @@ final class Service
      *
      * The loop exits when timeout/cancellation is requested, then the service
      * is unsubscribed automatically.
+     *
+     * The loop reads the client's shared connection, so it delivers the messages of every subscription on it.
+     * What such a read meets is reported through the error listener and the loop serves on: a handler that
+     * throws - any subscription's, one that throws a CancelledException included - with the messages behind
+     * it still delivered, a full subscription queue, an -ERR the server keeps the connection open for. Only
+     * the loop's own timeout or cancellation, or a connection closed for good, stops it.
      *
      * @param float|null $timeoutSeconds Optional run timeout in seconds.
      * @param Cancellation|null $cancellation Optional external cancellation token.
@@ -510,8 +542,11 @@ final class Service
                         // Thread the cancellation INTO processIncoming (not just the outer await) so
                         // the underlying socket read is actually bounded and torn down on cancel -
                         // otherwise an idle read is orphaned and leaves the shared connection wedged.
-                        // Reported whatever slowConsumerErrorsFailOperations says: this loop has no caller to fail,
-                        // and its catch below would only swallow an overflow.
+                        // An overflow is reported whatever slowConsumerErrorsFailOperations says, and so are an -ERR
+                        // the server keeps the connection open for, such as its answer to a SUB beyond the maximum
+                        // subscriptions, and a handler that throws while the read delivers - any subscription's on the
+                        // connection - whose messages behind it are still delivered: this loop has no caller to fail,
+                        // and its catch below would only swallow them.
                         $read = $this->client->readIncomingForOperation($effectiveCancellation, alwaysReport: true)->await($effectiveCancellation);
                         if (!$read->consumedBytes) {
                             // Yield briefly to avoid a tight loop when the transport is idle. A read
@@ -521,6 +556,8 @@ final class Service
                             delay(0.01, cancellation: $effectiveCancellation);
                         }
                     } catch (CancelledException) {
+                        // The loop's own timeout or cancellation. A handler's CancelledException does not get
+                        // here: the read reports it like any other handler failure.
                         break;
                     } catch (\Throwable) {
                         // A connection-level failure. If the connection is unrecoverable (closed for
@@ -728,7 +765,10 @@ final class Service
         $normalizedHeaders = [];
 
         foreach ($headers as $name => $value) {
-            $normalizedHeaders[strtolower($name)] = $value;
+            // Cast: a header name that is a decimal integer ("1: x", which any requester can send) is an int
+            // key, as PHP stores such array keys, and strtolower() rejected it under strict types: a TypeError
+            // thrown out of the endpoint into the read that delivered the request, which went unanswered.
+            $normalizedHeaders[strtolower((string) $name)] = $value;
         }
 
         return [

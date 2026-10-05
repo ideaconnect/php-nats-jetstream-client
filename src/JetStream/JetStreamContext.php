@@ -3158,7 +3158,7 @@ final class JetStreamContext
      * replies still await inline; suspending the dispatch fiber is safe because the connection's
      * per-sid dispatch guard tolerates a handler that suspends mid-drain.
      *
-     * @param array<string,string>|null $headers Out-param: receives the parsed header map when the
+     * @param array<int|string,string>|null $headers Out-param: receives the parsed header map when the
      *        header block was parsed (stays null for header-less messages), so a caller that reads a
      *        control-frame header afterwards (e.g. Nats-Last-Consumer) does not re-parse it (#139).
      * @return bool True when the message is a control message and was handled.
@@ -3275,7 +3275,7 @@ final class JetStreamContext
      * consumer) the drop would otherwise be silent, so it is made observable here. Status 100 (idle
      * heartbeat / flow control) is not terminal and is intentionally left silent (#121).
      *
-     * @param array<string,string> $headers
+     * @param array<int|string,string> $headers
      */
     private function surfaceCallerOwnedPushStatus(array $headers, string $stream, string $consumerLabel): void
     {
@@ -3392,7 +3392,7 @@ final class JetStreamContext
      * the header map already parsed by {@see handlePushControlMessage()} instead of the message, so
      * the control frame's header block is parsed exactly once per delivery (#139).
      *
-     * @param array<string,string> $headers
+     * @param array<int|string,string> $headers
      */
     private function heartbeatLastConsumerSeq(array $headers): ?int
     {

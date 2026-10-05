@@ -64,11 +64,12 @@ final class MuxRequestInboxTest extends TestCase
 
         self::assertSame('hello', $response->payload);
 
-        // Exactly ONE wildcard mux SUB, and ZERO per-request UNSUB (the whole point of #118).
+        // Exactly ONE wildcard mux SUB, and ZERO per-request UNSUB (the whole point of #118). The SUB's write
+        // carries the PING whose PONG confirms the mux; nothing waits for it.
         $subs = array_values(array_filter($transport->writes, static fn (string $w): bool => str_starts_with($w, 'SUB ')));
         $unsubs = array_filter($transport->writes, static fn (string $w): bool => str_starts_with($w, 'UNSUB '));
         self::assertCount(1, $subs);
-        self::assertStringMatchesFormat("SUB _INBOX.%s.* 1\r\n", $subs[0]);
+        self::assertStringMatchesFormat("SUB _INBOX.%s.* 1\r\nPING\r\n", $subs[0]);
         self::assertCount(0, $unsubs);
         // The request published its reply-to under the mux base's wildcard.
         self::assertStringStartsWith('PUB svc.echo _INBOX.', $transport->writes[3]);

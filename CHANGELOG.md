@@ -15,6 +15,214 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.10.3] - 2026-10-05
+
+### Upgrade notes
+
+- An `-ERR` the server keeps the connection open for no longer ends the connection: `maximum subscriptions
+  exceeded`, `Invalid Publish Subject` and any `Permissions Violation` other than `... for Publish to ...` and
+  `... for Subscription to ...`, which the client still only reports. The read that brought it fails with it
+  at once, as in 2.10.0, and no `Disconnected`, `Reconnected` or `Closed` follows, so the 2.10.1 note now
+  holds only for an `-ERR` the server closes the connection after (`Stale Connection`, `Authorization
+  Violation`, ...). The heartbeat, a reconnect's replay, a service's `run()` and the flushes of `drain()`,
+  `drainSubscription()` and a service's `drain()` report it to the error listener instead and carry on:
+  watch that listener, not `Closed`, for these errors.
+- After such an `-ERR` the flushes of `drain()` and `drainSubscription()` read on to their `PONG`, so a
+  server that then goes silent makes `drain()` wait out its budget, where it used to end at the `-ERR`. When
+  the server closes the connection after it instead, `drainSubscription()`'s flush runs the reconnect itself,
+  and with reconnect on the call returns only once that reconnect ends, past `requestTimeoutMs` if need be;
+  2.10.1 and 2.10.2 waited for the reconnect only within that budget.
+- Once the server rejects the shared reply inbox of `request()` and `requestMany()` for the subscription
+  limit, requests fail fast until a slot is free, and the connection stays open: one already sent whose own
+  read meets the `-ERR` fails with it, any other with a `ConnectionException` saying `request/reply failed:
+  the server may have rejected the shared reply-inbox subscription ...`. Each request subscribes the inbox
+  again and is sent only once the server has taken it, so every attempt costs a round trip and nothing
+  throttles them: a caller that retries should pause between attempts.
+- The write that subscribes the reply inbox now ends with a PING (`SUB _INBOX.<inbox>.* <sid>\r\nPING\r\n`).
+  A transport double that answers only a write that is exactly `PING\r\n`, as one scripted for `flush()`
+  often does, leaves it unanswered, so the `PONG` it sends for the next `flush()`, `rtt()` or `drain()`
+  answers that PING instead, and the call times out. Such a double should answer every PING.
+- A reconnect announces the new connection (`Reconnected`, or `Connected` when it completed a failed first
+  `connect()`) once it is over. Operations that waited for it, a joined `connect()` and a `drain()`
+  included, go on without waiting for the listener, and `disconnect()` and `drain()` no longer wait for one
+  still running: once they have closed the connection, what it calls fails with `Connection is not open`. An
+  operation the listener calls that finds the new connection gone reconnects again: the listener hears
+  `Disconnected` and `Reconnected` (or `Closed`) while that call is still running, the `Reconnected`
+  delivered from the event loop, so handlers can get the new connection's messages first. Do not hold a lock
+  across an await on the same connection in a listener: a call nested in it may need that lock.
+- A `drain()` that waited for a reconnect can therefore close the connection before a `publish()` whose
+  failed write ran that reconnect is retried, while the listener, or a logger that suspends as it records
+  the `Reconnected`, is still busy. That publish then fails with the error of its write and is not sent,
+  where the retry used to come first; a built-in transport's raw stream error is wrapped in a
+  `TransportClosedException`.
+- The listener hears of a connection only while it is still the open one, so a `Reconnected` call always
+  finds the connection Open. One closed, being closed, replaced or lost before the listener was told it
+  opened is not announced, and when it was lost, neither is its loss, though a `Closed` still is. The logger
+  still records every transition.
+- With reconnect off, the `Closed` event of a lost connection now carries the error that ended it and is
+  logged at warning level instead of info, so a failed read is logged twice: as the read's error and with
+  the `Closed` event.
+- A service's `run()` now reports what its reads used to swallow, to the error listener and at error level:
+  another subscription's handler that throws, once per failure (a handler failing on every message is logged
+  for every message), and an `-ERR` the server keeps the connection open for. A handler's
+  `CancelledException` no longer stops the service: only `run()`'s own timeout or cancellation does, or a
+  connection closed for good. A handler awaiting the cancellation passed to `run()` reports its
+  `CancelledException` when that cancellation stops the service.
+- `NatsHeaders::fromWireBlock()` and `fromWireBlockMulti()` declare their keys as `int|string`, since a header
+  name that is a decimal integer, such as `1`, comes back as an int key. Static analysis now reports code
+  that hands such a key to a function taking a string, and code that passes the whole map where string keys
+  are declared, such as Symfony Messenger's `SerializerInterface::decode()`: cast such keys to string there.
+  `NatsHeaders::get()` takes the map as it is.
+- A first `INFO` that is valid JSON but not an object (`INFO 1`, `INFO [1]`) fails the connect as broken JSON
+  does, saying `INFO payload is not a JSON object`.
+
+### Fixed
+
+- `[bugfix]` Since 2.10.1 an `-ERR` the server keeps the connection open for ended the connection, unless the
+  client only reports it, as it does `Invalid Subject`, `Permissions Violation for Publish to ...` and `...
+  for Subscription to ...`. So `maximum subscriptions exceeded`, `Invalid Publish Subject` and any other
+  `Permissions Violation`, such as `... for Publish with Reply of ...`, closed a healthy connection, or with
+  reconnect on reconnected it; after a rejected SUB, every reconnect attempt replayed that SUB and failed
+  again, until the reconnect gave up and closed the connection. Such an `-ERR` fails the read that brought
+  it, as before 2.10.1, and leaves the connection open (when an account's subscription limit is lowered
+  below what a client holds, the server closes the connection after `maximum subscriptions exceeded` anyway,
+  and the EOF ends it). Only an `-ERR` the server closes the connection after (`Stale Connection`,
+  `Authorization Violation`, `Maximum Payload Violation`, ...) and a `PONG` the socket would not take end the
+  connection, and nothing else a frame raises does. Such a failure also outranks any other met in the same
+  read, so a fatal `-ERR` read together with a rejected SUB's still ends the connection.
+- `[bugfix]` A reconnect whose replayed SUB the server rejected for exceeding the maximum subscriptions
+  failed, and so did every attempt after it, until the reconnect gave up and closed the connection. Any
+  failure of the replay that does not end the connection is now reported to the error listener instead, and
+  the reconnect completes; one that ends it still fails the attempt. A rejection read ahead of a line that
+  does not parse is reported as well, though that attempt fails on the parse error. A rejection that arrives
+  after the replay's short poll fails the read that brings it instead, and the connection stays open.
+- `[bugfix]` The flushes of `drain()` and `drainSubscription()` ended at an `-ERR` the server keeps the
+  connection open for, and the messages the server sent behind it, up to the `PONG`, were lost without a
+  count: `drain()` closed the socket with them unread and reported only the `-ERR`, and `drainSubscription()`
+  removed the subscription, so a later read dropped them as an unknown sid's. A long-standing bug, in 2.10.0
+  as well; on 2.10.1 and 2.10.2 `drainSubscription()` also ended the connection, since such an `-ERR` did
+  there. Both flushes now report such an `-ERR` to the error listener and read on to their `PONG` within the
+  same budget, also when a line that does not parse follows the `-ERR` in the same read. A fatal `-ERR` and a
+  `PONG` the socket would not take still end the flush at once, and `flush()` and `rtt()` still fail with
+  such an `-ERR`.
+- `[bugfix]` A `drain()` waited out its whole budget (`requestTimeoutMs`, 10 s by default) against a healthy
+  server while another fiber read the connection, such as an application's `processIncoming()` loop or a
+  service's `run()`: that fiber's read took the `PONG` of the drain's flush before the flush first read, and
+  the flush then waited for that fiber's next read, on a socket with nothing more to come. Every flush - that
+  of `drain()`, `flush()`, `rtt()`, `drainSubscription()` or a service's `drain()` - also had a narrower
+  window: another fiber's read could take the `PONG` just before the flush's own read started, which then
+  waited on the idle socket until the budget ran out, and the call returned only then, `rtt()` reporting that
+  wait as the round trip. A `drain()` issued right after a `request()`, in the same tick, met it against a
+  server that answered at once. A flush now looks for its `PONG` before every read, and its read looks again
+  before it takes the socket.
+- `[bugfix]` The shared reply inbox of `request()` and `requestMany()` was recorded only once the write of
+  its SUB had returned. When that write found the socket dead, the reconnect it started replayed the SUB,
+  and a permissions rejection read during that replay missed the latch of 2.7.1 (#167): the request and
+  every later one waited out their timeouts instead of failing at once with the permissions error. And when
+  a terminal close came while the write was under way and the write completed all the same (a narrow race,
+  since the shipped transports fail such a write when the socket closes), the closed connection's inbox
+  stayed recorded: after a new `connect()` every request was sent with a reply subject nobody held there
+  and timed out. The inbox is now recorded before its SUB is written, so whichever read meets the server's
+  answer finds it. A request joins a set-up still under way instead of trusting the recorded inbox, and a
+  set-up whose write fails without the connection coming back in time is rolled back. A terminal close
+  during the set-up fails the request without sending it (with `Connection was closed while the reply inbox
+  was being set up` when the write completed anyway), and a request after a new `connect()` neither waits
+  for a set-up left from the closed connection nor reuses its inbox.
+- `[bugfix]` The shared reply inbox of `request()` and `requestMany()` stayed dead once the server rejected
+  its SUB with `maximum subscriptions exceeded`, an `-ERR` that names no subject and leaves the connection
+  open. In 2.10.0 the request that met the rejection failed with it, and every later one was sent with a
+  reply subject nobody held and waited out its whole timeout (`requestMany()` returned nothing), even after
+  a slot freed up, until the connection closed for good. 2.10.1 and 2.10.2 ended the connection on that
+  `-ERR` instead, and with reconnect on every attempt replayed the inbox's SUB into the same limit until the
+  reconnect gave up. The SUB now goes out with a PING right behind it, and the inbox counts as confirmed
+  once that PING's PONG arrives, which the server sends only after its answer to the SUB, or once a reply
+  arrives on it. That `-ERR` arriving before then drops the inbox: the requests waiting on it fail at once,
+  a `requestMany()` that has collected replies returns them, and the next request subscribes a new inbox,
+  in the same write as an UNSUB of the dropped one. Until a new inbox is confirmed, a request waits for that
+  before it is sent, so while the limit holds requests fail fast without reaching the responder, and once a
+  slot is free they work again, with no reconnect. A reconnect whose replay of the inbox is rejected works
+  the same way, and a confirmed inbox stays in place when another subscription is rejected: the requests in
+  flight on it are not failed with the dropped-inbox error, though one whose own read brings that `-ERR`
+  fails with it, as any read does. Another subscription's `-ERR` that arrives while the inbox's SUB still
+  waits behind earlier writes, or before its PONG, drops an inbox the server takes after all; the next
+  request's UNSUB gives its slot back.
+- `[bugfix]` A request whose reply inbox was still being subscribed when a `drain()` began was sent all the
+  same, after the drain's UNSUB of that inbox: the responder ran it, though no reply could come back, and the
+  request failed with `Connection is not open` once the drain closed the connection. A `drain()` that begins
+  while a request subscribes the inbox, or waits for the server to take it, now fails the request with
+  `Connection is not open` without sending it, as one issued during the drain does.
+- `[bugfix]` An async `INFO` whose payload is valid JSON but not an object was not treated as malformed.
+  `INFO 1` failed the read with a `TypeError`, which 2.10.1 and 2.10.2 also took for a connection failure
+  and ended the connection with, and `INFO [1]` replaced the server info with defaults (no server id, no
+  headers support), after which every publish with headers was refused. Such an `INFO` is now reported to
+  the error listener as malformed, as broken JSON is, and the last server info is kept. A first `INFO` like
+  that fails the connect as broken JSON does, saying `INFO payload is not a JSON object`, where a number
+  failed it with a `ConnectionException` wrapping a `TypeError` and an array connected with the default info.
+- `[bugfix]` An operation called from a `Reconnected` listener - or from the `Connected` listener of a failed
+  initial connect that a reconnect completed - that found the new connection gone already joined the
+  reconnect that had announced it, which was still waiting for the listener to return. A read meeting EOF or
+  a fatal `-ERR`, a `flush()` or a `subscribe()` waited out its timeout; a `publish()`, a `request()`, a
+  lame-duck failover and a read without a cancellation never returned. The connection then stayed Open on the
+  dead socket, and a failure another fiber or the heartbeat noticed while the listener ran was lost the same
+  way, the heartbeat stopping for good. The new connection is now announced once the reconnect is over, as a
+  direct connect already was: such an operation reconnects again, as it would anywhere else, and an
+  announcement made while another `Connected` or `Reconnected` listener call runs is delivered from the
+  event loop, so that the calls do not nest one level deeper with every connection a server drops. A
+  `publish()` whose failed write ran the reconnect is retried by the state it then finds: buffered behind a
+  reconnect or lame-duck failover the listener left in flight (it used to fail, its frame lost, or go to the
+  connection the server was about to close); written to the connection a `drain()` is still flushing; or,
+  when the connection was closed meanwhile, failing with the error of its write, a built-in transport's raw
+  stream error wrapped in a `TransportClosedException` ("Transport is not connected").
+- `[bugfix]` A `drain()` that waited for a reconnect also waited for a slow `Reconnected` listener, past its
+  budget. A supervisor that reconnects on the `Closed` of a `drain()` called from that listener was refused
+  with `Recovery was aborted before the connection opened`, the reconnect still waiting for the listener; it
+  now opens a new connection, as documented. And a close the listener makes takes over what the reconnect
+  read, even while the close is still under way as the listener returns: `drain()` delivers it and
+  `disconnect()` discards it, where it used to be delivered during the close. A read that receives anything
+  during the close still delivers it with what it received, as any read does.
+- `[bugfix]` A `connect()` that joined a failed first dial waited for the `Connected` listener of the
+  reconnect that completed the dial, so a listener waiting for that `connect()` waited out its own timeout;
+  it now resumes when the listener starts, as on a direct connect. When that listener lets the new
+  connection die and returns with the next reconnect in flight, the `connect()` that dialled now fails with
+  `Connect was aborted before the connection opened` while those that joined it succeed, as on a direct
+  connect, where both used to report success on the dead socket.
+- `[bugfix]` With reconnect off, a connection the heartbeat gave up on (unanswered PINGs, a failed PING
+  write, the socket closing or breaking during its read) closed without saying why: `Reconnect is disabled`
+  and its cause (#172) reached only an operation that joined the recovery. The `Closed` event now carries
+  the cause, so that the connection listener and the log learn it. The reason for unanswered PINGs reads
+  "the last PING" when `maxPingsOut` is 1, and says that the heartbeat allows no unanswered PING when it is 0.
+- `[bugfix]` A service's `run()` swallowed the exception of a handler that threw while its loop read, another
+  subscription's on the same connection: nothing reported it, the loop backed off 20 ms, and the messages that
+  read brought behind the failing one, for any subscription, stayed queued until the server sent something
+  else. A request read behind it waited up to the heartbeat interval, and was lost when the service stopped
+  first, and a subscription failing on two or more messages per read starved the service's endpoints for
+  good. A handler that threw a `CancelledException` stopped the service, silently. Such a failure is now
+  reported to the error listener, the rest of the read is delivered, and the loop reads on without backing
+  off, as `drain()` treats a throwing handler. An `-ERR` the server keeps the connection open for is reported
+  the same way, also one read ahead of a line that does not parse; the loop used to swallow it too. The
+  loop's read also delivers what another read left queued - another fiber's that stopped at a throwing
+  handler, or the delivery after a reconnect - instead of leaving it for the server's next bytes, except
+  while a `disconnect()` is closing the connection, which discards it. A read that receives anything during
+  the close, the loop's or any other, still delivers it with what it received. A known limitation remains:
+  the read of an operation, such as a `request()` an endpoint handler makes, still fails with another
+  subscription's handler exception, and the endpoint then answers its requester with a `HANDLER_ERROR` reply.
+- `[bugfix]` A service's `drain()` swallowed what its flush met, such as another subscription's handler that
+  threw, and returned before the `PONG` that confirms the server has processed the `UNSUB`s. The flush now
+  reports it to the error listener and reads on to that `PONG`.
+- `[bugfix]` A service endpoint's request validator that threw escaped the endpoint into the read that
+  delivered the request: the requester got no reply, the endpoint counted no error, and the read failed with
+  the exception, which a service's `run()` swallowed. Such a validator is now answered like a handler that
+  throws: a `HANDLER_ERROR` reply without the exception's text, an error counted with the text as
+  `last_error`, and `request_error` and `request_end` for the observers. A `ServiceError` it throws is sent as
+  chosen, as a handler's is.
+- `[bugfix]` A request header whose name is a decimal integer, such as `1`, which any requester can send,
+  made a service endpoint throw a `TypeError` into the read that delivered the request, and the request went
+  unanswered, whenever the endpoint had an observer or its handler threw: `NatsHeaders::fromWireBlock()`
+  returns such a name as an int key, as PHP stores such array keys, and the endpoint lowercased it under
+  strict types. The endpoint now answers such a request like any other. `fromWireBlock()` and
+  `fromWireBlockMulti()` now declare their keys as `int|string`, so static analysis reports such a call in
+  your code too.
+
 ## [2.10.2] - 2026-10-04
 
 ### Upgrade notes

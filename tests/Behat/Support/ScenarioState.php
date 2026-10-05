@@ -105,7 +105,7 @@ final class ScenarioState
 
     public ?string $lastDirectSubject = null;
 
-    /** @var array<string,string> */
+    /** @var array<int|string,string> */
     public array $lastHeaders = [];
 
     /** @var list<string> */

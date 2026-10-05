@@ -6550,7 +6550,7 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
-            "-ERR 'Permissions Violation'\r\n",
+            "-ERR 'Maximum Payload Violation'\r\n",
         ]);
 
         $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
@@ -6563,7 +6563,8 @@ final class NatsConnectionTest extends TestCase
             self::assertStringStartsWith('Server sent error frame', $e->getMessage());
         }
 
-        // The fatal -ERR ended the connection, which reconnect off closes for good (#171).
+        // The fatal -ERR, one the server closes the connection after, ended the connection, which reconnect
+        // off closes for good (#171).
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 

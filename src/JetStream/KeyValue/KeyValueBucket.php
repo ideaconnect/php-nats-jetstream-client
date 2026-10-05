@@ -536,7 +536,7 @@ final class KeyValueBucket
      * (`Nats-Marker-Reason`: MaxAge/Remove/Purge, ADR-43) carries no `KV-Operation`; it is treated as
      * a PURGE tombstone so a reader/watcher sees a deletion rather than a live empty value.
      *
-     * @param array<string,string> $headers
+     * @param array<int|string,string> $headers A map from {@see NatsHeaders::fromWireBlock()}.
      */
     private function operationFromHeaders(array $headers): string
     {

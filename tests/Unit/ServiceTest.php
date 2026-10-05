@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -15,6 +16,9 @@ use IDCT\NATS\Services\BasicJsonSchemaValidator;
 use IDCT\NATS\Services\ServiceEndpoint;
 use IDCT\NATS\Services\ServiceEndpointHandlerInterface;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\ReconnectingTransport;
+use IDCT\NATS\Transport\TransportInterface;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -50,6 +54,22 @@ final class ServiceTestCtorArgHandler implements ServiceEndpointHandlerInterface
 
 final class ServiceTest extends TestCase
 {
+    /** @var list<NatsClient> Clients that tearDown() closes, so that a failed test leaves no serving loop behind. */
+    private array $opened = [];
+
+    protected function tearDown(): void
+    {
+        foreach ($this->opened as $client) {
+            try {
+                $client->disconnect()->await(new TimeoutCancellation(1));
+            } catch (\Throwable) {
+                // Already closed.
+            }
+        }
+
+        $this->opened = [];
+    }
+
     /** @return list<string> */
     private function infoAndPong(): array
     {
@@ -828,6 +848,76 @@ final class ServiceTest extends TestCase
     }
 
     /**
+     * A request validator that throws is answered like a handler that throws: the endpoint counts the error and
+     * keeps the exception's text as its last error, its observers see request_error (HANDLER_ERROR) and
+     * request_end, and the requester gets a HANDLER_ERROR 500 reply without that text. The exception used to
+     * escape the endpoint into the read that delivered the request: no reply, no error counted, and the read
+     * failed with it.
+     */
+    public function testRequestValidatorThatThrowsIsAnsweredLikeAHandlerThatThrows(): void
+    {
+        $transport = new FakeTransport([...$this->infoAndPong(), "MSG svc.v 13 _INBOX.req 2\r\n{}\r\n"]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $events = [];
+        $handled = false;
+        $service = $client->service('val', '1.0.0')
+            ->withRequestValidator(static function (): ?string {
+                throw new \RuntimeException('validator broke');
+            })
+            ->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$events): void {
+                $events[] = $event === 'request_error' ? $event . ':' . $context['code'] : $event;
+            })
+            ->addEndpoint('v', 'svc.v', static function () use (&$handled): string {
+                $handled = true;
+
+                return 'ok';
+            }, schema: ['type' => 'object']);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        self::assertFalse($handled, 'the handler did not run');
+        self::assertSame(['request_start', 'request_error:HANDLER_ERROR', 'request_end'], $events);
+        $endpoint = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $endpoint['num_requests'] ?? null);
+        self::assertSame(1, $endpoint['num_errors'] ?? null);
+        self::assertSame('validator broke', $endpoint['last_error'] ?? null);
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('HPUB _INBOX.req ', $writes);
+        self::assertStringContainsString('Nats-Service-Error-Code:500', $writes);
+        self::assertStringContainsString('"code":"HANDLER_ERROR"', $writes);
+        self::assertStringNotContainsString('validator broke', $writes, 'the exception text stays server-side');
+    }
+
+    /**
+     * A request validator that throws a ServiceError gets the reply it chose, as a handler that throws one does.
+     */
+    public function testRequestValidatorThatThrowsAServiceErrorGetsTheReplyItChose(): void
+    {
+        $transport = new FakeTransport([...$this->infoAndPong(), "MSG svc.v 13 _INBOX.req 2\r\n{}\r\n"]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('val', '1.0.0')
+            ->withRequestValidator(static function (): ?string {
+                throw new \IDCT\NATS\Services\ServiceError(503, 'schema registry unavailable');
+            })
+            ->addEndpoint('v', 'svc.v', static fn(NatsMessage $message): string => 'ok', schema: ['type' => 'object']);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('Nats-Service-Error-Code:503', $writes);
+        self::assertStringContainsString('Nats-Service-Error:schema registry unavailable', $writes);
+        $endpoint = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $endpoint['num_errors'] ?? null);
+        self::assertSame('schema registry unavailable', $endpoint['last_error'] ?? null);
+    }
+
+    /**
      * Verifies observers receive request lifecycle events and correlation metadata.
      */
     public function testObserversReceiveLifecycleEvents(): void
@@ -1143,6 +1233,63 @@ final class ServiceTest extends TestCase
         $writes = implode('', $transport->writes);
         self::assertStringContainsString('"code":"HANDLER_ERROR"', $writes);
         self::assertStringContainsString('"correlation_id":"req-123"', $writes);
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function requestsWithAnIntegerHeaderName(): iterable
+    {
+        yield 'with an observer, the handler answering' => [true];
+        yield 'without an observer, the handler throwing' => [false];
+    }
+
+    /**
+     * A request header whose name is a decimal integer ("1: x"), which any requester can send, no longer
+     * breaks the endpoint: the request is answered, and its correlation id still comes from the other
+     * headers. PHP keeps such a name as an int key, which building the observer context lowercased under
+     * strict types: a TypeError thrown out of the endpoint into the read that delivered the request, and no
+     * reply. That context is built for observers and for error replies, so an observer, or a handler that
+     * threw, was enough.
+     */
+    #[DataProvider('requestsWithAnIntegerHeaderName')]
+    public function testRequestWithAnIntegerHeaderNameIsStillAnswered(bool $observer): void
+    {
+        $headers = "NATS/1.0\r\n1: x\r\nX-Request-Id:req-1\r\n\r\n";
+        $payload = 'hello';
+        $headerBytes = strlen($headers);
+        $totalBytes = $headerBytes + strlen($payload);
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$headers}{$payload}\r\n",
+        ]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $seen = [];
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static function (NatsMessage $message) use ($observer): string {
+                if (!$observer) {
+                    throw new \RuntimeException('handler failed');
+                }
+
+                return 'echo:' . $message->payload;
+            });
+        if ($observer) {
+            $service->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$seen): void {
+                $seen[] = [$event, $context['correlation_id'] ?? null];
+            });
+        }
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        if ($observer) {
+            self::assertStringContainsString('echo:hello', $writes);
+            self::assertSame([['request_start', 'req-1'], ['request_end', 'req-1']], $seen);
+        } else {
+            self::assertStringContainsString('"code":"HANDLER_ERROR"', $writes);
+            self::assertStringContainsString('"correlation_id":"req-1"', $writes);
+        }
     }
 
     /**
@@ -2042,22 +2189,19 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * run(): a dispatch-level failure surfacing from readIncoming (a subscription handler throwing
-     * on the shared connection) while the connection is still OPEN must not kill the loop - run()
-     * backs off and reads again. Pinned by the loop reaching a SECOND socket read after the error
-     * (the backoff completed), then exiting cleanly on cancellation with the service stopped and
-     * the connection still open - the handler error never escapes run().
+     * run(): a handler of another subscription on the shared connection that throws while the loop reads is
+     * reported to the error listener, and the loop reads on with the connection still open. The loop used to
+     * catch the handler's exception, swallow it without a trace and back off.
      */
-    public function testRunBacksOffAndKeepsReadingAfterDispatchError(): void
+    public function testRunReportsASubscriptionHandlerThatThrowsAndReadsOn(): void
     {
+        $errors = [];
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
             // One frame for the poisoned subscription (sid 1, subscribed before the service).
             "MSG px.poison 1 4\r\nboom\r\n",
         ], blockWhenEmpty: true);
-
-        $client = new NatsClient(new NatsOptions(), $transport);
-        $client->connect()->await();
+        $client = $this->clientRecordingErrors($transport, $errors);
 
         $thrown = 0;
         $client->subscribe('px.poison', static function () use (&$thrown): void {
@@ -2074,41 +2218,208 @@ final class ServiceTest extends TestCase
             $service->run(cancellation: $deferred->getCancellation())->await();
         });
 
-        // State-driven wait: the loop survived the poison frame once a SECOND read starts (only the
-        // post-backoff idle read takes the blocking branch that increments startedReads).
-        $deadlineNs = hrtime(true) + 2_000_000_000;
-        while ($transport->startedReads < 1 && hrtime(true) < $deadlineNs) {
-            delay(0.005);
-        }
+        // The loop read on once its next read, of the idle socket, starts.
+        $this->waitFor(static fn(): bool => $transport->startedReads >= 1);
 
         self::assertSame(1, $thrown, 'the poisoned handler must have thrown inside the run loop');
-        self::assertGreaterThanOrEqual(1, $transport->startedReads, 'run() must back off and read again after a dispatch error');
+        self::assertSame(['poison handler'], $errors);
 
         $deferred->cancel();
         $runner->await();
 
-        // The failure was contained: connection still open, service cleanly stopped.
         self::assertSame(ConnectionState::Open, $client->state());
         self::assertStringContainsString('UNSUB ', implode('', $transport->writes));
     }
 
     /**
-     * run(): cancelling while the loop is in the dispatch-error BACKOFF must exit promptly - the
-     * backed-off loop still honors cancellation and stops the service. A queue of poison frames
-     * means an uncancelled loop would keep erroring/backing off (~20 ms each); the immediate cancel
-     * after the first error exits after at most a handful of them.
+     * run(): a request read in the same chunk as a message whose handler throws is answered by that read. It
+     * used to stay queued until the server sent something else - up to the heartbeat interval - and was lost
+     * when the service stopped first, since stop() discards what is queued for its endpoints.
      */
-    public function testRunCancellationDuringDispatchErrorBackoffStopsService(): void
+    public function testRunAnswersARequestReadBehindAMessageWhoseHandlerThrows(): void
     {
-        $poison = "MSG px.poison 1 4\r\nboom\r\n";
+        $errors = [];
         $transport = new FakeTransport([
             ...$this->infoAndPong(),
-            ...array_fill(0, 25, $poison),
+            // The poisoned subscription is sid 1, so the endpoint is sid 14, after the twelve discovery sids.
+            "MSG px.poison 1 4\r\nboom\r\nMSG svc.echo 14 _INBOX.req 5\r\nhello\r\n",
         ], blockWhenEmpty: true);
+        $client = $this->clientRecordingErrors($transport, $errors);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload)
+            ->run(0.1)->await();
+
+        self::assertStringContainsString('run:hello', implode('', $transport->writes));
+        self::assertSame(['poison handler'], $errors);
+    }
+
+    /**
+     * run(): the messages of the failing subscription read behind the one whose handler threw are delivered by
+     * the same read.
+     */
+    public function testRunDeliversTheRestOfTheFailingSubscriptionsMessages(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "MSG px.mixed 1 4\r\nboom\r\nMSG px.mixed 1 2\r\nok\r\n",
+        ], blockWhenEmpty: true);
+        $client = $this->clientRecordingErrors($transport, $errors);
+        $seen = [];
+        $client->subscribe('px.mixed', static function (NatsMessage $m) use (&$seen): void {
+            $seen[] = $m->payload;
+            if ($m->payload === 'boom') {
+                throw new \RuntimeException('mixed handler');
+            }
+        })->await();
+
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload)
+            ->run(0.1)->await();
+
+        self::assertSame(['boom', 'ok'], $seen);
+        self::assertSame(['mixed handler'], $errors);
+    }
+
+    /**
+     * run(): an -ERR the server keeps the connection open for and a throwing handler read together are both
+     * reported, and the request behind them is still answered. Which is reported first is not pinned: the
+     * handler's failure is reported as the read delivers, the -ERR once it has delivered everything, though the
+     * -ERR came first on the wire.
+     */
+    public function testRunReportsAnErrAndAHandlerFailureReadTogetherAndAnswersTheRequest(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "-ERR 'maximum subscriptions exceeded'\r\nMSG px.poison 1 4\r\nboom\r\nMSG svc.echo 14 _INBOX.req 5\r\nhello\r\n",
+        ], blockWhenEmpty: true);
+        $client = $this->clientRecordingErrors($transport, $errors);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload)
+            ->run(0.1)->await();
+
+        self::assertEqualsCanonicalizing(['poison handler', "Server sent error frame: 'maximum subscriptions exceeded'"], $errors);
+        self::assertStringContainsString('run:hello', implode('', $transport->writes));
+    }
+
+    /**
+     * run(): a handler that throws a CancelledException while the loop reads - its own bounded wait ran out,
+     * say - is reported like any other handler failure, and the service serves on. The loop used to take it
+     * for its own cancellation and stop: every endpoint was unsubscribed, nothing was reported, and the request
+     * that came next went unanswered.
+     */
+    public function testRunReportsAHandlerThatThrowsACancelledExceptionAndServesOn(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "MSG px.slow 1 1\r\nx\r\n",
+            "MSG svc.echo 14 _INBOX.req 5\r\nhello\r\n",
+        ], blockWhenEmpty: true);
+        $client = new NatsClient(new NatsOptions(
+            pingIntervalSeconds: 0,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error::class . ': ' . $error->getMessage();
+            },
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $client->subscribe('px.slow', static function (): void {
+            // A wait of the handler's own that runs out.
+            delay(1.0, cancellation: new TimeoutCancellation(0.001));
+        })->await();
+
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload)
+            ->run(0.2)->await();
+
+        self::assertSame([CancelledException::class . ': The operation was cancelled'], $errors);
+        self::assertStringContainsString('run:hello', implode('', $transport->writes), 'the service served on');
+    }
+
+    /**
+     * run(): one read brings a message whose handler throws, a request and then a line that does not parse.
+     * The handler's failure is reported, the request is answered by that read, the corrupt stream is reported
+     * and recovered from by a reconnect, and the loop serves on. The read used to throw the handler's failure
+     * once it had reconnected, for the loop to swallow.
+     */
+    public function testRunReportsAHandlerThatThrowsAheadOfALineThatDoesNotParseAndServesOn(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "MSG px.poison 1 4\r\nboom\r\nMSG svc.echo 14 _INBOX.req 5\r\nhello\r\nBOGUS\r\n",
+            ...$this->infoAndPong(), // the reconnect after the corrupt stream
+        ], blockWhenEmpty: true);
+        $client = $this->clientRecordingErrors($transport, $errors);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload)
+            ->run(0.2)->await();
+
+        self::assertSame(['poison handler', 'Unsupported control frame: BOGUS'], $errors);
+        self::assertStringContainsString('run:hello', implode('', $transport->writes));
+        self::assertCount(2, $transport->connectCalls, 'the corrupt stream was recovered from');
+        self::assertSame(ConnectionState::Open, $client->state());
+    }
+
+    /**
+     * run(): an -ERR the server keeps the connection open for, such as its answer to a SUB beyond the
+     * maximum subscriptions, is reported to the error listener, and the loop serves on. The loop's catch
+     * would only swallow it, and nothing said why an endpoint got no requests.
+     */
+    public function testRunReportsAnErrTheServerKeepsTheConnectionOpenForAndServesOn(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            "-ERR 'maximum subscriptions exceeded'\r\n",
+            "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
+        ]);
+        $client = new NatsClient(new NatsOptions(
+            pingIntervalSeconds: 0,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
+            },
+        ), $transport);
         $client->connect()->await();
 
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => 'run:' . $message->payload);
+
+        $service->run(0.1)->await();
+
+        self::assertContains("Server sent error frame: 'maximum subscriptions exceeded'", $errors);
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertStringContainsString('run:hello', implode('', $transport->writes), 'the loop serves the request after the -ERR');
+    }
+
+    /**
+     * run(): a subscription whose handler throws on every message no longer slows the loop down. A request
+     * queued behind 25 failing messages, each in a chunk of its own, is answered within a 100 ms run; the loop
+     * used to back off 20 ms after each failure, so it reached the fifth.
+     */
+    public function testRunDoesNotBackOffAfterAHandlerFails(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([
+            ...$this->infoAndPong(),
+            ...array_fill(0, 25, "MSG px.poison 1 4\r\nboom\r\n"),
+            "MSG svc.echo 14 _INBOX.req 5\r\nhello\r\n",
+        ], blockWhenEmpty: true);
+        $client = $this->clientRecordingErrors($transport, $errors);
         $thrown = 0;
         $client->subscribe('px.poison', static function () use (&$thrown): void {
             $thrown++;
@@ -2116,31 +2427,244 @@ final class ServiceTest extends TestCase
             throw new \RuntimeException('poison handler');
         })->await();
 
+        $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload)
+            ->run(0.1)->await();
+
+        self::assertSame(25, $thrown);
+        self::assertCount(25, $errors);
+        self::assertStringContainsString('run:hello', implode('', $transport->writes));
+    }
+
+    /**
+     * run(): cancelling while the loop backs off from a connection-level failure exits at once and stops the
+     * service. The server drops the client as stale while the loop reads; the reconnect that starts holds its
+     * dial, and the loop, which may not wait for it (waitForReconnect off), fails each read and backs off.
+     */
+    public function testRunCancellationDuringReconnectBackoffStopsService(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(connectTimeoutMs: 500, pingIntervalSeconds: 0, waitForReconnect: false), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+
         $service = $client->service('echo', '1.0.0')
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
-
         $deferred = new DeferredCancellation();
         $runner = async(static function () use ($service, $deferred): void {
             $service->run(cancellation: $deferred->getCancellation())->await();
         });
 
-        // State-driven: cancel right after the FIRST dispatch error, i.e. while run() sits in the
-        // 20 ms error backoff (one extra tick lets the run fiber resume with the error and enter it).
-        $deadlineNs = hrtime(true) + 2_000_000_000;
-        while ($thrown === 0 && hrtime(true) < $deadlineNs) {
-            delay(0.001);
-        }
-        self::assertGreaterThan(0, $thrown, 'the poisoned handler must have thrown inside the run loop');
-        delay(0.001);
+        $this->waitFor(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        $transport->holdNextDial();
+        $transport->pushFrame("-ERR 'Stale Connection'\r\n");
+        $this->waitFor(static fn(): bool => $client->state() === ConnectionState::Connecting);
+        delay(0.1);
+
+        $start = hrtime(true);
         $deferred->cancel();
+        $runner->await(new TimeoutCancellation(1.0));
 
+        self::assertLessThan(0.1, (hrtime(true) - $start) / 1e9, 'cancellation must end the backoff at once');
+        self::assertSame([], (new \ReflectionProperty($service, 'subscriptionSids'))->getValue($service));
+        self::assertFalse((new \ReflectionProperty($service, 'started'))->getValue($service));
+
+        $transport->releaseDial();
+        $this->waitFor(static fn(): bool => $client->state() === ConnectionState::Open);
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function reconnectModes(): iterable
+    {
+        yield 'reconnect off' => [false];
+        yield 'reconnect on' => [true];
+    }
+
+    /**
+     * run(): one read brings a message whose handler throws, a request, and a fatal -ERR. The handler's failure
+     * is reported and the request answered before the connection ends - on the connection the server is
+     * closing, as any message read ahead of a fatal -ERR is delivered - and the connection then closes
+     * (reconnect off) or reconnects. The request used to stay queued behind the failure: with reconnect off it
+     * was discarded with the connection, and with reconnect on it was answered on the new connection.
+     */
+    #[DataProvider('reconnectModes')]
+    public function testRunAnswersARequestReadAheadOfAFatalErrBehindAThrowingHandlerBeforeTheConnectionEnds(bool $reconnect): void
+    {
+        $errors = [];
+        $transport = new ReconnectingTransport();
+        $client = $this->clientRecordingErrors($transport, $errors, reconnect: $reconnect);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload);
+        $stop = new DeferredCancellation();
+        $runner = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        $this->waitFor(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        delay(0.02);
+
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('px.poison', (int) $transport->sidFor('px.poison'), 'boom')
+            . ReconnectingTransport::msgFrame('svc.echo', (int) $transport->sidFor('svc.echo'), 'hello', '_INBOX.req')
+            . "-ERR 'Stale Connection'\r\n",
+        );
+        if ($reconnect) {
+            $this->waitFor(static fn(): bool => $transport->epoch() === 1 && $client->state() === ConnectionState::Open);
+        } else {
+            $this->waitFor(static fn(): bool => $client->state() === ConnectionState::Closed);
+        }
+
+        self::assertSame([0], self::epochsOfWritesContaining($transport, 'run:hello'), 'answered before the connection ended');
+        self::assertSame(['poison handler'], $errors);
+        $stop->cancel();
         $runner->await();
+    }
 
-        // The cancellation exited the backed-off loop: the remaining poison frames were never
-        // drained (an uncancelled loop would process all 25 across its backoffs).
-        self::assertLessThan(25, $thrown, 'cancellation must exit the backoff loop, not drain every queued frame');
-        self::assertSame(ConnectionState::Open, $client->state());
-        self::assertStringContainsString('UNSUB ', implode('', $transport->writes));
+    /**
+     * run(): a request another fiber's read brought - a request() that waited for its reply - behind a message
+     * whose handler throws is answered without waiting for the server to send more. That read fails with the
+     * handler's exception and leaves the rest queued, and the loop's read, which waited for it, delivers the
+     * rest. It used to wait for the server's next bytes, up to the heartbeat interval, and was lost when the
+     * service stopped first. The request() itself still fails with the other subscription's exception.
+     */
+    public function testRunAnswersARequestAnotherFibersReadLeftQueuedBehindAThrowingHandler(): void
+    {
+        $errors = [];
+        $transport = new ReconnectingTransport();
+        $client = $this->clientRecordingErrors($transport, $errors, reconnect: false);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+        // A request that owns the socket read while it waits for a reply that never comes.
+        $request = async(static fn() => $client->request('backend.op', 'q', 2_000)->await());
+        $this->waitFor(static fn(): bool => $transport->controlLinesStartingWith('PUB backend.op') !== []);
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload);
+        $stop = new DeferredCancellation();
+        $runner = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        $this->waitFor(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        delay(0.02);
+
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('px.poison', (int) $transport->sidFor('px.poison'), 'boom')
+            . ReconnectingTransport::msgFrame('svc.echo', (int) $transport->sidFor('svc.echo'), 'hello', '_INBOX.req'),
+        );
+
+        $this->waitFor(static fn(): bool => self::epochsOfWritesContaining($transport, 'run:hello') !== []);
+        try {
+            $request->await();
+            self::fail('expected the request to fail with the other subscription\'s exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('poison handler', $e->getMessage());
+        }
+        $stop->cancel();
+        $runner->await();
+    }
+
+    /**
+     * run(): a request that the delivery after a reconnect left queued behind a message whose handler throws is
+     * answered by the loop's next read, without waiting for the server to send more. That delivery reports the
+     * failure and stops there; the request used to wait for the server's next bytes.
+     */
+    public function testRunAnswersARequestTheDeliveryAfterAReconnectLeftQueuedBehindAThrowingHandler(): void
+    {
+        $errors = [];
+        $transport = new ReconnectingTransport();
+        $client = $this->clientRecordingErrors($transport, $errors);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => 'run:' . $m->payload);
+        $stop = new DeferredCancellation();
+        $runner = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        $this->waitFor(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        $poisonSid = (int) $transport->sidFor('px.poison');
+        $echoSid = (int) $transport->sidFor('svc.echo');
+        delay(0.02);
+        // The new connection answers the replayed subscriptions with both messages, which the replay reads.
+        $transport->afterWrite = static function (string $bytes) use ($transport, $poisonSid, $echoSid): void {
+            if ($transport->epoch() === 1 && str_contains($bytes, 'SUB svc.echo')) {
+                $transport->afterWrite = null;
+                $transport->pushFrame(
+                    ReconnectingTransport::msgFrame('px.poison', $poisonSid, 'boom')
+                    . ReconnectingTransport::msgFrame('svc.echo', $echoSid, 'hello', '_INBOX.req'),
+                );
+            }
+        };
+
+        $transport->dropConnection();
+
+        $this->waitFor(static fn(): bool => self::epochsOfWritesContaining($transport, 'run:hello') !== []);
+        self::assertSame([1], self::epochsOfWritesContaining($transport, 'run:hello'));
+        self::assertSame(['Socket closed by peer (EOF)', 'poison handler'], $errors);
+        $stop->cancel();
+        $runner->await();
+    }
+
+    /**
+     * drain(): a handler of another subscription that throws while the flush after the UNSUBs reads is reported,
+     * and the flush reads on to its PONG, which confirms the server has processed the UNSUBs. The flush used to
+     * end with that handler's exception, before its PONG, and drain() swallowed it.
+     */
+    public function testDrainReportsAHandlerThatThrowsDuringItsFlushAndReadsOnToItsPong(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
+        $client = $this->clientRecordingErrors($transport, $errors);
+        $client->subscribe('px.poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
+        $service->start()->await();
+        // The server answers the flush's PING with a message for the poisoned subscription, then the PONG.
+        $transport->enqueueOnWriteContaining["PING\r\n"] = ["MSG px.poison 1 4\r\nboom\r\n", "PONG\r\n"];
+
+        $service->drain()->await();
+
+        self::assertSame(['poison handler'], $errors);
+        self::assertSame([], (new \ReflectionProperty($transport, 'readQueue'))->getValue($transport), 'the flush read its PONG');
+    }
+
+    /**
+     * run(): an application that passes its shutdown token both to run() and to a wait inside a subscription
+     * handler, and shuts down while that handler waits. run() stops, and the handler's CancelledException is
+     * reported, once, like any handler failure the loop's read meets. Before, the loop had stopped waiting for
+     * that read by then, and the exception went nowhere.
+     */
+    public function testRunStoppedWhileAHandlerAwaitsTheSameCancellationReportsThatHandlersCancelledException(): void
+    {
+        $errors = [];
+        $transport = new FakeTransport([...$this->infoAndPong(), "MSG px.work 1 1\r\nx\r\n"], blockWhenEmpty: true);
+        $client = new NatsClient(new NatsOptions(
+            pingIntervalSeconds: 0,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error::class . ': ' . $error->getMessage();
+            },
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $shutdown = new DeferredCancellation();
+        $waiting = false;
+        $client->subscribe('px.work', static function () use ($shutdown, &$waiting): void {
+            $waiting = true;
+            delay(5.0, cancellation: $shutdown->getCancellation());
+        })->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
+        $runner = async(static fn() => $service->run(cancellation: $shutdown->getCancellation())->await());
+        $this->waitFor(static function () use (&$waiting): bool {
+            return $waiting;
+        });
+
+        $shutdown->cancel();
+        $runner->await();
+        $this->waitFor(static function () use (&$errors): bool {
+            return $errors !== [];
+        });
+
+        self::assertSame([CancelledException::class . ': The operation was cancelled'], $errors);
     }
 
     /**
@@ -2167,5 +2691,58 @@ final class ServiceTest extends TestCase
                 ServiceEndpointHandlerInterface::class,
             ), $e->getMessage());
         }
+    }
+
+    /**
+     * A connected client whose error listener collects the message of everything the connection reports.
+     *
+     * @param list<string> $errors
+     */
+    private function clientRecordingErrors(TransportInterface $transport, array &$errors, bool $reconnect = true): NatsClient
+    {
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            reconnectEnabled: $reconnect,
+            reconnectDelayMs: 1,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error->getMessage();
+            },
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+
+        return $client;
+    }
+
+    /**
+     * @param \Closure(): bool $condition
+     */
+    private function waitFor(\Closure $condition): void
+    {
+        $deadlineNs = hrtime(true) + 2_000_000_000;
+        while (!$condition() && hrtime(true) < $deadlineNs) {
+            delay(0.005);
+        }
+
+        self::assertTrue($condition(), 'the condition was not met in time');
+    }
+
+    /**
+     * The epochs of the writes a live session of $transport accepted that contain $needle, in order.
+     *
+     * @return list<int>
+     */
+    private static function epochsOfWritesContaining(ReconnectingTransport $transport, string $needle): array
+    {
+        $epochs = [];
+        foreach ($transport->writes as $write) {
+            if (str_contains($write['bytes'], $needle)) {
+                $epochs[] = $write['epoch'];
+            }
+        }
+
+        return $epochs;
     }
 }

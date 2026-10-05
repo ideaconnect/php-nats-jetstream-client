@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
@@ -16,11 +17,12 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
-use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
+use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -507,11 +509,12 @@ final class DrainLifecycleTest extends TestCase
     }
 
     /**
-     * The reconnect a drain waits for completes only once its Reconnected listener returns. A slow
-     * listener can hold it past the drain budget with the connection already back: the drain still
-     * drains that connection - it unsubscribes there - instead of just closing it.
+     * A drain waiting for a reconnect goes on as soon as the connection is back: the Reconnected listener runs
+     * once the reconnect is over, so a slow one does not hold the drain up. The drain drains the new connection
+     * - it unsubscribes there - within its budget. The reconnect used to complete only once its listener had
+     * returned, and the drain then also waited for that reconnect to end: 0.65 s against a 150 ms budget.
      */
-    public function testDrainOutlastedByASlowReconnectedListenerStillDrainsTheReopenedConnection(): void
+    public function testDrainDoesNotWaitForASlowReconnectedListener(): void
     {
         $transport = new ReconnectingTransport();
         $listener = new class {
@@ -531,8 +534,10 @@ final class DrainLifecycleTest extends TestCase
         $reader = $this->startRecoveryInBackground($connection, $transport);
         $transport->acceptDials();
 
+        $start = hrtime(true);
         $connection->drain()->await();
 
+        self::assertLessThan(0.15, $this->secondsSince($start), 'within its budget');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $transport->epoch());
         self::assertSame(['UNSUB ' . $sid], $transport->controlLinesStartingWith('UNSUB', 1));
@@ -1238,6 +1243,307 @@ final class DrainLifecycleTest extends TestCase
         self::assertSame(['handler failed on first'], $recorder->errorsContaining('handler failed'));
     }
 
+    /** @return iterable<string, array{string, string, string}> */
+    public static function errsTheServerKeepsTheConnectionOpenForDuringAFlush(): iterable
+    {
+        foreach (['drain()' => 'drain', 'drainSubscription()' => 'drainSubscription'] as $label => $drain) {
+            foreach ([
+                'maximum subscriptions exceeded',
+                'Permissions Violation for Publish with Reply of "_INBOX.reserved"',
+                'Permissions Violation',
+                'Invalid Publish Subject',
+            ] as $error) {
+                yield "{$label}, '{$error}' alone ahead of the messages" => [$drain, $error, 'alone'];
+                yield "{$label}, '{$error}' behind a message in one read" => [$drain, $error, 'behind'];
+            }
+        }
+    }
+
+    /**
+     * An -ERR the server keeps the connection open for, read during the flush of drain() or drainSubscription(),
+     * is reported once and does not end that flush: it reads on to its PONG, so the messages the server sent
+     * behind the -ERR are delivered. The flush used to end at the -ERR, and those messages were lost without a
+     * count: drain() closed the socket with them unread, and drainSubscription() removed the subscription, so a
+     * later read dropped them as an unknown sid's.
+     */
+    #[DataProvider('errsTheServerKeepsTheConnectionOpenForDuringAFlush')]
+    public function testDrainFlushReportsAnErrTheServerKeepsTheConnectionOpenForAndReadsOnToTheMessagesStillInFlight(
+        string $drain,
+        string $error,
+        string $layout,
+    ): void {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->connect($transport, connectionListener: $recorder->connectionListener(), errorListener: $recorder->errorListener());
+        $handled = new class {
+            /** @var list<string> */
+            public array $payloads = [];
+        };
+        $sid = $connection->subscribe('orders', static function (NatsMessage $message) use ($handled): void {
+            $handled->payloads[] = $message->payload;
+        })->await();
+        // The server answers the flush's PING with the -ERR, alone or behind a message in the same read, and
+        // then with another message and the PONG in a later read.
+        $err = "-ERR '{$error}'\r\n";
+        $transport->answerPings = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport, $sid, $err, $layout): void {
+            if ($bytes !== "PING\r\n") {
+                return;
+            }
+
+            $transport->afterWrite = null;
+            if ($layout === 'alone') {
+                $transport->pushFrame($err);
+                $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'first'));
+            } else {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'first') . $err);
+            }
+            $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'second') . "PONG\r\n");
+        };
+
+        if ($drain === 'drain') {
+            $connection->drain()->await();
+        } else {
+            $connection->drainSubscription($sid)->await();
+        }
+
+        self::assertSame(['first', 'second'], $handled->payloads, 'the flush read on to its PONG');
+        self::assertSame(["Server sent error frame: '{$error}'"], $recorder->errors, 'the -ERR is reported once, and nothing is lost');
+        if ($drain === 'drain') {
+            self::assertSame(ConnectionState::Closed, $connection->state());
+            self::assertSame(1, $recorder->closedEvents());
+        } else {
+            self::assertSame(ConnectionState::Open, $connection->state(), 'the -ERR left the connection open');
+            self::assertFalse($connection->isSubscriptionActive($sid));
+        }
+    }
+
+    /**
+     * drain()'s flush reads on past an -ERR the server keeps the connection open for, but still ends at a fatal
+     * -ERR read after it: both are reported, in order, nothing behind the fatal one is read, and nothing
+     * reconnects. The flush used to end at the first -ERR, so the message and the fatal -ERR after it were
+     * never read.
+     */
+    public function testDrainFlushReadsOnPastANonClosingErrButEndsAtAFatalOneAfterIt(): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->connect($transport, errorListener: $recorder->errorListener());
+        $handled = new class {
+            /** @var list<string> */
+            public array $payloads = [];
+        };
+        $sid = $connection->subscribe('orders', static function (NatsMessage $message) use ($handled): void {
+            $handled->payloads[] = $message->payload;
+        })->await();
+        $transport->answerPings = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport, $sid): void {
+            if ($bytes === "PING\r\n") {
+                $transport->afterWrite = null;
+                $transport->pushFrame("-ERR 'maximum subscriptions exceeded'\r\n");
+                $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'first') . "-ERR 'Stale Connection'\r\n");
+                $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'second') . "PONG\r\n");
+            }
+        };
+
+        $connection->drain()->await();
+
+        self::assertSame(['first'], $handled->payloads);
+        self::assertSame(
+            ["Server sent error frame: 'maximum subscriptions exceeded'", "Server sent error frame: 'Stale Connection'"],
+            $recorder->errors,
+        );
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertCount(1, $transport->connectCalls, 'nothing reconnected');
+    }
+
+    /**
+     * The same when a line that does not parse follows the -ERR in the same read: the -ERR is reported, then the
+     * corrupt line, and the flush reads on to its PONG. The read used to throw the -ERR once it had dealt with
+     * the corrupt line, which ended the flush.
+     */
+    public function testDrainFlushReadsOnPastAnErrReadAheadOfALineThatDoesNotParse(): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->connect($transport, errorListener: $recorder->errorListener());
+        $handled = new class {
+            /** @var list<string> */
+            public array $payloads = [];
+        };
+        $sid = $connection->subscribe('orders', static function (NatsMessage $message) use ($handled): void {
+            $handled->payloads[] = $message->payload;
+        })->await();
+        $transport->answerPings = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport, $sid): void {
+            if ($bytes === "PING\r\n") {
+                $transport->afterWrite = null;
+                $transport->pushFrame("-ERR 'maximum subscriptions exceeded'\r\nBOGUS\r\n");
+                $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'first'));
+                $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'second') . "PONG\r\n");
+            }
+        };
+
+        $connection->drain()->await();
+
+        self::assertSame(['first', 'second'], $handled->payloads);
+        self::assertSame(
+            ["Server sent error frame: 'maximum subscriptions exceeded'", 'Unsupported control frame: BOGUS'],
+            $recorder->errors,
+        );
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * Guard: when the server closes the connection right after such an -ERR (an account's subscription limit
+     * lowered below what the client holds), drain()'s flush, which reads on past the -ERR, ends at the EOF at
+     * once, and the -ERR is all it reports.
+     */
+    public function testDrainFlushEndsAtOnceWhenTheServerClosesAfterAnErrThatKeepsTheConnectionOpen(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(new NatsOptions(
+            requestTimeoutMs: 2_000,
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+        $connection->subscribe('orders', static function (): void {})->await();
+        $transport->pushReadChunk("-ERR 'maximum subscriptions exceeded'\r\n");
+        $transport->pushReadChunk(FakeTransport::EOF);
+
+        $start = hrtime(true);
+        $connection->drain()->await();
+
+        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(["Server sent error frame: 'maximum subscriptions exceeded'"], $recorder->errors);
+    }
+
+    /**
+     * Guard: a PONG the socket would not take still ends drain()'s flush at once, its own read reporting the
+     * failure once, although the flush now reads on past failures that leave the connection open: on a socket
+     * whose read never returns, reading on would take the drain's whole budget.
+     */
+    public function testDrainFlushStillEndsAtOnceAtAPongTheSocketWouldNotTake(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], blockWhenEmpty: true);
+        $connection = new NatsConnection(new NatsOptions(
+            requestTimeoutMs: 2_000,
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+        $connection->subscribe('orders', static function (): void {})->await();
+        $transport->throwOnWriteContaining = 'PONG';
+        $transport->pushReadChunk("PING\r\n");
+
+        $start = hrtime(true);
+        $connection->drain()->await();
+
+        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(['Simulated write failure'], $recorder->errors, 'reported once');
+    }
+
+    /**
+     * A service's run() loop is reading when the server PINGs during drain()'s flush, and the PONG finds the
+     * socket gone: the loop's read reports the failure, once, and the drain's flush ends at once. Taking the
+     * failure for one that ends the connection would have that read throw it, after a recovery that does
+     * nothing while the drain closes the connection, and the loop swallows what its read throws.
+     */
+    public function testAServiceReadingDuringADrainReportsAPongTheSocketWouldNotTakeOnce(): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload);
+        $run = async(static fn() => $service->run(5.0)->await());
+        // Once the service has subscribed, its loop goes on to read.
+        $this->waitUntil(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        delay(0.05);
+        $transport->answerPings = false;
+        $transport->failNextWriteContaining('PONG');
+        $transport->afterWrite = static function (string $bytes) use ($transport): void {
+            if ($bytes === "PING\r\n") {
+                $transport->afterWrite = null;
+                $transport->pushFrame("PING\r\n");
+            }
+        };
+
+        $start = hrtime(true);
+        $client->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start));
+        self::assertSame(ConnectionState::Closed, $client->state());
+        self::assertSame(['The connection is gone'], $recorder->errorsContaining('The connection is gone'), 'reported once');
+        $run->await(new TimeoutCancellation(3));
+    }
+
+    /**
+     * drainSubscription(), whose flush reads on past an -ERR the server keeps the connection open for, meets a
+     * close that follows the -ERR itself: the server closing the connection after 'maximum subscriptions
+     * exceeded' when an account's subscription limit was lowered, say. With reconnect on, the flush's read runs
+     * the reconnect before the call resolves, as any read that is first to notice a dead connection does; here
+     * the server refuses new connections, so by then the reconnect has given up, said why, and closed the
+     * connection. In 2.10.0 the call ended at the -ERR and left the dead connection Open for the next
+     * operation; in 2.10.1 and 2.10.2 the -ERR itself ended the connection.
+     */
+    public function testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself(): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $record = $recorder->errorListener();
+        $connection = $this->connect(
+            $transport,
+            maxReconnectAttempts: 3,
+            connectionListener: $recorder->connectionListener(),
+            // The server closes the connection right after the -ERR, and refuses new ones.
+            errorListener: static function (\Throwable $error) use ($record, $transport): void {
+                $record($error);
+                if (str_contains($error->getMessage(), 'maximum subscriptions exceeded')) {
+                    $transport->refuseDials();
+                    $transport->dropConnection();
+                }
+            },
+        );
+        $sid = $connection->subscribe('orders', static function (): void {})->await();
+        $transport->answerPings = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport): void {
+            if ($bytes === "PING\r\n") {
+                $transport->afterWrite = null;
+                $transport->pushFrame("-ERR 'maximum subscriptions exceeded'\r\n");
+            }
+        };
+
+        $connection->drainSubscription($sid)->await();
+
+        self::assertSame(
+            ["Server sent error frame: 'maximum subscriptions exceeded'", 'Socket closed by peer (EOF)', 'Reconnect attempts exhausted'],
+            $recorder->errors,
+        );
+        self::assertSame(
+            [ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Closed],
+            $recorder->events,
+            'the reconnect ran, and gave up, before the call resolved',
+        );
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertCount(4, $transport->connectCalls, 'the first dial and three reconnect attempts');
+        self::assertFalse($connection->isSubscriptionActive($sid));
+    }
+
     /** @return iterable<string, array{string}> */
     public static function reportsDuringADrain(): iterable
     {
@@ -1515,20 +1821,45 @@ final class DrainLifecycleTest extends TestCase
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Closed], $recorder->events);
     }
 
-    /** @return iterable<string, array{ConnectionEvent}> */
-    public static function recoveryListenerEvents(): iterable
+    /**
+     * A Disconnected listener, which runs inside the reconnect, awaits drain(), and a supervisor reconnects on
+     * the Closed that drain announces: the supervisor's connect() fails at once instead of joining that
+     * reconnect - which waits on the very listener awaiting the drain - and hanging for good.
+     */
+    public function testSupervisorReconnectingAfterADrainFromADisconnectedListenerFailsInsteadOfHanging(): void
     {
-        yield 'Disconnected listener' => [ConnectionEvent::Disconnected];
-        yield 'Reconnected listener' => [ConnectionEvent::Reconnected];
+        [$holder, $connection] = $this->superviseADrainFromAListener(ConnectionEvent::Disconnected);
+
+        self::assertTrue($holder->supervised);
+        self::assertInstanceOf(ConnectionException::class, $holder->supervisorFailure);
+        self::assertSame('Recovery was aborted before the connection opened', $holder->supervisorFailure->getMessage());
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /**
-     * A listener inside a reconnect awaits drain(), and a supervisor reconnects on the Closed that drain
-     * announces: the supervisor's connect() fails at once instead of joining that reconnect - which waits
-     * on the very listener awaiting the drain - and hanging for good.
+     * A Reconnected listener runs once the reconnect is over, so a drain() it awaits is an ordinary drain, and a
+     * supervisor that reconnects on the Closed that drain announces opens a new connection, as it would from
+     * anywhere else. It used to be refused with "Recovery was aborted before the connection opened" by the
+     * reconnect, which was still waiting for that listener to return.
      */
-    #[DataProvider('recoveryListenerEvents')]
-    public function testSupervisorReconnectingAfterADrainFromARecoveryListenerFailsInsteadOfHanging(ConnectionEvent $trigger): void
+    public function testSupervisorReconnectingAfterADrainFromAReconnectedListenerOpensANewConnection(): void
+    {
+        [$holder, $connection, $transport] = $this->superviseADrainFromAListener(ConnectionEvent::Reconnected);
+
+        self::assertTrue($holder->supervised);
+        self::assertNull($holder->supervisorFailure);
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(2, $transport->epoch(), 'the supervisor dialled afresh');
+        self::assertSame(['UNSUB 1'], $transport->controlLinesStartingWith('UNSUB', 1), 'the drain drained the reopened connection');
+    }
+
+    /**
+     * Runs a drain() from the listener of $trigger during a reconnect, with a supervisor that reconnects on the
+     * Closed the drain announces, and returns once the reader that ran the reconnect is done.
+     *
+     * @return array{object{supervised: bool, supervisorFailure: ?\Throwable}, NatsConnection, ReconnectingTransport}
+     */
+    private function superviseADrainFromAListener(ConnectionEvent $trigger): array
     {
         $transport = new ReconnectingTransport();
         $holder = new class {
@@ -1577,10 +1908,7 @@ final class DrainLifecycleTest extends TestCase
 
         $reader->await(new TimeoutCancellation(3));
 
-        self::assertTrue($holder->supervised);
-        self::assertInstanceOf(ConnectionException::class, $holder->supervisorFailure);
-        self::assertSame('Recovery was aborted before the connection opened', $holder->supervisorFailure->getMessage());
-        self::assertSame(ConnectionState::Closed, $connection->state());
+        return [$holder, $connection, $transport];
     }
 
     /**
@@ -1677,6 +2005,295 @@ final class DrainLifecycleTest extends TestCase
         self::assertLessThan(0.5, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(0, $connection->statistics()->reconnects);
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function otherReaders(): iterable
+    {
+        yield "an application's processIncoming() loop" => ['loop'];
+        yield "a service's run()" => ['service'];
+    }
+
+    /**
+     * drain() against a server that answers its PING at once ends at once while another fiber reads the
+     * connection. That fiber's read can take the drain's PONG before the drain's flush first reads, and the
+     * flush then waited for that fiber's next read, on a socket with nothing more to come, until its whole
+     * budget had run out.
+     */
+    #[DataProvider('otherReaders')]
+    public function testDrainEndsPromptlyWhileAnotherFiberReads(string $reader): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $stop = new DeferredCancellation();
+        if ($reader === 'loop') {
+            $client->subscribe('orders', static function (): void {})->await();
+            $background = async(static function () use ($client, $stop): void {
+                while (!$stop->isCancelled() && $client->state() !== ConnectionState::Closed) {
+                    try {
+                        $client->processIncoming($stop->getCancellation())->await();
+                    } catch (\Throwable) {
+                        return;
+                    }
+                }
+            });
+        } else {
+            $service = $client->service('echo', '1.0.0')
+                ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload);
+            $background = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        }
+        // The other fiber is parked in its read of the idle socket.
+        delay(0.05);
+
+        $start = hrtime(true);
+        $client->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(ConnectionState::Closed, $client->state());
+        $stop->cancel();
+        $background->await(new TimeoutCancellation(1));
+    }
+
+    /**
+     * drain() issued right after a request(), in the same tick, against a server that answers its PING at once
+     * ends at once - a common shutdown. The request's read took the drain's PONG after the drain's flush had
+     * checked for it, in the hop before the flush's own read started, and that read then waited on a socket with
+     * nothing more to come until the drain's whole budget had run out.
+     */
+    public function testDrainIssuedRightAfterARequestEndsPromptly(): void
+    {
+        $transport = new ReconnectingTransport();
+        $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'warm' && $replyTo !== null
+            ? $transport->replyFrame($replyTo, 'ok')
+            : [];
+        $connection = $this->connect($transport, requestTimeoutMs: 2_000);
+        // The reply inbox is in place, so the request below writes only its PUB.
+        $connection->request('warm', 'x')->await();
+
+        $request = $connection->request('svc', 'unanswered', 5_000);
+        $start = hrtime(true);
+        $connection->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        try {
+            $request->await();
+        } catch (\Throwable) {
+            // The drain closed the connection under the request.
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function flushes(): iterable
+    {
+        yield 'drain()' => ['drain'];
+        yield 'drainSubscription()' => ['drainSubscription'];
+        yield 'flush()' => ['flush'];
+        yield 'rtt()' => ['rtt'];
+    }
+
+    /**
+     * A flush ends as soon as the server has answered its PING, whenever another fiber's read starts around it: a
+     * request() reading for its reply, or a processIncoming(). The flush checks for its PONG before each read, and
+     * its read runs on a fiber of its own; another fiber's read that started just before that fiber took the PONG
+     * and freed the read slot, and the flush's read then waited on a socket with nothing more to come until the
+     * flush's deadline. flush() and rtt() share drainSubscription()'s flush. Where the window falls depends on how
+     * many event-loop hops each call takes, so the other call is made after each of 0 to 16 hops, before the flush
+     * and after it.
+     */
+    #[DataProvider('flushes')]
+    public function testFlushEndsPromptlyWheneverAnotherFibersReadStartsAroundIt(string $flush): void
+    {
+        foreach (['request', 'processIncoming'] as $reader) {
+            for ($hops = -16; $hops <= 16; $hops++) {
+                $transport = new ReconnectingTransport();
+                $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'warm' && $replyTo !== null
+                    ? $transport->replyFrame($replyTo, 'ok')
+                    : [];
+                $connection = $this->connect($transport, requestTimeoutMs: 1_000);
+                $connection->request('warm', 'x')->await();
+                // Only where it is needed: every subscription adds a write to a drain, and moves the window.
+                $sid = $flush === 'drainSubscription' ? $connection->subscribe('orders', static function (): void {})->await() : 0;
+
+                $calls = [
+                    'flush' => static fn(): Future => self::startFlush($flush, $connection, $sid),
+                    'reader' => static fn(): Future => $reader === 'request'
+                        ? $connection->request('svc', 'unanswered', 3_000)
+                        : $connection->processIncoming(new TimeoutCancellation(3)),
+                ];
+                // A negative count makes the flush first and the other read $hops hops after it.
+                [$first, $second] = $hops < 0 ? ['flush', 'reader'] : ['reader', 'flush'];
+                $start = hrtime(true);
+                /** @var array<string, Future<mixed>> $futures */
+                $futures = [$first => $calls[$first]()];
+                $made = new DeferredFuture();
+                self::afterHops(abs($hops), static function () use (&$futures, $calls, $second, $made): void {
+                    $futures[$second] = $calls[$second]();
+                    $made->complete();
+                });
+                $made->getFuture()->await();
+                $futures['reader']->ignore();
+                $futures['flush']->await();
+
+                self::assertLessThan(
+                    0.5,
+                    $this->secondsSince($start),
+                    sprintf('%s with a %s %d hop(s) %s it waited out its 1 s budget', $flush, $reader, abs($hops), $hops < 0 ? 'after' : 'before'),
+                );
+                $connection->disconnect()->await();
+            }
+        }
+    }
+
+    /**
+     * Starts the flush that {@see flushes()} names.
+     *
+     * @return Future<mixed>
+     */
+    private static function startFlush(string $flush, NatsConnection $connection, int $sid): Future
+    {
+        if ($flush === 'drain') {
+            return $connection->drain();
+        }
+
+        if ($flush === 'drainSubscription') {
+            return $connection->drainSubscription($sid);
+        }
+
+        return $flush === 'rtt' ? $connection->rtt() : $connection->flush();
+    }
+
+    /** Makes $call after $hops event-loop hops: a callback queued that many times in a row. */
+    private static function afterHops(int $hops, \Closure $call): void
+    {
+        if ($hops === 0) {
+            $call();
+
+            return;
+        }
+
+        EventLoop::queue(static function () use ($hops, $call): void {
+            self::afterHops($hops - 1, $call);
+        });
+    }
+
+    /**
+     * drain() alongside an application's processIncoming() loop that stopped at a throwing handler, with the
+     * message read behind it still queued, ends once the server has answered its PING and that message's
+     * handler, which awaits, has run. A flush that delivered such a message before it read would wait out its
+     * whole budget: while the handler awaited, the loop's read would take the PONG and park the loop's next
+     * read, and the flush would then wait for that read, on a socket with nothing more to come.
+     */
+    public function testDrainEndsPromptlyAlongsideALoopThatLeftAMessageQueuedBehindAThrowingHandler(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $seen = [];
+        $sidA = $client->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'a:' . $message->payload;
+            throw new \RuntimeException('handler a');
+        })->await();
+        $sidB = $client->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+            delay(0.05);
+            $seen[] = 'b:' . $message->payload;
+        })->await();
+        $stop = new DeferredCancellation();
+        $loop = async(static function () use ($client, $stop): void {
+            while (!$stop->isCancelled() && $client->state() !== ConnectionState::Closed) {
+                try {
+                    $client->processIncoming($stop->getCancellation())->await();
+                } catch (\Throwable) {
+                    // The handler's failure; the loop reads on.
+                }
+            }
+        });
+        $transport->pushFrame(ReconnectingTransport::msgFrame('a', $sidA, 'x') . ReconnectingTransport::msgFrame('b', $sidB, 'y'));
+        $this->waitUntil(static function () use (&$seen): bool {
+            return $seen === ['a:x'];
+        });
+        // The loop is parked in its next read, b's message queued.
+        delay(0.02);
+        $this->answerTheNextPingAfter($transport, 0.01);
+
+        $start = hrtime(true);
+        $client->drain()->await();
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(['a:x', 'b:y'], $seen);
+        $stop->cancel();
+        $loop->await(new TimeoutCancellation(1));
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function drainsWhileAServiceLoopDelivers(): iterable
+    {
+        yield 'Service::drain()' => ['service'];
+        yield 'NatsClient::drain()' => ['client'];
+        yield 'NatsClient::drainSubscription()' => ['subscription'];
+    }
+
+    /**
+     * A drain called while a service's run() delivers a read - a handler that awaits, and a message queued
+     * behind it whose handler awaits longer - ends once the server has answered its PING and both handlers
+     * have run. A flush that delivered the queued message before it read, as the loop's read does with what an
+     * earlier read left queued, would wait out its whole budget: while that handler awaited, the loop would
+     * read the PONG and park its next read, and the flush would then wait for that read.
+     */
+    #[DataProvider('drainsWhileAServiceLoopDelivers')]
+    public function testADrainEndsPromptlyWhileAServiceLoopDeliversARead(string $drain): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $done = [];
+        $sidSlow = $client->subscribe('slow', static function () use (&$done): void {
+            delay(0.05);
+            $done[] = 'slow';
+        })->await();
+        $sidSlower = $client->subscribe('slower', static function () use (&$done): void {
+            delay(0.15);
+            $done[] = 'slower';
+        })->await();
+        $sidOther = $client->subscribe('other', static function (): void {})->await();
+        $service = $client->service('echo', '1.0.0')
+            ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $message): string => $message->payload);
+        $stop = new DeferredCancellation();
+        $runner = async(static fn() => $service->run(cancellation: $stop->getCancellation())->await());
+        $this->waitUntil(static fn(): bool => $transport->sidFor('svc.echo') !== null);
+        // The loop is parked in its read of the idle socket when both messages arrive.
+        delay(0.02);
+        $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $sidSlow, 'x') . ReconnectingTransport::msgFrame('slower', $sidSlower, 'y'));
+        delay(0.01);
+        $this->answerTheNextPingAfter($transport, 0.01);
+
+        $start = hrtime(true);
+        match ($drain) {
+            'service' => $service->drain()->await(),
+            'client' => $client->drain()->await(),
+            default => $client->drainSubscription($sidOther)->await(),
+        };
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertSame(['slow', 'slower'], $done);
+        $stop->cancel();
+        $runner->await(new TimeoutCancellation(1));
     }
 
     /**
@@ -2136,6 +2753,18 @@ final class DrainLifecycleTest extends TestCase
         $connection->processIncoming()->await();
         self::assertSame(['m1', 'bad', 'm2'], $handled->payloads);
         self::assertFalse($connection->isSubscriptionActive($sid));
+    }
+
+    /** Makes the server answer the next PING written after $seconds instead of at once. */
+    private function answerTheNextPingAfter(ReconnectingTransport $transport, float $seconds): void
+    {
+        $transport->answerPings = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport, $seconds): void {
+            if ($bytes === "PING\r\n") {
+                $transport->afterWrite = null;
+                EventLoop::delay($seconds, static fn() => $transport->pushFrame("PONG\r\n"));
+            }
+        };
     }
 
     /** Delivers the frames pushed so far, whose first handler fails: the rest stay queued behind it. */

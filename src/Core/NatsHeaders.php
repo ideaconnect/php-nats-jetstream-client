@@ -59,7 +59,7 @@ final class NatsHeaders
      * `nats-msg-id` where an exact-case lookup here misses it). Returns the first
      * case-insensitively matching value, preferring an exact-case hit.
      *
-     * @param array<string,string> $headers A map from {@see fromWireBlock()}.
+     * @param array<int|string,string> $headers A map from {@see fromWireBlock()}.
      */
     public static function get(array $headers, string $name): ?string
     {
@@ -80,9 +80,10 @@ final class NatsHeaders
      * Decodes a NATS/1.0 wire header block as a multimap, preserving every value of a repeated header
      * name (ADR-4). Use this when a header may legitimately appear more than once; the system headers
      * the client reads are single-valued, so {@see fromWireBlock()} (last-value-wins) remains the
-     * convenient default.
+     * convenient default. A name that is a decimal integer comes back as an int key, as in
+     * {@see fromWireBlock()}.
      *
-     * @return array<string,list<string>>
+     * @return array<int|string,list<string>>
      */
     public static function fromWireBlockMulti(?string $rawHeaders): array
     {
@@ -129,12 +130,16 @@ final class NatsHeaders
     /**
      * Decodes a NATS/1.0 wire header block into a name/value map.
      *
-     * A repeated header name collapses to last-value-wins (the map is `array<string,string>`, not a
+     * A repeated header name collapses to last-value-wins (the map is `array<int|string,string>`, not a
      * multimap); use {@see fromWireBlockMulti()} to preserve every value. This matches every header the
      * client consumes - the system headers it reads (Status, Nats-Sequence, KV-Operation,
      * Nats-Consumer-Stalled, ...) are single-valued.
      *
-     * @return array<string,string>
+     * A name that is a decimal integer, such as `1` or `-5`, comes back as an int key, since PHP stores
+     * such array keys as integers, and the declared key type says so: cast a key to string before handing
+     * it to a function that takes one. The headers come from whoever published the message.
+     *
+     * @return array<int|string,string>
      */
     public static function fromWireBlock(?string $rawHeaders): array
     {
