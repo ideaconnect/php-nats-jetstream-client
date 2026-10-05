@@ -336,6 +336,8 @@ echo $reply->payload . PHP_EOL;
 $client->disconnect()->await();
 ```
 
+`request()`, `requestWithHeaders()` and `requestMany()` share one reply-inbox subscription per connection, `_INBOX.<inbox>.*`, which the first request subscribes. When the server rejects it for permissions (the account may not subscribe to `_INBOX.>`), every request fails with a `ConnectionException` that names the permission needed, instead of waiting out its timeout, until the connection closes for good and a new `connect()` tries again. _Verified by: [MuxInboxRejectionTest](tests/Unit/MuxInboxRejectionTest.php), [NatsConnectionTest::testRequestSurfacesMuxInboxPermissionRejection](tests/Unit/NatsConnectionTest.php)._
+
 ### Request Many (Scatter-Gather)
 
 > 📄 **Runnable example:** [`examples/request-many.php`](examples/request-many.php)

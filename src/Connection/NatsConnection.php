@@ -141,8 +141,8 @@ final class NatsConnection
      * Muxed request inbox base subject for the current connection epoch (e.g. "_INBOX.<24hex>"), null
      * until the first request establishes it. One long-lived wildcard subscription "<base>.*" serves
      * EVERY request()/requestMany() reply instead of a fresh inbox + SUB/UNSUB per request (#118).
-     * Retained across reconnect; only releaseRuntimeState() clears it, so a fresh connect() starts a
-     * new random base.
+     * Retained across reconnect; cleared by releaseRuntimeState(), so a fresh connect() starts a new
+     * random base, when the server rejects the subscription (#167), and when its set-up fails.
      */
     private ?string $muxBase = null;
     /**
@@ -153,10 +153,11 @@ final class NatsConnection
     private ?int $muxSid = null;
     /**
      * Latched once the mux inbox subscription "<muxBase>.*" is rejected by server permissions (#167).
-     * The -ERR is async, so it lands after ensureMuxInbox() cached the (now dead) muxSid/muxBase. On
-     * detection the mux state is dropped (so a reconnect does not replay the rejected SUB) and every
-     * request()/requestMany() then fails fast with a clear, catchable error instead of a silent
-     * permanent timeout. Reset by releaseRuntimeState() so a fresh connect() re-attempts the mux inbox.
+     * The -ERR is async: it lands after ensureMuxInbox() recorded the (now dead) muxSid/muxBase, which it
+     * does before the SUB is written, so whichever fiber reads the -ERR finds them. On detection the mux
+     * state is dropped (so a reconnect does not replay the rejected SUB) and every request()/requestMany()
+     * then fails fast with a clear, catchable error instead of a silent permanent timeout. Reset by
+     * releaseRuntimeState() so a fresh connect() re-attempts the mux inbox.
      */
     private bool $muxRejected = false;
     /**
@@ -179,6 +180,11 @@ final class NatsConnection
      * @var Future<void>|null
      */
     private ?Future $muxInboxSetup = null;
+    /**
+     * Counts terminal closes ({@see releaseRuntimeState()}), so that a request that was setting the mux up when
+     * one happened reports the closed connection, even when a connect() has opened a new one since.
+     */
+    private int $terminalCloses = 0;
     /**
      * SIDs exempt from the per-subscription slow-consumer count bound - only the mux inbox sid. Every
      * in-flight reply shares that single sid's queue, and a dropped reply silently breaks whichever
@@ -1144,12 +1150,15 @@ final class NatsConnection
         // any still-registered in-flight waiter - its request fiber terminates via the wait-loop state
         // gate / recovery exception, not via the map. muxTokenSeq is intentionally NOT reset (the new
         // random base makes any cross-epoch token undeliverable regardless).
-        $this->muxBase = null;
-        $this->muxSid = null;
+        $this->forgetMux();
         $this->muxWaiters = [];
         // A fresh connect() may target an account/server that permits the reply-inbox wildcard, so a
         // terminal close clears the rejection latch and lets ensureMuxInbox() re-attempt the mux (#167).
         $this->muxRejected = false;
+        // No set-up still under way for this connection is left for a request on the next one to join (it
+        // fails with the closed connection).
+        $this->muxInboxSetup = null;
+        $this->terminalCloses++;
         $this->unboundedSids = [];
         $this->subscriptionRejectionHandlers = [];
         $this->removeAfterDelivery = [];
@@ -1958,9 +1967,16 @@ final class NatsConnection
      *
      * @param callable(NatsMessage):void $handler
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the subscribe.
+     * @param (\Closure(int): void)|null $registered Called with the sid once the subscription is registered, before
+     *        its SUB is written, so that whichever fiber reads the server's answer to the SUB finds what it records.
      */
-    private function subscribeInternal(string $subject, callable $handler, ?string $queue, ?\Fiber $caller): int
-    {
+    private function subscribeInternal(
+        string $subject,
+        callable $handler,
+        ?string $queue,
+        ?\Fiber $caller,
+        ?\Closure $registered = null,
+    ): int {
         if ($this->state !== ConnectionState::Open) {
             try {
                 $this->awaitOpenConnection(new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $caller);
@@ -1979,6 +1995,9 @@ final class NatsConnection
         $this->subscriptions[$sid] = $handler;
         $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
         $this->pendingMessages[$sid] = new SplQueue();
+        if ($registered !== null) {
+            $registered($sid);
+        }
 
         $generation = $this->connectionGeneration;
         try {
@@ -2001,7 +2020,8 @@ final class NatsConnection
             }
 
             // A terminal close released it, and a connect() opened a fresh connection since: nothing
-            // subscribed it there.
+            // subscribed it there. (The reply inbox's registration also goes when the server rejects its
+            // replayed SUB; ensureMuxInbox() reports that instead.)
             if (!isset($this->subscriptionMeta[$sid])) {
                 throw new ConnectionException(sprintf('Subscribe to "%s" failed: the connection was closed', $subject), 0, $writeError);
             }
@@ -2891,9 +2911,12 @@ final class NatsConnection
     /**
      * Establishes the per-connection mux request inbox on first use: one wildcard subscription
      * "<base>.*" whose handler ({@see dispatchMuxReply()}) routes every reply to its per-token waiter.
-     * Idempotent - a no-op once established, so it survives reconnect (muxSid/muxBase are retained,
-     * only {@see releaseRuntimeState()} nulls them). Serialized via $muxInboxSetup so concurrent first
-     * requests write exactly one SUB even though the subscribe suspends (#118).
+     * Idempotent - a no-op once established, so it survives reconnect (muxSid/muxBase are retained until
+     * a terminal close, or until the server rejects the SUB). Serialized via $muxInboxSetup so concurrent
+     * first requests write exactly one SUB even though the subscribe suspends (#118).
+     *
+     * The mux is recorded before its SUB is written, so whichever fiber reads the server's answer to the
+     * SUB knows it is the mux's (#167).
      *
      * Precondition: the caller has checked state === Open (the subscribe re-checks it). A request that
      * joins another fiber's establishment waits for it only within $budget - its own deadline.
@@ -2902,40 +2925,73 @@ final class NatsConnection
      */
     private function ensureMuxInbox(Cancellation $budget, ?\Fiber $caller): void
     {
-        if ($this->muxSid !== null) {
-            return;
-        }
-
         if ($this->muxInboxSetup !== null) {
-            // Another fiber is mid-establishment; join it instead of writing a second SUB.
+            // Another fiber is mid-establishment; join it instead of writing a second SUB. Checked before
+            // muxSid, which is set from just before that SUB is written, while the write may still be under way.
             $this->muxInboxSetup->await($budget);
 
             return;
         }
 
+        if ($this->muxSid !== null) {
+            return;
+        }
+
+        $base = Inbox::generate($this->options->inboxPrefix);
         $deferred = new DeferredFuture();
-        $this->muxInboxSetup = $deferred->getFuture();
-        $this->muxInboxSetup->ignore();
+        $setup = $deferred->getFuture();
+        $setup->ignore();
+        $this->muxInboxSetup = $setup;
 
         try {
-            $base = Inbox::generate($this->options->inboxPrefix);
             // dispatchMuxReply is non-suspending, so it is safe to invoke inside drainPendingForSid()'s
             // dequeue loop. The handler lives in subscriptions[$muxSid] and persists across reconnect
             // (resubscribeAll replays only the SUB bytes; only releaseRuntimeState clears the handler).
-            $sid = $this->subscribeInternal($base . '.*', $this->dispatchMuxReply(...), null, $caller);
-            $this->muxBase = $base;
-            $this->muxSid = $sid;
-            // Slow-consumer exemption: the mux queue must never drop a reply (breaks a request).
-            $this->unboundedSids[$sid] = true;
+            $this->subscribeInternal(
+                $base . '.*',
+                $this->dispatchMuxReply(...),
+                null,
+                $caller,
+                registered: function (int $sid) use ($base): void {
+                    $this->muxBase = $base;
+                    $this->muxSid = $sid;
+                    // Slow-consumer exemption: the mux queue must never drop a reply (breaks a request).
+                    $this->unboundedSids[$sid] = true;
+                },
+            );
             $deferred->complete();
         } catch (\Throwable $e) {
+            if ($this->muxBase === $base) {
+                // The subscribe rolled its registration back: the connection did not come back in time.
+                $this->forgetMux();
+            }
+
+            // The reconnect a failed write started can also remove the registration, when its replay of the SUB
+            // is rejected; the subscribe then reports a closed connection. Say what happened instead.
+            if ($this->muxRejected) {
+                $e = $this->muxRejectedException($e);
+            }
+
             $deferred->error($e);
 
             throw $e;
         } finally {
-            // Cleared so a failed establishment retries on the next request.
-            $this->muxInboxSetup = null;
+            // Cleared so a failed establishment retries on the next request - unless a terminal close already
+            // let a request on the next connection start its own.
+            if ($this->muxInboxSetup === $setup) {
+                $this->muxInboxSetup = null;
+            }
         }
+    }
+
+    /**
+     * Forgets the mux subscription, so the next request that needs one subscribes a new one. Its registration
+     * is the caller's to drop.
+     */
+    private function forgetMux(): void
+    {
+        $this->muxSid = null;
+        $this->muxBase = null;
     }
 
     /**
@@ -3006,7 +3062,7 @@ final class NatsConnection
      * subscription has been permission-rejected (#167), replacing the pre-fix silent timeout. Names the
      * reply-inbox wildcard the account must be allowed to subscribe to.
      */
-    private function muxRejectedException(): ConnectionException
+    private function muxRejectedException(?\Throwable $previous = null): ConnectionException
     {
         $wildcard = $this->options->inboxPrefix . '.>';
 
@@ -3015,7 +3071,28 @@ final class NatsConnection
             . $this->options->inboxPrefix . '.<inbox>.*" was rejected by the server (permissions violation). '
             . 'Grant the account subscribe permission for the reply-inbox wildcard "' . $wildcard
             . '" to use request()/requestMany().',
+            0,
+            $previous,
         );
+    }
+
+    /**
+     * Throws when the mux subscription a request is about to be sent on is gone: released by a terminal close
+     * while it was being set up, or latched as rejected by permissions (#167).
+     *
+     * @param int $closes The {@see $terminalCloses} when the request began setting the mux up.
+     *
+     * @phpstan-impure Reads state that reads in other fibers change while the request is suspended.
+     */
+    private function throwUnlessMuxInstalled(int $closes): void
+    {
+        if ($this->terminalCloses !== $closes) {
+            throw new ConnectionException('Connection was closed while the reply inbox was being set up');
+        }
+
+        if ($this->muxRejected) {
+            throw $this->muxRejectedException();
+        }
     }
 
     /**
@@ -3052,8 +3129,12 @@ final class NatsConnection
             throw $this->muxRejectedException();
         }
 
+        $closes = $this->terminalCloses;
         try {
             $this->ensureMuxInbox($budget, $caller);
+            // The server can answer the SUB before this request resumes from writing it, or from joining the
+            // fiber that writes it.
+            $this->throwUnlessMuxInstalled($closes);
         } catch (CancelledException) {
             throw $this->requestNotSentFailure($subject, $cancellation, 'the reply inbox to be set up');
         }
@@ -4600,12 +4681,12 @@ final class NatsConnection
                 // delivered (#167). Drop the dead mux state (so a reconnect does not replay the rejected
                 // SUB) and latch $muxRejected: request()/requestMany() then fail fast with a clear,
                 // catchable error instead of a silent permanent timeout. The random muxBase makes the
-                // substring match unambiguous.
+                // substring match unambiguous. ensureMuxInbox() records the mux before it writes the SUB,
+                // so this holds whichever read meets the -ERR, the replay of a reconnect included.
                 if ($this->muxSid !== null && $this->muxBase !== null && str_contains($error, $this->muxBase)) {
                     // dropSubscriptionState() also clears the sid's slow-consumer exemption flag.
                     $this->dropSubscriptionState($this->muxSid);
-                    $this->muxSid = null;
-                    $this->muxBase = null;
+                    $this->forgetMux();
                     $this->muxInboxSetup = null;
                     $this->muxRejected = true;
                 }

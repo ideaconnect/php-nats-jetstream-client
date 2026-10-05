@@ -170,6 +170,19 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   strict types. The endpoint now answers such a request like any other. `fromWireBlock()` and
   `fromWireBlockMulti()` now declare their keys as `int|string`, so static analysis reports such a call in
   your code too.
+- `[bugfix]` The shared reply inbox of `request()` and `requestMany()` was recorded only once the write of
+  its SUB had returned. When that write found the socket dead, the reconnect it started replayed the SUB,
+  and a permissions rejection read during that replay missed the latch of 2.7.1 (#167): the request and
+  every later one waited out their timeouts instead of failing at once with the permissions error. And when
+  a terminal close came while the write was under way and the write completed all the same (a narrow race,
+  since the shipped transports fail such a write when the socket closes), the closed connection's inbox
+  stayed recorded: after a new `connect()` every request was sent with a reply subject nobody held there
+  and timed out. The inbox is now recorded before its SUB is written, so whichever read meets the server's
+  answer finds it. A request joins a set-up still under way instead of trusting the recorded inbox, and a
+  set-up whose write fails without the connection coming back in time is rolled back. A terminal close
+  during the set-up fails the request with the closed connection without sending it (`Connection was closed
+  while the reply inbox was being set up` when the write completed anyway), and a request after a new
+  `connect()` neither waits for a set-up left from the closed connection nor reuses its inbox.
 
 ## [2.10.2] - 2026-10-04
 
