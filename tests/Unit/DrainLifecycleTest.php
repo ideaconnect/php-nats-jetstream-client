@@ -1498,7 +1498,8 @@ final class DrainLifecycleTest extends TestCase
      * exceeded' when an account's subscription limit was lowered, say. With reconnect on, the flush's read runs
      * the reconnect before the call resolves, as any read that is first to notice a dead connection does; here
      * the server refuses new connections, so by then the reconnect has given up, said why, and closed the
-     * connection. The call used to end at the -ERR and leave the dead connection Open for the next operation.
+     * connection. In 2.10.0 the call ended at the -ERR and left the dead connection Open for the next
+     * operation; in 2.10.1 and 2.10.2 the -ERR itself ended the connection.
      */
     public function testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself(): void
     {

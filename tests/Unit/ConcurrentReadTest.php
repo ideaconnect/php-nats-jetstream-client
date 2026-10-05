@@ -227,10 +227,11 @@ final class ConcurrentReadTest extends TestCase
     }
 
     /**
-     * A read issued from inside the reconnect that a failed read started - by a Reconnected listener, by a
-     * handler of a message that arrived during the reconnect, or by the error listener told of the failure -
-     * does not wait for that read, which cannot end before the reconnect does. The failed read used to hold
-     * the socket read through the whole reconnect, and such a read waited for it forever.
+     * A read issued while a failed read recovers the connection - by the Reconnected listener, which runs once
+     * the reconnect is over, by a handler of a message that arrived during the reconnect, or by the error
+     * listener told of the failure - does not wait for that read, which cannot end before the recovery does.
+     * The failed read used to hold the socket read through the whole reconnect, and such a read waited for it
+     * forever.
      */
     #[DataProvider('readsFromInsideAReconnect')]
     public function testReadFromInsideAReconnectDoesNotWaitForTheReadThatStartedIt(string $from): void
@@ -289,7 +290,7 @@ final class ConcurrentReadTest extends TestCase
         $transport->dropConnection();
 
         $reader->await(new TimeoutCancellation(2));
-        self::assertNotNull($nested->frames, 'the read from inside the reconnect returned');
+        self::assertNotNull($nested->frames, 'the read made during the recovery returned');
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertSame(1, $connection->statistics()->reconnects, 'one reconnect, however many reads noticed the drop');
     }

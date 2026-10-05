@@ -1826,19 +1826,6 @@ final class NatsConnection
     }
 
     /**
-     * Writes an already-encoded publish frame with the state-appropriate delivery:
-     *   - Open: write to the socket, with a single recover-and-retry on a transient write failure. The
-     *     retry is sent the way a publish issued after the recovery would be, by the state it finds.
-     *   - Draining: write straight to the still-live socket. A draining connection keeps its socket
-     *     open until drain() closes it, and a handler's ack/reply (a JetStream ack, respond(), a
-     *     request reply) MUST reach the wire - nats.go drains by publishing then closing. Buffering
-     *     is wrong (no reconnect will flush it) and refusing would redeliver the just-acked message;
-     *     recovery is not attempted (drain is tearing down). #150
-     *   - otherwise: buffer while a reconnect is in flight (flushed on reconnect) and yield one
-     *     event-loop tick so a synchronous publisher drives that reconnect, else fail loudly - a
-     *     publish after the connection has Closed still throws (#146).
-     */
-    /**
      * Validates a publish subject (cached) and its optional reply subject. The reply is validated
      * uncached: a publish replyTo is typically a per-request unique inbox, so caching it would only
      * churn the memo (see validateSubjectCached()). Shared by publish() and publishWithHeaders().
@@ -1851,6 +1838,19 @@ final class NatsConnection
         }
     }
 
+    /**
+     * Writes an already-encoded publish frame with the state-appropriate delivery:
+     *   - Open: write to the socket, with a single recover-and-retry on a transient write failure. The
+     *     retry is sent the way a publish issued after the recovery would be, by the state it finds.
+     *   - Draining: write straight to the still-live socket. A draining connection keeps its socket
+     *     open until drain() closes it, and a handler's ack/reply (a JetStream ack, respond(), a
+     *     request reply) MUST reach the wire - nats.go drains by publishing then closing. Buffering
+     *     is wrong (no reconnect will flush it) and refusing would redeliver the just-acked message;
+     *     recovery is not attempted (drain is tearing down). #150
+     *   - otherwise: buffer while a reconnect is in flight (flushed on reconnect) and yield one
+     *     event-loop tick so a synchronous publisher drives that reconnect, else fail loudly - a
+     *     publish after the connection has Closed still throws (#146).
+     */
     private function writePublishFrame(string $frame): void
     {
         if ($this->state === ConnectionState::Open) {
@@ -1870,12 +1870,12 @@ final class NatsConnection
                 // next frame follows it on the wire.
                 $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
 
-                // The reconnect has announced the new connection before returning, and the connection may have
-                // moved on since: the listener, or what it called, closed it or started another reconnect, or a
-                // drain() that waited for the reconnect began meanwhile. Sent as a publish issued now would be,
-                // the frame is then buffered behind that reconnect, or written to the connection being drained.
-                // Written directly, it would go into a socket already closed, or reach a new one ahead of its
-                // CONNECT, which a server that requires authentication answers by closing the connection.
+                // The connection may have moved on while the reconnect announced it: the listener, or what it
+                // called, closed it or started another reconnect, or a drain() that waited for the reconnect began
+                // meanwhile ({@see recoverConnection()}). Sent as a publish issued now would be, the frame is then
+                // buffered behind that reconnect, or written to the connection being drained. Written directly, it
+                // would go into a socket already closed, or reach a new one ahead of its CONNECT, which a server
+                // that requires authentication answers by closing the connection.
                 if ($this->state !== ConnectionState::Open) {
                     // Closed, or being closed other than by a drain() still flushing (which takes the frame, as it
                     // takes any publish): nothing will send the frame. The write's own error says why, as an error
@@ -3947,10 +3947,12 @@ final class NatsConnection
      * callback resuming after its write while the read path already began recovering) await the same
      * attempt and share its outcome, rather than racing on the parser, state, and socket.
      *
-     * A reconnect this call runs announces the new connection once it is over, before this returns
-     * ({@see announceOpen()}), and the listener may then close the connection, or start another reconnect
-     * through what it calls. A caller that goes on using the connection checks the state again rather than
-     * assume it is Open, or Closed.
+     * A reconnect this call runs announces the new connection once it is over ({@see announceOpen()}): it logs
+     * the open and calls the listener before this returns, unless another Connected or Reconnected listener
+     * call is running, when the listener is called from the event loop instead. The listener may close the
+     * connection, or start another reconnect through what it calls, and a drain() that waited for the
+     * reconnect may begin meanwhile, so a caller that goes on using the connection checks the state again
+     * rather than assume it is Open, or Closed.
      *
      * @param bool $ownedByConnect True only for the hand-off from {@see performConnect()}, which
      *                             runs inside the connect fiber while {@see $connecting} is set and

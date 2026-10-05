@@ -847,7 +847,8 @@ final class CloseIntentTest extends TestCase
     {
         yield 'reconnect attempts exhausted' => ['reconnect exhausted', true];
         yield 'reconnect refused authentication' => ['reconnect auth', true];
-        // With the error that ended the connection since 2.10.3 (#172): the dropped socket's EOF.
+        // With the error that ended the connection, the dropped socket's EOF (#172); 2.10.2 and earlier announced
+        // this Closed without one.
         yield 'connection lost with reconnect disabled' => ['reconnect disabled', true];
         yield 'first connect failed' => ['connect failed', true];
         yield 'first connect refused authentication' => ['connect auth', true];
@@ -858,7 +859,7 @@ final class CloseIntentTest extends TestCase
     /**
      * A disconnect() issued while a connect or a reconnect that gave up on the connection is still closing
      * the transport - a TLS or WebSocket close takes a while - closes quietly: the close is announced
-     * once, by the path that gave up (with its error, where it has one).
+     * once, by the path that gave up, with its error.
      */
     #[DataProvider('pathsThatGiveUpOnTheConnection')]
     public function testDisconnectWhileAPathThatGaveUpClosesTheTransportAnnouncesTheCloseOnce(string $path, bool $closedWithError): void

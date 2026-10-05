@@ -68,11 +68,12 @@ final class NatsOptions
       *        Such an announcement made while another Connected or Reconnected call runs is delivered from the
       *        event loop, and the messages the reconnect read can reach their handlers before it. Either way the
       *        listener is told of a connection only while it is still the open one: one closed, being closed,
-      *        replaced or lost before it could be told is not announced, nor is the loss of it.
+      *        replaced or lost before it could be told is not announced, and when it was lost, neither is its
+      *        loss, though a Closed still is.
       * @param (\Closure(\Throwable):void)|null $errorListener Optional callback invoked on asynchronous
-      *        errors that do not surface to a specific caller: slow-consumer drops, recoverable server
-      *        `-ERR` frames, and transport read failures that trigger reconnect. Exceptions thrown by the
-      *        listener are swallowed.
+      *        errors that do not surface to a specific caller, such as slow-consumer drops, server `-ERR`
+      *        frames, a handler that throws during a drain or a service's run() loop, and transport read
+      *        failures that trigger reconnect. Exceptions thrown by the listener are swallowed.
       * @param (\Closure():?string)|null $jwtProvider Optional callback returning the user JWT, invoked on
       *        every (re)connect. Takes precedence over the static {@see $jwt} when set, so short-lived or
       *        rotated JWTs are picked up on reconnect without rebuilding the client. Pair with a
