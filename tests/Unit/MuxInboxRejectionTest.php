@@ -238,6 +238,69 @@ final class MuxInboxRejectionTest extends TestCase
         self::assertCount(1, $server->controlLines('PUB svc.echo'), 'the second request was not sent');
     }
 
+    /** @return iterable<string, array{bool}> */
+    public static function handlerFailuresFailingOperationsOrNot(): iterable
+    {
+        yield 'operations report handler failures (default)' => [false];
+        yield 'handler failures fail operations' => [true];
+    }
+
+    /**
+     * Another subscription's handler that throws while a request waits for the new mux to be confirmed is reported,
+     * and the request is sent once the mux is confirmed and gets its reply (#173). With handlerErrorsFailOperations
+     * it fails the request, as it fails one that waits for its reply, and the request is not sent.
+     */
+    #[DataProvider('handlerFailuresFailingOperationsOrNot')]
+    public function testAHandlerFailureWhileARequestWaitsForTheNewMuxIsReportedUnlessConfiguredToFail(bool $failOperations): void
+    {
+        $server = $this->echoServer(limit: 2);
+        $recorder = new LifecycleRecorder();
+        $client = new NatsClient(new NatsOptions(
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+            handlerErrorsFailOperations: $failOperations,
+        ), $server);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $poison = $client->subscribe('poison', static function (): void {
+            throw new \RuntimeException('poison handler');
+        })->await();
+        // This subscription and the poisoned one hold both slots, so the first request's mux is rejected.
+        $appSid = $client->subscribe('app.one', static function (): void {})->await();
+        try {
+            $client->request('svc.echo', 'one', 1_000)->await();
+            self::fail('expected the first request to fail');
+        } catch (ConnectionException) {
+            // The server rejected its reply inbox.
+        }
+        $client->unsubscribe($appSid)->await();
+
+        // The server's answers to the new mux SUB are held while a message for the poisoned subscription arrives.
+        $server->holdAnswers();
+        $request = $client->request('svc.echo', 'two', 1_000);
+        delay(0.02);
+        $server->pushFrame("MSG poison {$poison} 2\r\np1\r\n");
+        delay(0.02);
+        $server->releaseAnswers();
+
+        if ($failOperations) {
+            try {
+                $request->await();
+                self::fail('expected the request to fail with the handler failure');
+            } catch (\RuntimeException $e) {
+                self::assertSame('poison handler', $e->getMessage());
+            }
+            self::assertCount(1, $server->controlLines('PUB svc.echo'), 'the second request was not sent');
+            self::assertSame([], $recorder->errorsContaining('poison handler'));
+
+            return;
+        }
+
+        self::assertSame('echo:two', $request->await()->payload);
+        self::assertSame(['poison handler'], $recorder->errorsContaining('poison handler'));
+    }
+
     /**
      * Another -ERR the server keeps the connection open for, read while a request waits for the new mux, is not
      * taken for the mux's rejection: the request gets its reply or fails with that -ERR, as any read does, never with

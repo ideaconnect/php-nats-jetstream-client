@@ -123,6 +123,7 @@ final class NatsOptionsTest extends TestCase
         self::assertSame(131072, $options->readChunkSizeBytes);
         self::assertTrue($options->waitForReconnect);
         self::assertFalse($options->slowConsumerErrorsFailOperations);
+        self::assertFalse($options->handlerErrorsFailOperations);
     }
 
     public function testWaitForReconnectCanBeDisabled(): void
@@ -133,5 +134,10 @@ final class NatsOptionsTest extends TestCase
     public function testSlowConsumerErrorsCanBeMadeToFailOperations(): void
     {
         self::assertTrue((new NatsOptions(slowConsumerErrorsFailOperations: true))->slowConsumerErrorsFailOperations);
+    }
+
+    public function testHandlerErrorsCanBeMadeToFailOperations(): void
+    {
+        self::assertTrue((new NatsOptions(handlerErrorsFailOperations: true))->handlerErrorsFailOperations);
     }
 }

@@ -2522,16 +2522,17 @@ final class ServiceTest extends TestCase
 
     /**
      * run(): a request another fiber's read brought - a request() that waited for its reply - behind a message
-     * whose handler throws is answered without waiting for the server to send more. That read fails with the
-     * handler's exception and leaves the rest queued, and the loop's read, which waited for it, delivers the
-     * rest. It used to wait for the server's next bytes, up to the heartbeat interval, and was lost when the
-     * service stopped first. The request() itself still fails with the other subscription's exception.
+     * whose handler throws is answered without waiting for the server to send more. With handlerErrorsFailOperations
+     * that read fails with the handler's exception and leaves the rest queued, and the loop's read, which waited for
+     * it, delivers the rest. It used to wait for the server's next bytes, up to the heartbeat interval, and was lost
+     * when the service stopped first. (By default the request()'s read reports the failure and delivers the rest
+     * itself: see HandlerFailureDuringOperationTest.)
      */
     public function testRunAnswersARequestAnotherFibersReadLeftQueuedBehindAThrowingHandler(): void
     {
         $errors = [];
         $transport = new ReconnectingTransport();
-        $client = $this->clientRecordingErrors($transport, $errors, reconnect: false);
+        $client = $this->clientRecordingErrors($transport, $errors, reconnect: false, handlerFailuresFailOperations: true);
         $client->subscribe('px.poison', static function (): void {
             throw new \RuntimeException('poison handler');
         })->await();
@@ -2698,8 +2699,12 @@ final class ServiceTest extends TestCase
      *
      * @param list<string> $errors
      */
-    private function clientRecordingErrors(TransportInterface $transport, array &$errors, bool $reconnect = true): NatsClient
-    {
+    private function clientRecordingErrors(
+        TransportInterface $transport,
+        array &$errors,
+        bool $reconnect = true,
+        bool $handlerFailuresFailOperations = false,
+    ): NatsClient {
         $client = new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: $reconnect,
@@ -2709,6 +2714,7 @@ final class ServiceTest extends TestCase
             errorListener: static function (\Throwable $error) use (&$errors): void {
                 $errors[] = $error->getMessage();
             },
+            handlerErrorsFailOperations: $handlerFailuresFailOperations,
         ), $transport);
         $this->opened[] = $client;
         $client->connect()->await();

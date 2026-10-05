@@ -364,22 +364,24 @@ final class SlowConsumerErrorPolicyTest extends TestCase
     public static function readsCallingAHandler(): iterable
     {
         yield "a request's read" => ['request'];
+        yield "a request's read, with handlerErrorsFailOperations" => ['request failing'];
         yield "the heartbeat's read" => ['heartbeat'];
     }
 
     /**
      * An overflow a handler lets escape - here the one its own poll of a SubscriptionQueue threw - is that
      * handler's failure, not an overflow of the subscription being delivered, and is treated like any other
-     * exception from a handler: it fails the request whose read called the handler, without being reported
-     * on top, and the heartbeat reports it once. A request used to take it for a new overflow and report it,
-     * after the handler had already been given it.
+     * exception from a handler: the request whose read called the handler reports it once and gets its reply,
+     * as the heartbeat reports it, and with handlerErrorsFailOperations it fails that request without being
+     * reported on top. A request used to take it for a new overflow and report it, after the handler had already
+     * been given it.
      */
     #[DataProvider('readsCallingAHandler')]
     public function testAnOverflowEscapingAHandlerIsThatHandlersFailure(string $read): void
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $client = $this->errorPolicyClient($transport, $recorder);
+        $client = $this->errorPolicyClient($transport, $recorder, handlerFailuresFailOperations: $read === 'request failing');
         $queue = $client->subscribeQueue('jobs')->await();
         $trigger = $client->subscribe('trigger', static function () use ($queue, $transport): void {
             // Three jobs in the poll's read; the queue's subscription holds two. Nothing here catches the
@@ -404,6 +406,13 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'svc' && $replyTo !== null
             ? [ReconnectingTransport::msgFrame('trigger', $trigger, 'go') . implode('', $transport->replyFrame($replyTo, 'pong'))]
             : [];
+
+        if ($read === 'request') {
+            self::assertSame('pong', $client->request('svc', 'ping')->await()->payload);
+            self::assertSame(['Subscription queue overflow for sid ' . $queue->sid], $recorder->errorsContaining('overflow'));
+
+            return;
+        }
 
         try {
             $client->request('svc', 'ping')->await();
@@ -1242,6 +1251,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         int $requestTimeoutMs = 2_000,
         int $maxPending = 2,
         bool $reconnect = true,
+        bool $handlerFailuresFailOperations = false,
     ): NatsClient {
         $client = new NatsClient(
             new NatsOptions(
@@ -1253,6 +1263,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                 maxPendingMessagesPerSubscription: $maxPending,
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
                 slowConsumerErrorsFailOperations: $failOperations,
+                handlerErrorsFailOperations: $handlerFailuresFailOperations,
             ),
             $transport,
         );

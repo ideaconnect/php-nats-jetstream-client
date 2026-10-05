@@ -15,6 +15,44 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- A subscription handler that throws while an operation's read delivers to it no longer fails that operation:
+  the exception is passed to the error listener and logged at error level, and the operation completes. With
+  no `errorListener` and no logger it is visible nowhere: register an `errorListener`, or set
+  `handlerErrorsFailOperations: true` to have operations fail as before. Code that caught another
+  subscription's handler exception from `request()`, a JetStream call or a `SubscriptionQueue` poll now gets
+  the operation's result instead. `processIncoming()` and `readIncoming()` still throw it.
+
+### Added
+
+- `[feature]` `NatsOptions::$handlerErrorsFailOperations` (default `false`): set `true` to keep the behavior
+  from before the change below, where a subscription handler that throws fails whichever operation's read
+  delivered to it. `Service::run()` and the background reads report it either way.
+
+### Changed
+
+- `[bugfix]` An operation that reads the socket while it waits for a result of its own no longer fails with
+  another subscription's handler exception (#173). It used to throw the exception of whichever handler its
+  read delivered to, even when its own result had arrived: a `request()` made inside a service endpoint failed
+  with it, so the endpoint answered its requester with a `HANDLER_ERROR` reply and kept the other handler's
+  message as its `last_error`; a JetStream publish could fail after the server had stored the message, so a
+  retry stored it twice; and the messages behind the failing one waited for another read. A handler that threw
+  a `CancelledException` made a `request()` take it for the end of its own wait: the request read on with its
+  reply left undelivered and timed out. Now the failure is reported through the error listener, logged at
+  error level, the rest of the read is delivered, and the operation completes. This covers `request()`,
+  `requestMany()` and what is built on them (JetStream publish, `ackSync()`, stream and consumer management,
+  Key/Value and Object Store calls), `flush()`, `rtt()`, `fetchBatch()`/`fetchNext()`, `directGetBatch()`,
+  pull consumers (`consumePipelined()`), Key/Value `keys()` and `history()`, and `SubscriptionQueue` polling,
+  as well as a request waiting for its reply inbox to be confirmed. A handler of the operation's own
+  subscription that throws still fails it, and `processIncoming()` / `readIncoming()`, the reads an
+  application makes itself, still throw. An `-ERR` the server keeps the connection open for still fails the
+  operation whose read meets it: it names no subscription, and it is often the answer to what the operation
+  itself sent. `handlerErrorsFailOperations` restores the old behavior. The README's new Handler Failures
+  section describes the whole behavior.
+
 ## [2.10.3] - 2026-10-05
 
 ### Upgrade notes
