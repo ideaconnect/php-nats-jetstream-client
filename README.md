@@ -1219,9 +1219,9 @@ $serviceClient->disconnect()->await();
 // $service->run(timeoutSeconds: 30.0)->await();
 ```
 
-Services expose runtime helpers: `statsSnapshot()` returns the current `io.nats.micro.v1.stats_response` array (per-endpoint `num_requests` / `num_errors` / `last_error` / `processing_time` / `average_processing_time`), `reset()` zeroes those counters, and `withRequestValidator()` enables opt-in per-request validation for endpoints declared with a `schema`. The validator receives the message and the endpoint schema and returns `null` to accept or a string rejection reason (which becomes a `VALIDATION_ERROR` error reply).
+Services expose runtime helpers: `statsSnapshot()` returns the current `io.nats.micro.v1.stats_response` array (per-endpoint `num_requests` / `num_errors` / `last_error` / `processing_time` / `average_processing_time`), `reset()` zeroes those counters, and `withRequestValidator()` enables opt-in per-request validation for endpoints declared with a `schema`. The validator receives the message and the endpoint schema and returns `null` to accept or a string rejection reason (which becomes a `VALIDATION_ERROR` error reply). A validator that throws is answered like a handler that throws: the requester gets a `HANDLER_ERROR` reply without the exception's text, which the endpoint keeps as its `last_error` and counts in `num_errors` (a `ServiceError` it throws is sent as chosen).
 
-_Verified by: [ServiceTest](tests/Unit/ServiceTest.php) (`testStatsIncludeDetailedMetrics`, `testResetClearsStats`, `testRequestValidatorCanRejectRequests`)._
+_Verified by: [ServiceTest](tests/Unit/ServiceTest.php) (`testStatsIncludeDetailedMetrics`, `testResetClearsStats`, `testRequestValidatorCanRejectRequests`, `testRequestValidatorThatThrowsIsAnsweredLikeAHandlerThatThrows`, `testRequestValidatorThatThrowsAServiceErrorGetsTheReplyItChose`)._
 
 ```php
 <?php

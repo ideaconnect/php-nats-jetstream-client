@@ -848,6 +848,76 @@ final class ServiceTest extends TestCase
     }
 
     /**
+     * A request validator that throws is answered like a handler that throws: the endpoint counts the error and
+     * keeps the exception's text as its last error, its observers see request_error (HANDLER_ERROR) and
+     * request_end, and the requester gets a HANDLER_ERROR 500 reply without that text. The exception used to
+     * escape the endpoint into the read that delivered the request: no reply, no error counted, and the read
+     * failed with it.
+     */
+    public function testRequestValidatorThatThrowsIsAnsweredLikeAHandlerThatThrows(): void
+    {
+        $transport = new FakeTransport([...$this->infoAndPong(), "MSG svc.v 13 _INBOX.req 2\r\n{}\r\n"]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $events = [];
+        $handled = false;
+        $service = $client->service('val', '1.0.0')
+            ->withRequestValidator(static function (): ?string {
+                throw new \RuntimeException('validator broke');
+            })
+            ->addObserver(static function (string $event, ServiceEndpoint $endpoint, NatsMessage $message, array $context) use (&$events): void {
+                $events[] = $event === 'request_error' ? $event . ':' . $context['code'] : $event;
+            })
+            ->addEndpoint('v', 'svc.v', static function () use (&$handled): string {
+                $handled = true;
+
+                return 'ok';
+            }, schema: ['type' => 'object']);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        self::assertFalse($handled, 'the handler did not run');
+        self::assertSame(['request_start', 'request_error:HANDLER_ERROR', 'request_end'], $events);
+        $endpoint = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $endpoint['num_requests'] ?? null);
+        self::assertSame(1, $endpoint['num_errors'] ?? null);
+        self::assertSame('validator broke', $endpoint['last_error'] ?? null);
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('HPUB _INBOX.req ', $writes);
+        self::assertStringContainsString('Nats-Service-Error-Code:500', $writes);
+        self::assertStringContainsString('"code":"HANDLER_ERROR"', $writes);
+        self::assertStringNotContainsString('validator broke', $writes, 'the exception text stays server-side');
+    }
+
+    /**
+     * A request validator that throws a ServiceError gets the reply it chose, as a handler that throws one does.
+     */
+    public function testRequestValidatorThatThrowsAServiceErrorGetsTheReplyItChose(): void
+    {
+        $transport = new FakeTransport([...$this->infoAndPong(), "MSG svc.v 13 _INBOX.req 2\r\n{}\r\n"]);
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client->connect()->await();
+
+        $service = $client->service('val', '1.0.0')
+            ->withRequestValidator(static function (): ?string {
+                throw new \IDCT\NATS\Services\ServiceError(503, 'schema registry unavailable');
+            })
+            ->addEndpoint('v', 'svc.v', static fn(NatsMessage $message): string => 'ok', schema: ['type' => 'object']);
+        $service->start()->await();
+
+        $client->processIncoming()->await();
+
+        $writes = implode('', $transport->writes);
+        self::assertStringContainsString('Nats-Service-Error-Code:503', $writes);
+        self::assertStringContainsString('Nats-Service-Error:schema registry unavailable', $writes);
+        $endpoint = $service->statsSnapshot()['endpoints'][0] ?? [];
+        self::assertSame(1, $endpoint['num_errors'] ?? null);
+        self::assertSame('schema registry unavailable', $endpoint['last_error'] ?? null);
+    }
+
+    /**
      * Verifies observers receive request lifecycle events and correlation metadata.
      */
     public function testObserversReceiveLifecycleEvents(): void

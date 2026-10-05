@@ -160,6 +160,10 @@ final class Service
     /**
      * Enables opt-in request validation for endpoints with a declared schema.
      *
+     * The validator returns null to accept a request, or the reason it rejects it, sent as a VALIDATION_ERROR
+     * reply. A validator that throws is answered like a handler that throws: a HANDLER_ERROR reply that keeps
+     * the exception's text to the endpoint's stats (or, for a ServiceError, the reply it chose).
+     *
      * @param callable(NatsMessage,array<string,mixed>):(null|string) $validator
      */
     public function withRequestValidator(callable $validator): self
@@ -229,8 +233,19 @@ final class Service
 
                             $this->notifyObservers('request_start', $endpoint, $message, $resolveContext);
 
+                            $validatorFailure = null;
                             if ($endpoint->schema !== null && $this->requestValidator !== null) {
-                                $validationError = ($this->requestValidator)($message, $endpoint->schema);
+                                try {
+                                    $validationError = ($this->requestValidator)($message, $endpoint->schema);
+                                } catch (\Throwable $e) {
+                                    // A validator that throws has not rejected the request, it has failed: the
+                                    // request is answered as when the handler throws, below. The exception used to
+                                    // escape into the read that delivered the request, so the requester got no
+                                    // reply and no error was counted.
+                                    $validationError = null;
+                                    $validatorFailure = $e;
+                                }
+
                                 if ($validationError !== null) {
                                     $duration = (int) max(0, hrtime(true) - $started);
                                     $endpoint->errors++;
@@ -274,11 +289,16 @@ final class Service
                             $errorHeaders = null;
 
                             try {
+                                if ($validatorFailure !== null) {
+                                    // Handled by the catches below, which answer a handler's failure.
+                                    throw $validatorFailure;
+                                }
+
                                 $response = ($this->handlers[$subject])($message);
                             } catch (ServiceError $serviceError) {
-                                // The handler explicitly chose to fail with a custom code/description
-                                // (and optional body). Honor it verbatim - this is a deliberate error
-                                // reply, not an internal fault, so the chosen detail IS sent to the caller.
+                                // The handler (or the request validator) explicitly chose to fail with a custom
+                                // code/description (and optional body). Honor it verbatim - this is a deliberate
+                                // error reply, not an internal fault, so the chosen detail IS sent to the caller.
                                 $endpoint->errors++;
                                 $endpoint->lastError = $serviceError->description;
                                 $this->notifyObservers('request_error', $endpoint, $message, $resolveContext, [

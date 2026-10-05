@@ -102,6 +102,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[bugfix]` A service's `drain()` swallowed what its flush met, such as another subscription's handler that
   threw, and returned before the `PONG` that confirms the server has processed the `UNSUB`s. The flush now
   reports it to the error listener and reads on to that `PONG`.
+- `[bugfix]` A service endpoint's request validator that threw escaped the endpoint into the read that
+  delivered the request: the requester got no reply, the endpoint counted no error, and the read failed with
+  the exception, which a service's `run()` swallowed. Such a validator is now answered like a handler that
+  throws: a `HANDLER_ERROR` reply without the exception's text, an error counted with the text as
+  `last_error`, and `request_error` and `request_end` for the observers. A `ServiceError` it throws is sent as
+  chosen, as a handler's is.
 
 ## [2.10.2] - 2026-10-04
 
