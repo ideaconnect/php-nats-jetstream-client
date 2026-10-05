@@ -17,6 +17,7 @@ use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
+use IDCT\NATS\Tests\Support\OperationsThatRead;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
@@ -44,6 +45,7 @@ use function Amp\delay;
  */
 final class SlowConsumerErrorPolicyTest extends TestCase
 {
+    use OperationsThatRead;
     use ReconnectScenarios;
 
     protected function tearDown(): void
@@ -226,24 +228,6 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         self::assertSame(['m1', 'm2', 'm3', 'm4'], $subscriber->payloads, 'the message that overflowed was dropped');
     }
 
-    /** @return iterable<string, array{string}> */
-    public static function operationsThatRead(): iterable
-    {
-        yield 'request()' => ['request'];
-        yield 'requestMany()' => ['requestMany'];
-        yield 'flush()' => ['flush'];
-        yield 'rtt()' => ['rtt'];
-        yield 'JetStream fetchBatch()' => ['fetchBatch'];
-        yield 'JetStream directGetBatch()' => ['directGetBatch'];
-        yield 'JetStream pull consumer' => ['pullConsumer'];
-        yield 'Key/Value keys()' => ['keys'];
-        yield 'Key/Value history()' => ['history'];
-        yield 'SubscriptionQueue::fetch()' => ['queueFetch'];
-        yield 'SubscriptionQueue::next()' => ['queueNext'];
-        yield 'SubscriptionQueue::next() with a timeout' => ['queueNextWithTimeout'];
-        yield 'SubscriptionQueue::fetchAll()' => ['queueFetchAll'];
-    }
-
     /**
      * Every operation, with each kind of overflow: a subscription's own queue, and a SubscriptionQueue's
      * polling buffer.
@@ -270,7 +254,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $recorder = new LifecycleRecorder();
         $client = $this->errorPolicyClient($transport, $recorder);
         [$overflow, $sid] = $this->overflow($kind, $client, $transport);
-        [$run, $expected] = $this->prepare($operation, $client, $transport, $overflow);
+        [$run, $expected] = $this->prepareOperation($operation, $client, $transport, $overflow);
 
         self::assertSame($expected, $run());
         self::assertSame(['Subscription queue overflow for sid ' . $sid], $recorder->errorsContaining('overflow'));
@@ -288,7 +272,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $recorder = new LifecycleRecorder();
         $client = $this->errorPolicyClient($transport, $recorder, failOperations: true);
         [$overflow, $sid] = $this->overflow($kind, $client, $transport);
-        [$run] = $this->prepare($operation, $client, $transport, $overflow);
+        [$run] = $this->prepareOperation($operation, $client, $transport, $overflow);
 
         try {
             $run();
@@ -876,7 +860,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
             $this->opened[] = $client;
             $client->connect()->await();
             [$overflow, $sid] = $this->overflow('polling buffer', $client, $transport);
-            [$run, $expected] = $this->prepare('request', $client, $transport, $overflow);
+            [$run, $expected] = $this->prepareOperation('request', $client, $transport, $overflow);
 
             self::assertSame($expected, $run(), $loggerKind);
             self::assertSame(['Subscription queue overflow for sid ' . $sid], $recorder->errorsContaining('overflow'), $loggerKind);
@@ -1250,119 +1234,6 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         self::assertSame(['Subscription queue overflow for sid ' . $other], $recorder->errorsContaining('overflow'));
     }
 
-    /**
-     * Scripts the server so that the read bringing $operation its result also brings $overflow, and returns
-     * the operation - run to its result - with the result expected.
-     *
-     * @return array{\Closure(): mixed, mixed}
-     */
-    private function prepare(string $operation, NatsClient $client, ReconnectingTransport $transport, string $overflow): array
-    {
-        switch ($operation) {
-            case 'request':
-            case 'requestMany':
-                $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'svc' && $replyTo !== null
-                    ? [$overflow . implode('', $transport->replyFrame($replyTo, 'pong'))]
-                    : [];
-
-                return $operation === 'request'
-                    ? [static fn(): string => $client->request('svc', 'ping')->await()->payload, 'pong']
-                    : [static fn(): array => self::payloads($client->requestMany('svc', 'ping', maxResponses: 1)->await()), ['pong']];
-            case 'flush':
-            case 'rtt':
-                $transport->answerPings = false;
-                $transport->afterWrite = static function (string $bytes) use ($transport, $overflow): void {
-                    if ($bytes === "PING\r\n") {
-                        $transport->afterWrite = null;
-                        $transport->pushFrame($overflow . "PONG\r\n");
-                    }
-                };
-
-                return [static function () use ($client, $operation): string {
-                    if ($operation === 'flush') {
-                        $client->flush()->await();
-                    } else {
-                        $client->rtt()->await();
-                    }
-
-                    return 'answered';
-                }, 'answered'];
-            case 'fetchBatch':
-            case 'directGetBatch':
-            case 'pullConsumer':
-                $request = match ($operation) {
-                    'fetchBatch' => '$JS.API.CONSUMER.MSG.NEXT.ORDERS.worker',
-                    'directGetBatch' => '$JS.API.DIRECT.GET.ORDERS',
-                    default => '$JS.API.CONSUMER.MSG.NEXT.ORDERS.pipeline',
-                };
-                $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $overflow, $request, $operation): array {
-                    $sid = $replyTo === null ? null : $transport->sidFor($replyTo);
-                    if ($subject !== $request || $replyTo === null || $sid === null) {
-                        return [];
-                    }
-
-                    $message = $operation === 'directGetBatch'
-                        ? ReconnectingTransport::hmsgFrame($replyTo, $sid, "NATS/1.0\r\nNats-Subject: orders.created\r\nNats-Sequence: 1\r\nNats-Num-Pending: 0\r\n\r\n", 'order-1')
-                        : ReconnectingTransport::msgFrame('orders.created', $sid, 'order-1', '$JS.ACK.ORDERS.worker.1.1.1.0.0');
-
-                    return [$overflow . $message];
-                };
-
-                return match ($operation) {
-                    'fetchBatch' => [static fn(): array => self::payloads($client->jetStream()->fetchBatch('ORDERS', 'worker', 1, 1_000)->await()), ['order-1']],
-                    'directGetBatch' => [static fn(): array => self::payloads($client->jetStream()->directGetBatch('ORDERS', ['batch' => 1], 1_000)->await()), ['order-1']],
-                    default => [static function () use ($client): array {
-                        $received = new class {
-                            /** @var list<string> */
-                            public array $payloads = [];
-                        };
-                        $client->jetStream()->pullConsumer('ORDERS', 'pipeline')->setBatching(1)->setIterations(1)
-                            ->handle(static function (NatsMessage $message) use ($received): void {
-                                $received->payloads[] = $message->payload;
-                            })->await();
-
-                        return $received->payloads;
-                    }, ['order-1']],
-                };
-            case 'keys':
-            case 'history':
-                $consumer = $operation === 'keys' ? 'KEYS' : 'HIST';
-                $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => str_starts_with($subject, '$JS.API.CONSUMER.CREATE.') && $replyTo !== null
-                    ? $transport->replyFrame($replyTo, sprintf('{"stream_name":"KV_cfg","name":"%s","num_pending":1,"config":{"ack_policy":"none"}}', $consumer))
-                    : [];
-                // The replayed record, with the overflow, once the consumer's deliver subscription is there.
-                $transport->afterWrite = static function (string $bytes) use ($transport, $overflow, $operation, $consumer): void {
-                    if (preg_match('/^SUB _INBOX\.KV\.\S+ (\d+)\r\n$/', $bytes, $sub) !== 1) {
-                        return;
-                    }
-
-                    $transport->afterWrite = null;
-                    $ack = '$JS.ACK.KV_cfg.' . $consumer . '.1.4.1.0.0';
-                    $record = $operation === 'keys'
-                        ? ReconnectingTransport::hmsgFrame('$KV.cfg.email', (int) $sub[1], "NATS/1.0\r\nNats-Sequence: 4\r\n\r\n", '', $ack)
-                        : ReconnectingTransport::msgFrame('$KV.cfg.theme', (int) $sub[1], 'blue', $ack);
-                    $transport->pushFrame($overflow . $record);
-                };
-
-                return $operation === 'keys'
-                    ? [static fn(): array => $client->jetStream()->keyValue('cfg')->keys()->await(), ['email']]
-                    : [static fn(): array => array_map(
-                        static fn($entry): ?string => $entry->value,
-                        $client->jetStream()->keyValue('cfg')->history('theme')->await(),
-                    ), ['blue']];
-            default:
-                $queue = $client->subscribeQueue('jobs')->await();
-                $transport->pushFrame($overflow . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j1'));
-
-                return match ($operation) {
-                    'queueFetch' => [static fn(): ?string => $queue->fetch()?->payload, 'j1'],
-                    'queueNext' => [static fn(): ?string => $queue->next()?->payload, 'j1'],
-                    'queueNextWithTimeout' => [static fn(): ?string => $queue->setTimeout(1.0)->next()?->payload, 'j1'],
-                    default => [static fn(): array => self::payloads($queue->fetchAll(1)), ['j1']],
-                };
-        }
-    }
-
     /** A client whose subscriptions hold at most two messages (or $maxPending), under SlowConsumerPolicy::Error. */
     private function errorPolicyClient(
         ReconnectingTransport $transport,
@@ -1457,15 +1328,6 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         return ReconnectingTransport::msgFrame('other', $sid, 'o1')
             . ReconnectingTransport::msgFrame('other', $sid, 'o2')
             . ReconnectingTransport::msgFrame('other', $sid, 'o3');
-    }
-
-    /**
-     * @param list<NatsMessage> $messages
-     * @return list<string>
-     */
-    private static function payloads(array $messages): array
-    {
-        return array_map(static fn(NatsMessage $message): string => $message->payload, $messages);
     }
 
     /** A connection whose subscriptions hold at most three messages, under SlowConsumerPolicy::Error. */
