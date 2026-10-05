@@ -23,14 +23,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   the exception is passed to the error listener and logged at error level, and the operation completes. With
   no `errorListener` and no logger it is visible nowhere: register an `errorListener`, or set
   `handlerErrorsFailOperations: true` to have operations fail as before. Code that caught another
-  subscription's handler exception from `request()`, a JetStream call or a `SubscriptionQueue` poll now gets
-  the operation's result instead. `processIncoming()` and `readIncoming()` still throw it.
+  subscription's handler exception from `request()`, `flush()`, `rtt()`, a JetStream call or a
+  `SubscriptionQueue` poll now gets the operation's result instead. `processIncoming()` and `readIncoming()`
+  still throw it.
 
 ### Added
 
 - `[feature]` `NatsOptions::$handlerErrorsFailOperations` (default `false`): set `true` to keep the behavior
   from before the change below, where a subscription handler that throws fails whichever operation's read
-  delivered to it. `Service::run()` and the background reads report it either way.
+  delivered to it, and a handler's `CancelledException` can end an operation's wait early. `Service::run()`
+  and the background reads report it either way.
 
 ### Changed
 

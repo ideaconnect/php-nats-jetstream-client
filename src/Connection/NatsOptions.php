@@ -140,8 +140,9 @@ final class NatsOptions
       *        longer fails with it, so the endpoint no longer answers with a HANDLER_ERROR for it. A handler
       *        of the operation's own subscription that throws still fails it. Set `true` for the behavior
       *        before this option existed: any handler's exception fails the operation whose read delivered
-      *        to it, even a request whose reply had already arrived. processIncoming() and readIncoming()
-      *        throw a handler's exception either way. Service::run(), the heartbeat, a reconnect and
+      *        to it, even a request whose reply had already arrived, and a handler's CancelledException can
+      *        end an operation's wait early, as it did then. processIncoming() and readIncoming() throw a
+      *        handler's exception either way. Service::run(), the heartbeat, a reconnect and
       *        drain()/drainSubscription() report it either way.
      */
     public function __construct(
