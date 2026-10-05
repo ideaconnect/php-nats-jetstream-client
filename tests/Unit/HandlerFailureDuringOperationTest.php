@@ -199,8 +199,8 @@ final class HandlerFailureDuringOperationTest extends TestCase
     /** @return iterable<string, array{\Throwable, bool}> */
     public static function handlerFailuresAndWhoseSubscription(): iterable
     {
-        yield "an exception, in the operation's own subscription" => [new \RuntimeException('own handler'), true];
-        yield 'an exception, in another subscription' => [new \RuntimeException('own handler'), false];
+        yield "an exception, in the operation's own subscription" => [new \RuntimeException('failing handler'), true];
+        yield 'an exception, in another subscription' => [new \RuntimeException('failing handler'), false];
         yield "an overflow it lets escape, in the operation's own subscription" => [new SlowConsumerException(999), true];
         yield 'an overflow it lets escape, in another subscription' => [new SlowConsumerException(999), false];
     }
