@@ -345,6 +345,10 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $client = $this->errorPolicyClient($transport, $recorder);
         $queue = $this->fullQueue($client, $transport);
         $later = $this->recordingSubscription($client, 'updates');
+        // The reply inbox is in place first, so that the request below writes only its PUB: setting the inbox up
+        // also writes a PING, whose PONG would come ahead of the reply and be all your loop's one read gets.
+        $transport->responder = static fn(string $subject, ?string $replyTo): array => $replyTo === null ? [] : $transport->replyFrame($replyTo, 'ready');
+        self::assertSame('ready', $client->request('warm.up', '', 1_000)->await()->payload);
         $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'svc' && $replyTo !== null
             ? [
                 ReconnectingTransport::msgFrame('backlog', $queue->sid, 'b3')

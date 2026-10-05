@@ -142,7 +142,8 @@ final class NatsConnection
      * until the first request establishes it. One long-lived wildcard subscription "<base>.*" serves
      * EVERY request()/requestMany() reply instead of a fresh inbox + SUB/UNSUB per request (#118).
      * Retained across reconnect; cleared by releaseRuntimeState(), so a fresh connect() starts a new
-     * random base, when the server rejects the subscription (#167), and when its set-up fails.
+     * random base, when the server rejects the subscription (#167, {@see dropUnconfirmedMux()}), and when
+     * its set-up fails.
      */
     private ?string $muxBase = null;
     /**
@@ -181,6 +182,41 @@ final class NatsConnection
      */
     private ?Future $muxInboxSetup = null;
     /**
+     * Whether the server is known to hold the mux subscription: the PONG of the PING written right behind its
+     * SUB has arrived ({@see $muxFence}), or something was delivered on it. Reset whenever its SUB is written,
+     * by a first request or by a reconnect's replay. Until then a 'maximum subscriptions exceeded' -ERR, which
+     * names no subject, may be the one rejecting that SUB, and the client drops the mux rather than trust it
+     * ({@see dropUnconfirmedMux()}); once the mux is confirmed, such an -ERR is another SUB's.
+     */
+    private bool $muxConfirmed = false;
+    /**
+     * The pong slot of the PING written in the same write as the mux SUB, right behind it. The server answers
+     * a SUB it rejects with an -ERR ahead of that PING's PONG, so the PONG confirms the mux. Null once it has
+     * arrived, or once the mux it was written for is gone.
+     *
+     * @var DeferredFuture<null>|null
+     */
+    private ?DeferredFuture $muxFence = null;
+    /**
+     * Bumped whenever the client drops the mux subscription ({@see dropUnconfirmedMux()}), so that a request
+     * waiting on the dropped one, or about to be sent on it, fails fast instead of waiting out its timeout.
+     */
+    private int $muxGeneration = 0;
+    /**
+     * Set when the client drops the mux subscription, cleared once a mux is confirmed: meanwhile a request
+     * waits for the mux it is about to be sent on to be confirmed, so that while the server keeps rejecting
+     * the SUB, requests fail without being sent.
+     */
+    private bool $awaitMuxFence = false;
+    /**
+     * Sids of dropped mux subscriptions, unsubscribed in the write that subscribes the next one: when the
+     * -ERR was another SUB's after all, the server still holds the dropped one, and the UNSUB frees its slot
+     * before the new SUB is counted. The server ignores an UNSUB for a sid it does not hold.
+     *
+     * @var list<int>
+     */
+    private array $muxSidsToRelease = [];
+    /**
      * Counts terminal closes ({@see releaseRuntimeState()}), so that a request that was setting the mux up when
      * one happened reports the closed connection, even when a connect() has opened a new one since.
      */
@@ -207,8 +243,9 @@ final class NatsConnection
     private ?string $pingTimerId = null;
     /**
      * FIFO pong-correlation queue (#117, nats.go `nc.pongs` parity): every outbound PING except
-     * the connect handshake's enqueues one slot, and the PONG handler completes the OLDEST slot -
-     * TCP delivers PONGs in PING order, so head-of-queue is exactly the PING this PONG answers.
+     * the connect handshake's enqueues one slot, in the step that hands the PING to the transport
+     * ({@see enqueuePongSlot()}), and the PONG handler completes the OLDEST slot - TCP delivers
+     * PONGs in PING order, so head-of-queue is exactly the PING this PONG answers.
      * Heartbeat PINGs enqueue a slot nobody awaits purely to hold their queue position; a
      * timed-out flush leaves its slot queued because its PONG is still owed and must consume that
      * slot (not a later waiter's) when it arrives. Epoch ends - the reconnect handshake and every
@@ -1155,8 +1192,10 @@ final class NatsConnection
         // A fresh connect() may target an account/server that permits the reply-inbox wildcard, so a
         // terminal close clears the rejection latch and lets ensureMuxInbox() re-attempt the mux (#167).
         $this->muxRejected = false;
-        // No set-up still under way for this connection is left for a request on the next one to join (it
-        // fails with the closed connection).
+        // The next connection's first mux starts afresh too: nothing to release, no fence to wait for, and no
+        // set-up still under way for this one to join (it fails with the closed connection).
+        $this->awaitMuxFence = false;
+        $this->muxSidsToRelease = [];
         $this->muxInboxSetup = null;
         $this->terminalCloses++;
         $this->unboundedSids = [];
@@ -1220,11 +1259,29 @@ final class NatsConnection
      * (its socket close then errors the abandoned write out), flush() times out - while the
      * fiber's late outcome is ignored. Only bounded-time contracts (drain, flush) pay the extra
      * fiber; hot paths keep the direct single-fiber write.
+     *
+     * @param DeferredFuture<null>|null $pongSlot The pong slot of the PING that $bytes end with ({@see newPongSlot()}).
+     *        The writer queues it right before it hands the bytes to the transport, so that its place in the queue is
+     *        its PING's place on the wire ({@see enqueuePongSlot()}). A writer that runs after the caller stopped
+     *        waiting still queues it with its PING, whose PONG is then owed to it; a write that fails takes it out
+     *        again, since its PING never reached the wire.
      */
-    private function writeBounded(string $bytes, Cancellation $cancellation): void
+    private function writeBounded(string $bytes, Cancellation $cancellation, ?DeferredFuture $pongSlot = null): void
     {
-        $write = async(function () use ($bytes): void {
-            $this->transport->write($bytes)->await();
+        $write = async(function () use ($bytes, $pongSlot): void {
+            if ($pongSlot !== null) {
+                $this->pongWaiters[] = $pongSlot;
+            }
+
+            try {
+                $this->transport->write($bytes)->await();
+            } catch (\Throwable $writeError) {
+                if ($pongSlot !== null) {
+                    $this->discardPongSlot($pongSlot);
+                }
+
+                throw $writeError;
+            }
         });
         $write->ignore();
         $write->await($cancellation);
@@ -1421,21 +1478,13 @@ final class NatsConnection
             // pong slot pairs this PING with ITS pong (#117): a stale PONG answering an earlier
             // heartbeat PING (whose bounded self-read timed out without consuming it) completes
             // that older slot instead of ending this flush early - ending early would close the
-            // socket with in-flight MSGs unread, silent loss on the documented lossless path.
-            $flushSlot = $this->enqueuePongSlot();
-            try {
-                $this->writeBounded($this->codec->encodePing(), $this->remainingBudgetCancellation($drainDeadline));
-            } catch (CancelledException $wedged) {
-                // The PING write wedged past the deadline but its bytes may still reach the wire
-                // when the queue drains (or die with drain()'s socket close); either way the
-                // epoch teardown clears the slot, so leaving it queued stays FIFO-correct.
-                throw $wedged;
-            } catch (\Throwable $writeError) {
-                // The PING never hit the wire: drop its slot so correlation stays aligned.
-                $this->discardPongSlot($flushSlot);
-
-                throw $writeError;
-            }
+            // socket with in-flight MSGs unread, silent loss on the documented lossless path. The
+            // writer queues the slot as it writes the PING. A write that wedged past the deadline
+            // leaves it queued, since its bytes may still reach the wire when the queue drains (or
+            // die with drain()'s socket close), and the epoch teardown clears it; a failed write,
+            // whose PING never hit the wire, takes it out again.
+            $flushSlot = $this->newPongSlot();
+            $this->writeBounded($this->codec->encodePing(), $this->remainingBudgetCancellation($drainDeadline), $flushSlot);
 
             // Read until the server's PONG for THIS ping confirms the flush (handleFrame completes
             // the slot, or a concurrent teardown errors it - drain()'s close-and-clean-up is right
@@ -1969,6 +2018,8 @@ final class NatsConnection
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the subscribe.
      * @param (\Closure(int): void)|null $registered Called with the sid once the subscription is registered, before
      *        its SUB is written, so that whichever fiber reads the server's answer to the SUB finds what it records.
+     * @param string $before Frames written ahead of the SUB, in the same write.
+     * @param string $after Frames written right behind the SUB, in the same write.
      */
     private function subscribeInternal(
         string $subject,
@@ -1976,6 +2027,8 @@ final class NatsConnection
         ?string $queue,
         ?\Fiber $caller,
         ?\Closure $registered = null,
+        string $before = '',
+        string $after = '',
     ): int {
         if ($this->state !== ConnectionState::Open) {
             try {
@@ -2001,7 +2054,7 @@ final class NatsConnection
 
         $generation = $this->connectionGeneration;
         try {
-            $this->transport->write($this->codec->encodeSubscribe($subject, $sid, $queue))->await();
+            $this->transport->write($before . $this->codec->encodeSubscribe($subject, $sid, $queue) . $after)->await();
         } catch (\Throwable $writeError) {
             // The socket is dead. The subscription stays registered while the connection recovers, so the
             // reconnect subscribes it on the new connection; it is rolled back only when the connection does
@@ -2353,23 +2406,24 @@ final class NatsConnection
         // FIFO pong correlation (#117): completion of THIS slot means "the server processed
         // everything written before THIS flush's PING". A stale PONG answering an earlier
         // (heartbeat or timed-out) PING completes that PING's slot, never this one, and a
-        // concurrent flush timing out cannot release this waiter.
-        $slot = $this->enqueuePongSlot();
+        // concurrent flush timing out cannot release this waiter. The writer queues the slot as
+        // it writes the PING, so a PING another fiber writes meanwhile - the one behind the
+        // reply inbox's SUB, say - keeps its own PONG.
+        $slot = $this->newPongSlot();
         $generation = $this->connectionGeneration;
         try {
             // The WAIT is bounded (the write itself cannot be cancelled): flush() documents a
             // request-timeout bound, but a backpressure-suspended write held it forever before
             // the read phase's deadline could even start (#149's write-phase twin).
-            $this->writeBounded($this->codec->encodePing(), $this->remainingBudgetCancellation($deadline));
+            $this->writeBounded($this->codec->encodePing(), $this->remainingBudgetCancellation($deadline), $slot);
         } catch (CancelledException) {
             // Write wedged past the flush budget. The PING may still reach the wire whenever
             // the queue drains, so its slot deliberately STAYS queued (same rule as the
             // read-phase timeout below); epoch teardown clears it if the PONG never comes.
             throw new TimeoutException('Flush timed out writing PING (transport backpressure)');
         } catch (\Throwable $writeError) {
-            // The PING never hit the wire: drop its slot so correlation stays aligned with
-            // wire order (nats.go removePongFromList parity).
-            $this->discardPongSlot($slot);
+            // The PING never hit the wire, and the writer took its slot out again, so correlation
+            // stays aligned with wire order (nats.go removePongFromList parity).
 
             // The socket is dead. The connection recovers within this flush's budget, and the flush fails
             // anyway, as when its PONG dies with the socket: what it was to confirm went to the dead one.
@@ -2512,11 +2566,12 @@ final class NatsConnection
      *        nothing else would deliver it until the server sent more. Not for a flush: a handler it ran there
      *        could suspend while another fiber took the flush's PONG and started its next read, which the flush
      *        would then wait for until its deadline. A drain delivers that backlog itself.
-     * @param DeferredFuture<null>|null $pongSlot The pong slot of the flush this read is for. When it is complete
-     *        by the time the read would take the read slot, or wait for another fiber's read, the read returns
-     *        without reading. The flush checks its slot before each read, but the read runs on a fiber of its own,
-     *        and before that fiber starts another fiber's read can take the PONG and free the read slot: the read
-     *        then waited on a socket with nothing more to come until the flush's deadline.
+     * @param DeferredFuture<null>|null $pongSlot The pong slot this read is for: a flush's, or that of the PING behind
+     *        the mux SUB, which a request waits for ({@see awaitMuxConfirmation()}). When it is complete by the time
+     *        the read would take the read slot, or wait for another fiber's read, the read returns without reading.
+     *        The caller checks for its PONG before each read, but the read runs on a fiber of its own, and before
+     *        that fiber starts another fiber's read can take the PONG and free the read slot: the read then waited
+     *        on a socket with nothing more to come until the caller's deadline.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2554,7 +2609,7 @@ final class NatsConnection
                 $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
             }
 
-            // The flush's PONG is already in: another fiber's read took it after the flush last checked.
+            // The PONG this read is for is already in: another fiber's read took it after the caller last checked.
             if ($pongSlot?->isComplete() ?? false) {
                 return new IncomingChunkResult(0, false);
             }
@@ -2916,7 +2971,9 @@ final class NatsConnection
      * first requests write exactly one SUB even though the subscribe suspends (#118).
      *
      * The mux is recorded before its SUB is written, so whichever fiber reads the server's answer to the
-     * SUB knows it is the mux's (#167).
+     * SUB knows it is the mux's (#167, {@see dropUnconfirmedMux()}). The same write unsubscribes the muxes
+     * the client dropped before, and carries a PING right behind the SUB, whose PONG confirms the mux.
+     * Nothing waits for that PONG here.
      *
      * Precondition: the caller has checked state === Open (the subscribe re-checks it). A request that
      * joins another fiber's establishment waits for it only within $budget - its own deadline.
@@ -2938,12 +2995,19 @@ final class NatsConnection
         }
 
         $base = Inbox::generate($this->options->inboxPrefix);
+        $generation = $this->muxGeneration;
         $deferred = new DeferredFuture();
         $setup = $deferred->getFuture();
         $setup->ignore();
         $this->muxInboxSetup = $setup;
 
         try {
+            $release = '';
+            foreach ($this->muxSidsToRelease as $droppedSid) {
+                $release .= $this->codec->encodeUnsubscribe($droppedSid);
+            }
+            $this->muxSidsToRelease = [];
+
             // dispatchMuxReply is non-suspending, so it is safe to invoke inside drainPendingForSid()'s
             // dequeue loop. The handler lives in subscriptions[$muxSid] and persists across reconnect
             // (resubscribeAll replays only the SUB bytes; only releaseRuntimeState clears the handler).
@@ -2955,9 +3019,15 @@ final class NatsConnection
                 registered: function (int $sid) use ($base): void {
                     $this->muxBase = $base;
                     $this->muxSid = $sid;
+                    $this->muxConfirmed = false;
                     // Slow-consumer exemption: the mux queue must never drop a reply (breaks a request).
                     $this->unboundedSids[$sid] = true;
+                    // Queued in the step that hands its PING to the transport, as every PING's slot is, so that
+                    // whatever PINGs other fibers write, this slot completes on the PONG answering that PING.
+                    $this->muxFence = $this->enqueuePongSlot();
                 },
+                before: $release,
+                after: $this->codec->encodePing(),
             );
             $deferred->complete();
         } catch (\Throwable $e) {
@@ -2968,7 +3038,9 @@ final class NatsConnection
 
             // The reconnect a failed write started can also remove the registration, when its replay of the SUB
             // is rejected; the subscribe then reports a closed connection. Say what happened instead.
-            if ($this->muxRejected) {
+            if ($this->muxGeneration !== $generation) {
+                $e = $this->muxDroppedException($e);
+            } elseif ($this->muxRejected) {
                 $e = $this->muxRejectedException($e);
             }
 
@@ -2976,8 +3048,8 @@ final class NatsConnection
 
             throw $e;
         } finally {
-            // Cleared so a failed establishment retries on the next request - unless a terminal close already
-            // let a request on the next connection start its own.
+            // Cleared so a failed establishment retries on the next request - unless a terminal close or a drop
+            // of the mux already let another request start its own.
             if ($this->muxInboxSetup === $setup) {
                 $this->muxInboxSetup = null;
             }
@@ -2992,6 +3064,39 @@ final class NatsConnection
     {
         $this->muxSid = null;
         $this->muxBase = null;
+        $this->muxConfirmed = false;
+        $this->muxFence = null;
+    }
+
+    /** Records that the server holds the mux subscription ({@see $muxConfirmed}). */
+    private function confirmMux(): void
+    {
+        $this->muxConfirmed = true;
+        $this->awaitMuxFence = false;
+    }
+
+    /**
+     * Drops the mux subscription when a 'maximum subscriptions exceeded' -ERR arrives before the server is known
+     * to hold it ({@see $muxConfirmed}). That -ERR names no subject, but the server answers a SUB it rejects
+     * ahead of the PONG of the PING written behind it, and a rejected SUB delivers nothing, so until then the -ERR
+     * may be the mux's. Like the #167 latch, except that nothing is latched, since the limit is transient: the
+     * requests waiting on the mux fail fast, and the next request subscribes a new one, which it waits to see
+     * confirmed before it is sent.
+     *
+     * The mux is recorded before its SUB is written, so an -ERR for an earlier SUB that arrives while that write
+     * still waits behind earlier writes drops it as well: the window covers that wait plus one round trip.
+     */
+    private function dropUnconfirmedMux(int $sid): void
+    {
+        $this->dropSubscriptionState($sid);
+        $this->muxSidsToRelease[] = $sid;
+        $this->forgetMux();
+        $this->muxGeneration++;
+        $this->awaitMuxFence = true;
+        // A set-up whose write is still under way no longer sets a mux up: a request that joined it now would wait
+        // for a confirmation nothing is coming for. The next request subscribes a new mux instead, and its write
+        // follows the dropped one's on the socket, so the UNSUB in it comes after the dropped SUB.
+        $this->muxInboxSetup = null;
     }
 
     /**
@@ -3077,14 +3182,32 @@ final class NatsConnection
     }
 
     /**
+     * The error of a request whose mux reply-inbox subscription the client dropped because the server may have
+     * rejected it for the subscription limit ({@see dropUnconfirmedMux()}): no reply can come on it. Unlike the
+     * permissions rejection of {@see muxRejectedException()} this is not latched, since a slot can free up.
+     */
+    private function muxDroppedException(?\Throwable $previous = null): ConnectionException
+    {
+        return new ConnectionException(
+            'request/reply failed: the server may have rejected the shared reply-inbox subscription "'
+            . $this->options->inboxPrefix . '.<inbox>.*" because the connection is at its subscription limit '
+            . '(maximum subscriptions exceeded). The next request subscribes it again.',
+            0,
+            $previous,
+        );
+    }
+
+    /**
      * Throws when the mux subscription a request is about to be sent on is gone: released by a terminal close
-     * while it was being set up, or latched as rejected by permissions (#167).
+     * while it was being set up, latched as rejected by permissions (#167), or dropped because the server may
+     * have rejected it ({@see dropUnconfirmedMux()}).
      *
      * @param int $closes The {@see $terminalCloses} when the request began setting the mux up.
+     * @param int $generation The {@see $muxGeneration} then.
      *
      * @phpstan-impure Reads state that reads in other fibers change while the request is suspended.
      */
-    private function throwUnlessMuxInstalled(int $closes): void
+    private function throwUnlessMuxInstalled(int $closes, int $generation): void
     {
         if ($this->terminalCloses !== $closes) {
             throw new ConnectionException('Connection was closed while the reply inbox was being set up');
@@ -3092,6 +3215,48 @@ final class NatsConnection
 
         if ($this->muxRejected) {
             throw $this->muxRejectedException();
+        }
+
+        if ($this->muxGeneration !== $generation) {
+            throw $this->muxDroppedException();
+        }
+    }
+
+    /**
+     * Waits until the server is known to hold the mux subscription ({@see $muxConfirmed}), as a request does
+     * before it is sent on a mux subscribed after the client dropped one ({@see $awaitMuxFence}). It reads the
+     * way the request reads for its reply, except that its read returns without reading once the PONG that confirms
+     * the mux is in, whichever fiber's read took it. When the server rejects the SUB again, the mux is dropped and the
+     * request fails without being sent; when this read brought that -ERR, it is the previous exception instead
+     * of being thrown, so it fails the request once and is not reported on top.
+     *
+     * @throws CancelledException When $budget fires first.
+     */
+    private function awaitMuxConfirmation(Cancellation $budget, int $closes, int $generation): void
+    {
+        while (!$this->muxConfirmed) {
+            try {
+                $read = $this->readChunk(
+                    $budget,
+                    \Fiber::getCurrent(),
+                    reportOverflows: !$this->options->slowConsumerErrorsFailOperations,
+                    pongSlot: $this->muxFence,
+                )->await();
+            } catch (ConnectionException $readError) {
+                // The -ERR that dropped the mux becomes the previous exception of the dropped-inbox error, unless the
+                // connection ended meanwhile: then the read's own error says best why.
+                if ($this->terminalCloses === $closes && $this->muxGeneration !== $generation) {
+                    throw $this->muxDroppedException($readError);
+                }
+
+                throw $readError;
+            }
+
+            $this->throwUnlessMuxInstalled($closes, $generation);
+
+            if (!$read->consumedBytes) {
+                delay(0.001, cancellation: $budget);
+            }
         }
     }
 
@@ -3112,10 +3277,14 @@ final class NatsConnection
     /**
      * The part of {@see requestInternal()}/{@see requestManyInternal()} before the publish: wait for an
      * in-flight reconnect, then make sure the mux reply inbox exists - both within the request's budget.
+     * After the client dropped a mux the server may have rejected, it also waits for the new one to be
+     * confirmed, so that a request whose inbox the server rejects again is not sent. Nor is a request whose
+     * set-up a drain() overtook, since the drain has unsubscribed the inbox.
      *
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @return int The {@see $muxGeneration} the request is sent on: when it changes, the mux was dropped.
      */
-    private function prepareRequest(string $subject, Cancellation $budget, ?Cancellation $cancellation, ?\Fiber $caller): void
+    private function prepareRequest(string $subject, Cancellation $budget, ?Cancellation $cancellation, ?\Fiber $caller): int
     {
         if ($this->state !== ConnectionState::Open) {
             try {
@@ -3130,14 +3299,27 @@ final class NatsConnection
         }
 
         $closes = $this->terminalCloses;
+        $generation = $this->muxGeneration;
         try {
             $this->ensureMuxInbox($budget, $caller);
             // The server can answer the SUB before this request resumes from writing it, or from joining the
             // fiber that writes it.
-            $this->throwUnlessMuxInstalled($closes);
+            $this->throwUnlessMuxInstalled($closes, $generation);
+
+            if ($this->awaitMuxFence) {
+                $this->awaitMuxConfirmation($budget, $closes, $generation);
+            }
         } catch (CancelledException) {
             throw $this->requestNotSentFailure($subject, $cancellation, 'the reply inbox to be set up');
         }
+
+        // A drain() that began while the request set the inbox up, or waited for the server to take it, has unsubscribed
+        // it: no reply can come. The request fails as one issued during the drain does, without being sent.
+        if ($this->state === ConnectionState::Draining) {
+            throw new ConnectionException('Connection is not open');
+        }
+
+        return $generation;
     }
 
     /**
@@ -3168,7 +3350,7 @@ final class NatsConnection
             ? $timeoutCancellation
             : new CompositeCancellation($cancellation, $timeoutCancellation);
 
-        $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
+        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
         $token = $this->newMuxToken();
         $replyTo = $this->muxBase . '.' . $token;
 
@@ -3209,6 +3391,12 @@ final class NatsConnection
                 // the deadline (#167).
                 if ($this->muxRejected) {
                     throw $this->muxRejectedException();
+                }
+
+                // The client dropped the mux reply inbox the request was sent on, since the server may have
+                // rejected it: no reply can arrive on it.
+                if ($this->muxGeneration !== $muxGeneration) {
+                    throw $this->muxDroppedException();
                 }
 
                 if ($waitCancellation->isRequested()) {
@@ -3342,7 +3530,7 @@ final class NatsConnection
             ? $totalCancellation
             : new CompositeCancellation($cancellation, $totalCancellation);
 
-        $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
+        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
         $token = $this->newMuxToken();
         $replyTo = $this->muxBase . '.' . $token;
 
@@ -3397,6 +3585,16 @@ final class NatsConnection
                     }
 
                     throw $this->muxRejectedException();
+                }
+
+                // The client dropped the mux reply inbox, since the server may have rejected it (a reconnect's
+                // replay of it, once replies were coming in): likewise no further reply can arrive.
+                if ($this->muxGeneration !== $muxGeneration) {
+                    if ($messages !== []) {
+                        break;
+                    }
+
+                    throw $this->muxDroppedException();
                 }
 
                 if ($noResponders) {
@@ -4261,7 +4459,8 @@ final class NatsConnection
      * successful SUB with verbose off) made reconnect latency scale at ~5ms x subscription
      * count inside the reconnect critical section, where publishes buffer and nothing
      * dispatches (#137). The byte stream is identical to the per-sid version - each SUB is
-     * immediately followed by its UNSUB re-arm, in registration order.
+     * immediately followed by its UNSUB re-arm, in registration order - except that the mux
+     * reply-inbox SUB is followed by a PING, which confirms it.
      *
      * @return array<int, array{max: ?int, received: int}> The sids re-subscribed, with the auto-unsubscribe
      *         max each was replayed with and the messages it had received by then.
@@ -4295,6 +4494,18 @@ final class NatsConnection
                 // REMAINING allowance; the cumulative local counter still ends delivery at the
                 // original max (#112). Mirrors nats.go resendSubscriptions.
                 $buffer .= $this->codec->encodeUnsubscribe($sid, $remaining);
+            }
+
+            if ($sid === $this->muxSid) {
+                // The new server may reject the mux like any replayed SUB, so it is unconfirmed until the PONG of
+                // this PING. A subscription limit rejects every SUB from the first one it refuses, so an -ERR for
+                // the limit ahead of that PONG means the mux is refused too, while those of the SUBs replayed
+                // after it come behind the PONG: a mux that keeps its slot is not dropped for them. The slot is
+                // alone in the queue - connectOnce() cleared it, and nothing else writes a PING until the
+                // connection is Open - so the PONG is this PING's.
+                $this->muxConfirmed = false;
+                $this->muxFence = $this->enqueuePongSlot();
+                $buffer .= $this->codec->encodePing();
             }
         }
 
@@ -4540,12 +4751,30 @@ final class NatsConnection
 
     /**
      * Queues a pong-correlation slot for a PING that is about to be written (see {@see $pongWaiters}).
-     * Enqueue happens synchronously before the write suspends, so queue order matches the order the
-     * PINGs reach the wire even when several fibers send concurrently.
+     * The slot is queued in the same synchronous step that hands its PING to the transport, which
+     * takes writes in the order they are made, so queue order matches the order the PINGs reach the
+     * wire even when several fibers send concurrently. A PING written from a fiber of its own has its
+     * slot queued by that fiber ({@see writeBounded()}): queued before that fiber ran, a PING another
+     * fiber wrote meanwhile - the one behind the reply inbox's SUB, say - reached the wire first, and
+     * its PONG completed this slot.
      *
      * @return DeferredFuture<null>
      */
     private function enqueuePongSlot(): DeferredFuture
+    {
+        $slot = $this->newPongSlot();
+        $this->pongWaiters[] = $slot;
+
+        return $slot;
+    }
+
+    /**
+     * A pong-correlation slot that is not queued yet, for a PING that {@see writeBounded()} writes and queues
+     * the slot for.
+     *
+     * @return DeferredFuture<null>
+     */
+    private function newPongSlot(): DeferredFuture
     {
         /** @var DeferredFuture<null> $slot */
         $slot = new DeferredFuture();
@@ -4553,7 +4782,6 @@ final class NatsConnection
         // epoch teardown; suppress unhandled-error reporting - waiters still get the error from
         // their own await().
         $slot->getFuture()->ignore();
-        $this->pongWaiters[] = $slot;
 
         return $slot;
     }
@@ -4648,6 +4876,12 @@ final class NatsConnection
             $this->outstandingPings = 0;
 
             $slot = array_shift($this->pongWaiters);
+            if ($slot !== null && $slot === $this->muxFence) {
+                // The server answered the PING written behind the mux SUB without rejecting the SUB first.
+                $this->muxFence = null;
+                $this->confirmMux();
+            }
+
             if ($slot !== null && !$slot->isComplete()) {
                 $slot->complete();
             }
@@ -4716,6 +4950,11 @@ final class NatsConnection
                 return;
             }
 
+            $muxSid = $this->muxSid;
+            if ($muxSid !== null && !$this->muxConfirmed && $this->isSubscriptionLimitError($error)) {
+                $this->dropUnconfirmedMux($muxSid);
+            }
+
             $serverError = new ConnectionException('Server sent error frame: ' . $error);
             // The read fails with it either way, as it always did; only an -ERR the server closes the
             // connection after ends the connection here (#171).
@@ -4730,6 +4969,12 @@ final class NatsConnection
             $sid = $frame->sid;
             if ($sid === null || !isset($this->subscriptions[$sid])) {
                 return;
+            }
+
+            if ($sid === $this->muxSid) {
+                // A delivery on the mux proves the server holds it, as its fence PONG does. Recorded here, so
+                // that an -ERR later in the same chunk finds it.
+                $this->confirmMux();
             }
 
             [$rawHeaders, $payload] = $this->extractHeadersAndPayload($frame);
@@ -5045,8 +5290,17 @@ final class NatsConnection
         $normalized = strtolower(trim($error, " '\t\r\n\0\x0B"));
 
         return str_starts_with($normalized, 'permissions violation')
-            || $normalized === 'maximum subscriptions exceeded'
+            || $this->isSubscriptionLimitError($error)
             || $normalized === 'invalid publish subject';
+    }
+
+    /**
+     * Returns true for the -ERR rejecting a SUB beyond the connection's subscription limit. It names neither the
+     * subject nor the sid, so only the order of the server's answers can tie it to a SUB ({@see $muxConfirmed}).
+     */
+    private function isSubscriptionLimitError(string $error): bool
+    {
+        return strtolower(trim($error, " '\t\r\n\0\x0B")) === 'maximum subscriptions exceeded';
     }
 
     /**

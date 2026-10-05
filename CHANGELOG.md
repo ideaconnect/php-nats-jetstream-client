@@ -84,6 +84,19 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   stream error of a built-in transport is then wrapped in a `TransportClosedException` ("Transport is not
   connected"), so the publish still fails with a `NatsThrowable`, as when its retry went into the closed
   transport.
+- While a connection is at its subscription limit, `request()` and `requestMany()` no longer wait out their
+  timeout once the server has rejected their shared reply inbox. A request already sent whose own read meets
+  the server's `-ERR` fails with it (`Server sent error frame: 'maximum subscriptions exceeded'`), as in
+  2.10.0. Any other fails at once with a `ConnectionException` saying `request/reply failed: the server may
+  have rejected the shared reply-inbox subscription ...`, with that `-ERR` as its previous exception when its
+  own read met it, and after a rejection a request is not sent until the server has taken a new inbox. Each
+  such request subscribes the inbox again, so until a slot is free every request costs a round trip: an UNSUB,
+  a SUB and a PING out, an `-ERR` and a PONG back. Nothing throttles that, so a caller that retries should
+  pause between attempts. The write that subscribes the reply inbox now also carries a PING: a transport
+  double that matches its bytes sees `SUB _INBOX.<inbox>.* <sid>\r\nPING\r\n`. A double that answers only
+  a write that is exactly `PING\r\n`, as one scripted for `flush()` often does, leaves that PING unanswered,
+  so the PONG it sends for the next `flush()`, `rtt()` or `drain()` answers the inbox's PING instead, and
+  that call times out. Such a double should answer every PING it is sent.
 
 ### Fixed
 
@@ -183,6 +196,27 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   during the set-up fails the request with the closed connection without sending it (`Connection was closed
   while the reply inbox was being set up` when the write completed anyway), and a request after a new
   `connect()` neither waits for a set-up left from the closed connection nor reuses its inbox.
+- `[bugfix]` The shared reply inbox of `request()` and `requestMany()` stayed dead once the server rejected
+  its SUB with `maximum subscriptions exceeded`, an `-ERR` that names no subject and leaves the connection
+  open. In 2.10.0 the request that met the rejection failed with it, and every later one was sent with a
+  reply subject nobody held and waited out its whole timeout (`requestMany()` returned nothing), even after
+  a slot freed up, until the connection closed for good. 2.10.1 and 2.10.2 closed the connection on that
+  `-ERR` instead, and with reconnect on every attempt replayed the inbox's SUB into the same limit until the
+  reconnect gave up. The SUB now goes out with a PING right behind it, and the inbox counts as confirmed
+  once that PING's PONG arrives, which the server sends only after its answer to the SUB, or once a reply
+  arrives on it. That `-ERR` arriving before then drops the inbox: the requests waiting on it fail at once,
+  a `requestMany()` that has collected replies returns them, and the next request subscribes a new inbox,
+  in the same write as an UNSUB of the dropped one. Until a new inbox is confirmed, a request waits for that
+  before it is sent, so while the limit holds requests fail fast without reaching the responder, and once a
+  slot is free they work again, with no reconnect. A reconnect whose replay of the inbox is rejected works
+  the same way, and a confirmed inbox stays in place when another subscription is rejected, so the requests
+  in flight on it are not failed for that. Another subscription's `-ERR` that arrives while the inbox's SUB
+  still waits behind earlier writes, or before its PONG, drops an inbox the server takes after all; the next
+  request's UNSUB gives its slot back. A `drain()` that begins while a request subscribes the inbox, or
+  waits for it to be confirmed, unsubscribes it: the request fails with `Connection is not open`, as one
+  issued during the drain does, without being sent. A request whose inbox SUB was still being written when
+  the drain began used to be sent all the same, after the drain's UNSUB of that inbox: the responder ran it,
+  though no reply could come back, and the request failed with `Connection is not open` anyway.
 
 ## [2.10.2] - 2026-10-04
 
