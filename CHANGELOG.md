@@ -26,6 +26,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   is reported to the error listener, where a number failed the read with a `TypeError` and an array replaced
   the server info with defaults. At connect the `ConnectionException` says `INFO payload is not a JSON
   object`, where a number gave one wrapping a `TypeError` and an array connected with that default info.
+- A `drain()` whose flush meets an `-ERR` the server keeps the connection open for and then no `PONG` (a
+  server that went silent) now waits out its budget, where it used to end at once at the `-ERR`.
+- `drainSubscription()`, whose flush now reads on past such an `-ERR`, meets a close that follows it itself:
+  when the server closes the connection right after `maximum subscriptions exceeded` (an account's
+  subscription limit was lowered), the flush's read recovers the connection before the call resolves, as any
+  read that is first to notice a dead connection does. With reconnect on the call lasts until that reconnect
+  ends, which can be longer than its `requestTimeoutMs` budget; with reconnect off it reports `Reconnect is
+  disabled` and the connection is Closed. It used to resolve at once and leave the dead connection Open for
+  the next operation.
 
 ### Fixed
 
@@ -52,6 +61,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   and its cause (#172) reached only an operation that joined the recovery. The `Closed` event now carries
   the cause, so that the connection listener and the log learn it. The reason for unanswered PINGs reads
   "the last PING" when `maxPingsOut` is 1, and says that the heartbeat allows no unanswered PING when it is 0.
+- `[bugfix]` The flushes of `drain()` and `drainSubscription()` ended at an `-ERR` the server sends while
+  keeping the connection open (`maximum subscriptions exceeded`, a `Permissions Violation`, `Invalid Publish
+  Subject`), and the messages the server sent behind it, up to the `PONG`, were lost without a count:
+  `drain()` closed the socket with them unread and reported only the `-ERR`, and `drainSubscription()`
+  removed the subscription, so a later read dropped them as an unknown sid's. A long-standing bug, in 2.10.0
+  as well; on 2.10.1 and 2.10.2 `drainSubscription()` also reconnected, since such an `-ERR` ended the
+  connection there. Both flushes now report such an `-ERR` to the error listener and read on to their `PONG`
+  within the same budget, also when a line that does not parse follows the `-ERR` in the same read. A fatal
+  `-ERR` and a `PONG` the socket would not take still end the flush at once, and `flush()` and `rtt()` still
+  fail with such an `-ERR`. A service's `run()` likewise reports an `-ERR` read ahead of a line that does not
+  parse, which its read used to throw after the reconnect, for the loop to swallow.
 
 ## [2.10.2] - 2026-10-04
 

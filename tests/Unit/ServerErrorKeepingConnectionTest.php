@@ -329,6 +329,82 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     }
 
     /**
+     * The read of a serving loop also reports such an -ERR when a line that does not parse follows it in the
+     * same chunk: the -ERR, then the corrupt line, and the read returns once the connection has recovered from
+     * the corrupt stream. It used to throw the -ERR after the reconnect, and the loop swallowed it.
+     */
+    public function testAReadForAServingLoopReportsAnErrReadAheadOfALineThatDoesNotParse(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new FakeTransport([
+            self::INFO, "PONG\r\n",
+            "-ERR 'maximum subscriptions exceeded'\r\nBOGUS\r\n",
+            self::INFO, "PONG\r\n", // the reconnect after the corrupt stream
+        ]);
+        $connection = new NatsConnection(new NatsOptions(
+            reconnectEnabled: true,
+            maxReconnectAttempts: 1,
+            reconnectDelayMs: 1,
+            reconnectMaxDelayMs: 1,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+
+        $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
+
+        self::assertSame(1, $read->frames);
+        self::assertSame(
+            ["Server sent error frame: 'maximum subscriptions exceeded'", 'Unsupported control frame: BOGUS'],
+            $recorder->errors,
+        );
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls, 'the corrupt stream was recovered from');
+    }
+
+    /**
+     * flush() and rtt() still fail with an -ERR the server keeps the connection open for, read before their
+     * PONG, where the flushes of drain() and drainSubscription() report it and read on: the server rejected
+     * something sent before the PING whose answer they are to confirm. The connection stays open.
+     */
+    #[DataProvider('pingRoundTrips')]
+    public function testFlushAndRttStillFailWithAnErrTheServerKeepsTheConnectionOpenFor(string $operation): void
+    {
+        $recorder = new LifecycleRecorder();
+        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $connection = new NatsConnection(new NatsOptions(
+            requestTimeoutMs: 1_000,
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $connection->connect()->await();
+        $transport->enqueueOnWriteContaining = ["PING\r\n" => ["-ERR 'maximum subscriptions exceeded'\r\n", "PONG\r\n"]];
+
+        try {
+            if ($operation === 'flush') {
+                $connection->flush()->await();
+            } else {
+                $connection->rtt()->await();
+            }
+            self::fail('expected the -ERR to fail ' . $operation . '()');
+        } catch (ConnectionException $e) {
+            self::assertSame("Server sent error frame: 'maximum subscriptions exceeded'", $e->getMessage());
+        }
+
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame([], $recorder->errors, 'thrown, not reported');
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function pingRoundTrips(): iterable
+    {
+        yield 'flush()' => ['flush'];
+        yield 'rtt()' => ['rtt'];
+    }
+
+    /**
      * That read still throws an -ERR that ends the connection, once the connection has ended.
      */
     public function testAReadForAServingLoopStillThrowsAnErrThatEndsTheConnection(): void

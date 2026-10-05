@@ -324,9 +324,9 @@ final class NatsConnection
     private \WeakMap $reportedOverflows;
     /**
      * The failures of frames that end the connection ({@see frameFailureEndsConnection()}): a fatal -ERR, which
-     * the server sends right before it closes the connection, and a PONG the socket would not take. Marked
-     * where they are raised, so that no other failure a frame raises can end the connection. Weak: an entry
-     * goes away with its exception.
+     * the server sends right before it closes the connection, and, outside a drain, a PONG the socket would not
+     * take. Marked where they are raised, so that no other failure a frame raises can end the connection. Weak:
+     * an entry goes away with its exception.
      *
      * @var \WeakMap<\Throwable, true>
      */
@@ -787,11 +787,12 @@ final class NatsConnection
 
     /**
      * Whether a frame whose dispatch failed means the connection is finished: a fatal -ERR, which the server
-     * sends right before it closes the socket, or a PONG the socket would not take. Nothing else does: not an
-     * -ERR the server sends while keeping the connection open, such as the one rejecting a SUB beyond the
-     * maximum subscriptions ({@see isServerErrorKeepingTheConnectionOpen()}), which since 2.10.1 had ended
-     * healthy connections; not a full subscription queue, where one subscriber fell behind; not anything
-     * else a frame throws.
+     * sends right before it closes the socket, or, outside a drain, a PONG the socket would not take. Nothing
+     * else does: not an -ERR the server sends while keeping the connection open, such as the one rejecting a
+     * SUB beyond the maximum subscriptions ({@see isServerErrorKeepingTheConnectionOpen()}), which since 2.10.1
+     * had ended healthy connections; not a full subscription queue, where one subscriber fell behind; not
+     * anything else a frame throws. During a drain a PONG the socket would not take ends the drain's flush
+     * instead ({@see handleFrame()}): the connection is closing anyway.
      */
     private function frameFailureEndsConnection(\Throwable $failure): bool
     {
@@ -1211,8 +1212,8 @@ final class NatsConnection
      * Every drain ends with the connection Closed and one {@see ConnectionEvent::Closed} event - emitted
      * by the drain, or by what closed the connection before it could (a reconnect that gave up, a
      * disconnect() issued meanwhile). connect() is refused until the drain is over. A full subscription
-     * queue (SlowConsumerPolicy::Error) that the drain's flush runs into is reported and does not end the
-     * flush.
+     * queue (SlowConsumerPolicy::Error), a handler that throws, or an -ERR the server keeps the connection
+     * open for, that the drain's flush runs into, is reported and does not end the flush.
      *
      * @return Future<void>
      */
@@ -1354,8 +1355,8 @@ final class NatsConnection
      * deliveries the server already emitted are read - all within the remaining drain budget. Failures
      * are contained so drain() still reaches Closed: a wedged write skips the rest of the phase, and
      * anything else goes to the error listener (#149/#150). A full subscription queue
-     * (SlowConsumerPolicy::Error) is reported without ending the flush: the deliveries still in flight
-     * are behind it.
+     * (SlowConsumerPolicy::Error), a handler that throws and an -ERR the server keeps the connection open
+     * for are reported without ending the flush: the deliveries still in flight are behind them.
      */
     private function unsubscribeAndFlushForDrain(float $drainDeadline): void
     {
@@ -1400,14 +1401,16 @@ final class NatsConnection
             $flushCancellation = new TimeoutCancellation(max(0.001, $drainDeadline - $this->monotonicSeconds()));
             try {
                 while (!$flushCancellation->isRequested()) {
-                    // A full subscription queue or a throwing handler is reported, not thrown: ending the
-                    // flush on it would close the socket on the deliveries still in flight, lost without a
-                    // trace.
+                    // A full subscription queue, a throwing handler or an -ERR the server keeps the connection
+                    // open for (its answer to a SUB beyond the maximum subscriptions, say) is reported, not
+                    // thrown: ending the flush on it would close the socket on the deliveries still in flight,
+                    // lost without a trace. A failure that ends the connection still ends the flush.
                     $read = $this->readChunk(
                         $flushCancellation,
                         \Fiber::getCurrent(),
                         reportOverflows: true,
                         reportHandlerFailures: true,
+                        reportFailuresKeepingTheConnection: true,
                     )->await();
 
                     if ($flushSlot->isComplete()) {
@@ -1434,10 +1437,9 @@ final class NatsConnection
             // unusable, so skip the flush phase - drain()'s teardown closes it, which errors the
             // abandoned write's fiber out. The drain bound now covers the write phase too (#149).
         } catch (\Throwable $flushError) {
-            // A failed drain write (dead socket), a frame's failure (a server -ERR, fatal or not), or a
-            // handler that threw/published while the flush-phase read delivered backlog surfaced here.
-            // Route it to the error listener (a swallowed failure during the lossless path was
-            // invisible before) and return to drain()'s cleanup so it still closes
+            // A failed drain write (dead socket) or a frame's failure that ends the connection (a fatal
+            // -ERR) surfaced here. Route it to the error listener (a swallowed failure during the lossless
+            // path was invisible before) and return to drain()'s cleanup so it still closes
             // rather than leaving the connection wedged in Draining with the socket open (#150).
             $this->emitErrorSafely($flushError);
         }
@@ -2069,8 +2071,11 @@ final class NatsConnection
      *
      * A failed UNSUB or flush and a handler that throws are reported through the error listener: like
      * drain(), it does not reject for them, and a throwing handler does not cost the messages behind it.
-     * Nor does another subscription's full queue (SlowConsumerPolicy::Error): that overflow is reported
-     * and the flush reads on to its PONG.
+     * Nor does another subscription's full queue (SlowConsumerPolicy::Error), or an -ERR the server keeps
+     * the connection open for: either is reported and the flush reads on to its PONG. A connection lost
+     * during the flush is recovered by the flush's own read, as by any read that is first to notice it, so
+     * with reconnect on the call lasts until that reconnect ends (when the server closes the connection
+     * right after such an -ERR, say).
      *
      * When a delivery for the sid is already under way - on another fiber, or it is the handler that
      * called this, draining its own subscription - that delivery hands over the messages queued behind
@@ -2120,13 +2125,20 @@ final class NatsConnection
                         throw new TimeoutException('drainSubscription timed out writing UNSUB (transport backpressure)');
                     }
 
-                    // Neither a full queue nor a throwing handler ends the flush early: the messages still in
-                    // flight for this subscription would arrive after it is removed, and be dropped.
-                    $this->flushWithin($deadline, $caller, reportOverflows: true, reportHandlerFailures: true);
+                    // Neither a full queue, a throwing handler nor an -ERR the server keeps the connection open
+                    // for ends the flush early: the messages still in flight for this subscription would arrive
+                    // after it is removed, and be dropped.
+                    $this->flushWithin(
+                        $deadline,
+                        $caller,
+                        reportOverflows: true,
+                        reportHandlerFailures: true,
+                        reportFailuresKeepingTheConnection: true,
+                    );
                 } catch (\Throwable $flushError) {
-                    // A failed UNSUB or flush (a dead socket, a timeout), or a handler that threw while the
-                    // flush delivered, is reported the way drain() reports it (#150). Removing the
-                    // subscription below is still safe: a lost connection takes the server-side one with it.
+                    // A failed UNSUB or flush (a dead socket, a timeout, a frame's failure that ends the
+                    // connection) is reported the way drain() reports it (#150). Removing the subscription
+                    // below is still safe: a lost connection takes the server-side one with it.
                     $this->emitErrorSafely($flushError);
                 }
             }
@@ -2213,9 +2225,18 @@ final class NatsConnection
      *        for drainSubscription(), which needs the messages still in flight before the PONG.
      * @param bool $reportHandlerFailures Report a handler that throws while the flush delivers, and read on,
      *        instead of ending the flush with it: for drainSubscription(), for the same reason.
+     * @param bool $reportFailuresKeepingTheConnection Report a frame's failure that leaves the connection open,
+     *        such as an -ERR the server keeps it open for, and read on, instead of ending the flush with it: for
+     *        drainSubscription(), for the same reason. flush() and rtt() still fail with it: the server rejected
+     *        something their caller sent, and they are to confirm what was sent.
      */
-    private function flushWithin(float $deadline, ?\Fiber $caller, bool $reportOverflows, bool $reportHandlerFailures = false): void
-    {
+    private function flushWithin(
+        float $deadline,
+        ?\Fiber $caller,
+        bool $reportOverflows,
+        bool $reportHandlerFailures = false,
+        bool $reportFailuresKeepingTheConnection = false,
+    ): void {
         if ($this->state !== ConnectionState::Open) {
             try {
                 $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $caller);
@@ -2259,7 +2280,13 @@ final class NatsConnection
         $cancellation = $this->remainingBudgetCancellation($deadline);
         try {
             while (!$slot->isComplete()) {
-                $read = $this->readChunk($cancellation, \Fiber::getCurrent(), $reportOverflows, reportHandlerFailures: $reportHandlerFailures)->await();
+                $read = $this->readChunk(
+                    $cancellation,
+                    \Fiber::getCurrent(),
+                    $reportOverflows,
+                    reportHandlerFailures: $reportHandlerFailures,
+                    reportFailuresKeepingTheConnection: $reportFailuresKeepingTheConnection,
+                )->await();
 
                 // Only a genuinely idle read yields: without it the loop would busy-spin and
                 // starve the deadline. A read that consumed bytes but produced no complete frame
@@ -2367,7 +2394,8 @@ final class NatsConnection
      *        the rest, instead of throwing its exception ({@see deliverPending()}): for a drain.
      * @param bool $reportFailuresKeepingTheConnection Report a frame's failure that leaves the connection open,
      *        such as an -ERR the server keeps it open for, instead of throwing it: for a read whose caller would
-     *        only swallow it ({@see readIncomingForOperation()}).
+     *        only swallow it ({@see readIncomingForOperation()}), and for the flushes of drain() and
+     *        drainSubscription(), which read on to their PONG.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2460,13 +2488,14 @@ final class NatsConnection
                 // Whatever a frame or a handler throws meanwhile, the recovered frames are delivered and the
                 // corrupt stream is reported and recovered; then the first failure reaches the caller (#128
                 // rethrow-after-containment) and a later one is reported rather than hiding it.
-                $failure = null;
+                $dispatchError = null;
                 try {
                     $this->dispatchFrames($recovered, $reportOverflows, $ownSid);
                 } catch (\Throwable $e) {
-                    $failure = $e;
+                    $dispatchError = $e;
                 }
 
+                $failure = $dispatchError;
                 try {
                     // Deliver the enqueued messages even when a frame failed to dispatch, mirroring the
                     // clean-path drain below.
@@ -2477,6 +2506,14 @@ final class NatsConnection
                     } else {
                         $this->emitErrorSafely($e);
                     }
+                }
+
+                // A frame's failure that leaves the connection open is reported instead, when the read reports
+                // such failures, as on the clean path below: an -ERR read ahead of the corrupt line must not
+                // end a drain's flush, or reach a serving loop that would only swallow it.
+                if ($dispatchError !== null && $reportFailuresKeepingTheConnection && !$this->frameFailureEndsConnection($dispatchError)) {
+                    $this->emitErrorSafely($dispatchError);
+                    $failure = null;
                 }
 
                 // A handler that throws while the recovered frames are delivered must not leave the
@@ -4329,6 +4366,15 @@ final class NatsConnection
                     $this->writeBounded($this->codec->encodePong(), $this->remainingBudgetCancellation($drainDeadline));
                 } catch (CancelledException) {
                     // Wedged: see above.
+                } catch (\Throwable $pongError) {
+                    // The socket is gone, and with it the PONG the drain's flush waits for: end that flush now,
+                    // whichever fiber's read met this PING, as a read failing during a drain does. Not marked as
+                    // ending the connection, which the drain closes anyway, so the read treats it like any other
+                    // failure: it reports it when it reports failures (the drain's own read, a serving loop's),
+                    // and throws it otherwise.
+                    $this->failPongWaiters(new ConnectionException('Connection lost before the server answered the PING'));
+
+                    throw $pongError;
                 }
 
                 return;
