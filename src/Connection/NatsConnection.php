@@ -2613,7 +2613,7 @@ final class NatsConnection
             }
 
             // A serving loop's read first delivers what an earlier read left queued: one that stopped at a
-            // throwing handler, another fiber's that did, or the delivery after a reconnect. A read that finds
+            // throwing handler, or another fiber's that did, such as the application's own. A read that finds
             // nothing new delivers nothing, so that would otherwise wait for the server to send more. Done before
             // the check below, so that a handler that suspends cannot leave two fibers reading at once. Such a
             // handler can outlast the connection, too: a recovery started meanwhile is waited for, as above,
@@ -4093,10 +4093,13 @@ final class NatsConnection
         // we are OUT of the critical section: `reconnecting` is cleared, so a callback that publishes
         // and hits a write failure starts a fresh recovery instead of deadlocking on the in-progress
         // one, and the per-sid dispatch guard keeps it non-reentrant. (Only reached when the recovery
-        // reopened the connection; the catch above rethrows on failure.) A full SubscriptionQueue is
-        // reported without cutting the delivery short.
+        // reopened the connection; the catch above rethrows on failure.) A full SubscriptionQueue and a
+        // handler that throws are reported without cutting the delivery short: the read of an operation
+        // that ran this reconnect may wait for a message behind them, and it delivers nothing an earlier
+        // read left queued, so a delivery that stopped there left that operation waiting for the server's
+        // next bytes (#173).
         try {
-            $this->deliverPending(reportOverflows: true);
+            $this->deliverReportingFailures();
         } catch (\Throwable $handlerError) {
             // Recovery itself already succeeded; only a handler(-triggered) failure can escape this
             // drain. It must not reach the recovery callers, whose catch blocks treat anything thrown
@@ -5180,8 +5183,8 @@ final class NatsConnection
 
     /**
      * {@see deliverPending()} for a delivery whose failures have nobody to be thrown to - a drain's, the
-     * heartbeat's, a reconnect handshake's: every overflow and every handler failure is reported, and the
-     * rest is still delivered. Nothing is thrown: only a handler can fail during a delivery.
+     * heartbeat's, a reconnect handshake's, the one after a reconnect: every overflow and every handler failure
+     * is reported, and the rest is still delivered. Nothing is thrown: only a handler can fail during a delivery.
      */
     private function deliverReportingFailures(): void
     {

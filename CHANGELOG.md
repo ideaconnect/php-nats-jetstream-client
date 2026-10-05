@@ -52,6 +52,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   operation whose read meets it: it names no subscription, and it is often the answer to what the operation
   itself sent. `handlerErrorsFailOperations` restores the old behavior. The README's new Handler Failures
   section describes the whole behavior.
+- `[bugfix]` The delivery after a reconnect stopped at the first handler that threw: it reported the failure
+  and left the messages behind it queued, for every subscription. An operation whose own read ran the
+  reconnect, such as a `SubscriptionQueue` poll or a fetch, then waited for the server's next bytes for a result
+  that had already arrived: a poll returned nothing once its timeout ended, and a fetch discarded what was
+  queued for it when it unsubscribed. The delivery now reports the failure and delivers the rest (#173).
 
 ## [2.10.3] - 2026-10-05
 

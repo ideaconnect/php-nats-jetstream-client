@@ -2563,11 +2563,12 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * run(): a request that the delivery after a reconnect left queued behind a message whose handler throws is
-     * answered by the loop's next read, without waiting for the server to send more. That delivery reports the
-     * failure and stops there; the request used to wait for the server's next bytes.
+     * run(): a request that the replay after a reconnect brought behind a message whose handler throws is answered
+     * on the new connection without waiting for the server to send more: the delivery after the reconnect reports
+     * the failure and delivers the rest (#173). That delivery used to stop at the failure and leave the request to
+     * the loop's next read, and before that to the server's next bytes.
      */
-    public function testRunAnswersARequestTheDeliveryAfterAReconnectLeftQueuedBehindAThrowingHandler(): void
+    public function testRunAnswersARequestTheReplayAfterAReconnectBroughtBehindAThrowingHandler(): void
     {
         $errors = [];
         $transport = new ReconnectingTransport();

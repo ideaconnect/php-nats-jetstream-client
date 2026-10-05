@@ -19,6 +19,9 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 
+use function Amp\async;
+use function Amp\delay;
+
 /**
  * A subscription handler that throws while an operation's read delivers to it (#173). Operations read the socket
  * themselves while they wait for a result of their own, so their reads deliver messages for every subscription.
@@ -151,6 +154,46 @@ final class HandlerFailureDuringOperationTest extends TestCase
 
         self::assertSame('pong', $client->request('svc', 'ping', 500)->await()->payload);
         self::assertSame(['The operation was cancelled'], $recorder->errorsContaining('cancelled'));
+    }
+
+    /**
+     * An operation whose read runs a reconnect gets its result when the replay brings it behind a message whose
+     * handler throws: the delivery after the reconnect reports the failure and delivers the rest. It used to stop
+     * at the failure, and the operation, whose read delivers nothing an earlier read left queued, waited for the
+     * server's next bytes: this poll returned nothing once its timeout ended.
+     */
+    public function testAnOperationWhoseReadRunsAReconnectGetsItsResultBehindAHandlerFailure(): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            reconnectDelayMs: 1,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+            errorListener: $recorder->errorListener(),
+        ), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $poison = $this->poisonSubscription($client);
+        $queue = $client->subscribeQueue('jobs')->await();
+        // The new connection answers the replay of the queue's SUB with the poisoned message, then the job.
+        $transport->afterWrite = static function (string $bytes) use ($transport, $poison, $queue): void {
+            if ($transport->epoch() === 1 && str_contains($bytes, 'SUB jobs')) {
+                $transport->afterWrite = null;
+                $transport->pushFrame(
+                    ReconnectingTransport::msgFrame('poison', $poison, 'p1')
+                    . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j1'),
+                );
+            }
+        };
+        $poll = async(static fn(): ?string => $queue->setTimeout(1.0)->next()?->payload);
+        delay(0.05);
+
+        $transport->dropConnection();
+
+        self::assertSame('j1', $poll->await());
+        self::assertSame([self::FAILURE], $recorder->errorsContaining(self::FAILURE));
     }
 
     /** @return iterable<string, array{\Throwable, bool}> */
