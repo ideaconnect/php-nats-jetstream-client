@@ -164,9 +164,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   good. Such a failure is now reported to the error listener, the rest of the read is delivered, and the loop
   reads on without backing off, as `drain()` treats a throwing handler. The loop's read also delivers what
   another read left queued - another fiber's that stopped at a throwing handler, or the delivery after a
-  reconnect - instead of leaving it for the server's next bytes. A known limitation remains: the read of an
-  operation, such as a `request()` an endpoint handler makes, still fails with another subscription's handler
-  exception, and the endpoint then answers its requester with a `HANDLER_ERROR` reply.
+  reconnect - instead of leaving it for the server's next bytes, except while a `disconnect()` is closing
+  the connection, which discards it. A read that receives anything during the close, the loop's or any
+  other, still delivers it with what it received. A known limitation remains: the read of an operation, such
+  as a `request()` an endpoint handler makes, still fails with another subscription's handler exception, and
+  the endpoint then answers its requester with a `HANDLER_ERROR` reply.
 - `[bugfix]` A service's `drain()` swallowed what its flush met, such as another subscription's handler that
   threw, and returned before the `PONG` that confirms the server has processed the `UNSUB`s. The flush now
   reports it to the error listener and reads on to that `PONG`.

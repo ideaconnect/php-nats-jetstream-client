@@ -1274,7 +1274,9 @@ good. A handler that awaits the very cancellation you pass to `run()`, and is st
 therefore reports that `CancelledException` too. An endpoint handler's own exception never gets this far: it
 becomes a `HANDLER_ERROR` reply. The loop's read also delivers what another read left queued - another
 fiber's read that stopped at a throwing handler, or the delivery after a reconnect - instead of waiting for
-the server to send more. `drain()` reports such a handler as well, and its flush reads on to the `PONG` that
+the server to send more, except while a `disconnect()` is closing the connection: that is the close's to
+discard. A read that receives anything during the close, the loop's or any other, still delivers it with
+what it received. `drain()` reports such a handler as well, and its flush reads on to the `PONG` that
 confirms the server has processed the `UNSUB`s.
 
 A known limitation: the read of an operation - a `request()`, a JetStream call, a polling queue - still
@@ -1282,7 +1284,7 @@ fails with another subscription's handler exception, as `processIncoming()` does
 endpoint handler makes can therefore fail with it, and the endpoint then answers its requester with a
 `HANDLER_ERROR` reply and records that exception as its `last_error`.
 
-_Verified by: [ServiceTest](tests/Unit/ServiceTest.php) (`testRunReportsASubscriptionHandlerThatThrowsAndReadsOn`, `testRunAnswersARequestReadBehindAMessageWhoseHandlerThrows`, `testRunDoesNotBackOffAfterAHandlerFails`, `testRunReportsAHandlerThatThrowsACancelledExceptionAndServesOn`, `testRunAnswersARequestAnotherFibersReadLeftQueuedBehindAThrowingHandler`, `testRunAnswersARequestTheDeliveryAfterAReconnectLeftQueuedBehindAThrowingHandler`, `testRunStoppedWhileAHandlerAwaitsTheSameCancellationReportsThatHandlersCancelledException`, `testDrainReportsAHandlerThatThrowsDuringItsFlushAndReadsOnToItsPong`), [WaitForReconnectTest](tests/Unit/WaitForReconnectTest.php) (`testAServingReadDeliveringWhatAnEarlierReadLeftQueuedLeavesTheHandshakeToTheRecovery`)._
+_Verified by: [ServiceTest](tests/Unit/ServiceTest.php) (`testRunReportsASubscriptionHandlerThatThrowsAndReadsOn`, `testRunAnswersARequestReadBehindAMessageWhoseHandlerThrows`, `testRunDoesNotBackOffAfterAHandlerFails`, `testRunReportsAHandlerThatThrowsACancelledExceptionAndServesOn`, `testRunAnswersARequestAnotherFibersReadLeftQueuedBehindAThrowingHandler`, `testRunAnswersARequestTheDeliveryAfterAReconnectLeftQueuedBehindAThrowingHandler`, `testRunStoppedWhileAHandlerAwaitsTheSameCancellationReportsThatHandlersCancelledException`, `testDrainReportsAHandlerThatThrowsDuringItsFlushAndReadsOnToItsPong`), [WaitForReconnectTest](tests/Unit/WaitForReconnectTest.php) (`testAServingReadDeliveringWhatAnEarlierReadLeftQueuedLeavesTheHandshakeToTheRecovery`), [CloseIntentTest](tests/Unit/CloseIntentTest.php) (`testServingReadDuringADisconnectLeavesWhatAnEarlierReadLeftQueuedToTheClose`), [ReconnectedListenerTest](tests/Unit/ReconnectedListenerTest.php) (`testMessageTheReconnectReadIsNotDeliveredByAServiceLoopWhileTheListenersDisconnectIsUnderWay`, `testMessageTheReconnectReadIsNotDeliveredByAServiceLoopThatWaitedForTheReconnectWhenTheListenerAwaitsItsDisconnect`)._
 
 ### Services: SCHEMA Discovery
 

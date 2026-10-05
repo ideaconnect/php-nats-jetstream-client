@@ -2529,8 +2529,10 @@ final class NatsConnection
      * @param bool $alwaysReport Report every overflow, whatever the option says, an -ERR the server keeps the
      *        connection open for, and a handler that throws while the read delivers, whose messages behind it
      *        are still delivered: for a read whose caller would only swallow them, such as a serving loop. Such
-     *        a read also delivers what an earlier read left queued. A failure that ends the connection is still
-     *        thrown, once the connection has recovered.
+     *        a read also delivers what an earlier read left queued, unless a disconnect() is closing the connection,
+     *        which discards it. A read that receives anything during the close still delivers it with what it
+     *        received, as any read does. A failure that ends the connection is still thrown, once the connection
+     *        has recovered.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2563,9 +2565,10 @@ final class NatsConnection
      *        drainSubscription(), which read on to their PONG.
      * @param bool $deliverLeftovers Deliver what an earlier read left queued, before reading and after waiting
      *        for another fiber's read: for a serving loop's read ({@see readIncomingForOperation()}), since
-     *        nothing else would deliver it until the server sent more. Not for a flush: a handler it ran there
-     *        could suspend while another fiber took the flush's PONG and started its next read, which the flush
-     *        would then wait for until its deadline. A drain delivers that backlog itself.
+     *        nothing else would deliver it until the server sent more - unless it is a close's to handle
+     *        ({@see leftoversBelongToAClose()}). Not for a flush: a handler it ran there could suspend while
+     *        another fiber took the flush's PONG and started its next read, which the flush would then wait for
+     *        until its deadline. A drain delivers that backlog itself.
      * @param DeferredFuture<null>|null $pongSlot The pong slot this read is for: a flush's, or that of the PING behind
      *        the mux SUB, which a request waits for ({@see awaitMuxConfirmation()}). When it is complete by the time
      *        the read would take the read slot, or wait for another fiber's read, the read returns without reading.
@@ -2599,8 +2602,10 @@ final class NatsConnection
             // nothing new delivers nothing, so that would otherwise wait for the server to send more. Done before
             // the check below, so that a handler that suspends cannot leave two fibers reading at once. Such a
             // handler can outlast the connection, too: a recovery started meanwhile is waited for, as above,
-            // before the socket is read, or this read would take the replies to the recovery's handshake.
-            while ($deliverLeftovers && $this->pendingDirty !== []) {
+            // before the socket is read, or this read would take the replies to the recovery's handshake. What a
+            // disconnect() under way is to discard is left to it, as the delivery after a reconnect leaves it, and
+            // that is checked before every pass: a handler that suspends can let a close begin.
+            while ($deliverLeftovers && $this->pendingDirty !== [] && !$this->leftoversBelongToAClose()) {
                 $this->deliverPending($reportOverflows, $ownSid, $reportHandlerFailures);
                 if ($this->state === ConnectionState::Open || $this->state === ConnectionState::Draining) {
                     break;
@@ -2624,7 +2629,7 @@ final class NatsConnection
                 $this->readSlotReleased->getFuture()->await($cancellation);
 
                 // Unless it stopped at a throwing handler: what it left queued is delivered here, as above.
-                if ($deliverLeftovers && $this->pendingDirty !== []) {
+                if ($deliverLeftovers && $this->pendingDirty !== [] && !$this->leftoversBelongToAClose()) {
                     $this->deliverPending($reportOverflows, $ownSid, $reportHandlerFailures);
                 }
 
@@ -2799,6 +2804,20 @@ final class NatsConnection
             // be 0 when a large frame spans several chunks and this one did not complete it (#119).
             return new IncomingChunkResult(count($frames), true);
         });
+    }
+
+    /**
+     * Whether what an earlier read left queued is a close's to handle, not a serving loop's read's to deliver
+     * ({@see readChunk()}): close-intent is set and the connection is not Draining. A disconnect() under way
+     * discards it - delivered, it reached handlers after disconnect() had been called - and a drain() without a
+     * connection delivers it itself. A drain() that is Draining takes the backlog over and lets reads deliver as
+     * they go, as its flush's reads do. Only the delivery of leftovers asks this: a read that receives anything
+     * during the close delivers the whole queue with what it received, as any read does ({@see deliverPending()}
+     * does not look at close-intent).
+     */
+    private function leftoversBelongToAClose(): bool
+    {
+        return $this->closing && $this->state !== ConnectionState::Draining;
     }
 
     /**

@@ -12,6 +12,7 @@ use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\KeepsEventLoopAlive;
@@ -665,6 +666,122 @@ final class ReconnectedListenerTest extends TestCase
         self::assertSame([], $delivered, 'discarded by the close');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected, ConnectionEvent::Closed], $action->recorder->events);
+    }
+
+    /**
+     * As above, with a service's run() serving the connection: its loop's read runs the reconnect, and reads
+     * again while the listener's close is still under way. That read used to deliver the message the reconnect
+     * read, as one an earlier read left queued, after disconnect() had been called; it leaves it to the close.
+     */
+    public function testMessageTheReconnectReadIsNotDeliveredByAServiceLoopWhileTheListenersDisconnectIsUnderWay(): void
+    {
+        $transport = new ReconnectingTransport();
+        $holder = new class {
+            public ?NatsClient $client = null;
+            /** @var Future<void>|null */
+            public ?Future $close = null;
+        };
+        $recorder = new LifecycleRecorder();
+        $record = $recorder->connectionListener();
+        $listener = static function (ConnectionEvent $event, ?\Throwable $error = null) use ($record, $transport, $holder): void {
+            $record($event, $error);
+            if ($event === ConnectionEvent::Reconnected && $holder->client !== null && $holder->close === null) {
+                $transport->closeDelay = 0.2;
+                $holder->close = $holder->client->disconnect();
+                delay(0.05);
+            }
+        };
+        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $holder->client = $client;
+        $delivered = [];
+        $sid = $client->subscribe('updates', static function (NatsMessage $message) use (&$delivered): void {
+            $delivered[] = $message->payload;
+        })->await();
+        // The server sends a message right after the reconnect re-subscribes: the reconnect reads it.
+        $transport->afterWrite = static function (string $bytes) use ($transport, $sid): void {
+            if ($transport->epoch() === 1 && str_contains($bytes, 'SUB updates')) {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('updates', $sid, 'm1'));
+            }
+        };
+        $service = $client->service('work', '1.0.0')
+            ->addEndpoint('work', 'svc.work', static fn(NatsMessage $message): string => 'done');
+        $running = $service->run(3.0);
+        // The loop's read is parked on the socket when it drops.
+        delay(0.05);
+
+        $transport->refuseDials();
+        $transport->dropConnection();
+        $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Connecting);
+        $transport->acceptDials();
+        $running->await(new TimeoutCancellation(5));
+        self::assertInstanceOf(Future::class, $holder->close);
+        $holder->close->await(new TimeoutCancellation(3));
+
+        self::assertSame(1, $client->statistics()->inMsgs, 'the reconnect read the message');
+        self::assertSame([], $delivered, 'discarded by the close');
+        self::assertSame(ConnectionState::Closed, $client->state());
+        self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected, ConnectionEvent::Closed], $recorder->events);
+    }
+
+    /**
+     * As above, with the shipped transport's instant close and a listener that awaits its disconnect(): a request's
+     * read runs the reconnect, and a service's run() waits for that reconnect to read again. The loop resumes once
+     * the disconnect() has set out to close the connection, before the close is done, and its read delivered the
+     * message the reconnect read.
+     */
+    public function testMessageTheReconnectReadIsNotDeliveredByAServiceLoopThatWaitedForTheReconnectWhenTheListenerAwaitsItsDisconnect(): void
+    {
+        $transport = new ReconnectingTransport();
+        $holder = new class {
+            public ?NatsClient $client = null;
+            /** @var Future<void>|null */
+            public ?Future $close = null;
+        };
+        $recorder = new LifecycleRecorder();
+        $record = $recorder->connectionListener();
+        $listener = static function (ConnectionEvent $event, ?\Throwable $error = null) use ($record, $holder): void {
+            $record($event, $error);
+            if ($event === ConnectionEvent::Reconnected && $holder->client !== null && $holder->close === null) {
+                $holder->close = $holder->client->disconnect();
+                $holder->close->await();
+            }
+        };
+        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $holder->client = $client;
+        $delivered = [];
+        $sid = $client->subscribe('updates', static function (NatsMessage $message) use (&$delivered): void {
+            $delivered[] = $message->payload;
+        })->await();
+        $transport->afterWrite = static function (string $bytes) use ($transport, $sid): void {
+            if ($transport->epoch() === 1 && str_contains($bytes, 'SUB updates')) {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('updates', $sid, 'm1'));
+            }
+        };
+        // A request nobody answers holds the socket read when the connection drops.
+        $request = $client->request('svc.nobody', 'q', 2_500);
+        $request->ignore();
+        delay(0.05);
+        $service = $client->service('work', '1.0.0')
+            ->addEndpoint('work', 'svc.work', static fn(NatsMessage $message): string => 'done');
+        $running = $service->run(3.0);
+        delay(0.05);
+
+        $transport->refuseDials();
+        $transport->dropConnection();
+        $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Connecting);
+        $transport->acceptDials();
+        $running->await(new TimeoutCancellation(5));
+        self::assertInstanceOf(Future::class, $holder->close);
+        $holder->close->await(new TimeoutCancellation(3));
+
+        self::assertSame(1, $client->statistics()->inMsgs, 'the reconnect read the message');
+        self::assertSame([], $delivered, 'discarded by the close');
+        self::assertSame(ConnectionState::Closed, $client->state());
+        self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected, ConnectionEvent::Closed], $recorder->events);
     }
 
     /**

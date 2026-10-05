@@ -9,6 +9,7 @@ use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
@@ -1030,6 +1031,84 @@ final class CloseIntentTest extends TestCase
         self::assertSame(1, $transport->epoch(), 'no reconnect after the reopen');
         self::assertSame(0, $connection->statistics()->reconnects);
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Closed, ConnectionEvent::Connected], $recorder->events);
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function leftoversDuringADisconnect(): iterable
+    {
+        yield 'left queued before the serving read starts' => [false];
+        yield 'left queued by the read it waits for' => [true];
+    }
+
+    /**
+     * A serving loop's read - the read a service's run() makes - while a disconnect() is closing the connection
+     * leaves what an earlier read left queued to the close, which discards it (#134): what a read that stopped at a
+     * throwing handler left behind, before the serving read started or while it waited for that read. With a close
+     * that takes a while, a TLS or WebSocket one, the serving read used to deliver it to its handler after
+     * disconnect() had been called.
+     */
+    #[DataProvider('leftoversDuringADisconnect')]
+    public function testServingReadDuringADisconnectLeavesWhatAnEarlierReadLeftQueuedToTheClose(bool $whileItWaits): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $seen = [];
+        $sidA = $connection->subscribe('a', static function (): void {
+            throw new \RuntimeException('handler a');
+        })->await();
+        $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = $message->payload;
+        })->await();
+        $messages = ReconnectingTransport::msgFrame('a', $sidA, 'x') . ReconnectingTransport::msgFrame('b', $sidB, 'y');
+        $holder = new class {
+            /** @var Future<IncomingChunkResult>|null */
+            public ?Future $serving = null;
+        };
+        $transport->closeDelay = 0.2;
+
+        // A plain read stops at a's throwing handler and leaves b's message queued.
+        $plainRead = $connection->processIncoming(new TimeoutCancellation(2));
+        if ($whileItWaits) {
+            // The serving read waits for the plain read, which reads the messages once the close is under way.
+            delay(0.01);
+            $holder->serving = $connection->readIncomingForOperation(new TimeoutCancellation(2), alwaysReport: true);
+            delay(0.01);
+            $transport->beforeClose = static function () use ($transport, $messages): void {
+                $transport->beforeClose = null;
+                $transport->pushFrame($messages);
+            };
+        } else {
+            // The plain read is over when the close starts, and the serving read starts with it.
+            $transport->pushFrame($messages);
+            $this->assertFailsWithTheHandlersException($plainRead);
+            $transport->beforeClose = static function () use ($transport, $connection, $holder): void {
+                $transport->beforeClose = null;
+                $holder->serving = $connection->readIncomingForOperation(new TimeoutCancellation(2), alwaysReport: true);
+            };
+        }
+
+        $connection->disconnect()->await(new TimeoutCancellation(3));
+        $this->assertFailsWithTheHandlersException($plainRead);
+        self::assertInstanceOf(Future::class, $holder->serving);
+        try {
+            $holder->serving->await(new TimeoutCancellation(3));
+        } catch (\Throwable) {
+            // The close ended its read of the socket.
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame([], $seen, 'discarded by disconnect()');
+    }
+
+    /** @param Future<int> $read */
+    private function assertFailsWithTheHandlersException(Future $read): void
+    {
+        try {
+            $read->await(new TimeoutCancellation(3));
+            self::fail('expected the handler\'s exception');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a', $e->getMessage());
+        }
     }
 
     /** A connection that retries a failed first dial (retryOnFailedInitialConnect, reconnect disabled). */
