@@ -509,11 +509,12 @@ final class DrainLifecycleTest extends TestCase
     }
 
     /**
-     * The reconnect a drain waits for completes only once its Reconnected listener returns. A slow
-     * listener can hold it past the drain budget with the connection already back: the drain still
-     * drains that connection - it unsubscribes there - instead of just closing it.
+     * A drain waiting for a reconnect goes on as soon as the connection is back: the Reconnected listener runs
+     * once the reconnect is over, so a slow one does not hold the drain up. The drain drains the new connection
+     * - it unsubscribes there - within its budget. The reconnect used to complete only once its listener had
+     * returned, and the drain then also waited for that reconnect to end: 0.65 s against a 150 ms budget.
      */
-    public function testDrainOutlastedByASlowReconnectedListenerStillDrainsTheReopenedConnection(): void
+    public function testDrainDoesNotWaitForASlowReconnectedListener(): void
     {
         $transport = new ReconnectingTransport();
         $listener = new class {
@@ -533,8 +534,10 @@ final class DrainLifecycleTest extends TestCase
         $reader = $this->startRecoveryInBackground($connection, $transport);
         $transport->acceptDials();
 
+        $start = hrtime(true);
         $connection->drain()->await();
 
+        self::assertLessThan(0.15, $this->secondsSince($start), 'within its budget');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $transport->epoch());
         self::assertSame(['UNSUB ' . $sid], $transport->controlLinesStartingWith('UNSUB', 1));
@@ -1817,20 +1820,45 @@ final class DrainLifecycleTest extends TestCase
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Closed], $recorder->events);
     }
 
-    /** @return iterable<string, array{ConnectionEvent}> */
-    public static function recoveryListenerEvents(): iterable
+    /**
+     * A Disconnected listener, which runs inside the reconnect, awaits drain(), and a supervisor reconnects on
+     * the Closed that drain announces: the supervisor's connect() fails at once instead of joining that
+     * reconnect - which waits on the very listener awaiting the drain - and hanging for good.
+     */
+    public function testSupervisorReconnectingAfterADrainFromADisconnectedListenerFailsInsteadOfHanging(): void
     {
-        yield 'Disconnected listener' => [ConnectionEvent::Disconnected];
-        yield 'Reconnected listener' => [ConnectionEvent::Reconnected];
+        [$holder, $connection] = $this->superviseADrainFromAListener(ConnectionEvent::Disconnected);
+
+        self::assertTrue($holder->supervised);
+        self::assertInstanceOf(ConnectionException::class, $holder->supervisorFailure);
+        self::assertSame('Recovery was aborted before the connection opened', $holder->supervisorFailure->getMessage());
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /**
-     * A listener inside a reconnect awaits drain(), and a supervisor reconnects on the Closed that drain
-     * announces: the supervisor's connect() fails at once instead of joining that reconnect - which waits
-     * on the very listener awaiting the drain - and hanging for good.
+     * A Reconnected listener runs once the reconnect is over, so a drain() it awaits is an ordinary drain, and a
+     * supervisor that reconnects on the Closed that drain announces opens a new connection, as it would from
+     * anywhere else. It used to be refused with "Recovery was aborted before the connection opened" by the
+     * reconnect, which was still waiting for that listener to return.
      */
-    #[DataProvider('recoveryListenerEvents')]
-    public function testSupervisorReconnectingAfterADrainFromARecoveryListenerFailsInsteadOfHanging(ConnectionEvent $trigger): void
+    public function testSupervisorReconnectingAfterADrainFromAReconnectedListenerOpensANewConnection(): void
+    {
+        [$holder, $connection, $transport] = $this->superviseADrainFromAListener(ConnectionEvent::Reconnected);
+
+        self::assertTrue($holder->supervised);
+        self::assertNull($holder->supervisorFailure);
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(2, $transport->epoch(), 'the supervisor dialled afresh');
+        self::assertSame(['UNSUB 1'], $transport->controlLinesStartingWith('UNSUB', 1), 'the drain drained the reopened connection');
+    }
+
+    /**
+     * Runs a drain() from the listener of $trigger during a reconnect, with a supervisor that reconnects on the
+     * Closed the drain announces, and returns once the reader that ran the reconnect is done.
+     *
+     * @return array{object{supervised: bool, supervisorFailure: ?\Throwable}, NatsConnection, ReconnectingTransport}
+     */
+    private function superviseADrainFromAListener(ConnectionEvent $trigger): array
     {
         $transport = new ReconnectingTransport();
         $holder = new class {
@@ -1879,10 +1907,7 @@ final class DrainLifecycleTest extends TestCase
 
         $reader->await(new TimeoutCancellation(3));
 
-        self::assertTrue($holder->supervised);
-        self::assertInstanceOf(ConnectionException::class, $holder->supervisorFailure);
-        self::assertSame('Recovery was aborted before the connection opened', $holder->supervisorFailure->getMessage());
-        self::assertSame(ConnectionState::Closed, $connection->state());
+        return [$holder, $connection, $transport];
     }
 
     /**

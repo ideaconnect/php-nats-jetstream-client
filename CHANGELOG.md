@@ -46,6 +46,44 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   name that is a decimal integer comes back as an int key. Static analysis now reports code that hands such a
   key to a function taking a string, and code that passes the whole map where string keys are declared, such
   as Symfony Messenger's `SerializerInterface::decode()`. `NatsHeaders::get()` takes such a map.
+- A reconnect announces the new connection (`Reconnected`, or `Connected` for a failed initial `connect()` it
+  completed) once it is over, no longer while it still counts as in flight. Operations waiting for it - under
+  `waitForReconnect`, a `connect()` that joined it, a `drain()` - and publishes parked on its sealed flush
+  resume without waiting for the listener to return, so they can run while it is still busy. An operation
+  whose own read or write ran the reconnect still returns after the listener, unless the announcement is
+  delivered from the event loop (see the next note). `disconnect()` and `drain()` no longer wait for a
+  listener that is still running; its later operations fail with `Connection is not open`. A close the
+  listener makes takes over what the reconnect read, even when the close is still under way as the listener
+  returns: `drain()` delivers it, `disconnect()` discards it. It used to be delivered during such a close. A
+  read that receives anything during the close still delivers it with what it received, as any read does.
+- An operation called from those listeners that finds the new connection gone reconnects again, and the
+  listener hears `Disconnected` and `Reconnected` (or `Closed`) while its call is still running. An open
+  announced while another `Connected` or `Reconnected` call runs is delivered from the event loop, so the
+  calls do not nest one level deeper per connection under a server that drops every connection. The
+  operation that ran that reconnect then returns without waiting for the listener, and the messages the
+  reconnect read can reach subscription handlers before the listener hears of the connection. A listener
+  should not hold a lock across an await on the same connection: a call nested in it may need that lock.
+- A `drain()` that waited for a reconnect goes on while the `Reconnected` listener is still busy, and while a
+  logger that suspends is still recording the `Reconnected` - which applies with no connection listener set
+  too. A `publish()` whose failed write ran that reconnect is retried only after both: when the drain has
+  closed the connection by then, the publish fails with the error of its write and its frame is not sent,
+  where the retry used to come first. One retried while the drain is still flushing is written to the
+  connection being drained.
+- A `Reconnected` call always finds the connection Open. An open that is closed, being closed, replaced or
+  lost before the listener could be told is not announced, nor is the loss of a connection the listener was
+  not told of, so the listener still hears `Disconnected` and `Reconnected` in turn. The logger records every
+  transition, as before.
+- When a failed first dial hands off to a reconnect, the `connect()` calls that joined it resume when the
+  `Connected` listener starts, as on a direct connect. If that listener lets the new connection die and
+  returns with the next reconnect in flight, the `connect()` that dialled fails with `Connect was aborted
+  before the connection opened` while those that joined it succeeded, as on a direct connect; the connection
+  comes back once that reconnect is done. Both used to report success, on the dead socket.
+- A publish whose failed write ran the reconnect is retried by the state it finds once the reconnect is over:
+  buffered behind another reconnect the listener left in flight, written to the connection a `drain()` is
+  still flushing, or failing with the error of its write when the connection was closed meanwhile. A raw
+  stream error of a built-in transport is then wrapped in a `TransportClosedException` ("Transport is not
+  connected"), so the publish still fails with a `NatsThrowable`, as when its retry went into the closed
+  transport.
 
 ### Fixed
 
@@ -67,6 +105,19 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   the reconnect completes; one that ends it still fails the attempt. A rejection read ahead of a line that
   does not parse is reported as well, though that attempt fails on the parse error. A rejection that arrives
   after the replay's short poll fails the read that brings it instead, and the connection stays open.
+- `[bugfix]` An operation called from a `Reconnected` listener - or from the `Connected` listener of a failed
+  initial connect that a reconnect completed - that found the new connection gone already joined the
+  reconnect that had announced it, which was still waiting for the listener to return. A read meeting EOF or
+  a fatal `-ERR`, a `flush()` or a `subscribe()` waited out its timeout; a `publish()`, a `request()`, a
+  lame-duck failover and a read without a cancellation never returned. The connection then stayed Open on the
+  dead socket, and a failure another fiber or the heartbeat noticed while the listener ran was lost the same
+  way, the heartbeat stopping for good. The new connection is now announced once the reconnect is over, as a
+  direct connect already was: such an operation reconnects again, as it would anywhere else. A `drain()`
+  waiting for a reconnect no longer overruns its budget waiting for a slow `Reconnected` listener as well,
+  and one called from that listener is an ordinary drain: a supervisor that reconnects on its `Closed` opens a
+  new connection, as documented, instead of being refused with `Recovery was aborted before the connection
+  opened`. A `connect()` that joined a failed first dial no longer waits for the `Connected` listener of the
+  reconnect that completed it, so a listener waiting for it does not wait out its own timeout.
 - `[bugfix]` With reconnect off, a connection the heartbeat gave up on (unanswered PINGs, a failed PING
   write, the socket closing or breaking during its read) closed without saying why: `Reconnect is disabled`
   and its cause (#172) reached only an operation that joined the recovery. The `Closed` event now carries

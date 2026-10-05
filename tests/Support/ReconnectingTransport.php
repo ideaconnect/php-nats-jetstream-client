@@ -27,11 +27,18 @@ use function Amp\delay;
  *   - refuseDials() / acceptDials(): dials fail while refused, keeping a recovery in its backoff loop;
  *   - holdNextDial() / releaseDial(): the next dial parks until released, freezing a recovery mid-dial
  *     (a held dial that is released while dials are refused fails);
+ *   - holdNextGreeting() / releaseGreeting(): the next session's greeting (its INFO) is held back until
+ *     released, like one still on its way over a slow network: the client has a live socket but has not
+ *     written its CONNECT yet;
+ *   - {@see $requireConnectFirst}: a session whose first frame from the client is not CONNECT refuses the
+ *     CONNECT that follows, as a server that requires authentication does;
  *   - {@see $rejectAuthentication}: the next handshakes are refused with an authorization -ERR;
  *   - {@see $closeDelay}: close() takes a while, like a TLS or WebSocket close handshake;
  *   - stallNextWriteContaining(): the next write containing a needle is held up, like a socket under
  *     backpressure;
- *   - failNextWriteContaining(): the next write containing a needle finds the socket dead.
+ *   - failNextWriteContaining(): the next write containing a needle finds the socket dead - failing with
+ *     a TransportClosedException, or with the error the test gives, such as the raw stream error a
+ *     built-in transport's socket throws.
  *
  * Reads and writes belong to the session they started on, like a real socket's: one still pending
  * when that session ends fails, even if a new session is live by then - at once, like a real socket's,
@@ -78,6 +85,13 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     public bool $rejectAuthentication = false;
 
     /**
+     * Whether a session whose first frame from the client is not CONNECT answers the CONNECT that follows with an
+     * "Authorization Violation" -ERR. nats-server with authorization configured does that to a connection whose
+     * first protocol message is anything but CONNECT, and closes it.
+     */
+    public bool $requireConnectFirst = false;
+
+    /**
      * Frames the next handshake's PONG carries right behind it, in the same read - the way a server can
      * coalesce an async INFO with it. One-shot.
      */
@@ -104,6 +118,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
 
     /** One-shot: the next write containing this needle drops the session and fails. */
     private ?string $failingWriteNeedle = null;
+
+    /** What the failing write throws; null for a TransportClosedException. */
+    private ?\Throwable $failingWriteError = null;
 
     /**
      * One-shot write stalls (see {@see stallNextWriteContaining()}).
@@ -134,6 +151,13 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     private bool $handshakePending = false;
     private bool $dialsRefused = false;
     private bool $holdNextDial = false;
+    private bool $holdNextGreeting = false;
+    /** Whether the live session's greeting is held back (see {@see holdNextGreeting()}). */
+    private bool $greetingHeldBack = false;
+    /** Whether the live session has had a frame from the client yet. */
+    private bool $clientFrameSeen = false;
+    /** Whether the live session's first frame from the client was not CONNECT (see {@see $requireConnectFirst}). */
+    private bool $connectNotFirst = false;
     /** @var ?DeferredFuture<null> */
     private ?DeferredFuture $heldDial = null;
     /** @var DeferredFuture<null> Completed (and replaced) whenever parked reads must re-check. */
@@ -179,6 +203,10 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
             $this->silent = false;
             $this->handshakePending = true;
             $this->sids = [];
+            $this->greetingHeldBack = $this->holdNextGreeting;
+            $this->holdNextGreeting = false;
+            $this->clientFrameSeen = false;
+            $this->connectNotFirst = false;
             $this->wakeReaders();
         });
     }
@@ -211,12 +239,17 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
                 $this->failingWriteNeedle = null;
                 $this->endSession();
 
-                throw new TransportClosedException('The connection is gone');
+                throw $this->failingWriteError ?? new TransportClosedException('The connection is gone');
             }
 
             $frames = self::parseClientFrames($bytes);
 
             $this->writes[] = ['epoch' => $epoch, 'bytes' => $bytes];
+
+            if (!$this->clientFrameSeen && $frames !== []) {
+                $this->clientFrameSeen = true;
+                $this->connectNotFirst = $frames[0]['op'] !== 'CONNECT';
+            }
 
             $pongs = [];
             $responses = [];
@@ -248,7 +281,7 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
                     throw new TransportClosedException('Socket closed by peer (EOF)');
                 }
 
-                $chunk = array_shift($this->reads);
+                $chunk = $this->greetingHeldBack ? null : array_shift($this->reads);
                 if ($chunk !== null) {
                     return $chunk;
                 }
@@ -323,10 +356,15 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
         return $this->writesStalled;
     }
 
-    /** Makes the next write containing $needle find the socket dead: the session drops and the write fails. */
-    public function failNextWriteContaining(string $needle): void
+    /**
+     * Makes the next write containing $needle find the socket dead: the session drops and the write fails, with
+     * $error when given (a built-in transport passes on its socket's raw stream error, an
+     * {@see \Amp\ByteStream\ClosedException} say), else with a TransportClosedException.
+     */
+    public function failNextWriteContaining(string $needle, ?\Throwable $error = null): void
     {
         $this->failingWriteNeedle = $needle;
+        $this->failingWriteError = $error;
     }
 
     /** Parks the next dial until {@see releaseDial()}. */
@@ -340,6 +378,24 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
         $held = $this->heldDial;
         $this->heldDial = null;
         $held?->complete();
+    }
+
+    /** Holds back the greeting of the next session until {@see releaseGreeting()}: nothing can be read before it. */
+    public function holdNextGreeting(): void
+    {
+        $this->holdNextGreeting = true;
+    }
+
+    public function releaseGreeting(): void
+    {
+        $this->greetingHeldBack = false;
+        $this->wakeReaders();
+    }
+
+    /** Whether a session is live whose greeting is held back (see {@see holdNextGreeting()}). */
+    public function greetingHeld(): bool
+    {
+        return $this->sessionLive && $this->greetingHeldBack;
     }
 
     /** Delivers a raw frame on the live session (dropped when there is none). */
@@ -468,7 +524,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     {
         switch ($frame['op']) {
             case 'CONNECT':
-                return $this->rejectAuthentication ? ["-ERR 'Authorization Violation'\r\n"] : [];
+                return $this->rejectAuthentication || ($this->requireConnectFirst && $this->connectNotFirst)
+                    ? ["-ERR 'Authorization Violation'\r\n"]
+                    : [];
             case 'SUB':
                 $sid = (int) $frame['args'][count($frame['args']) - 1];
                 $this->sids[$frame['args'][0]] = $sid;

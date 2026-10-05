@@ -60,7 +60,15 @@ final class NatsOptions
       * @param (\Closure(\IDCT\NATS\Connection\Enum\ConnectionEvent,?\Throwable):void)|null $connectionListener
       *        Optional callback invoked on connection lifecycle transitions (connected, disconnected,
       *        reconnected, closed, discovered-servers, lame-duck). Exceptions thrown by the listener are
-      *        swallowed so a faulty handler cannot break the connection runtime.
+      *        swallowed so a faulty handler cannot break the connection runtime. A reconnect announces the
+      *        new connection (Reconnected, or Connected when it completes a failed initial connect) once it
+      *        is over: operations waiting for the reconnect resume without waiting for the listener, and an
+      *        operation the listener calls that finds the new connection gone already reconnects it again,
+      *        the listener hearing Disconnected and Reconnected, or Closed, while its call is still running.
+      *        Such an announcement made while another Connected or Reconnected call runs is delivered from the
+      *        event loop, and the messages the reconnect read can reach their handlers before it. Either way the
+      *        listener is told of a connection only while it is still the open one: one closed, being closed,
+      *        replaced or lost before it could be told is not announced, nor is the loss of it.
       * @param (\Closure(\Throwable):void)|null $errorListener Optional callback invoked on asynchronous
       *        errors that do not surface to a specific caller: slow-consumer drops, recoverable server
       *        `-ERR` frames, and transport read failures that trigger reconnect. Exceptions thrown by the

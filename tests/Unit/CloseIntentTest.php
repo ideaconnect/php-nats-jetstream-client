@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\ByteStream\ClosedException;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
@@ -17,6 +18,7 @@ use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Tests\Support\UncancellableDialTransport;
+use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -804,6 +806,39 @@ final class CloseIntentTest extends TestCase
         self::assertSame(1, $transport->epoch(), 'no reconnect after the reopen');
         self::assertSame(0, $connection->statistics()->reconnects);
         self::assertSame([], $transport->controlLinesStartingWith('PUB events'));
+    }
+
+    /**
+     * A publish whose failed write runs the reconnect, which disconnect() stops: the publish fails with an error
+     * of this library even when its write failed with the raw stream error a built-in transport passes on - a
+     * TransportClosedException "Transport is not connected" carrying that error, as when the retry went into
+     * the closed transport. The raw error, thrown as it was, would escape a catch (NatsThrowable).
+     */
+    public function testPublishWhoseReconnectADisconnectStopsFailsWithAnErrorOfThisLibrary(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $writeError = new ClosedException('The stream is not writable');
+        $transport->refuseDials();
+        $transport->failNextWriteContaining('PUB orders', $writeError);
+
+        $publish = $connection->publish('orders', 'payload');
+        $publish->ignore();
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
+        $connection->disconnect()->await();
+
+        $failure = null;
+        try {
+            $publish->await(new TimeoutCancellation(2));
+        } catch (\Throwable $e) {
+            $failure = $e;
+        }
+
+        self::assertInstanceOf(TransportClosedException::class, $failure);
+        self::assertSame('Transport is not connected', $failure->getMessage());
+        self::assertSame($writeError, $failure->getPrevious());
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame([], $transport->controlLinesStartingWith('PUB'));
     }
 
     /** @return iterable<string, array{string, bool}> The path, and whether its Closed event carries an error. */

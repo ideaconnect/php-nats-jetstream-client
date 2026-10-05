@@ -20,6 +20,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\NatsThrowable;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\TimeoutException;
@@ -220,9 +221,11 @@ final class NatsConnection
     private ?DeferredFuture $reconnecting = null;
     /**
      * The fiber that owns the in-flight recovery (the only one that can complete {@see $reconnecting}).
-     * Lifecycle/error listeners run synchronously inside it, so a listener-initiated connect() that
-     * joined the recovery would await a deferred its own fiber must complete - a permanent deadlock.
-     * connect() compares its caller's fiber against this to refuse such a join loudly (#145).
+     * The listeners called during the recovery - Disconnected, the Closed of a recovery that gives up, the
+     * error listener, say - run synchronously inside it, so a listener-initiated connect() that joined the
+     * recovery would await a deferred its own fiber must complete - a permanent deadlock. connect()
+     * compares its caller's fiber against this to refuse such a join loudly (#145). Connected and
+     * Reconnected are announced once the recovery is over ({@see announceOpen()}).
      *
      * @var ?\Fiber<mixed, mixed, mixed, mixed>
      */
@@ -287,6 +290,22 @@ final class NatsConnection
      * announced once. Cleared on a fresh connect().
      */
     private bool $closedAnnounced = false;
+    /**
+     * How many Connected or Reconnected listener calls are running. A reconnect that opens the connection while
+     * one runs - typically one that an operation called from that listener had to start - has its own
+     * announcement delivered from the event loop instead of from the operation ({@see announceOpen()}), so that
+     * listener calls do not nest one level deeper with every new connection a flapping server drops.
+     */
+    private int $openListenerCalls = 0;
+    /**
+     * A connection a reconnect opened that the connection listener has yet to hear about: the event announcing
+     * it and the connection's {@see $connectionGeneration}. Set by {@see announceOpen()} until the listener is
+     * called. When that connection is lost first, the listener hears of neither the open nor the loss
+     * ({@see performRecovery()}).
+     *
+     * @var ?array{event: ConnectionEvent, generation: int}
+     */
+    private ?array $unannouncedOpen = null;
     /**
      * Cancels the backoff delay of the reconnect in progress, so close-intent stops a reconnect at once
      * instead of when its current delay ends ({@see setCloseIntent()}).
@@ -648,8 +667,8 @@ final class NatsConnection
                 $this->connectFiber = null;
             }
 
-            // A direct success already settled $connecting before emitting Connected; a completed
-            // owned recovery hand-off leaves it pending until here.
+            // A success, direct or through the owned recovery hand-off, already settled $connecting before
+            // emitting Connected; it is still pending here only when a close stopped the hand-off.
             $this->settleConnecting(null);
             // The dial can RESOLVE without the connection opening: an owned recovery aborted by a
             // concurrent disconnect()/drain() returns without throwing, leaving state Closed. Callers
@@ -690,10 +709,11 @@ final class NatsConnection
      * Loops, because a finished recovery can be followed by another one before the caller resumes.
      * Refuses - the fail-fast behaviour - when waiting is disabled, when the user is closing the
      * connection, when no recovery is in flight (Idle, or terminally Closed: nothing will reopen the
-     * connection), and when the caller IS the recovery fiber: a connection/error listener runs inside
-     * it, and waiting there would await a deferred only that suspended fiber can complete (#145). A
-     * recovery that a failed initial connect() hands off to runs in the connect fiber, which is then
-     * the recovery fiber; any other caller - a Connected listener included - can wait safely. A
+     * connection), and when the caller IS the recovery fiber: a listener called during the recovery (a
+     * Disconnected or error listener) runs inside it, and waiting there would await a deferred only that
+     * suspended fiber can complete (#145). A recovery that a failed initial connect() hands off to runs in
+     * the connect fiber, which is then the recovery fiber; any other caller - a Connected or Reconnected
+     * listener included, which runs once the recovery is over - can wait safely. A
      * recovery that fails surfaces its own error (e.g. "Reconnect attempts exhausted"), exactly as a
      * joined connect() does.
      *
@@ -751,7 +771,8 @@ final class NatsConnection
      * Recovers a connection whose socket failed the write of a control frame - a SUB, or the PING of
      * flush() or rtt() - and waits for it the way an operation waits for a recovery already in flight
      * ({@see awaitOpenConnection()}): within the caller's own budget, and not at all when waiting is
-     * disabled. A recovery that outlasts the budget carries on without the caller.
+     * disabled. A recovery that outlasts the budget carries on without the caller. A reconnect that the
+     * recovery's Reconnected listener leaves in flight is waited for within the same budget.
      *
      * Such a write used to leave the connection Open on the dead socket, its raw error reaching the caller,
      * and every operation that wrote a control frame failed the same way until the heartbeat noticed. A
@@ -761,11 +782,12 @@ final class NatsConnection
      * the connection for good, and the caller gets its "Reconnect is disabled".
      *
      * @param int $generation The {@see $connectionGeneration} the failed write ran on.
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the operation.
      *
      * @throws ConnectionException When the connection does not come back, or at once when waiting is disabled.
      * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
      */
-    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation): void
+    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation, ?\Fiber $caller): void
     {
         $recovery = async(function () use ($generation, $writeError): void {
             $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
@@ -779,9 +801,17 @@ final class NatsConnection
 
         $recovery->await($cancellation);
 
-        // No recovery ran: the user is closing the connection, or a connect() owns the dial.
         if ($this->state !== ConnectionState::Open) {
-            throw new ConnectionException('Connection is not open', 0, $writeError);
+            try {
+                // The recovery announced the new connection before it ended, and the listener, or what it
+                // called, may have started another reconnect since: waited for within the same budget, like
+                // any reconnect in flight.
+                $this->awaitOpenConnection($cancellation, $caller);
+            } catch (ConnectionException) {
+                // Nothing to wait for, or it did not reopen the connection: the user is closing it, a connect()
+                // owns the dial, or the connection was closed for good.
+                throw new ConnectionException('Connection is not open', 0, $writeError);
+            }
         }
     }
 
@@ -950,8 +980,10 @@ final class NatsConnection
      * synchronous lifecycle emission on a direct performConnect() exit path so the deferred is never
      * pending while user code (a connection/error listener) runs: a pending $connecting under a
      * listener re-opens the join deadlock (a listener's connect() awaiting a deferred only the
-     * suspended emitting fiber can complete) and the swallowed-recovery window (#145). Idempotent -
-     * the owned-recovery hand-off leaves it for connect() to settle after performConnect() returns.
+     * suspended emitting fiber can complete) and the swallowed-recovery window (#145). The
+     * owned-recovery hand-off settles it before its Connected as well ({@see recoverConnection()}).
+     * Idempotent - connect() settles it again after performConnect() returns, for a hand-off that a
+     * close stopped or that failed.
      */
     private function settleConnecting(?\Throwable $error): void
     {
@@ -1057,8 +1089,9 @@ final class NatsConnection
      *
      * Bounded by the connect timeout, which is how long a transport that cannot stop its dial may take to
      * end it ({@see CancellableDialTransportInterface}); a connection listener could take any time at all.
-     * Skipped for the fiber that runs what was stopped: a close called from a connection/error listener runs
-     * inside it, and waiting there would await what only that suspended fiber can complete (#145).
+     * Skipped for the fiber that runs what was stopped: a close called from a listener called during it (a
+     * Disconnected or error listener) runs inside it, and waiting there would await what only that suspended
+     * fiber can complete (#145). A Reconnected listener runs once the reconnect is over, and is not waited for.
      *
      * @param list<array{DeferredFuture<void>, ?\Fiber<mixed, mixed, mixed, mixed>}> $stopped From {@see stoppedDials()}.
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called the close.
@@ -1205,9 +1238,10 @@ final class NatsConnection
      * flushes the publishes buffered during the outage, then the new connection is drained as usual. If
      * the budget runs out first the drain still ends Closed - it stops the reconnect, runs its usual
      * backlog pass and reports the buffered publishes it discards through the error listener. A drain
-     * that cannot wait (waiting disabled, or called from a connection/error listener, which runs inside
-     * the reconnect) closes the connection and throws, like nats.go's Drain() while reconnecting,
-     * rather than leaving the reconnect to reopen a connection the application is shutting down.
+     * that cannot wait (waiting disabled, or called from a listener that runs inside the reconnect - a
+     * Disconnected or error listener) closes the connection and throws, like nats.go's Drain() while
+     * reconnecting, rather than leaving the reconnect to reopen a connection the application is shutting
+     * down.
      *
      * Every drain ends with the connection Closed and one {@see ConnectionEvent::Closed} event - emitted
      * by the drain, or by what closed the connection before it could (a reconnect that gave up, a
@@ -1450,10 +1484,10 @@ final class NatsConnection
      * budget and returns whether the connection is open to be drained. It is not when the budget ran out
      * first, when the reconnect gave up, or when the user disconnect()ed meanwhile.
      *
-     * A drain that cannot wait - waiting disabled, or called from a connection/error listener, which
-     * runs inside the reconnect and would wait on itself (#145) - closes the connection and throws, like
-     * nats.go's Drain() while reconnecting: otherwise the reconnect would reopen a connection the
-     * application is shutting down.
+     * A drain that cannot wait - waiting disabled, or called from a listener that runs inside the
+     * reconnect (a Disconnected or error listener) and would wait on itself (#145) - closes the connection
+     * and throws, like nats.go's Drain() while reconnecting: otherwise the reconnect would reopen a
+     * connection the application is shutting down.
      *
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called drain().
      */
@@ -1472,9 +1506,8 @@ final class NatsConnection
             // ended: the drain still winds down and closes.
         }
 
-        // Also when the budget ran out: the reconnect completes only after its Reconnected listener
-        // returns, so a slow listener can hold the wait past the budget with the connection already
-        // back - and that connection must still be drained (UNSUB, flush), not just closed.
+        // Also when the budget ran out: the connection can come back in the same tick the budget runs out,
+        // and must then still be drained (UNSUB, flush), not just closed.
         return $this->state === ConnectionState::Open;
     }
 
@@ -1736,7 +1769,8 @@ final class NatsConnection
 
     /**
      * Writes an already-encoded publish frame with the state-appropriate delivery:
-     *   - Open: write to the socket, with a single recover-and-retry on a transient write failure.
+     *   - Open: write to the socket, with a single recover-and-retry on a transient write failure. The
+     *     retry is sent the way a publish issued after the recovery would be, by the state it finds.
      *   - Draining: write straight to the still-live socket. A draining connection keeps its socket
      *     open until drain() closes it, and a handler's ack/reply (a JetStream ack, respond(), a
      *     request reply) MUST reach the wire - nats.go drains by publishing then closing. Buffering
@@ -1777,6 +1811,31 @@ final class NatsConnection
                 // publish() does not return until the frame is (re-)written, so the same publisher's
                 // next frame follows it on the wire.
                 $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
+
+                // The reconnect has announced the new connection before returning, and the connection may have
+                // moved on since: the listener, or what it called, closed it or started another reconnect, or a
+                // drain() that waited for the reconnect began meanwhile. Sent as a publish issued now would be,
+                // the frame is then buffered behind that reconnect, or written to the connection being drained.
+                // Written directly, it would go into a socket already closed, or reach a new one ahead of its
+                // CONNECT, which a server that requires authentication answers by closing the connection.
+                if ($this->state !== ConnectionState::Open) {
+                    // Closed, or being closed other than by a drain() still flushing (which takes the frame, as it
+                    // takes any publish): nothing will send the frame. The write's own error says why, as an error
+                    // of this library - a built-in transport's raw stream error is wrapped.
+                    if (
+                        $this->state === ConnectionState::Closed
+                        || ($this->closing && $this->state !== ConnectionState::Draining)
+                    ) {
+                        throw $writeError instanceof NatsThrowable
+                            ? $writeError
+                            : new TransportClosedException('Transport is not connected', 0, $writeError);
+                    }
+
+                    $this->writePublishFrame($frame);
+
+                    return;
+                }
+
                 $this->transport->write($frame)->await();
             }
 
@@ -1930,7 +1989,7 @@ final class NatsConnection
             // not come back in time, so that the registry does not keep an entry whose sid the caller never
             // learns (#116).
             try {
-                $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000));
+                $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $caller);
             } catch (CancelledException) {
                 $this->dropSubscriptionState($sid);
 
@@ -2063,7 +2122,7 @@ final class NatsConnection
      * and then drains on the new connection: the reconnect never re-subscribes a sid being drained, but
      * one that had already re-subscribed it keeps it until just before it goes live, and the server can
      * deliver on it until then. When it cannot wait - waiting disabled, a caller inside the reconnect
-     * (a connection/error listener), or the budget ran out - it delivers the messages already received
+     * (a Disconnected or error listener), or the budget ran out - it delivers the messages already received
      * and removes the subscription; should the reconnect already have re-subscribed the sid, messages
      * the server sends on it before the reconnect's UNSUB lands are then dropped. During a drain() the
      * drain takes the subscription over: drain() has already unsubscribed it, its flush may still bring
@@ -2295,7 +2354,7 @@ final class NatsConnection
             // The socket is dead. The connection recovers within this flush's budget, and the flush fails
             // anyway, as when its PONG dies with the socket: what it was to confirm went to the dead one.
             try {
-                $this->recoverAfterFailedWrite($generation, $writeError, $this->remainingBudgetCancellation($deadline));
+                $this->recoverAfterFailedWrite($generation, $writeError, $this->remainingBudgetCancellation($deadline), $caller);
             } catch (CancelledException) {
                 throw new TimeoutException('Flush timed out waiting for the connection to be re-established');
             }
@@ -3590,6 +3649,11 @@ final class NatsConnection
      * callback resuming after its write while the read path already began recovering) await the same
      * attempt and share its outcome, rather than racing on the parser, state, and socket.
      *
+     * A reconnect this call runs announces the new connection once it is over, before this returns
+     * ({@see announceOpen()}), and the listener may then close the connection, or start another reconnect
+     * through what it calls. A caller that goes on using the connection checks the state again rather than
+     * assume it is Open, or Closed.
+     *
      * @param bool $ownedByConnect True only for the hand-off from {@see performConnect()}, which
      *                             runs inside the connect fiber while {@see $connecting} is set and
      *                             must bypass the in-flight-connect guard below.
@@ -3662,7 +3726,7 @@ final class NatsConnection
         $this->recoveryFiber = \Fiber::getCurrent();
 
         try {
-            $this->performRecovery($cause);
+            $opened = $this->performRecovery($cause);
             $deferred->complete();
         } catch (\Throwable $e) {
             $deferred->error($e);
@@ -3683,11 +3747,29 @@ final class NatsConnection
             }
         }
 
-        // A reconnect that a close stopped returns without reopening the connection. What is queued is then
-        // the close's: drain() delivers it within its budget, and disconnect() discards it. Delivered here as
-        // well, it reached handlers after disconnect(), or beside drain()'s own delivery and past the rules
-        // that one keeps.
-        if ($this->state !== ConnectionState::Open) {
+        // Announced once the reconnect is over, as performConnect() announces a connect (#145) and as the
+        // delivery below runs: what the listener calls then runs as it would anywhere else. Announced inside,
+        // an operation that found the new connection gone already joined this reconnect, which was waiting for
+        // the listener to return: the operation waited out its timeout, or for good, and the connection stayed
+        // Open on the dead socket. Now that operation reconnects again.
+        if ($opened !== null) {
+            // A failed initial connect handed off here: settled before its Connected listener runs, as
+            // performConnect() settles a direct one, so that a connect() which joined the dial, and which the
+            // listener may wait for, is not waiting for the listener in turn.
+            if ($ownedByConnect) {
+                $this->settleConnecting(null);
+            }
+
+            $this->announceOpen($opened);
+        }
+
+        // A reconnect that a close stopped returns without reopening the connection, and the listener may have
+        // closed it since - or still be closing it, a disconnect() whose socket close takes a while - or what it
+        // called given up on it. What is queued is then the close's: drain() delivers it within its budget, and
+        // disconnect() discards it. Delivered here as well, it reached handlers after disconnect(), or beside
+        // drain()'s own delivery and past the rules that one keeps. When what the listener called started
+        // another reconnect instead, what is queued waits for that one.
+        if ($this->closing || $this->state !== ConnectionState::Open) {
             return;
         }
 
@@ -3774,14 +3856,17 @@ final class NatsConnection
      * Performs the actual reconnect + subscription replay, serialized by {@see recoverConnection()}.
      *
      * @param \Throwable|null $cause The error that ended the connection, chained to "Reconnect is disabled".
+     * @return ConnectionEvent|null The event that announces the reopened connection, which
+     *         {@see recoverConnection()} emits once the reconnect is over; null when a close stopped the
+     *         reconnect.
      */
-    private function performRecovery(?\Throwable $cause = null): void
+    private function performRecovery(?\Throwable $cause = null): ?ConnectionEvent
     {
         // User close-intent set before/while recovery began: do not re-open (#84).
         if ($this->closing) {
             $this->state = ConnectionState::Closed;
 
-            return;
+            return null;
         }
 
         if (!$this->options->reconnectEnabled) {
@@ -3811,7 +3896,19 @@ final class NatsConnection
         $this->state = ConnectionState::Connecting;
 
         $this->cancelPingTimer();
-        if (!$firstConnect) {
+        // How the reopened connection will be announced: the first-ever open reached through the recovery loop
+        // (a failed initial connect) as Connected, not Reconnected, so listeners keyed on Connected still fire
+        // (#161).
+        $opened = $firstConnect ? ConnectionEvent::Connected : ConnectionEvent::Reconnected;
+        $unannounced = $this->unannouncedOpen;
+        if ($unannounced !== null && $unannounced['generation'] === $this->connectionGeneration) {
+            // The listener has not heard yet that the connection now lost was open (announceOpen() had yet to
+            // call it), so for the listener the outage it last heard of goes on: it is not told of this loss
+            // either, and hears of the next open as it would have heard of that one. The log records both.
+            $this->unannouncedOpen = null;
+            $this->logLifecycleEvent(ConnectionEvent::Disconnected, null);
+            $opened = $unannounced['event'];
+        } elseif (!$firstConnect) {
             $this->emitEvent(ConnectionEvent::Disconnected);
         }
 
@@ -3823,7 +3920,7 @@ final class NatsConnection
             if ($this->closing) {
                 $this->state = ConnectionState::Closed;
 
-                return;
+                return null;
             }
 
             $this->closeTransportBestEffort();
@@ -3832,7 +3929,7 @@ final class NatsConnection
             if ($this->closing) {
                 $this->state = ConnectionState::Closed;
 
-                return;
+                return null;
             }
 
             try {
@@ -3848,7 +3945,7 @@ final class NatsConnection
                     }
                     $this->state = ConnectionState::Closed;
 
-                    return;
+                    return null;
                 }
 
                 // The replay window: state stays Connecting through the subscription replay and
@@ -3873,15 +3970,13 @@ final class NatsConnection
                     }
                     $this->state = ConnectionState::Closed;
 
-                    return;
+                    return null;
                 }
 
                 $this->markConnectionOpen();
-                // The first-ever open reached through the recovery loop (a failed initial connect)
-                // fires Connected, not Reconnected, so listeners keyed on Connected still fire (#161).
-                $this->emitEvent($firstConnect ? ConnectionEvent::Connected : ConnectionEvent::Reconnected);
 
-                return;
+                // recoverConnection() announces it once the reconnect is over.
+                return $opened;
             } catch (AuthenticationException $e) {
                 // disconnect()/drain() stopped this reconnect while it was authenticating: end like the
                 // other stopped exits - the close is theirs to report and announce (#84).
@@ -3889,7 +3984,7 @@ final class NatsConnection
                     $this->state = ConnectionState::Closed;
                     $this->closeTransportBestEffort();
 
-                    return;
+                    return null;
                 }
 
                 // Credentials will not become valid by retrying: stop the reconnect loop immediately
@@ -3935,7 +4030,7 @@ final class NatsConnection
         if ($this->closing) {
             $this->state = ConnectionState::Closed;
 
-            return;
+            return null;
         }
 
         $this->markClosedForGood();
@@ -4089,6 +4184,9 @@ final class NatsConnection
      *
      * @return array<int, array{max: ?int, received: int}> The sids re-subscribed, with the auto-unsubscribe
      *         max each was replayed with and the messages it had received by then.
+     *
+     * @phpstan-impure Writes the replay and reads the server's answers, suspending meanwhile: close-intent can
+     *                 be set, and subscriptions dropped, while it runs.
      */
     private function resubscribeAll(): array
     {
@@ -5165,9 +5263,17 @@ final class NatsConnection
             $this->closedAnnounced = true;
         }
 
-        // Log every lifecycle transition regardless of whether a connection listener is configured (#69).
-        // Guarded like the listener below: a throwing user logger must neither keep the transition from
-        // the listener nor break the caller - a drain() or disconnect() that is closing the connection.
+        $this->logLifecycleEvent($event, $error);
+        $this->notifyConnectionListener($event, $error);
+    }
+
+    /**
+     * Logs a lifecycle transition, whether or not a connection listener is configured (#69). Guarded like the
+     * listener: a throwing user logger must neither keep the transition from the listener nor break the caller -
+     * a drain() or disconnect() that is closing the connection.
+     */
+    private function logLifecycleEvent(ConnectionEvent $event, ?\Throwable $error): void
+    {
         try {
             if ($error !== null) {
                 $this->logger->warning('NATS connection ' . $event->name, ['event' => $event->name, 'exception' => $error]);
@@ -5177,17 +5283,92 @@ final class NatsConnection
         } catch (\Throwable) {
             // Swallowed: see above.
         }
+    }
 
+    /**
+     * Calls the configured connection listener, if any, counting the Connected and Reconnected calls while they
+     * run ({@see $openListenerCalls}).
+     */
+    private function notifyConnectionListener(ConnectionEvent $event, ?\Throwable $error): void
+    {
         $listener = $this->options->connectionListener;
         if ($listener === null) {
             return;
+        }
+
+        $announcesOpen = $event === ConnectionEvent::Connected || $event === ConnectionEvent::Reconnected;
+        if ($announcesOpen) {
+            $this->openListenerCalls++;
         }
 
         try {
             $listener($event, $error);
         } catch (\Throwable) {
             // A throwing listener must never break connection handling.
+        } finally {
+            if ($announcesOpen) {
+                $this->openListenerCalls--;
+            }
         }
+    }
+
+    /**
+     * Announces a connection that a reconnect has just opened, once the reconnect is over
+     * ({@see recoverConnection()}): $event is Reconnected, or Connected for the first-ever open.
+     *
+     * The open is logged at once, and the listener is called at once as well - unless a Connected or Reconnected
+     * listener call is already running. The reconnect was then most likely run by an operation that call waits
+     * for, which found the connection the call announced gone already. Called from that operation, the listener
+     * would run nested inside the call that waits for it, and under a server that drops every new connection the
+     * calls would nest one level deeper with every connection - a suspended fiber each, with the operation that
+     * ran the first reconnect blocked until the server settles. The listener is called from the event loop
+     * instead, and the operation goes on at once. So does the reconnect's delivery of what it read during its
+     * replay: the subscription handlers can then get messages from the new connection before the listener hears
+     * of it.
+     *
+     * Either way the listener hears of the connection only while it is still the open one: not once it is closed
+     * or being closed, nor once it was replaced, and not once it was lost - then the listener hears of neither
+     * the open nor the loss ({@see performRecovery()}). A Reconnected listener call therefore always finds the
+     * connection Open, and never comes after the Closed that ended it.
+     */
+    private function announceOpen(ConnectionEvent $event): void
+    {
+        $generation = $this->connectionGeneration;
+        $this->unannouncedOpen = ['event' => $event, 'generation' => $generation];
+        $this->logLifecycleEvent($event, null);
+
+        if ($this->openListenerCalls > 0) {
+            EventLoop::queue(function () use ($generation): void {
+                $this->notifyOpen($generation);
+            });
+
+            return;
+        }
+
+        $this->notifyOpen($generation);
+    }
+
+    /**
+     * Calls the connection listener for the open of the connection of $generation, if it is still the open one
+     * and the listener has not heard of it yet ({@see announceOpen()}).
+     */
+    private function notifyOpen(int $generation): void
+    {
+        $unannounced = $this->unannouncedOpen;
+        // Lost first: performRecovery() dropped the announcement.
+        if ($unannounced === null || $unannounced['generation'] !== $generation) {
+            return;
+        }
+
+        $this->unannouncedOpen = null;
+        // Closed or being closed, or replaced since by a connect() after a close. A loss would have dropped the
+        // announcement (see above), so the state is Open unless the user closed the connection; it is checked all
+        // the same, as the one thing a Reconnected listener may count on.
+        if ($this->closing || $this->connectionGeneration !== $generation || $this->state !== ConnectionState::Open) {
+            return;
+        }
+
+        $this->notifyConnectionListener($unannounced['event'], null);
     }
 
     /**

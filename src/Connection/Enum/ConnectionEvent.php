@@ -12,13 +12,27 @@ namespace IDCT\NATS\Connection\Enum;
  */
 enum ConnectionEvent
 {
-    /** The initial connection handshake completed and the connection is open. */
+    /**
+     * The initial connection handshake completed and the connection is open. When a reconnect completed a
+     * failed initial connect, it is announced like a Reconnected, once that reconnect is over.
+     */
     case Connected;
 
-    /** The transport was lost; the client will attempt to reconnect (if enabled). */
+    /**
+     * The transport was lost; the client will attempt to reconnect (if enabled). Not announced for a
+     * connection the listener had not been told of yet - its Reconnected, or the Connected of a failed initial
+     * connect a reconnect completed, still to come: the listener hears of the next connection instead.
+     */
     case Disconnected;
 
-    /** A reconnect attempt succeeded and subscriptions were replayed. */
+    /**
+     * A reconnect attempt succeeded and subscriptions were replayed. Announced once the reconnect is over, and
+     * only while the connection it announces is still open: a listener called with it always finds the
+     * connection Open. Announced from the event loop when another Connected or Reconnected listener call is
+     * running - typically the one whose operation had to reconnect - so that listener calls do not nest; the
+     * messages the reconnect read can then reach subscription handlers first. All of this holds for the
+     * Connected of a failed initial connect that a reconnect completed as well.
+     */
     case Reconnected;
 
     /**
