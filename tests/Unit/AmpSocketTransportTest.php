@@ -9,11 +9,13 @@ use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\Socket\ConnectContext;
 use Amp\Socket\DnsSocketConnector;
+use Amp\Socket\RetrySocketConnector;
 use Amp\Socket\Socket;
 use Amp\Socket\SocketAddress;
 use Amp\Socket\SocketConnector;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Tests\Support\StopsDialOnRefusalConnector;
 use IDCT\NATS\Transport\AmpSocketTransport;
 use IDCT\NATS\Transport\TlsRequiredException;
 use IDCT\NATS\Transport\TransportClosedException;
@@ -374,9 +376,12 @@ final class AmpSocketTransportTest extends TestCase
      * ends at once, and leaves no socket behind, even once the pause is over and the port answers again. The
      * pause ignores the cancellation, and used to hold the dial, and a close waiting for it, for its length.
      *
-     * The time is measured from the moment the stop fires to the moment the call ends, so a stop timer that
-     * fires late, or a slow start of the dial, does not count against it. A dial held by the pause ends about
-     * 1.9 s after the stop.
+     * No timer stops the dial. The test installs Amp's retry connector over a {@see StopsDialOnRefusalConnector},
+     * which stops the dial from a microtask queued when the first attempt is refused. The microtask runs once the
+     * pause has begun, so the stop lands at the start of the pause however late timers fire and however slowly the
+     * attempt is refused. The time is measured from the stop to the end of the call: a dial held by the pause ends
+     * about 2 s or more after the stop, and one that honours the stop ends in the same event-loop turn. The default
+     * connector is restored afterwards.
      */
     public function testDialStoppedDuringTheRetryPauseEndsAtOnceAndLeavesNoSocket(): void
     {
@@ -387,38 +392,40 @@ final class AmpSocketTransportTest extends TestCase
 
         $transport = new AmpSocketTransport(new NatsOptions());
         $stop = new DeferredCancellation();
-        // Amp's first attempt is refused within a few milliseconds, so the stop lands in the 2 s pause after it.
-        $stoppedAt = null;
-        EventLoop::delay(0.1, static function () use ($stop, &$stoppedAt): void {
-            $stoppedAt = hrtime(true);
-            $stop->cancel();
-        });
+        // The refused first attempt stops the dial, and the stop lands at the start of Amp's 2 s retry pause.
+        $refusals = new StopsDialOnRefusalConnector($stop);
+        $default = socketConnector();
+        socketConnector(new RetrySocketConnector($refusals));
 
         try {
-            $transport->connect('nats://' . $address, 1_000, $stop->getCancellation())->await();
-            self::fail('expected CancelledException');
-        } catch (CancelledException) {
-            // Stopped.
-        }
-        $endedAt = hrtime(true);
+            try {
+                $transport->connect('nats://' . $address, 1_000, $stop->getCancellation())->await();
+                self::fail('expected CancelledException');
+            } catch (CancelledException) {
+                // Stopped.
+            }
+            $endedAt = hrtime(true);
 
-        self::assertNotNull($stoppedAt, 'only the stop cancels the dial');
-        self::assertLessThan(
-            1.0,
-            ($endedAt - $stoppedAt) / 1e9,
-            'the dial must end as soon as it is stopped, not when the retry pause is over',
-        );
+            self::assertNotNull($refusals->stoppedAt, 'only the stop cancels the dial');
+            self::assertLessThan(
+                1.0,
+                ($endedAt - $refusals->stoppedAt) / 1e9,
+                'the dial must end as soon as it is stopped, not when the retry pause is over',
+            );
 
-        // The port answers again before Amp's pause is over: its next attempt leaves no socket installed.
-        $server = listen('tcp://' . $address);
-        delay(2.5);
-        $server->close();
+            // The port answers again before Amp's pause is over: its next attempt leaves no socket installed.
+            $server = listen('tcp://' . $address);
+            delay(2.5);
+            $server->close();
 
-        try {
-            $transport->write("PING\r\n")->await();
-            self::fail('expected TransportClosedException');
-        } catch (TransportClosedException) {
-            // No socket.
+            try {
+                $transport->write("PING\r\n")->await();
+                self::fail('expected TransportClosedException');
+            } catch (TransportClosedException) {
+                // No socket.
+            }
+        } finally {
+            socketConnector($default);
         }
     }
 

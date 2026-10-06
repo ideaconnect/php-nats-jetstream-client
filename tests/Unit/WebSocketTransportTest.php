@@ -10,6 +10,7 @@ use Amp\DeferredCancellation;
 use Amp\Socket\BindContext;
 use Amp\Socket\Certificate;
 use Amp\Socket\ConnectException as AmpConnectException;
+use Amp\Socket\RetrySocketConnector;
 use Amp\Socket\ServerTlsContext;
 use Amp\Socket\Socket;
 use Amp\Socket\TlsException;
@@ -17,6 +18,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Tests\Support\ScriptedChunkSocket;
+use IDCT\NATS\Tests\Support\StopsDialOnRefusalConnector;
 use IDCT\NATS\Tests\Support\WedgedWriteSocket;
 use IDCT\NATS\Transport\AmpSocketTransport;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
@@ -24,12 +26,12 @@ use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\WebSocketFrameCodec;
 use IDCT\NATS\Transport\WebSocketTransport;
 use PHPUnit\Framework\TestCase;
-use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
 use function Amp\Socket\connect;
 use function Amp\Socket\listen;
+use function Amp\Socket\socketConnector;
 
 final class WebSocketTransportTest extends TestCase
 {
@@ -1950,10 +1952,12 @@ final class WebSocketTransportTest extends TestCase
 
     /**
      * A dial stopped while Amp's retry connector pauses between attempts ends at once, as for the socket
-     * transport ({@see AmpSocketTransportTest::testDialStoppedDuringTheRetryPauseEndsAtOnceAndLeavesNoSocket()}).
-     * The time is measured from the moment the stop fires to the moment the call ends, so a stop timer that
-     * fires late, or a slow start of the dial, does not count against it. A dial held by the pause ends about
-     * 1.9 s after the stop.
+     * transport ({@see AmpSocketTransportTest::testDialStoppedDuringTheRetryPauseEndsAtOnceAndLeavesNoSocket()}),
+     * with the stop placed the same way: the test installs Amp's retry connector over a
+     * {@see StopsDialOnRefusalConnector}, which stops the dial from a microtask queued when the first attempt is
+     * refused, so the stop lands at the start of the 2 s pause however late timers fire. The time is measured from
+     * the stop to the end of the call: a dial held by the pause ends about 2 s or more after the stop, and one that
+     * honours the stop ends in the same event-loop turn. The default connector is restored afterwards.
      */
     public function testDialStoppedDuringTheRetryPauseEndsAtOnce(): void
     {
@@ -1964,25 +1968,25 @@ final class WebSocketTransportTest extends TestCase
 
         $transport = new WebSocketTransport(new NatsOptions());
         $stop = new DeferredCancellation();
-        // Amp's first attempt is refused within a few milliseconds, so the stop lands in the 2 s pause after it.
-        $stoppedAt = null;
-        EventLoop::delay(0.1, static function () use ($stop, &$stoppedAt): void {
-            $stoppedAt = hrtime(true);
-            $stop->cancel();
-        });
+        // The refused first attempt stops the dial, and the stop lands at the start of Amp's 2 s retry pause.
+        $refusals = new StopsDialOnRefusalConnector($stop);
+        $default = socketConnector();
+        socketConnector(new RetrySocketConnector($refusals));
 
         try {
             $transport->connect('ws://' . $address, 1_000, $stop->getCancellation())->await();
             self::fail('expected CancelledException');
         } catch (CancelledException) {
             // Stopped.
+        } finally {
+            socketConnector($default);
         }
         $endedAt = hrtime(true);
 
-        self::assertNotNull($stoppedAt, 'only the stop cancels the dial');
+        self::assertNotNull($refusals->stoppedAt, 'only the stop cancels the dial');
         self::assertLessThan(
             1.0,
-            ($endedAt - $stoppedAt) / 1e9,
+            ($endedAt - $refusals->stoppedAt) / 1e9,
             'the dial must end as soon as it is stopped, not when the retry pause is over',
         );
     }
