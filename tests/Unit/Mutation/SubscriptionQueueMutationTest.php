@@ -244,13 +244,9 @@ final class SubscriptionQueueMutationTest extends TestCase
     }
 
     /**
-     * The break inside next()'s loop fires as soon as a message is buffered: the FIRST queued message
-     * is returned, and the second remains buffered for a subsequent call.
-     *
-     * - GreaterThan @ 172 (count >= 0): would break on the very first iteration regardless of whether
-     *   a message arrived, returning null when the buffer is still empty.
-     * - GreaterThanNegotiation @ 172 (count <= 0): would break only while empty, never on a delivery,
-     *   so it would run to the timeout instead of returning promptly.
+     * next() returns the FIRST queued message and leaves the second buffered for a subsequent call: one
+     * call takes one message, in order. That the loop stops reading once a message is buffered is pinned
+     * by the next test.
      */
     public function testNextBreaksOnFirstBufferedMessageLeavingRestBuffered(): void
     {
@@ -264,7 +260,7 @@ final class SubscriptionQueueMutationTest extends TestCase
         $queue->setTimeout(0.2);
 
         $first = $queue->next();
-        // kills GreaterThan@172 / GreaterThanNegotiation@172: must return the first delivered message.
+        // The first delivered message comes back first.
         self::assertNotNull($first);
         self::assertSame('one', $first->payload);
 
@@ -275,14 +271,14 @@ final class SubscriptionQueueMutationTest extends TestCase
     }
 
     /**
-     * Once a message is buffered, next() must BREAK out of the wait loop immediately - it must not
-     * keep pumping the socket. With a blocking transport that supplies one frame then parks, the real
-     * code reads exactly the queued chunk and breaks (no blocking read is ever started); the mutant
-     * keeps looping and starts a blocking processIncoming read.
+     * Once a message is buffered, next() must leave the wait loop immediately - it must not keep pumping
+     * the socket. With a blocking transport that supplies one frame then parks, the real code reads
+     * exactly the queued chunk and stops (no blocking read is ever started); the mutants keep looping and
+     * start a blocking read.
      *
-     * - Break_ @ 173 (break -> continue): after the message is buffered the loop continues, so a
-     *   further processIncoming starts a blocking read on the now-empty transport (startedReads > 0)
-     *   until the deadline, instead of returning at once.
+     * - The `bufferIsEmpty()` check in the loop condition, with `&&` -> `||` or the check negated: after
+     *   the message is buffered the loop continues, so a further read blocks on the now-empty transport
+     *   (startedReads > 0) until the deadline, instead of returning at once.
      */
     public function testNextBreakStopsLoopWithoutFurtherReads(): void
     {
@@ -297,8 +293,8 @@ final class SubscriptionQueueMutationTest extends TestCase
             new TimeoutCancellation(2.0),
         )[0];
 
-        // kills Break_ @ 173: the queued chunk is consumed and the loop breaks before any blocking
-        // read is started.
+        // kills the loop condition's `&&` -> `||` and its negated `bufferIsEmpty()`: the queued chunk is
+        // consumed and the loop ends before any blocking read is started.
         self::assertNotNull($msg);
         self::assertSame('a', $msg->payload);
         self::assertSame(0, $transport->startedReads);

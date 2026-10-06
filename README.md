@@ -683,7 +683,7 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/polling-subscribe.php`](examples/polling-subscribe.php)
 
-_Verified by: [SubscriptionQueueTest](tests/Unit/SubscriptionQueueTest.php) (`fetch`/`next`/`fetchAll`/`setTimeout`); [NatsClientIntegrationTest::testSubscriptionQueuePollingDeliversLive](tests/Integration/NatsClientIntegrationTest.php); [features/core/headers_queueing.feature](features/core/headers_queueing.feature)._
+_Verified by: [SubscriptionQueueTest](tests/Unit/SubscriptionQueueTest.php) (`fetch`/`next`/`fetchAll`/`setTimeout`); [ConcurrentReadTest::testPollReturnsAMessageAnotherReadDeliversDuringItsPause](tests/Unit/ConcurrentReadTest.php); [NatsClientIntegrationTest::testSubscriptionQueuePollingDeliversLive](tests/Integration/NatsClientIntegrationTest.php); [features/core/headers_queueing.feature](features/core/headers_queueing.feature)._
 
 ```php
 <?php
@@ -713,6 +713,8 @@ $messages = $queue->fetchAll(limit: 10);
 $client->unsubscribe($queue->sid)->await();
 $client->disconnect()->await();
 ```
+
+A poll with a timeout looks at its queue before each further read. A message that another fiber's read delivers between the poll's reads, such as one from your own `processIncoming()` loop, is therefore taken at once rather than at the end of the timeout: `next()` returns it, and `fetchAll()` returns once it holds `limit` messages.
 
 A queue's buffer is bounded like its subscription's. If your application does not poll often enough, messages are dropped under the slow-consumer policy - see [Slow Consumers](#slow-consumers) for which ones, and how the loss is reported.
 

@@ -17,6 +17,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` `SubscriptionQueue::next()` with a timeout, and `fetchAll()` with a limit and a timeout, returned a
+  message that another fiber's read delivered while they paused between reads (an application's
+  `processIncoming()` loop, say) only once the timeout ran out (#174). They started another read before they
+  looked at the queue, and that read waited on the socket, with the message already there, for the server's
+  next bytes or the whole timeout. They now take what arrived before they read again. `next()` had this shape
+  since 1.0.0, `fetchAll()` since 2.0.0.
+
 ### Testing & CI
 
 - `[docs]` The E2E job runs the unit suite once instead of twice, and the Docker fixtures do less background

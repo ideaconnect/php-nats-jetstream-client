@@ -188,6 +188,51 @@ final class ConcurrentReadTest extends TestCase
         self::assertSame('echo:hi', $request->await());
     }
 
+    /** @return iterable<string, array{string}> */
+    public static function pollsWithATimeout(): iterable
+    {
+        yield 'next() with a timeout' => ['next'];
+        yield 'fetchAll(1) with a timeout' => ['fetchAll'];
+    }
+
+    /**
+     * A queue polled with a timeout returns a message that another fiber's read delivers while the poll
+     * pauses between reads (#174). The application's processIncoming() holds the socket read when the poll
+     * starts, so the poll's first read waits for it and finds nothing. The message that ends that read is
+     * for another subscription, whose handler defers a second read of the application's together with the
+     * queue's message: the deferred callback runs in the next event-loop tick, before any timer, and so
+     * while the poll pauses for 1 ms. The poll used to start another read before it looked at the queue, and
+     * that read waited on a socket with nothing more to come until the whole timeout ran out.
+     */
+    #[DataProvider('pollsWithATimeout')]
+    public function testPollReturnsAMessageAnotherReadDeliversDuringItsPause(string $poll): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->connectClient($transport);
+        $queue = $client->subscribeQueue('jobs')->await();
+        $other = $client->subscribe('other', static function () use ($transport, $client, $queue): void {
+            EventLoop::defer(static function () use ($transport, $client, $queue): void {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+                async(static fn(): int => $client->processIncoming()->await())->ignore();
+            });
+        })->await();
+        // The application's read holds the socket when the poll starts; the message that ends it is for "other".
+        $reader = async(static fn(): int => $client->processIncoming()->await());
+        delay(0.01);
+        EventLoop::delay(0.05, static fn() => $transport->pushFrame(ReconnectingTransport::msgFrame('other', $other, 'o1')));
+        self::assertFalse($reader->isComplete(), 'the application\'s read holds the socket when the poll starts');
+
+        $start = hrtime(true);
+        $result = $poll === 'next'
+            ? $queue->setTimeout(5.0)->next()?->payload
+            : array_map(static fn(NatsMessage $message): string => $message->payload, $queue->setTimeout(5.0)->fetchAll(1));
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        self::assertSame($poll === 'next' ? 'job-1' : ['job-1'], $result);
+        self::assertLessThan(2.5, $elapsed, 'the poll returned the message once it was there, not at the end of its 5 s timeout');
+        self::assertSame(1, $reader->await(), 'the application\'s first read brought the other subscription\'s message');
+    }
+
     /**
      * The reported freeze, with no fiber of the application's own: a single processIncoming() loop, a
      * handler that awaits something (during which the heartbeat's timer sends a PING and starts reading),
