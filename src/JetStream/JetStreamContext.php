@@ -2913,6 +2913,16 @@ final class JetStreamContext
                         break;
                     }
 
+                    // The head pull can have completed while the issue phase above waited for its writes:
+                    // another fiber's read (an application's processIncoming() loop, say) delivered its batch
+                    // or its status. A read started now would wait on the socket, with that batch already
+                    // here, for the server's next bytes or the earliest deadline (the shape of #174). Go back
+                    // to the top instead, which honours stop() and drain() and retires the head.
+                    $head = $issueOrder[0] ?? null;
+                    if ($head !== null && $inflight[$head]->done) {
+                        continue;
+                    }
+
                     // PUMP PHASE: read frames until the head pull completes or the earliest per-pull
                     // deadline elapses (so the engine never blocks unbounded on a silent server).
                     $nowNs = hrtime(true);

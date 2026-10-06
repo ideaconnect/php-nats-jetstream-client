@@ -36,6 +36,10 @@ use function Amp\delay;
  * never hand the event loop control: no timer or socket read ran again - that other read's included - and
  * the process spun at 100% CPU for good. The loops below are capped, so the old behaviour fails them
  * instead of hanging the suite.
+ *
+ * The other way round, the application's read can deliver what an operation waits for while that operation
+ * is between its reads: a SubscriptionQueue polled with a timeout, pausing, or the pipelined pull engine,
+ * writing its next pull request. The operation takes it before it reads again (#174).
  */
 final class ConcurrentReadTest extends TestCase
 {
@@ -280,6 +284,75 @@ final class ConcurrentReadTest extends TestCase
         self::assertSame(['j1', 'j2', 'j3', 'j4'], array_map(static fn(NatsMessage $message): string => $message->payload, $messages));
         self::assertSame(0, $queue->droppedCount());
         self::assertSame(1, $reader->await(), 'the application\'s first read brought the other subscription\'s message');
+    }
+
+    /** @return iterable<string, array{float}> */
+    public static function secondPullRequestWrites(): iterable
+    {
+        yield 'written at once' => [0.0];
+        yield 'held up 100 ms' => [0.1];
+    }
+
+    /**
+     * The pipelined pull engine behind PullConsumerIterator::handle() hands over a batch that another
+     * fiber's read delivered while the engine issued its next pull, the same shape as #174. The
+     * application's processIncoming() loop runs beside the engine. The server answers the first pull at once
+     * and holds the second, the stream being empty, and the application's read delivers the first pull's
+     * message while the engine waits for the write of the second pull's request. The test transport's
+     * writes take a few event-loop hops; one held up 100 ms is like a socket under backpressure. The engine
+     * looked at its head pull only before it issued pulls, so it went on to read with the batch already
+     * there, and the handler got the message only at the first pull's deadline: its 5 s expiry plus 1 s.
+     */
+    #[DataProvider('secondPullRequestWrites')]
+    public function testPipelinedPullEngineHandsOverABatchAnotherReadDeliveredWhileItIssued(float $stall): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->connectClient($transport);
+        $pulls = new class {
+            public int $count = 0;
+            public bool $stallArmed = false;
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport, $pulls): array {
+            if (!str_starts_with($subject, '$JS.API.CONSUMER.MSG.NEXT.S.C') || $replyTo === null || ++$pulls->count > 1) {
+                return [];
+            }
+
+            $sid = $transport->sidFor($replyTo);
+            self::assertNotNull($sid);
+
+            return [ReconnectingTransport::msgFrame('orders.new', $sid, 'a', '$JS.ACK.S.C.1.1.1.0.0')];
+        };
+        $transport->afterWrite = static function (string $bytes) use ($transport, $pulls, $stall): void {
+            // Written after the first pull request: hold up the second.
+            if ($stall > 0.0 && !$pulls->stallArmed && str_contains($bytes, 'CONSUMER.MSG.NEXT')) {
+                $pulls->stallArmed = true;
+                $transport->stallNextWriteContaining('CONSUMER.MSG.NEXT', $stall);
+            }
+        };
+        $run = new class {
+            public bool $over = false;
+            public ?float $handledAfter = null;
+        };
+        $reader = async(static function () use ($client, $run): void {
+            while (!$run->over) {
+                $client->processIncoming()->await();
+            }
+        });
+        $reader->ignore();
+        delay(0.01);
+
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(1)->setDepth(2)->setExpiresMs(5_000);
+        $start = hrtime(true);
+        $processed = $iterator->handle(static function () use ($iterator, $run, $start): void {
+            $run->handledAfter = (hrtime(true) - $start) / 1e9;
+            $iterator->stop();
+        })->await(new TimeoutCancellation(10));
+        $run->over = true;
+
+        self::assertSame(1, $processed);
+        self::assertNotNull($run->handledAfter);
+        self::assertLessThan(3.0, $run->handledAfter, 'the handler got the message once it was there, not at the first pull\'s 6 s deadline');
+        self::assertSame(2, $pulls->count, 'both pulls were issued before the first one was handed over');
     }
 
     /**

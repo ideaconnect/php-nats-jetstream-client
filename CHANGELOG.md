@@ -29,6 +29,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   does not complete the call, so its own next read has the queue's whole buffer (#174). When that delivery had
   filled the queue, the messages the next read brought overflowed it: they or the earlier ones were dropped, or
   under `SlowConsumerPolicy::Error` the call failed with a `SlowConsumerException`.
+- `[bugfix]` The pipelined pull engine behind `PullConsumerIterator::handle()` handed over a batch that another
+  fiber's read delivered while the engine waited for the write of a pull request (an application's
+  `processIncoming()` loop, say, with the socket under backpressure) only at that pull's deadline, its expiry
+  plus 1 s, or with the server's next bytes. It looked at its oldest pull only before it issued pulls, and
+  then read with that pull's batch already there. It now looks again before it reads. The review of #174
+  found this; the engine had the same shape since it arrived in 2.7.0.
 
 ### Testing & CI
 
