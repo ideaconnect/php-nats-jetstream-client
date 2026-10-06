@@ -16,6 +16,10 @@ namespace IDCT\NATS\Connection;
  * idle sleep per chunk. Only a read that consumed nothing ({@see $consumedBytes} false - an empty
  * read, or another fiber owning the socket) is truly idle and yields the 1 ms so the event loop
  * advances and deadlines fire.
+ *
+ * An operation's read ended by its wake-up - something was delivered to the operation's subscription
+ * while the read waited ({@see NatsConnection::readIncomingForOperation()}) - consumed nothing either:
+ * the operation looks at its own state first, and only pauses when that shows nothing.
  */
 final class IncomingChunkResult
 {
@@ -24,7 +28,8 @@ final class IncomingChunkResult
      * @param bool $consumedBytes Whether this read pulled a non-empty chunk off the transport and fed
      *                            it to the parser - i.e. it made wire progress, even if $frames is 0
      *                            because the frame is not yet complete. False for an empty read, a
-     *                            read skipped because another fiber owns the socket, or a read error.
+     *                            read skipped because another fiber owns the socket, a read error, or
+     *                            an operation's read ended by its wake-up.
      */
     public function __construct(
         public readonly int $frames,

@@ -17,8 +17,29 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- **Custom transports.** `TransportInterface::readLine()` must keep every byte it has not returned when its
+  cancellation ends it, a partial frame included: the connection cancels a read not only at a deadline but also to
+  wake an operation whose result another fiber delivered meanwhile, and then reads on (#174). The built-in transports
+  do, and the rule always held in practice, since every non-blocking poll and the heartbeat cancel their reads after
+  a short bound. A transport that lost bytes on cancellation would now corrupt the stream in normal operation.
+
 ### Fixed
 
+- `[bugfix]` An operation that reads the socket while it waits for a result of its own, a `SubscriptionQueue` poll,
+  `fetchBatch()`/`fetchNext()`, `directGetBatch()`, the pull consumer or Key/Value `keys()`/`history()`, got a result
+  that another fiber's read delivered only with the server's next bytes or at its deadline when that delivery reached
+  it while the operation's read was already waiting (#174). That happened in three ways: the delivery was still under
+  way when the read started, held up in the handler of another subscription that awaits an HTTP or database call, say,
+  or in the write of the PONG a server PING ahead of the message is owed; it came in the few event-loop hops between
+  the operation's check and the start of its read; or it came with the reconnect the read waited for. On a real server
+  the first costs the whole deadline, the server pinging only every two minutes, and the third about two seconds. An
+  operation's read now ends without reading as soon as anything is delivered to the operation's subscription,
+  wherever the read waits: on the socket, whose read it cancels, behind another fiber's read, or for a reconnect; the
+  operation then looks again. Application reads, `processIncoming()` and `readIncoming()`, are unchanged, and so is
+  the order of deliveries: an operation gets its message once the in-order delivery reaches it, so a handler ahead of
+  it that outlasts the operation's deadline still makes it time out.
 - `[bugfix]` `SubscriptionQueue::next()` with a timeout, and `fetchAll()` with a limit and a timeout, returned a
   message that another fiber's read delivered while they paused between reads (an application's
   `processIncoming()` loop, say) only once the timeout ran out (#174). They started another read before they

@@ -204,7 +204,8 @@ final class SubscriptionQueue
             // The queue is checked before every further read, not only right after one: another fiber's
             // read (an application's processIncoming() loop, say) can deliver to it during the pause below,
             // and a read started then would wait on the socket, with the message already here, for the
-            // server's next bytes or the whole timeout (#174).
+            // server's next bytes or the whole timeout (#174). A delivery that reaches the queue while the
+            // read waits ends that read without reading, and the check runs then as well.
             do {
                 $read = $this->client->readIncomingForOperation($cancellation, $this->sid)->await();
 
@@ -287,7 +288,8 @@ final class SubscriptionQueue
                         // Another fiber's read (an application's processIncoming() loop, say) can deliver
                         // to this queue during that pause. Take it now, so that a call it completes ends
                         // here instead of starting a read that would wait on the socket, with the messages
-                        // already here, for the server's next bytes or the whole window (#174).
+                        // already here, for the server's next bytes or the whole window (#174). A delivery
+                        // that reaches the queue while the read waits ends that read without reading.
                         $this->takeBuffered($collected, $limit);
                     }
                 }

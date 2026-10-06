@@ -2917,7 +2917,8 @@ final class JetStreamContext
                     // another fiber's read (an application's processIncoming() loop, say) delivered its batch
                     // or its status. A read started now would wait on the socket, with that batch already
                     // here, for the server's next bytes or the earliest deadline (the shape of #174). Go back
-                    // to the top instead, which honours stop() and drain() and retires the head.
+                    // to the top instead, which honours stop() and drain() and retires the head. A delivery
+                    // to the inbox while the pump read below waits ends that read without reading.
                     $head = $issueOrder[0] ?? null;
                     if ($head !== null && $inflight[$head]->done) {
                         continue;
