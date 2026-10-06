@@ -21,6 +21,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Tests\Support\CountingCancellation;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LoopbackNatsServer;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
@@ -417,6 +418,129 @@ final class ReadWakeupTest extends TestCase
         self::assertNotNull($error->getPrevious(), 'with its cause');
     }
 
+    /**
+     * A flush waits for its PONG the same way: the application's read takes a chunk holding a server PING and, behind it,
+     * the PONG the flush waits for, and the dispatch of that chunk waits for its own PONG's write, held up like one on a
+     * socket under backpressure, until the flush's read takes the socket. The dispatch then goes on and takes the
+     * flush's PONG, and the flush returns at once, rather than at its 2 s deadline.
+     */
+    public function testAFlushGetsThePongADispatchWaitingOnAPongWriteBrings(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = $this->connectWatched($watched);
+        $transport->answerPings = false;
+        $stop = new DeferredCancellation();
+        $this->startApplicationReadLoop($client, $stop);
+        $this->awaitRead($watched);
+        $transport->stallNextWriteContaining('PONG', 1.5);
+        $transport->afterWrite = static function (string $bytes) use ($transport): void {
+            if ($bytes === "PING\r\n") {
+                $transport->pushFrame("PING\r\nPONG\r\n");
+            }
+        };
+        $released = new class {
+            public bool $byARead = false;
+        };
+        $watched->onRead = static function () use ($transport, $released): void {
+            if ($transport->writesStalled() > 0) {
+                $released->byARead = true;
+                $transport->releaseStalledWrites();
+            }
+        };
+
+        $start = hrtime(true);
+        $client->flush()->await();
+        $elapsed = $this->secondsSince($start);
+        $stop->cancel();
+
+        self::assertTrue($released->byARead, "the flush's read took the socket while the PONG's write was held up");
+        self::assertLessThan(1.0, $elapsed, sprintf('flush() returned after %.3f s, its deadline being 2 s', $elapsed));
+    }
+
+    /**
+     * A request waiting for a new reply inbox to be confirmed, after the client dropped one the server may have
+     * rejected, while another fiber's read runs a reconnect with dials refused. The reconnect's first attempt failed the
+     * fence slot the request reads for, and the slot stays the current fence until the replay re-arms it. A slot already
+     * complete is no wake-up: made one, it fired before each read's fiber started, every read returned at its first
+     * check, before the wait for the reconnect, and the request looked at its cancellation every millisecond for the
+     * whole outage. The read waits for the reconnect instead.
+     */
+    public function testARequestWaitingForANewReplyInboxDoesNotPollThroughAReconnect(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $connection = new NatsConnection($this->options(true, 5_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $this->opened[] = $connection;
+        $connection->connect()->await();
+        $transport->responder = static fn(string $subject, ?string $replyTo): array => $replyTo === null ? [] : $transport->replyFrame($replyTo, 'ok');
+        // As after the client dropped a reply inbox the server may have rejected: the next request waits for its new one.
+        (new \ReflectionProperty(NatsConnection::class, 'awaitMuxFence'))->setValue($connection, true);
+        // The PONG that would confirm the new inbox does not come before the outage.
+        $transport->answerPings = false;
+
+        $stop = new DeferredCancellation();
+        $this->startApplicationReadLoop($connection, $stop);
+        $this->awaitRead($watched);
+
+        $looks = new CountingCancellation();
+        $request = $connection->request('svc.echo', 'x', 5_000, $looks);
+        $request->ignore();
+        $this->waitUntil(static fn(): bool => $transport->controlLinesStartingWith('SUB') !== []);
+        delay(0.05);
+        self::assertFalse($request->isComplete());
+
+        // The connection drops with dials refused: the application's read, which holds the socket, runs the reconnect.
+        $transport->refuseDials();
+        $transport->dropConnection();
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
+        // Lets the reconnect's first attempt fail the pong slots, the fence included.
+        delay(0.05);
+
+        $before = $looks->isRequestedCalls;
+        delay(0.3);
+        $looksDuringTheOutage = $looks->isRequestedCalls - $before;
+
+        $transport->answerPings = true;
+        $transport->acceptDials();
+        $reply = $request->await(new TimeoutCancellation(5));
+        $stop->cancel();
+
+        self::assertSame('ok', $reply->payload, 'the request is sent once the new connection confirms the reply inbox');
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertLessThan(30, $looksDuringTheOutage, sprintf('the request looked at its cancellation %d times in 0.3 s of the outage: it polled', $looksDuringTheOutage));
+    }
+
+    /**
+     * A flush reads many chunks before its PONG comes. Its wake-up is the one of its pong slot, made once per slot: a
+     * wake-up per read subscribed a callback, holding a DeferredCancellation, to the slot for each of them, and the slot
+     * kept them all until it completed.
+     */
+    public function testAFlushReadingManyChunksBeforeItsPongDoesNotPileCallbacksOntoItsSlot(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $delivered = new class {
+            public int $count = 0;
+        };
+        $sid = $connection->subscribe('noise', static function () use ($delivered): void {
+            $delivered->count++;
+        })->await();
+        $transport->pongDelay = 1.0;
+        $chunks = 2_000;
+        for ($i = 0; $i < $chunks; $i++) {
+            $transport->pushFrame(ReconnectingTransport::msgFrame('noise', $sid, 'x'));
+        }
+
+        $flush = $connection->flush();
+        $this->waitUntil(static fn(): bool => $delivered->count === $chunks, 5.0);
+        delay(0.01);
+        $callbacks = self::subscribersOf($this->pendingPongSlot($connection)->getFuture());
+        $flush->await(new TimeoutCancellation(5));
+
+        self::assertLessThan(10, $callbacks, sprintf('the flush left %d callbacks on its pending pong slot after %d reads', $callbacks, $chunks));
+    }
+
     /** @return iterable<string, array{string}> */
     public static function pollsThatWait(): iterable
     {
@@ -760,6 +884,37 @@ final class ReadWakeupTest extends TestCase
     }
 
     /**
+     * The pong slot of the flush in flight on $connection.
+     *
+     * @return DeferredFuture<null>
+     */
+    private function pendingPongSlot(NatsConnection $connection): DeferredFuture
+    {
+        $waiters = (new \ReflectionProperty(NatsConnection::class, 'pongWaiters'))->getValue($connection);
+        self::assertIsArray($waiters);
+        $slot = end($waiters);
+        self::assertInstanceOf(DeferredFuture::class, $slot);
+
+        /** @var DeferredFuture<null> $slot */
+        return $slot;
+    }
+
+    /**
+     * How many callbacks are subscribed to $future.
+     *
+     * @param Future<mixed> $future
+     */
+    private static function subscribersOf(Future $future): int
+    {
+        $state = (new \ReflectionProperty(Future::class, 'state'))->getValue($future);
+        self::assertIsObject($state);
+        $callbacks = (new \ReflectionProperty($state, 'callbacks'))->getValue($state);
+        self::assertIsArray($callbacks);
+
+        return count($callbacks);
+    }
+
+    /**
      * A client connected through the built-in socket transport, watched, to a {@see LoopbackNatsServer}.
      *
      * @return array{NatsClient, LoopbackNatsServer, WatchedTransport}
@@ -825,7 +980,7 @@ final class ReadWakeupTest extends TestCase
      *
      * @return Future<void> Completes when the loop has stopped.
      */
-    private function startApplicationReadLoop(NatsClient $client, DeferredCancellation $stop): Future
+    private function startApplicationReadLoop(NatsClient|NatsConnection $client, DeferredCancellation $stop): Future
     {
         $loop = async(static function () use ($client, $stop): void {
             while (!$stop->isCancelled()) {

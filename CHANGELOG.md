@@ -45,6 +45,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   request shares, so their read ends on their own reply instead, as the waiter that takes it fires: another request's
   reply does not end it. A request cancelled right after its reply arrived throws the caller's own cancellation, with
   its reason.
+- `[bugfix]` `flush()`, `rtt()`, the flushes of `drain()` and `drainSubscription()` and the confirmation of the reply
+  inbox end their read as soon as their PONG is in, whichever fiber's read took it, also when that read's dispatch
+  had to wait before it reached the PONG, for the write of the PONG it owed the server for a PING ahead of it, say
+  (#174). They used to wait for the server's next bytes or their deadline. A flush whose PING went out before the
+  connection dropped fails with `Connection lost before the server answered the PING` as soon as the reconnect's
+  first attempt clears the pong slots, rather than once the reconnect is over or at the flush's deadline.
 - `[bugfix]` `SubscriptionQueue::next()` with a timeout, and `fetchAll()` with a limit and a timeout, returned a
   message that another fiber's read delivered while they paused between reads (an application's
   `processIncoming()` loop, say) only once the timeout ran out (#174). They started another read before they

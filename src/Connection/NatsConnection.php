@@ -322,6 +322,14 @@ final class NatsConnection
      */
     private array $wakesAfterRecovery = [];
     /**
+     * The wake-up of each pong slot a read waits for ({@see wakeOnPong()}): one per slot, whichever reader asks, so that
+     * a flush, a drain's flush or a mux confirmation that reads many chunks before its PONG does not pile a callback per
+     * read onto the slot. A slot that completed is forgotten with its last reader.
+     *
+     * @var \WeakMap<DeferredFuture<null>, Cancellation>|null
+     */
+    private ?\WeakMap $pongWakes = null;
+    /**
      * Set by disconnect()/drain() to signal user close-intent. The reconnect paths bail when it is set
      * so an in-flight heartbeat/read-path recovery cannot re-open a connection the user just closed
      * (#84). Cleared on a fresh connect().
@@ -2653,6 +2661,27 @@ final class NatsConnection
     }
 
     /**
+     * The wake-up of a read that waits for a pong slot ({@see readChunk()}): fires once the slot completes, with its PONG
+     * or with the end of the connection, whichever fiber completes it. A slot completes once and stays complete, so the
+     * wake-up can be taken at any time: one taken after the slot completed fires at once.
+     *
+     * @param DeferredFuture<null> $slot
+     */
+    private function wakeOnPong(DeferredFuture $slot): Cancellation
+    {
+        $this->pongWakes ??= new \WeakMap();
+        $known = $this->pongWakes[$slot] ?? null;
+        if ($known !== null) {
+            return $known;
+        }
+
+        $wake = new DeferredCancellation();
+        $slot->getFuture()->finally($wake->cancel(...))->ignore();
+
+        return $this->pongWakes[$slot] = $wake->getCancellation();
+    }
+
+    /**
      * What a wait of an operation's read waits with ({@see readChunk()}): the caller's cancellation and the read's
      * wake-up, whichever of the two are given.
      */
@@ -2701,7 +2730,10 @@ final class NatsConnection
      *        the read would take the read slot, or wait for another fiber's read, the read returns without reading.
      *        The caller checks for its PONG before each read, but the read runs on a fiber of its own, and before
      *        that fiber starts another fiber's read can take the PONG and free the read slot: the read then waited
-     *        on a socket with nothing more to come until the caller's deadline.
+     *        on a socket with nothing more to come until the caller's deadline. A slot still pending is also the
+     *        read's wake-up ({@see wakeOnPong()}), unless $wake is given: a slot that completes while the read waits
+     *        ends it as well, such as one that another fiber's dispatch completes once the write of a PONG it owed the
+     *        server let it go on, or one that a reconnect fails, its PONG gone with the old socket.
      * @param Cancellation|null $wake An operation's wake-up: fires once what the operation waits for may have arrived
      *        since the operation last looked for it, whichever fiber's read delivered it. The caller takes it in its own
      *        fiber, right after it looked. The read then ends without reading, and returns as one that waited for
@@ -2724,6 +2756,14 @@ final class NatsConnection
         ?DeferredFuture $pongSlot = null,
         ?Cancellation $wake = null,
     ): Future {
+        if ($wake === null && $pongSlot !== null && !$pongSlot->isComplete()) {
+            // A slot still pending is the read's wake-up. One already complete is not: that read returns at the slot
+            // check below, once any reconnect it waits for is over. Made its wake-up, it fired before the read began, and
+            // a caller that loops until something else happens (awaitMuxConfirmation()) polled through the whole
+            // reconnect, a look every millisecond.
+            $wake = $this->wakeOnPong($pongSlot);
+        }
+
         return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake): IncomingChunkResult {
             // What the read waits with: the caller's cancellation, and the operation's wake-up. Every wait below
             // subscribes to it before it suspends, and the checks before each wait run with no suspension between
