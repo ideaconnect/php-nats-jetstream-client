@@ -11,7 +11,10 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-services=(18222 18223 18224 18225 18226 18227 18228)
+# Monitoring ports from docker-compose.yml: nats, nats-token, nats-userpass, nats-tls, nats-nkey,
+# nats-jwt, nats-tls-upgrade and nats-ws. Keep this list in step with the compose file: a server left
+# out is not waited for, and the first tests or examples that use it can start before it is up.
+services=(18222 18223 18224 18225 18226 18227 18228 18229)
 deadline_seconds="${NATS_WAIT_TIMEOUT_SECONDS:-30}"
 
 if ! [[ "$deadline_seconds" =~ ^[1-9][0-9]*$ ]]; then

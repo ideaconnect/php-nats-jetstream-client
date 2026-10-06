@@ -5,7 +5,7 @@
 #   1. Validate JWT fixture artifacts used by JWT integration tests
 #   2. Start Docker Compose services when needed
 #   3. Wait for all NATS fixture services to become ready
-#   4. Run unit tests
+#   4. Run unit tests (unless SKIP_UNIT_TESTS is set)
 #   5. Run integration tests with RUN_INTEGRATION=1 enabled
 #   6. Run Behat feature tests against the same fixture stack
 #
@@ -16,6 +16,8 @@
 #   KEEP_NATS_SERVICES=1      Leave Docker Compose services running after completion
 #   SKIP_JWT_FIXTURE_CHECK=1  Skip JWT fixture validation preflight
 #   SKIP_JWT_FIXTURE_CHECK=true  Also accepted; truthy values are 1/true/yes/on
+#   SKIP_UNIT_TESTS=1         Skip the unit stage (truthy values as above). CI sets it: its coverage
+#                             step and the Unit + Static jobs already run the unit suite.
 #   BEHAT_SUITE=core          Run a specific Behat suite during the e2e pass
 
 set -euo pipefail
@@ -23,6 +25,7 @@ set -euo pipefail
 root_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 keep_services="${KEEP_NATS_SERVICES:-0}"
 skip_jwt_fixture_check="${SKIP_JWT_FIXTURE_CHECK:-0}"
+skip_unit_tests="${SKIP_UNIT_TESTS:-0}"
 behat_suite="${BEHAT_SUITE:-}"
 had_running_services=0
 
@@ -75,8 +78,12 @@ docker compose up -d
 echo "[test:e2e] waiting for NATS services"
 bash scripts/wait-for-nats-services.sh
 
-echo "[test:e2e] running unit tests"
-composer test:unit
+if is_truthy "$skip_unit_tests"; then
+  echo "[test:e2e] skipping unit tests (SKIP_UNIT_TESTS=${skip_unit_tests})"
+else
+  echo "[test:e2e] running unit tests"
+  composer test:unit
+fi
 
 echo "[test:e2e] running integration tests"
 RUN_INTEGRATION=1 composer test:integration

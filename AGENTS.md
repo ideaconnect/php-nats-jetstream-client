@@ -65,7 +65,7 @@ Use this file as the authoritative project guide for coding agents working in th
   TLS fixture material used by integration tests.
 
 - `docker-compose.yml`
-  Local integration fixture stack. Services expose client ports `14222` to `14227` and monitoring ports `18222` to `18227`.
+  Local integration fixture stack. Services expose client ports `14222` to `14229` (`14229` is `nats-ws`'s WebSocket port) and monitoring ports `18222` to `18229`.
 
 ## Commands Agents Should Know
 
@@ -148,9 +148,12 @@ Choose the narrowest useful test first, then broaden only as needed.
 - Behat feature tests reuse the same Docker Compose fixture stack and readiness flow via `composer test:bdd`.
 - `scripts/run-tests-e2e.sh` performs JWT fixture validation first, then starts compose, waits for readiness, runs unit tests, runs integration tests, and runs Behat.
 - `scripts/run-tests-bdd.sh` performs the same fixture preflight and readiness flow before running Behat.
+- `scripts/wait-for-nats-services.sh` polls the monitoring port of every compose server; keep its port list in step with `docker-compose.yml` when adding a server.
 - `KEEP_NATS_SERVICES=1 composer test:e2e` leaves compose services running after the run.
 - `SKIP_JWT_FIXTURE_CHECK=1 composer test:e2e` skips JWT fixture validation when explicitly desired.
+- `SKIP_UNIT_TESTS=1 composer test:e2e` skips the unit stage. CI's E2E job sets it: its coverage step and the Unit + Static jobs already run the unit suite.
 - `BEHAT_SUITE=core composer test:e2e` narrows only the Behat stage while keeping the unit/integration steps intact.
+- The compose servers run without debug or trace logging (`-D`/`-V`), and their healthchecks probe every 30 s; nothing reads either. Add `"-DV"` to a service's `command` locally when you need a protocol trace.
 
 ## Development Standards
 

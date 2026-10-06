@@ -15,6 +15,21 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` The E2E job runs the unit suite once instead of twice, and the Docker fixtures do less background
+  work (#176). The job no longer runs the unit suite inside `composer test:e2e`: its coverage step runs it right
+  after, together with the integration suite, and the Unit + Static jobs run it on PHP 8.2 to 8.5. The skipped
+  pass took about 3 minutes and gave the timing flakes in #176 one more place to hit. `scripts/run-tests-e2e.sh`
+  gained `SKIP_UNIT_TESTS` for this; without it the local flow is unchanged. The compose servers no longer
+  run with debug and trace logging (`-DV`), which wrote every inbound payload through Docker's log pipeline
+  and was never read, and their healthchecks probe every 30 s instead of every 2 s (nothing reads the health
+  status; readiness comes from `scripts/wait-for-nats-services.sh`). That script now also waits for the
+  WebSocket server (`nats-ws`, monitoring port 18229), which it had left out. The unused `workflow_dispatch`
+  input `integration-repeat-count` is gone: no job read it. Dev-only, no library change.
+
 ## [2.11.0] - 2026-10-05
 
 ### Upgrade notes

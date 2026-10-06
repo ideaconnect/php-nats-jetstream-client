@@ -2422,7 +2422,9 @@ composer infection
 
 Infection requires **PHP 8.3+** and is intentionally **not** in `require-dev` (so the library stays installable on PHP 8.2). The CI `mutation` job installs it on the fly; to run mutation testing locally, add it first: `composer require --dev infection/infection:^0.33`.
 
-`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, runs the Behat feature suite, and tears the stack down again.
+`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, runs the Behat feature suite, and tears the stack down again. `SKIP_UNIT_TESTS=1 composer test:e2e` leaves out the unit stage; CI sets it, because its coverage step and the Unit + Static jobs already run the unit suite.
+
+The compose servers run without debug or trace logging. To trace one while debugging, add `"-DV"` to its `command` in `docker-compose.yml` and recreate it with `docker compose up -d --force-recreate <name>`.
 
 `composer test:bdd` runs only the Behat feature suite against the same local Docker Compose fixtures. Use `BEHAT_SUITE=core composer test:bdd` to run a narrower slice while iterating locally, or `BEHAT_SUITE=core composer test:e2e` to keep the rest of the e2e flow and narrow only the Behat stage.
 
@@ -2529,7 +2531,7 @@ To do a quick local flake check against the compose-backed environment, run:
 composer test:integration:repeat
 ```
 
-CI declares a `workflow_dispatch` input (`integration-repeat-count`) reserved for a soak run, but there is currently no soak job wired to it. Repeat the integration suite locally with `composer test:integration:repeat`.
+CI has no soak job: repeat the integration suite locally with `composer test:integration:repeat`.
 
 ## Contributing and contributors
 
