@@ -31,7 +31,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   input `integration-repeat-count` is gone: no job read it. Dev-only, no library change.
 - `[docs]` Timing-bound tests no longer depend on how fast the runner is or how late a timer fires (#176).
   About 100 unit tests and 11 integration tests bounded elapsed time close to what they measured, or relied on
-  a timer firing in time, and failed on busy CI runners although the code was fine. They now decide by the order
+  a timer firing in time, so a busy CI runner could fail them although the code was fine. Several did; the rest
+  were found before they could, by checking how much room each bound left. They now decide by the order
   of events or by which of two timers fires first, measure from the event that matters (a stopped dial from the
   moment it is stopped), count idle sleeps instead of timing chunked reads (a new `LoopTickCountingTransport`
   test double), or keep their bounds far from what the broken behavior takes. Each changed test still fails when

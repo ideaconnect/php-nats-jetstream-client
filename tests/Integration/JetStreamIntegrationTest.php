@@ -638,7 +638,10 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
-     * Verifies TERM and WPI tokens influence pull-consumer redelivery workflow.
+     * Verifies a WPI (inProgress) brings no immediate redelivery and leaves the message to be redelivered later,
+     * and that a TERM stops redelivery. The WPI probe runs well inside the 3 s ack_wait, when a message that got no
+     * WPI would not be redelivered yet either, so it only rules out an immediate redelivery: it would still pass
+     * if the WPI did nothing. JetStreamContextTest::testAckHelpersPublishProtocolTokens pins the +WPI token.
      */
     public function testJetStreamTermAndInProgressTokens(): void
     {
@@ -663,7 +666,8 @@ final class JetStreamIntegrationTest extends TestCase
             'max_deliver' => 3,
         ])->await();
 
-        // WPI should extend in-flight processing and delay redelivery.
+        // A WPI must not bring an immediate redelivery. Run inside ack_wait, the probe cannot tell whether the WPI
+        // pushed the redelivery back.
         $js->publish($subject, '{"event":"wpi"}')->await();
         $first = $js->fetchNext($stream, $consumer, 4_000)->await();
         self::assertSame('{"event":"wpi"}', $first->payload);
@@ -941,12 +945,12 @@ final class JetStreamIntegrationTest extends TestCase
         // pause: a server slower than that pause would push it after the drain's UNSUB, to no one.
         $adminJs->publish($subject, '{"event":"drain-ack"}')->await();
         $deadline = $this->monotonic() + 5.0;
-        while (
-            (int) ($adminJs->getConsumer($stream, $consumer)->await()->raw['num_ack_pending'] ?? 0) < 1
-            && $this->monotonic() < $deadline
-        ) {
+        $ackPending = (int) ($adminJs->getConsumer($stream, $consumer)->await()->raw['num_ack_pending'] ?? 0);
+        while ($ackPending < 1 && $this->monotonic() < $deadline) {
             delay(0.05);
+            $ackPending = (int) ($adminJs->getConsumer($stream, $consumer)->await()->raw['num_ack_pending'] ?? 0);
         }
+        self::assertGreaterThanOrEqual(1, $ackPending, 'the server must push the message, and count it as waiting for an ack, before the drain starts');
 
         $subscriber->drain()->await();
 
