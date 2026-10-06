@@ -29,6 +29,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   status; readiness comes from `scripts/wait-for-nats-services.sh`). That script now also waits for the
   WebSocket server (`nats-ws`, monitoring port 18229), which it had left out. The unused `workflow_dispatch`
   input `integration-repeat-count` is gone: no job read it. Dev-only, no library change.
+- `[docs]` Timing-bound tests no longer depend on how fast the runner is or how late a timer fires (#176).
+  About 100 unit tests and 11 integration tests bounded elapsed time close to what they measured, or relied on
+  a timer firing in time, and failed on busy CI runners although the code was fine. They now decide by the order
+  of events or by which of two timers fires first, measure from the event that matters (a stopped dial from the
+  moment it is stopped), count idle sleeps instead of timing chunked reads (a new `LoopTickCountingTransport`
+  test double), or keep their bounds far from what the broken behavior takes. Each changed test still fails when
+  its bug is put back. The integration suite's recoverable client no longer gives a connection up after one late
+  PONG, which made a busy NATS container add a reconnect. Two `WaitForReconnectTest` tests that could no longer
+  fail since 2.10.0 were reworked so they can. Dev-only, no library change.
 
 ## [2.11.0] - 2026-10-05
 
