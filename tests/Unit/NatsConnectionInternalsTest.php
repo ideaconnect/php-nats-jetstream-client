@@ -197,6 +197,11 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->invokePrivate($connection, 'awaitInitialPong');
     }
 
+    /**
+     * The twelve empty reads before INFO are polled through. The connect timeout, which is also the handshake's
+     * deadline, is two seconds, so that a slow runner cannot end the wait before the polls run out; the sixteen
+     * polls a 100 ms timeout still gets are checked on the budget itself.
+     */
     public function testAwaitServerInfoAllowsMoreThanEightPollsBeforeInfoArrives(): void
     {
         $queue = array_merge(
@@ -204,21 +209,24 @@ final class NatsConnectionInternalsTest extends TestCase
             ["INFO {\"server_id\":\"S9\",\"server_name\":\"n9\",\"version\":\"2.12.0\",\"jetstream\":true,\"max_payload\":1048576,\"headers\":true}\r\n"],
         );
 
-        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport($queue));
+        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 2_000), new FakeTransport($queue));
 
         $info = $this->invokePrivate($connection, 'awaitServerInfo');
 
         self::assertSame('S9', $info->serverId);
+        self::assertSame(16, $this->invokePrivate(new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport()), 'handshakePollBudget'));
     }
 
+    /** As above, for the PONG after CONNECT behind twelve +OKs. */
     public function testAwaitInitialPongAllowsMoreThanEightPollsBeforePongArrives(): void
     {
         $queue = array_merge(array_fill(0, 12, "+OK\r\n"), ["PONG\r\n"]);
 
-        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport($queue));
+        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 2_000), new FakeTransport($queue));
 
         // awaitInitialPong() returns the frames coalesced behind the PONG (#157); none here.
         self::assertSame([], $this->invokePrivate($connection, 'awaitInitialPong'));
+        self::assertSame(16, $this->invokePrivate(new NatsConnection(new NatsOptions(connectTimeoutMs: 100), new FakeTransport()), 'handshakePollBudget'));
     }
 
     public function testAwaitServerInfoRespondsToPingBeforeInfo(): void

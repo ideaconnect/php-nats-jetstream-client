@@ -3593,7 +3593,9 @@ final class ObjectStoreBucketTest extends TestCase
         ]);
         $this->muxReplies($transport, $reads);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        // Every reply is queued: the timeout only bounds a failure, and a short one let a slow runner time out a
+        // chunk's request.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport);
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 1);
@@ -3632,7 +3634,9 @@ final class ObjectStoreBucketTest extends TestCase
         ]);
         $this->muxReplies($transport, $reads);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        // Every reply is queued: the timeout only bounds a failure, and a short one let a slow runner time out a
+        // chunk's request.
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport);
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 1);

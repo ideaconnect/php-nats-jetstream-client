@@ -35,7 +35,7 @@ use function Amp\delay;
  *   - {@see $rejectAuthentication}: the next handshakes are refused with an authorization -ERR;
  *   - {@see $closeDelay}: close() takes a while, like a TLS or WebSocket close handshake;
  *   - stallNextWriteContaining(): the next write containing a needle is held up, like a socket under
- *     backpressure;
+ *     backpressure, until its time is up or the test calls releaseStalledWrites();
  *   - failNextWriteContaining(): the next write containing a needle finds the socket dead - failing with
  *     a TransportClosedException, or with the error the test gives, such as the raw stream error a
  *     built-in transport's socket throws.
@@ -364,6 +364,22 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     public function writesStalled(): int
     {
         return $this->writesStalled;
+    }
+
+    /**
+     * Ends now every stall of the live session that would end with it, as if its time were up: the stalled
+     * writes complete. For a test that holds a write up, with a stall longer than it lasts, until it has done
+     * what must happen while the write waits, rather than racing the stall's timer.
+     */
+    public function releaseStalledWrites(): void
+    {
+        foreach ($this->stalledWrites as $timer => $released) {
+            EventLoop::cancel($timer);
+            if (!$released->isComplete()) {
+                $released->complete();
+            }
+        }
+        $this->stalledWrites = [];
     }
 
     /**

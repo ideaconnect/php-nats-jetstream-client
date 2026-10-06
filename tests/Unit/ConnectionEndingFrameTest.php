@@ -116,12 +116,13 @@ final class ConnectionEndingFrameTest extends TestCase
 
     /**
      * The request waits for that reconnect no longer than its own timeout allows, and fails with the
-     * server's error even when the timeout ends the wait; the reconnect carries on without it.
+     * server's error even when the timeout ends the wait; the reconnect carries on without it. Its dial is
+     * held until the test lets it through, and only the ten-second connect timeout would end it otherwise.
      */
     public function testRequestThatMeetsAFatalErrWaitsForTheReconnectOnlyWithinItsTimeout(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 300);
+        $connection = $this->connect($transport, requestTimeoutMs: 300, connectTimeoutMs: 10_000);
         $this->answerFirstRequestWithStaleConnection($transport);
         $transport->holdNextDial();
 
@@ -135,7 +136,7 @@ final class ConnectionEndingFrameTest extends TestCase
         $elapsed = $this->secondsSince($start);
 
         self::assertGreaterThan(0.2, $elapsed, 'it waited for the reconnect');
-        self::assertLessThan(1.0, $elapsed, 'but not past its own timeout');
+        self::assertLessThan(2.0, $elapsed, 'but not past its own timeout');
         self::assertSame(ConnectionState::Connecting, $connection->state(), 'the reconnect carries on');
 
         $this->releaseTheHeldDial($transport);
@@ -145,12 +146,14 @@ final class ConnectionEndingFrameTest extends TestCase
 
     /**
      * A request that may not wait for a reconnect does not wait for this one either: it fails at once, and
-     * the reconnect has started by then, so the next operation does not reach the old socket.
+     * the reconnect has started by then, so the next operation does not reach the old socket. The reconnect's
+     * dial is held until the test lets it through, so a request that waited for it would take its whole ten
+     * seconds.
      */
     public function testRequestThatMeetsAFatalErrWithWaitingDisabledFailsAtOnce(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, waitForReconnect: false, requestTimeoutMs: 2_000);
+        $connection = $this->connect($transport, waitForReconnect: false, requestTimeoutMs: 10_000, connectTimeoutMs: 10_000);
         $this->answerFirstRequestWithStaleConnection($transport);
         $transport->holdNextDial();
 
@@ -162,7 +165,7 @@ final class ConnectionEndingFrameTest extends TestCase
             self::assertSame("Server sent error frame: 'Stale Connection'", $e->getMessage());
         }
 
-        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Connecting, $connection->state());
 
         $this->releaseTheHeldDial($transport);

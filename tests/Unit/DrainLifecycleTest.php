@@ -324,20 +324,33 @@ final class DrainLifecycleTest extends TestCase
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
-    /** A very small request timeout still gives drain() a 100 ms budget. */
+    /**
+     * A very small request timeout still gives drain() a 100 ms budget: the deadline it sets as it starts lies
+     * 100 ms ahead, and it waits for its PONG until then. The deadline is read off the connection, so that a
+     * slow runner cannot blur 100 ms into 400.
+     */
     public function testDrainBudgetIsAtLeastOneHundredMilliseconds(): void
     {
         $transport = new ReconnectingTransport();
         $connection = $this->connect($transport, requestTimeoutMs: 1);
         // The drain waits for its PONG until the budget ends.
         $transport->answerPings = false;
+        $drainDeadline = new \ReflectionProperty(NatsConnection::class, 'drainDeadline');
 
         $start = hrtime(true);
-        $connection->drain()->await();
+        $drain = $connection->drain();
+        $this->waitUntil(static fn(): bool => $drainDeadline->getValue($connection) !== null);
+        $deadlineKnown = hrtime(true);
+        $deadline = $drainDeadline->getValue($connection);
+        $drain->await();
         $elapsed = $this->secondsSince($start);
 
+        // The drain set its deadline between the two readings of the clock, 100 ms after the moment it did so.
+        self::assertIsFloat($deadline);
+        self::assertGreaterThanOrEqual($start / 1e9 + 0.1, $deadline);
+        self::assertLessThanOrEqual($deadlineKnown / 1e9 + 0.1, $deadline);
         self::assertGreaterThanOrEqual(0.09, $elapsed);
-        self::assertLessThan(0.4, $elapsed);
+        self::assertLessThan(2.0, $elapsed, 'it ended at its budget');
     }
 
     public function testConnectIsRefusedWhileADrainWaitsForAReconnect(): void
@@ -488,8 +501,8 @@ final class DrainLifecycleTest extends TestCase
             }
 
             $handled->payloads[] = $message->payload;
-            // 20 ms of synchronous work per message.
-            usleep(20_000);
+            // 150 ms of synchronous work per message: a pass that went on past the deadline would take 3 s.
+            usleep(150_000);
         })->await();
         $chunk = ReconnectingTransport::msgFrame('updates', $sid, 'boom');
         for ($i = 1; $i <= 20; $i++) {
@@ -502,7 +515,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
 
-        self::assertLessThan(0.3, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(['m1'], $handled->payloads, 'only the head of the pass once the budget is spent');
         self::assertContains('drain deadline exceeded: 19 buffered message(s) were not delivered before close', $recorder->errors);
         $reader->await();
@@ -512,7 +525,8 @@ final class DrainLifecycleTest extends TestCase
      * A drain waiting for a reconnect goes on as soon as the connection is back: the Reconnected listener runs
      * once the reconnect is over, so a slow one does not hold the drain up. The drain drains the new connection
      * - it unsubscribes there - within its budget. The reconnect used to complete only once its listener had
-     * returned, and the drain then also waited for that reconnect to end: 0.65 s against a 150 ms budget.
+     * returned, and the drain then also waited for that reconnect to end: here, with a listener freed only once
+     * the drain is over, until its whole five-second budget had run out.
      */
     public function testDrainDoesNotWaitForASlowReconnectedListener(): void
     {
@@ -522,9 +536,9 @@ final class DrainLifecycleTest extends TestCase
         };
         $connection = $this->connect(
             $transport,
-            requestTimeoutMs: 150,
+            requestTimeoutMs: 5_000,
             connectionListener: static function (ConnectionEvent $event) use ($listener): void {
-                // Still busy when the drain's budget runs out.
+                // Still busy when the drain is over: the test frees it only then.
                 while ($event === ConnectionEvent::Reconnected && $listener->busy) {
                     delay(0.01);
                 }
@@ -537,7 +551,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
 
-        self::assertLessThan(0.15, $this->secondsSince($start), 'within its budget');
+        self::assertLessThan(2.0, $this->secondsSince($start), 'within its budget');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $transport->epoch());
         self::assertSame(['UNSUB ' . $sid], $transport->controlLinesStartingWith('UNSUB', 1));
@@ -547,12 +561,12 @@ final class DrainLifecycleTest extends TestCase
 
     /**
      * A drain whose budget ran out stops the reconnect it waited for at once, mid-backoff too, so the
-     * connection can be reopened right after the drain.
+     * connection can be reopened right after the drain, not once the ten-second backoff is over.
      */
     public function testConnectRightAfterADrainThatRanOutOfTimeSucceeds(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 100, reconnectDelayMs: 1_000, reconnectMaxDelayMs: 1_000);
+        $connection = $this->connect($transport, requestTimeoutMs: 100, reconnectDelayMs: 10_000, reconnectMaxDelayMs: 10_000);
         $reader = $this->startRecoveryInBackground($connection, $transport);
 
         $connection->drain()->await();
@@ -561,14 +575,15 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $connection->connect()->await();
 
-        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Open, $connection->state());
         $reader->await();
     }
 
     /**
      * A reconnect attempt that fails after the user closed the connection ends the reconnect there: no
-     * backoff first, and no "attempts exhausted" failure or second Closed event for the user's close.
+     * backoff first (ten seconds here), and no "attempts exhausted" failure or second Closed event for the
+     * user's close.
      */
     public function testReconnectAttemptFailingAfterADisconnectStopsWithoutBackingOffOrReportingExhaustion(): void
     {
@@ -578,8 +593,8 @@ final class DrainLifecycleTest extends TestCase
             $transport,
             maxReconnectAttempts: 1,
             connectionListener: $recorder->connectionListener(),
-            reconnectDelayMs: 1_000,
-            reconnectMaxDelayMs: 1_000,
+            reconnectDelayMs: 10_000,
+            reconnectMaxDelayMs: 10_000,
         );
         $reader = $this->startRecoveryHeldMidDial($connection, $transport);
 
@@ -591,12 +606,12 @@ final class DrainLifecycleTest extends TestCase
         // Resolves: the reconnect was stopped, it did not fail.
         $reader->await();
 
-        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $recorder->closedEvents());
     }
 
-    /** The same when the user closes during the backoff that follows the last attempt. */
+    /** The same when the user closes during the backoff that follows the last attempt, which it cuts short. */
     public function testDisconnectDuringTheLastReconnectBackoffDoesNotReportExhaustion(): void
     {
         $transport = new ReconnectingTransport();
@@ -605,8 +620,8 @@ final class DrainLifecycleTest extends TestCase
             $transport,
             maxReconnectAttempts: 1,
             connectionListener: $recorder->connectionListener(),
-            reconnectDelayMs: 1_000,
-            reconnectMaxDelayMs: 1_000,
+            reconnectDelayMs: 10_000,
+            reconnectMaxDelayMs: 10_000,
         );
         $reader = $this->startRecoveryInBackground($connection, $transport);
         // The only attempt was refused: the reconnect is backing off.
@@ -617,7 +632,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $reader->await();
 
-        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $recorder->closedEvents());
     }
@@ -1105,8 +1120,9 @@ final class DrainLifecycleTest extends TestCase
         $kept = $connection->subscribe('updates', static function (): void {})->await();
         $reader = $this->startRecoveryInBackground($connection, $transport);
         $connection->publish('events', 'buffered')->await();
-        // Holds the reconnect between its re-subscription and going live: flushing the buffered publish.
-        $transport->stallNextWriteContaining('PUB events', 0.1);
+        // Holds the reconnect between its re-subscription and going live: flushing the buffered publish, held
+        // up until the test lets it through.
+        $transport->stallNextWriteContaining('PUB events', 30.0);
         $transport->acceptDials();
         $this->waitUntil(static fn(): bool => $transport->controlLinesStartingWith('SUB', 1) !== []);
         self::assertSame(ConnectionState::Connecting, $connection->state());
@@ -1114,6 +1130,9 @@ final class DrainLifecycleTest extends TestCase
         $drain = $connection->drainSubscription($drained);
         delay(0.001);
         $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $drained, 'routed'));
+        // The reconnect goes live once the test lets its buffered publish through.
+        $this->waitUntil(static fn(): bool => $transport->writesStalled() === 1);
+        $transport->releaseStalledWrites();
         $drain->await();
 
         self::assertSame(['routed'], $handled->payloads);
@@ -1403,8 +1422,9 @@ final class DrainLifecycleTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], blockWhenEmpty: true);
+        // A ten-second budget: a flush that read on past the EOF would take five times the bound below.
         $connection = new NatsConnection(new NatsOptions(
-            requestTimeoutMs: 2_000,
+            requestTimeoutMs: 10_000,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
@@ -1417,7 +1437,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
 
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(["Server sent error frame: 'maximum subscriptions exceeded'"], $recorder->errors);
     }
@@ -1431,8 +1451,9 @@ final class DrainLifecycleTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], blockWhenEmpty: true);
+        // A ten-second budget: a flush that read on past the failed PONG would take five times the bound below.
         $connection = new NatsConnection(new NatsOptions(
-            requestTimeoutMs: 2_000,
+            requestTimeoutMs: 10_000,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
@@ -1445,7 +1466,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
 
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(['Simulated write failure'], $recorder->errors, 'reported once');
     }
@@ -1564,7 +1585,8 @@ final class DrainLifecycleTest extends TestCase
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
         $listener = $recorder->errorListener();
-        // A 0.3 s budget, room for 20 messages per subscription, and a listener taking 50 ms per report.
+        // A 0.3 s budget, room for 20 messages per subscription, and a listener taking 150 ms per report: a drain
+        // that made every report after its delivery pass would take 3 s.
         $client = new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
@@ -1572,7 +1594,7 @@ final class DrainLifecycleTest extends TestCase
                 pingIntervalSeconds: 0,
                 errorListener: static function (\Throwable $error) use ($listener): void {
                     $listener($error);
-                    usleep(50_000);
+                    usleep(150_000);
                 },
                 maxPendingMessagesPerSubscription: 20,
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
@@ -1610,7 +1632,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $client->drain()->await();
 
-        self::assertLessThan(0.7, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         $reported = $report === 'handler' ? $recorder->errorsContaining('handler failed') : $recorder->errorsContaining('overflow');
         self::assertLessThan(20, count($reported), 'the drain stopped delivering once its budget was spent');
         self::assertCount(1, $recorder->errorsContaining('drain deadline exceeded'));
@@ -1744,20 +1766,21 @@ final class DrainLifecycleTest extends TestCase
         $recorder = new LifecycleRecorder();
         $connection = $this->connect(
             $transport,
-            requestTimeoutMs: 100,
+            requestTimeoutMs: 1_200,
             maxReconnectAttempts: 3,
             connectionListener: $recorder->connectionListener(),
             reconnectDelayMs: 20,
         );
         $reader = $this->startRecoveryInBackground($connection, $transport);
-        // The reconnect gives up well within the drain's budget, but its close outlasts that budget.
+        // The reconnect gives up well within the drain's budget, some 40 ms into its 1.2 s, so that it still does
+        // when a slow runner pauses for 0.8 s in between, but its close outlasts that budget.
         $transport->beforeClose = static function () use ($transport, $connection): void {
             if ($connection->state() !== ConnectionState::Closed) {
                 return;
             }
 
             $transport->beforeClose = null;
-            $transport->closeDelay = 0.3;
+            $transport->closeDelay = 1.5;
             // Only that close is slow: the drain's own is quick.
             EventLoop::queue(static function () use ($transport): void {
                 $transport->closeDelay = 0.0;
@@ -1989,7 +2012,8 @@ final class DrainLifecycleTest extends TestCase
     public function testDrainEndsPromptlyWhenTheSocketDiesDuringItsFlush(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 2_000);
+        // A ten-second budget: a flush that read the dead socket until it ran out would take five times the bound.
+        $connection = $this->connect($transport, requestTimeoutMs: 10_000);
         $connection->subscribe('updates', static function (): void {})->await();
         $transport->answerPings = false;
         $transport->afterWrite = static function (string $bytes) use ($transport): void {
@@ -2002,7 +2026,7 @@ final class DrainLifecycleTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
 
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(0, $connection->statistics()->reconnects);
     }
@@ -2116,7 +2140,7 @@ final class DrainLifecycleTest extends TestCase
                 $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'warm' && $replyTo !== null
                     ? $transport->replyFrame($replyTo, 'ok')
                     : [];
-                $connection = $this->connect($transport, requestTimeoutMs: 1_000);
+                $connection = $this->connect($transport, requestTimeoutMs: 10_000);
                 $connection->request('warm', 'x')->await();
                 // Only where it is needed: every subscription adds a write to a drain, and moves the window.
                 $sid = $flush === 'drainSubscription' ? $connection->subscribe('orders', static function (): void {})->await() : 0;
@@ -2142,9 +2166,9 @@ final class DrainLifecycleTest extends TestCase
                 $futures['flush']->await();
 
                 self::assertLessThan(
-                    0.5,
+                    2.0,
                     $this->secondsSince($start),
-                    sprintf('%s with a %s %d hop(s) %s it waited out its 1 s budget', $flush, $reader, abs($hops), $hops < 0 ? 'after' : 'before'),
+                    sprintf('%s with a %s %d hop(s) %s it waited out its 10 s budget', $flush, $reader, abs($hops), $hops < 0 ? 'after' : 'before'),
                 );
                 $connection->disconnect()->await();
             }
@@ -2257,7 +2281,7 @@ final class DrainLifecycleTest extends TestCase
         $transport = new ReconnectingTransport();
         $client = new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
-            requestTimeoutMs: 2_000,
+            requestTimeoutMs: 10_000,
             pingIntervalSeconds: 0,
         ), $transport);
         $this->opened[] = $client;
@@ -2281,8 +2305,9 @@ final class DrainLifecycleTest extends TestCase
         delay(0.02);
         $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $sidSlow, 'x') . ReconnectingTransport::msgFrame('slower', $sidSlower, 'y'));
         delay(0.01);
-        $this->answerTheNextPingAfter($transport, 0.01);
 
+        // The server answers the drain's PING at once, as it is written, so that the PONG is in while the slow
+        // handler still awaits, however late a timer fires.
         $start = hrtime(true);
         match ($drain) {
             'service' => $service->drain()->await(),
@@ -2290,7 +2315,7 @@ final class DrainLifecycleTest extends TestCase
             default => $client->drainSubscription($sidOther)->await(),
         };
 
-        self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
+        self::assertLessThan(5.0, $this->secondsSince($start), 'the drain did not wait out its 10 s budget');
         self::assertSame(['slow', 'slower'], $done);
         $stop->cancel();
         $runner->await(new TimeoutCancellation(1));

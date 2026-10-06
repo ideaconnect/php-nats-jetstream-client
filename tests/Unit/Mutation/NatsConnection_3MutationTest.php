@@ -96,8 +96,9 @@ final class NatsConnection_3MutationTest extends TestCase
 
         // kills PregMatchRemoveCaret @ 982: real treats this as a normal reply (collected),
         // the mutant treats it as a no-responders sentinel (empty result).
-        // No maxResponses/stall: the loop collects the one reply then runs to the (small) total deadline.
-        $replies = $connection->requestMany('svc.scan', 'q', null, null, 200)->await();
+        // No maxResponses/stall: the loop collects the one reply then runs to the total deadline, 1.2 s: long
+        // enough that a slow runner pausing for 0.8 s before the first read still reads the reply before it.
+        $replies = $connection->requestMany('svc.scan', 'q', null, null, 1_200)->await();
         self::assertCount(1, $replies);
         self::assertSame('', $replies[0]->payload);
     }
@@ -236,12 +237,13 @@ final class NatsConnection_3MutationTest extends TestCase
         $connection = new NatsConnection(new NatsOptions(), $transport);
         $connection->connect()->await();
 
-        // No maxResponses, no stall: the loop ends on the total deadline. Each idle slice read is
+        // No maxResponses, no stall: the loop ends on the total deadline, 1.2 s, long enough that a slow runner
+        // pausing for 0.8 s before the first read still reads the reply before it. Each idle slice read is
         // cancelled, hitting the catch with $cancellation === null.
         // kills NotIdentical / LogicalAnd / LogicalAndAllSubExprNegation / LogicalAndNegation @ 947:
         //  - && -> ||, or any negation that makes the branch fire (or dereference null), would throw
         //    instead of returning the one collected message.
-        $replies = $connection->requestMany('svc.scan', 'q', null, null, 40)->await();
+        $replies = $connection->requestMany('svc.scan', 'q', null, null, 1_200)->await();
 
         self::assertCount(1, $replies);
         self::assertSame('A', $replies[0]->payload);
@@ -271,8 +273,10 @@ final class NatsConnection_3MutationTest extends TestCase
         // kills LogicalAndSingleSubExprNegation @ 947: real ($cancellation->isRequested() === false) ->
         // continue; the mutant (`&& !isRequested()`) would treat the slice timeout as an external
         // cancellation and rethrow, dropping the collected message.
+        // A 1.2 s total deadline, long enough that a slow runner pausing for 0.8 s before the first read still
+        // reads the reply before it.
         $replies = $connection
-            ->requestMany('svc.scan', 'q', null, null, 40, null, $deferredCancellation->getCancellation())
+            ->requestMany('svc.scan', 'q', null, null, 1_200, null, $deferredCancellation->getCancellation())
             ->await();
 
         self::assertCount(1, $replies);

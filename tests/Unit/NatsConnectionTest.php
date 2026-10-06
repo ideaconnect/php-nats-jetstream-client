@@ -3870,7 +3870,9 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Verifies max outstanding pings triggers reconnect path and preserves open state.
+     * Verifies max outstanding pings triggers reconnect path and preserves open state. With maxPingsOut=0 the
+     * restarted timer reconnects again on its next tick, so what the first reconnect left is recorded as it is
+     * announced, rather than after a pause that would have to end before that next tick.
      */
     public function testMaxPingsOutTriggersReconnect(): void
     {
@@ -3889,6 +3891,11 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
+        $atReconnect = new class {
+            public ?NatsClient $client = null;
+            public ?int $connects = null;
+            public ?string $serverId = null;
+        };
         $client = new NatsClient(
             new NatsOptions(
                 reconnectEnabled: true,
@@ -3897,18 +3904,23 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
                 pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
+                connectionListener: static function (ConnectionEvent $event) use ($transport, $atReconnect): void {
+                    if ($event === ConnectionEvent::Reconnected && $atReconnect->connects === null) {
+                        $atReconnect->connects = count($transport->connectCalls);
+                        $atReconnect->serverId = $atReconnect->client?->serverInfo()?->serverId;
+                    }
+                },
             ),
             $transport,
         );
+        $atReconnect->client = $client;
         $client->connect()->await();
 
-        // Let the ping timer fire once; with maxPingsOut=0 this must trigger reconnect. The window
-        // must end before the restarted timer's next tick, or a second reconnect would fire.
-        delay(0.08);
+        // The ping timer fires once; with maxPingsOut=0 this must trigger a reconnect.
+        self::awaitUntil(static fn(): bool => $atReconnect->connects !== null, 'the reconnect of the first tick');
 
-        self::assertCount(2, $transport->connectCalls);
-        self::assertNotNull($client->serverInfo());
-        self::assertSame('S2', $client->serverInfo()->serverId);
+        self::assertSame(2, $atReconnect->connects);
+        self::assertSame('S2', $atReconnect->serverId);
 
         $client->disconnect()->await();
     }
@@ -6812,6 +6824,11 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        $atReconnect = new class {
+            public ?NatsConnection $connection = null;
+            public ?ConnectionState $state = null;
+            public ?int $connects = null;
+        };
         $connection = new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0.05,
@@ -6820,17 +6837,24 @@ final class NatsConnectionTest extends TestCase
                 maxReconnectAttempts: 1,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
+                connectionListener: static function (ConnectionEvent $event) use ($transport, $atReconnect): void {
+                    if ($event === ConnectionEvent::Reconnected && $atReconnect->connects === null) {
+                        $atReconnect->state = $atReconnect->connection?->state();
+                        $atReconnect->connects = count($transport->connectCalls);
+                    }
+                },
             ),
             $transport,
         );
+        $atReconnect->connection = $connection;
         $connection->connect()->await();
 
-        // One tick + reconnect; must end before the restarted timer's next tick (maxPingsOut=0
-        // reconnects on every tick).
-        delay(0.08);
+        // One tick + reconnect, recorded as the reconnect is announced: maxPingsOut=0 reconnects on every tick,
+        // so the restarted timer's next tick reconnects again.
+        self::awaitUntil(static fn(): bool => $atReconnect->connects !== null, 'the reconnect of the first tick');
 
-        self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertCount(2, $transport->connectCalls);
+        self::assertSame(ConnectionState::Open, $atReconnect->state);
+        self::assertSame(2, $atReconnect->connects);
 
         $connection->disconnect()->await();
     }
@@ -6950,6 +6974,14 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
+        // The first PING write fails - the handshake's - and the reconnect loop dials again. What that left is recorded
+        // as the open is announced (Connected: the connection was never open before): the new connection never
+        // answers a heartbeat PING, so a later tick gives up on it in turn.
+        $atReconnect = new class {
+            public ?NatsConnection $connection = null;
+            public ?ConnectionState $state = null;
+            public ?int $connects = null;
+        };
         $connection = new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0.05,
@@ -6958,15 +6990,22 @@ final class NatsConnectionTest extends TestCase
                 maxReconnectAttempts: 1,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
+                connectionListener: static function (ConnectionEvent $event) use ($transport, $atReconnect): void {
+                    if (($event === ConnectionEvent::Connected || $event === ConnectionEvent::Reconnected) && $atReconnect->connects === null) {
+                        $atReconnect->state = $atReconnect->connection?->state();
+                        $atReconnect->connects = count($transport->connectCalls);
+                    }
+                },
             ),
             $transport,
         );
+        $atReconnect->connection = $connection;
         $connection->connect()->await();
 
-        delay(0.15);
+        self::awaitUntil(static fn(): bool => $atReconnect->connects !== null, 'the open after the failed PING write');
 
-        self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertCount(2, $transport->connectCalls);
+        self::assertSame(ConnectionState::Open, $atReconnect->state);
+        self::assertSame(2, $atReconnect->connects);
 
         $connection->disconnect()->await();
     }
@@ -7304,11 +7343,15 @@ final class NatsConnectionTest extends TestCase
         );
         $connection->connect()->await();
 
-        // Let several heartbeat ticks elapse without any application processIncoming() calls.
-        delay(0.2);
+        // Let several heartbeat ticks elapse without any application processIncoming() calls: counted, not timed.
+        // A connection that did not read its own PONGs would be closed at the second.
+        self::awaitUntil(
+            static fn(): bool => $transport->pings >= 3 || $connection->state() !== ConnectionState::Open,
+            'three heartbeat PINGs',
+        );
 
         self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertGreaterThanOrEqual(2, $transport->pings);
+        self::assertGreaterThanOrEqual(3, $transport->pings);
 
         $connection->disconnect()->await();
     }
@@ -9919,13 +9962,16 @@ final class NatsConnectionTest extends TestCase
         ];
 
         $connection = new NatsConnection(
-            new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 500),
+            new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 1_200),
             $transport,
         );
         $connection->connect()->await();
 
         $flushA = $connection->flush();
-        delay(0.2); // stagger so A's deadline fires while B is still within its budget
+        // Stagger so A's deadline fires while B is still within its budget, which then has 1.1 s left for the
+        // releases below: room for a pause of 0.8 s on a slow runner. B starts before A's deadline fires however
+        // late this delay ends, as timers fire in the order they are due.
+        delay(1.1);
         $flushB = $connection->flush();
 
         try {

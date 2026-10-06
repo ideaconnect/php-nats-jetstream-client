@@ -33,8 +33,8 @@ use function Amp\delay;
  *   - holdAnswers() / releaseAnswers(): the session's answers are held back, like a slow network;
  *   - {@see $answerPings}: while it is false, PINGs after the handshake's go unanswered;
  *   - stallNextWriteContaining(): the next write containing a needle takes a while, like a socket under
- *     backpressure. Writes reach the session in the order they were made, so the writes made after it wait
- *     for it;
+ *     backpressure, until its time is up or the test calls releaseStalledWrites(). Writes reach the session in
+ *     the order they were made, so the writes made after it wait for it;
  *   - completeNextWriteContainingLate(): the next write containing a needle reaches the session and is answered at
  *     once, but its writer learns it is done only a while later, so a read in another fiber meets the answer first.
  *
@@ -93,6 +93,8 @@ final class SubscriptionLimitServer implements TransportInterface
     private array $lateCompletions = [];
     /** @var array<string, DeferredFuture<null>> Stalled writes that end with the session, by their timer. */
     private array $stalledWrites = [];
+    /** @var array<string, DeferredFuture<null>> Every stall still running, by its timer, whether it ends with the session or not. */
+    private array $runningStalls = [];
     /** @var Future<void>|null The live session's latest write, which the next one waits for. */
     private ?Future $lastWrite = null;
     /** @var DeferredFuture<null> Completed (and replaced) whenever parked reads must re-check. */
@@ -293,6 +295,20 @@ final class SubscriptionLimitServer implements TransportInterface
         $this->lateCompletions[$needle] = $seconds;
     }
 
+    /**
+     * Ends every stall still running now, as if its time were up. For a test that holds a write up, with a stall
+     * longer than it lasts, until it has done what must happen while the write waits, rather than racing the
+     * stall's timer.
+     */
+    public function releaseStalledWrites(): void
+    {
+        foreach ($this->runningStalls as $released) {
+            if (!$released->isComplete()) {
+                $released->complete();
+            }
+        }
+    }
+
     /** The index of the latest session: 0 for the first dial, 1 after the first reconnect, ... */
     public function epoch(): int
     {
@@ -421,6 +437,7 @@ final class SubscriptionLimitServer implements TransportInterface
                 $released->complete();
             }
         });
+        $this->runningStalls[$timer] = $released;
         if ($endsWithSession) {
             $this->stalledWrites[$timer] = $released;
         }
@@ -429,7 +446,7 @@ final class SubscriptionLimitServer implements TransportInterface
             $released->getFuture()->await();
         } finally {
             EventLoop::cancel($timer);
-            unset($this->stalledWrites[$timer]);
+            unset($this->stalledWrites[$timer], $this->runningStalls[$timer]);
         }
     }
 

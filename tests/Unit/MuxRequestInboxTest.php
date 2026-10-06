@@ -144,8 +144,10 @@ final class MuxRequestInboxTest extends TestCase
         $this->replyTo($transport, 'svc.scan', 'r');
         $connection = $this->connect($transport);
 
-        // maxResponses 1 so it completes as soon as the single reply lands.
-        $messages = $connection->requestMany('svc.scan', 'x', null, 1, 500)->await();
+        // maxResponses 1 so it completes as soon as the single reply lands. The total is only a safety net, and a
+        // long one: requestMany() gives up before its first read once the clock is past it, so a slow runner that
+        // paused for longer than a short total would return before reading the reply.
+        $messages = $connection->requestMany('svc.scan', 'x', null, 1, 5_000)->await();
         self::assertCount(1, $messages);
 
         $waiters = new \ReflectionProperty($connection, 'muxWaiters');

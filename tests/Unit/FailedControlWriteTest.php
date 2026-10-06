@@ -149,7 +149,9 @@ final class FailedControlWriteTest extends TestCase
     public function testSubscribeWithWaitingDisabledFailsAtOnceWhileTheConnectionRecovers(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, waitForReconnect: false);
+        $connection = $this->connect($transport, waitForReconnect: false, requestTimeoutMs: 10_000);
+        // The recovery the failed write starts has its dials refused until the test lets them through below.
+        $transport->refuseDials();
         $transport->failNextWriteContaining('SUB orders');
 
         $start = hrtime(true);
@@ -162,7 +164,11 @@ final class FailedControlWriteTest extends TestCase
             self::assertInstanceOf(TransportClosedException::class, $e->getPrevious());
         }
 
-        self::assertLessThan(0.1, $this->secondsSince($start));
+        // A subscribe that waited for the recovery would still be waiting when its ten seconds ran out.
+        self::assertLessThan(2.0, $this->secondsSince($start));
+        $stateWhenItFailed = $connection->state();
+        self::assertSame(ConnectionState::Connecting, $stateWhenItFailed, 'the recovery was still under way');
+        $transport->acceptDials();
         $this->waitUntil(static fn(): bool => $transport->epoch() === 1 && $connection->state() === ConnectionState::Open);
         self::assertNull($transport->sidFor('orders'));
     }

@@ -2463,9 +2463,11 @@ final class ServiceTest extends TestCase
 
         $start = hrtime(true);
         $deferred->cancel();
-        $runner->await(new TimeoutCancellation(1.0));
+        $runner->await(new TimeoutCancellation(5.0));
 
-        self::assertLessThan(0.1, (hrtime(true) - $start) / 1e9, 'cancellation must end the backoff at once');
+        // The backoff is 20 ms, so the bound only says that the loop did not carry on: a loop that went on after
+        // the cancellation would still be running when the five seconds above ran out.
+        self::assertLessThan(2.0, (hrtime(true) - $start) / 1e9, 'cancellation must end the backoff at once');
         self::assertSame([], (new \ReflectionProperty($service, 'subscriptionSids'))->getValue($service));
         self::assertFalse((new \ReflectionProperty($service, 'started'))->getValue($service));
 
