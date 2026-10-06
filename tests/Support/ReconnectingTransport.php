@@ -42,8 +42,8 @@ use function Amp\delay;
  *
  * Reads and writes belong to the session they started on, like a real socket's: one still pending
  * when that session ends fails, even if a new session is live by then - at once, like a real socket's,
- * unless the test asks for a write whose failure surfaces only later. Responses held back by
- * {@see $responseDelay} end with their session too.
+ * unless the test asks for a write whose failure surfaces only later. Responses and PONGs held back by
+ * {@see $responseDelay} and {@see $pongDelay} end with their session too.
  *
  * Reads block like an idle socket until a frame arrives, the session ends or the caller's cancellation
  * fires. A {@see $responder} answers published messages with raw frames; {@see replyFrame()} builds a
@@ -77,6 +77,12 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
 
     /** Seconds the responder's frames are held back (a slow server); 0 delivers them at once. */
     public float $responseDelay = 0.0;
+
+    /**
+     * Seconds the PONGs answering PINGs after a session's handshake PING are held back (a slow server); 0
+     * answers them at once. The handshake's own PONG always goes out at once.
+     */
+    public float $pongDelay = 0.0;
 
     /** Whether PINGs after a session's handshake PING are answered (the handshake's always is). */
     public bool $answerPings = true;
@@ -252,17 +258,21 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
             }
 
             $pongs = [];
+            $laterPongs = [];
             $responses = [];
             foreach ($frames as $frame) {
                 if ($frame['op'] === 'PUB' || $frame['op'] === 'HPUB') {
                     $responses = [...$responses, ...$this->answer($frame)];
+                } elseif ($frame['op'] === 'PING' && !$this->handshakePending) {
+                    $laterPongs = [...$laterPongs, ...$this->answer($frame)];
                 } else {
                     $pongs = [...$pongs, ...$this->answer($frame)];
                 }
             }
 
-            // Only the responder is slow: protocol PONGs (the handshake's included) go out at once.
+            // Only the responder and later PONGs can be slow: the handshake's PONG goes out at once.
             $this->deliver($epoch, $pongs, 0.0);
+            $this->deliver($epoch, $laterPongs, $this->pongDelay);
             $this->deliver($epoch, $responses, $this->responseDelay);
 
             if ($this->afterWrite !== null) {
