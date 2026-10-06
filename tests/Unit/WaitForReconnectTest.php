@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Unit;
 
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
+use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
@@ -20,6 +21,7 @@ use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
+use IDCT\NATS\Tests\Support\UncancellableDialTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
@@ -96,7 +98,7 @@ final class WaitForReconnectTest extends TestCase
 
         $elapsed = $this->secondsSince($start);
         self::assertGreaterThanOrEqual(0.14, $elapsed, 'the request waited out its timeout');
-        self::assertLessThan(0.6, $elapsed);
+        self::assertLessThan(1.2, $elapsed, 'its own timeout, not the connection\'s 2 s one');
         self::assertSame(ConnectionState::Connecting, $connection->state());
         self::assertSame([], $transport->controlLinesStartingWith('PUB svc.echo'), 'a request that never got a connection is never sent');
 
@@ -106,36 +108,38 @@ final class WaitForReconnectTest extends TestCase
     }
 
     /**
-     * One budget covers the whole request: the reconnect ends ~200 ms into a 400 ms budget and the
-     * server answers 300 ms after the publish, so the request must time out at ~400 ms. With a fresh
-     * budget after the wait it would have received the reply at ~500 ms.
+     * One budget covers the whole request: the reconnect ends ~200 ms into a 1.2 s budget and the server
+     * answers 1.1 s after the publish, so the request must time out at ~1.2 s. With a fresh budget after
+     * the wait it would have received the reply at ~1.3 s. The outcome, unlike an elapsed time, does not
+     * depend on how late the runner fires its timers, and the reconnect may end up to ~1 s late without
+     * changing it.
      */
     public function testRequestSharesOneTimeoutBetweenTheReconnectWaitAndTheReply(): void
     {
         $transport = new ReconnectingTransport();
         $this->echoResponder($transport);
-        $transport->responseDelay = 0.3;
+        $transport->responseDelay = 1.1;
         $connection = $this->connect($transport);
         $reader = $this->startRecoveryInBackground($connection, $transport);
 
         $this->acceptDialsAfter($transport, 0.2);
-        $start = hrtime(true);
         try {
-            $connection->request('svc.echo', 'hi', 400)->await();
+            $connection->request('svc.echo', 'hi', 1_200)->await();
             self::fail('expected the request to run out of its single budget');
         } catch (TimeoutException $e) {
             self::assertSame('Request timed out for subject svc.echo', $e->getMessage());
         }
 
-        self::assertLessThan(0.55, $this->secondsSince($start), 'the reply wait must not get a fresh budget after the reconnect');
         self::assertCount(1, $transport->controlLinesStartingWith('PUB svc.echo', $transport->epoch()), 'the request was sent once reconnected');
         $reader->await();
     }
 
     /**
      * The same single budget bounds a request that joins another request's still-running reply-inbox
-     * set-up (its SUB write held up by backpressure): the joiner gives up at its own deadline while
-     * the first request, with budget to spare, completes.
+     * set-up (its SUB write held up by backpressure): the joiner gives up at its own deadline, while that
+     * SUB write is still stalled, and the first request, with budget to spare, completes. The joiner's
+     * deadline is due before the stall ends, so which of the two comes first does not depend on how late
+     * the runner fires its timers, unlike an elapsed time.
      */
     public function testRequestJoiningASlowReplyInboxSetUpGivesUpAtItsOwnDeadline(): void
     {
@@ -153,7 +157,8 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Request timed out for subject svc.echo while waiting for the reply inbox to be set up', $e->getMessage());
         }
 
-        self::assertLessThan(0.25, $this->secondsSince($start));
+        self::assertGreaterThanOrEqual(0.09, $this->secondsSince($start), 'it used its whole budget');
+        self::assertSame(1, $transport->writesStalled(), 'it gave up while the SUB of the reply inbox was still being written');
         self::assertSame('echo:first', $first->await()->payload);
         self::assertSame(['PUB svc.echo'], array_map(
             static fn(string $line): string => implode(' ', array_slice(explode(' ', $line), 0, 2)),
@@ -193,7 +198,7 @@ final class WaitForReconnectTest extends TestCase
         } catch (ConnectionException $e) {
             self::assertSame('Connection is not open', $e->getMessage());
         }
-        self::assertLessThan(0.05, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'at once, not at its 2 s timeout');
     }
 
     public function testRequestFailsFastDuringReconnectWhenWaitingIsDisabled(): void
@@ -211,7 +216,7 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Connection is not open', $e->getMessage());
         }
 
-        self::assertLessThan(0.05, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'at once, not at its 2 s timeout');
         $transport->acceptDials();
         $reader->await();
     }
@@ -235,7 +240,7 @@ final class WaitForReconnectTest extends TestCase
             // Expected: the caller's own cancellation, not a timeout.
         }
 
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'when the cancellation fired, not at its 2 s timeout');
         $transport->acceptDials();
         $reader->await();
     }
@@ -258,7 +263,7 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Connection is not open', $e->getMessage());
         }
 
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'when the disconnect came, not at its 2 s timeout');
         self::assertSame(ConnectionState::Closed, $connection->state());
 
         try {
@@ -269,18 +274,19 @@ final class WaitForReconnectTest extends TestCase
     }
 
     /**
-     * disconnect() does not wait for a reconnect in flight: that reconnect keeps backing off until it
-     * notices the close. An operation issued meanwhile must fail at once rather than wait for it, since
-     * nothing will reopen a connection the user closed.
+     * disconnect() waits for the reconnect it stops only as long as the connect timeout: one whose dial the
+     * transport cannot stop is still in flight when disconnect() returns. An operation issued then must fail
+     * at once rather than wait for it, since nothing will reopen a connection the user closed.
      */
     public function testOperationAfterDisconnectDuringAReconnectFailsAtOnce(): void
     {
-        $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, reconnectDelayMs: 300, reconnectMaxDelayMs: 300);
-        $reader = $this->startRecoveryInBackground($connection, $transport);
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
 
-        // The reconnect is now in its 300 ms backoff; it winds down only once that is over.
-        $connection->disconnect()->await();
+        // Returns once the connect timeout is over, with the reconnect still dialling.
+        $connection->disconnect()->await(new TimeoutCancellation(5));
+        self::assertFalse($reader->isComplete(), 'the reconnect is still in flight');
 
         $start = hrtime(true);
         try {
@@ -290,8 +296,9 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Connection is not open', $e->getMessage());
         }
 
-        self::assertLessThan(0.1, $this->secondsSince($start), 'no waiting for the reconnect that is winding down');
+        self::assertLessThan(1.0, $this->secondsSince($start), 'no waiting for the reconnect that is winding down');
 
+        $inner->releaseDial();
         try {
             $reader->await();
         } catch (\Throwable) {
@@ -358,7 +365,7 @@ final class WaitForReconnectTest extends TestCase
                 self::fail($name . ' must be refused with ConnectionException, got ' . ($error === null ? 'success' : $error::class));
             }
             self::assertSame('Connection is not open', $error->getMessage(), $name);
-            self::assertLessThan(0.1, $elapsed, $name . ' must be refused at once, not wait on the recovery it runs inside');
+            self::assertLessThan(1.0, $elapsed, $name . ' must be refused at once, not wait on the recovery it runs inside until its 2 s timeout');
         }
     }
 
@@ -439,7 +446,7 @@ final class WaitForReconnectTest extends TestCase
 
         $elapsed = $this->secondsSince($start);
         self::assertGreaterThanOrEqual(0.14, $elapsed);
-        self::assertLessThan(0.6, $elapsed);
+        self::assertLessThan(1.2, $elapsed, 'the subscribe gave up at the request timeout');
 
         // The failed subscribe left nothing behind: not even the replay writes its SUB.
         $transport->acceptDials();
@@ -479,59 +486,60 @@ final class WaitForReconnectTest extends TestCase
 
         $elapsed = $this->secondsSince($start);
         self::assertGreaterThanOrEqual(0.14, $elapsed);
-        self::assertLessThan(0.6, $elapsed);
+        self::assertLessThan(1.2, $elapsed, 'the flush gave up at the request timeout');
         $transport->acceptDials();
         $reader->await();
     }
 
     /**
-     * The reconnect ends ~200 ms into flush's 300 ms budget and its PONG never comes: one budget means
-     * the flush gives up at ~300 ms, where a fresh budget after the reconnect would run to ~500 ms.
+     * The reconnect ends ~200 ms into flush's 1.2 s budget and the server answers the flush's PING 1.1 s
+     * after it: one budget means the flush gives up at ~1.2 s, before that PONG (~1.3 s), where a fresh
+     * budget after the reconnect would last until ~1.4 s and receive it. The outcome, unlike an elapsed time,
+     * does not depend on how late the runner fires its timers, and the reconnect may end up to ~1 s late
+     * without changing it.
      */
     public function testFlushSharesOneTimeoutBetweenTheReconnectWaitAndThePong(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 300);
-        $transport->answerPings = false;
+        $connection = $this->connect($transport, requestTimeoutMs: 1_200);
+        $transport->pongDelay = 1.1;
         $reader = $this->startRecoveryInBackground($connection, $transport);
 
         $this->acceptDialsAfter($transport, 0.2);
-        $start = hrtime(true);
         try {
             $connection->flush()->await();
-            self::fail('expected the flush to time out');
+            self::fail('expected the flush to time out before the PONG came');
         } catch (TimeoutException $e) {
             self::assertSame('Flush timed out waiting for server PONG', $e->getMessage());
         }
 
-        self::assertLessThan(0.45, $this->secondsSince($start));
         self::assertSame(ConnectionState::Open, $connection->state());
         $reader->await();
     }
 
     /**
      * Without any reconnect, flush()'s PING write (slowed by backpressure) and its PONG wait share the
-     * one request-timeout budget it documents: 200 ms of write leave 100 ms for the PONG, where each
-     * phase used to get a full 300 ms.
+     * one request-timeout budget it documents: 200 ms of write leave 100 ms for the PONG, which the server
+     * sends 200 ms after the write, so the flush times out first. With a full 300 ms for each phase, as
+     * each phase used to get, it would receive the PONG. Unlike an elapsed time, which of the two happens
+     * does not depend on how late the runner fires its timers.
      */
     public function testFlushWriteAndPongPhasesShareOneTimeout(): void
     {
         $transport = new ReconnectingTransport();
         $connection = $this->connect($transport, requestTimeoutMs: 300);
         $transport->stallNextWriteContaining("PING\r\n", 0.2);
-        $transport->answerPings = false;
+        $transport->pongDelay = 0.2;
 
         $start = hrtime(true);
         try {
             $connection->flush()->await();
-            self::fail('expected the flush to time out');
+            self::fail('expected the flush to time out before the PONG came');
         } catch (TimeoutException $e) {
             self::assertSame('Flush timed out waiting for server PONG', $e->getMessage());
         }
 
-        $elapsed = $this->secondsSince($start);
-        self::assertGreaterThanOrEqual(0.28, $elapsed);
-        self::assertLessThan(0.45, $elapsed);
+        self::assertGreaterThanOrEqual(0.28, $this->secondsSince($start), 'the flush used its whole budget');
     }
 
     public function testRttDuringReconnectExcludesTheWaitFromTheMeasurement(): void
@@ -543,9 +551,12 @@ final class WaitForReconnectTest extends TestCase
         $this->acceptDialsAfter($transport, 0.1);
         $start = hrtime(true);
         $rtt = $connection->rtt()->await();
+        $elapsed = $this->secondsSince($start);
 
-        self::assertGreaterThanOrEqual(0.09, $this->secondsSince($start), 'rtt() waited for the reconnect');
-        self::assertLessThan(0.05, $rtt, 'the wait is not part of the measured round trip');
+        self::assertGreaterThanOrEqual(0.09, $elapsed, 'rtt() waited for the reconnect');
+        // Compared with the elapsed time rather than a fixed bound, so that a slow runner cannot fail it: the round
+        // trip it measured leaves out the 0.1 s or more it waited for the reconnect.
+        self::assertLessThan($elapsed - 0.09, $rtt, 'the wait is not part of the measured round trip');
         $reader->await();
     }
 
@@ -569,18 +580,23 @@ final class WaitForReconnectTest extends TestCase
     public function testProcessIncomingDuringReconnectWaitsThenReadsFromTheNewConnection(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport);
+        $subscription = new class {
+            public ?int $sid = null;
+        };
+        // The server sends a message on the new connection once the reconnect is over, however long that takes.
+        $connection = $this->connect($transport, connectionListener: static function (ConnectionEvent $event) use ($transport, $subscription): void {
+            if ($event === ConnectionEvent::Reconnected && $subscription->sid !== null) {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('updates', $subscription->sid, 'after'));
+            }
+        });
         $received = [];
-        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+        $subscription->sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
             $received[] = $message->payload;
         })->await();
         $reader = $this->startRecoveryInBackground($connection, $transport);
 
         $this->acceptDialsAfter($transport, 0.05);
-        EventLoop::delay(0.15, static function () use ($transport, $sid): void {
-            $transport->pushFrame(ReconnectingTransport::msgFrame('updates', $sid, 'after'));
-        });
-        $frames = $connection->processIncoming(new TimeoutCancellation(2))->await();
+        $frames = $connection->processIncoming(new TimeoutCancellation(5))->await();
 
         self::assertSame(1, $frames);
         self::assertSame(['after'], $received, 'the replayed subscription delivers on the new connection');
@@ -603,7 +619,7 @@ final class WaitForReconnectTest extends TestCase
 
         $elapsed = $this->secondsSince($start);
         self::assertGreaterThanOrEqual(0.09, $elapsed);
-        self::assertLessThan(0.5, $elapsed);
+        self::assertLessThan(1.0, $elapsed, 'the read gave up when its cancellation fired');
         self::assertSame(ConnectionState::Connecting, $connection->state());
         $transport->acceptDials();
         $reader->await();
@@ -698,7 +714,9 @@ final class WaitForReconnectTest extends TestCase
 
     /**
      * A request whose read fails because another fiber (here the heartbeat) started the recovery must
-     * give up at its own deadline instead of waiting for the whole recovery.
+     * give up at its own deadline instead of waiting for the whole recovery. The heartbeat notices the hang
+     * within ~0.05 s, well inside the request's 1.2 s budget, so that the request is still reading when the
+     * recovery closes the socket even on a runner that fires its timers late.
      */
     public function testInFlightRequestWhoseReadFailsReturnsAtItsOwnDeadline(): void
     {
@@ -710,13 +728,13 @@ final class WaitForReconnectTest extends TestCase
 
         $start = hrtime(true);
         try {
-            $connection->request('svc.echo', 'hi', 300)->await(new TimeoutCancellation(3));
+            $connection->request('svc.echo', 'hi', 1_200)->await(new TimeoutCancellation(5));
             self::fail('expected the request to time out');
         } catch (TimeoutException $e) {
             self::assertSame('Request timed out for subject svc.echo', $e->getMessage());
         }
 
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(2.2, $this->secondsSince($start), 'the request gave up at its own deadline');
         self::assertSame(ConnectionState::Connecting, $connection->state(), 'the heartbeat\'s recovery is still backing off');
         $transport->acceptDials();
         $this->waitUntilOpen($connection);
@@ -725,7 +743,8 @@ final class WaitForReconnectTest extends TestCase
     /**
      * The same when the request's read gets a corrupt chunk instead of an error - here the last bytes of the
      * old socket, read while the heartbeat's recovery closes it: the request joins that recovery only until
-     * its own deadline. It used to wait for the whole reconnect.
+     * its own deadline. It used to wait for the whole reconnect. As above, the request's 1.2 s budget is
+     * well beyond the ~0.1 s the heartbeat takes to notice the hang.
      */
     public function testInFlightRequestWhoseReadHitsACorruptChunkReturnsAtItsOwnDeadline(): void
     {
@@ -745,13 +764,13 @@ final class WaitForReconnectTest extends TestCase
 
         $start = hrtime(true);
         try {
-            $connection->request('svc.echo', 'hi', 300)->await(new TimeoutCancellation(3));
+            $connection->request('svc.echo', 'hi', 1_200)->await(new TimeoutCancellation(5));
             self::fail('expected the request to time out');
         } catch (TimeoutException $e) {
             self::assertSame('Request timed out for subject svc.echo', $e->getMessage());
         }
 
-        self::assertLessThan(0.8, $this->secondsSince($start));
+        self::assertLessThan(2.2, $this->secondsSince($start), 'the request gave up at its own deadline');
         self::assertSame(ConnectionState::Connecting, $connection->state(), 'the heartbeat\'s recovery is still backing off');
         $transport->acceptDials();
         $this->waitUntilOpen($connection);
@@ -772,8 +791,7 @@ final class WaitForReconnectTest extends TestCase
         $transport->silence();
 
         // Only the heartbeat, running while this fiber waits, can notice the hang.
-        delay(0.2);
-        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
         $transport->acceptDials();
 
         $replies = [];
@@ -869,24 +887,40 @@ final class WaitForReconnectTest extends TestCase
     }
 
     /**
-     * The reconnect ends ~400 ms into drain's 600 ms budget and the drain PING is never answered: the
-     * drain ends at ~600 ms, its flush getting only what the wait left of the one budget - a fresh budget
-     * for the flush would take it to ~1 s.
+     * The reconnect ends ~200 ms into drain's 1.2 s budget and the server answers the drain's PING 1.1 s
+     * after it: the drain closes at ~1.2 s without that PONG (~1.3 s), its flush getting only what the wait
+     * left of the one budget, where a fresh budget for the flush would last until ~1.4 s and wait for it.
+     * Which comes first, unlike an elapsed time, does not depend on how late the runner fires its timers,
+     * and the reconnect may end up to ~1 s late without changing it.
      */
     public function testDrainSharesOneTimeoutBetweenTheReconnectWaitAndItsFlush(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 600);
+        $connection = $this->connect($transport, requestTimeoutMs: 1_200);
+        $server = new class {
+            public bool $pinged = false;
+            public bool $answered = false;
+        };
         $transport->answerPings = false;
+        // The server answers the drain's PING, the one written while the connection drains, 1.1 s after it.
+        $transport->afterWrite = static function (string $bytes) use ($connection, $transport, $server): void {
+            if (str_ends_with($bytes, "PING\r\n") && $connection->state() === ConnectionState::Draining) {
+                $server->pinged = true;
+                EventLoop::delay(1.1, static function () use ($transport, $server): void {
+                    $server->answered = true;
+                    $transport->pushFrame("PONG\r\n");
+                });
+            }
+        };
         $reader = $this->startRecoveryInBackground($connection, $transport);
 
-        $this->acceptDialsAfter($transport, 0.4);
+        $this->acceptDialsAfter($transport, 0.2);
         $start = hrtime(true);
         $connection->drain()->await();
 
-        $elapsed = $this->secondsSince($start);
-        self::assertGreaterThanOrEqual(0.55, $elapsed, 'the drain waited for the reconnect');
-        self::assertLessThan(0.85, $elapsed, 'the flush does not get a fresh budget after the reconnect');
+        self::assertTrue($server->pinged, 'the drain flushed on the new connection');
+        self::assertFalse($server->answered, 'the drain closed when its one budget ran out, before the server answered its PING');
+        self::assertGreaterThanOrEqual(1.15, $this->secondsSince($start), 'the drain waited for its PONG until the budget ran out');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $connection->statistics()->reconnects);
         $reader->await();
@@ -896,6 +930,8 @@ final class WaitForReconnectTest extends TestCase
      * When the reconnect outlasts drain's budget the drain still ends Closed: it stops the reconnect,
      * runs its usual backlog pass - here a message queued behind a handler that is still busy, reported
      * as undelivered - and reports the buffered publishes it discards instead of dropping them silently.
+     * The handler stays busy until the test lets it go, rather than for a fixed time, so that a runner
+     * slow to start the drain cannot let it finish first and deliver the message.
      */
     public function testDrainThatRunsOutOfTimeWaitingForTheReconnectStillClosesAndReportsWhatItDiscards(): void
     {
@@ -910,11 +946,13 @@ final class WaitForReconnectTest extends TestCase
             },
         );
         $received = [];
-        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
+        /** @var DeferredFuture<null> $handlerRelease */
+        $handlerRelease = new DeferredFuture();
+        $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$received, $handlerRelease): void {
             $received[] = $message->payload;
             if ($message->payload === 'm1') {
-                // Still busy when the drain gives up.
-                delay(0.3);
+                // Still busy when the drain gives up: released once the drain is over, or after 5 s.
+                $handlerRelease->getFuture()->await(new TimeoutCancellation(5));
             }
         })->await();
 
@@ -932,10 +970,11 @@ final class WaitForReconnectTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
         $elapsed = $this->secondsSince($start);
+        $handlerRelease->complete();
 
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertGreaterThanOrEqual(0.14, $elapsed);
-        self::assertLessThan(0.5, $elapsed);
+        self::assertLessThan(1.2, $elapsed, 'the drain gave up when its budget ran out');
         self::assertContains(
             sprintf('Drain ran out of time waiting for the reconnect: %d bytes of buffered publishes were discarded', strlen("PUB events 8\r\nbuffered\r\n")),
             $errors,
@@ -983,7 +1022,7 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Cannot drain while reconnecting: the connection was closed instead', $e->getMessage());
         }
 
-        self::assertLessThan(0.05, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'at once, not after waiting for the reconnect');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertContains(
             sprintf('Drain could not wait for the reconnect: %d bytes of buffered publishes were discarded', strlen("PUB events 8\r\nbuffered\r\n")),
@@ -1042,7 +1081,7 @@ final class WaitForReconnectTest extends TestCase
         [$error, $elapsed] = $holder->outcome;
         self::assertInstanceOf(ConnectionException::class, $error);
         self::assertSame('Cannot drain while reconnecting: the connection was closed instead', $error->getMessage());
-        self::assertLessThan(0.1, $elapsed);
+        self::assertLessThan(1.0, $elapsed, 'at once, not after waiting on itself until its 2 s budget ran out');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(0, $connection->statistics()->reconnects);
         self::assertCount(1, $transport->connectCalls, 'the reconnect stopped before dialling');
@@ -1096,7 +1135,7 @@ final class WaitForReconnectTest extends TestCase
         $start = hrtime(true);
         $connection->drain()->await();
 
-        self::assertLessThan(0.3, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'when the disconnect came, not when the 2 s backoff delay ended');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Closed], $recorder->events);
         $reader->await();
@@ -1116,7 +1155,6 @@ final class WaitForReconnectTest extends TestCase
         $first = $connection->drain();
         delay(0.02);
 
-        $start = hrtime(true);
         try {
             $connection->drain()->await();
             self::fail('expected the second drain to fail');
@@ -1124,20 +1162,27 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Connection is not open', $e->getMessage());
         }
 
-        self::assertLessThan(0.05, $this->secondsSince($start), 'it does not wait for the reconnect');
+        // An order of events rather than an elapsed time, so that a slow runner cannot fail it.
+        self::assertSame(ConnectionState::Connecting, $connection->state(), 'it failed without waiting for the reconnect');
         $first->await();
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame(1, $connection->statistics()->reconnects);
         $reader->await();
     }
 
+    /**
+     * A drain() after disconnect() has nothing to drain and throws at once, even while the reconnect the
+     * disconnect stopped is still winding down: here one whose dial the transport cannot stop, which
+     * disconnect() waits for only as long as the connect timeout.
+     */
     public function testDrainAfterDisconnectDuringAReconnectThrowsWithNothingToDrain(): void
     {
-        $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, reconnectDelayMs: 300, reconnectMaxDelayMs: 300);
-        $reader = $this->startRecoveryInBackground($connection, $transport);
-        // The reconnect was in its 300 ms backoff: the disconnect cuts that short and stops it.
-        $connection->disconnect()->await();
+        $inner = new ReconnectingTransport();
+        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $reader = $this->startRecoveryHeldMidDial($connection, $inner);
+        // Returns once the connect timeout is over, with the reconnect still dialling.
+        $connection->disconnect()->await(new TimeoutCancellation(5));
+        self::assertFalse($reader->isComplete(), 'the reconnect is still in flight');
 
         $start = hrtime(true);
         try {
@@ -1147,9 +1192,10 @@ final class WaitForReconnectTest extends TestCase
             self::assertSame('Connection is not open', $e->getMessage());
         }
 
-        self::assertLessThan(0.1, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'at once, not after waiting for the reconnect');
         self::assertSame(ConnectionState::Closed, $connection->state());
 
+        $inner->releaseDial();
         try {
             $reader->await();
         } catch (\Throwable) {
@@ -1226,7 +1272,7 @@ final class WaitForReconnectTest extends TestCase
         }
 
         // The fetch deadline is its expiry plus one second of slack.
-        self::assertLessThan(1.8, $this->secondsSince($start));
+        self::assertLessThan(2.3, $this->secondsSince($start), 'the fetch ended by its deadline');
         self::assertSame(ConnectionState::Connecting, $client->state());
         $transport->acceptDials();
         $this->waitUntilOpen($client);
@@ -1262,7 +1308,7 @@ final class WaitForReconnectTest extends TestCase
         };
 
         self::assertSame($poll === 'fetchAll' ? [] : null, $result);
-        self::assertLessThan(0.5, $this->secondsSince($start));
+        self::assertLessThan(1.0, $this->secondsSince($start), 'only its short non-blocking wait, not a wait for the reconnect');
         self::assertSame(ConnectionState::Connecting, $client->state(), 'the reconnect is still backing off');
         $transport->acceptDials();
         $this->waitUntilOpen($client);

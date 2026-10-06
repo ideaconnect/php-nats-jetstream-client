@@ -4,11 +4,6 @@ on:
   push:
   pull_request:
   workflow_dispatch:
-    inputs:
-      integration-repeat-count:
-        description: Number of repeated integration passes for the soak job
-        required: false
-        default: "2"
 
 jobs:
   unit:
@@ -49,13 +44,18 @@ jobs:
       - uses: ramsey/composer-install@v3
       - name: JWT Fixtures
         run: composer fixture:jwt
-      - name: End-to-End Tests
+      - name: End-to-End Tests (integration + Behat)
+        # No unit stage here: the coverage step below runs the unit suite together with the integration
+        # suite, and the Unit + Static jobs run it on every supported PHP version. Running it here as well
+        # added about 3 minutes and one more chance to hit a timing flake (#176).
         run: composer test:e2e
         env:
           KEEP_NATS_SERVICES: "1"
+          SKIP_UNIT_TESTS: "1"
       - name: Generate Coverage Report
         # Combined unit + integration coverage (against the stack kept up above) so that
-        # integration-only code (TLS upgrade, Object Store download, etc.) is counted.
+        # integration-only code (TLS upgrade, Object Store download, etc.) is counted. This is also
+        # the job's only unit-suite run (the step above skips it).
         run: composer coverage:clover:all
       - name: Enforce Coverage Threshold
         # Reuses the clover report above (no extra test run); threshold is defined in composer.json

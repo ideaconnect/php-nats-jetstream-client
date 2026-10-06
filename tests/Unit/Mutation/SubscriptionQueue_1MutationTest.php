@@ -10,6 +10,8 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
+use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -27,9 +29,11 @@ use function Amp\Future\await;
  *       }
  *   } while ($this->monotonicSeconds() < $deadline);
  *
- * The two mutants both concern *when* the loop pays the 1 ms idle yield. Each test picks a timeout
- * window in which the real behavior and the mutated behavior produce a different next() return value
- * (a message vs null), so the difference is a crisp, deterministic assertion rather than a timing bound.
+ * The two mutants both concern *when* the loop pays the 1 ms idle yield. The first test counts the
+ * chunks next() reads after the event loop ran a tick ({@see LoopTickCountingTransport}): only a loop
+ * that idle-sleeps on partial reads lets the loop tick between them, whatever the machine's speed. The
+ * second picks a timeout window in which the real behavior and the mutated behavior produce a different
+ * next() return value (a message vs null). Neither asserts a time bound.
  */
 final class SubscriptionQueue_1MutationTest extends TestCase
 {
@@ -42,7 +46,7 @@ final class SubscriptionQueue_1MutationTest extends TestCase
         ];
     }
 
-    private function makeConnectedClient(FakeTransport $transport): NatsClient
+    private function makeConnectedClient(TransportInterface $transport): NatsClient
     {
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -55,17 +59,19 @@ final class SubscriptionQueue_1MutationTest extends TestCase
      *
      * A single frame is fed as many one-byte partial chunks: every read pulls a byte (consumedBytes
      * = true) but completes no frame until the last byte lands. On the REAL code `!consumedBytes` is
-     * false for each partial read, so the loop drains all ~317 chunks with NO per-chunk sleep and
-     * assembles the message well inside the 60 ms window -> next() returns it.
+     * false for each partial read, so the loop drains all ~317 chunks with NO per-chunk sleep, back to
+     * back, without letting the event loop tick between two reads, and next() returns the message.
      *
      * The mutant inverts the guard to `if ($read->consumedBytes)`, so it sleeps 1 ms on EVERY
-     * partial read (~316 ms of accrued sleeps). The TimeoutCancellation fires mid-frame, the message
-     * is never completed, and next() returns null. assertNotNull therefore fails on the mutant.
+     * partial read, and the event loop ticks during each sleep: the transport counts every chunk after
+     * the first as read after a tick, where the real code counts none. The 5 s timeout gives the real
+     * code all the time it needs, however slow the machine is (#176).
      */
     public function testNextAssemblesChunkedFrameWithoutIdleSleepPerPartialChunk(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = $this->makeConnectedClient($transport);
+        $counting = new LoopTickCountingTransport($transport);
+        $client = $this->makeConnectedClient($counting);
 
         $queue = $client->subscribeQueue('big')->await();
         self::assertInstanceOf(SubscriptionQueue::class, $queue);
@@ -76,19 +82,22 @@ final class SubscriptionQueue_1MutationTest extends TestCase
             $transport->pushReadChunk($byte);
         }
 
-        // ~316 partial reads would cost ~316 ms of 1 ms sleeps on the mutant; the real path pays none.
-        $queue->setTimeout(0.06);
+        $queue->setTimeout(5.0);
+        $counting->reset(); // count the frame's chunks only, not the handshake's
 
-        $startedNs = hrtime(true);
         // Outer bound: fail loudly rather than hang if a regression parks the caller.
-        $message = await([async(static fn (): ?NatsMessage => $queue->next())], new TimeoutCancellation(5.0))[0];
-        $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
+        $message = await([async(static fn (): ?NatsMessage => $queue->next())], new TimeoutCancellation(10.0))[0];
 
-        // kills LogicalNot @ 208: real code assembles + returns the message; the mutant times out to null.
-        self::assertNotNull($message, 'partial-frame reads must loop without a per-chunk idle sleep');
+        self::assertNotNull($message, 'the chunked frame must be assembled and returned');
         self::assertSame($payload, $message->payload);
-        // Real code finishes near-instantly, not after the ~316 ms a per-partial-chunk sleep would cost.
-        self::assertLessThan(0.06, $elapsedSeconds, 'the frame must assemble inside the window, not sleep per partial chunk');
+        self::assertSame(strlen($frame), $counting->chunksRead, 'every byte of the frame must be read as its own chunk');
+        // kills LogicalNot @ 208: only a loop that sleeps 1 ms per partial read lets the event loop tick
+        // between two of them.
+        self::assertSame(
+            0,
+            $counting->chunksReadAfterALoopTick,
+            'partial-frame reads must loop without a per-chunk idle sleep',
+        );
     }
 
     /**

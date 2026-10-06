@@ -87,7 +87,9 @@ final class ConcurrentReadTest extends TestCase
     public function testReadReturnsOnceTheReadAnotherFiberHoldsIsDone(string $read): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport);
+        // A ten-second ping interval gives the heartbeat's read a two-second window, so that it is still there to
+        // deliver the message when a slow runner brings it late; its timer never ticks within the test.
+        $connection = $this->connect($transport, pingIntervalSeconds: 10);
         $updates = new class {
             /** @var list<string> */
             public array $payloads = [];
@@ -106,7 +108,8 @@ final class ConcurrentReadTest extends TestCase
         self::assertTrue($heartbeat->isComplete(), 'it waited for the heartbeat\'s read');
         self::assertSame(['u1'], $updates->payloads, 'delivered by the heartbeat\'s read');
         self::assertEquals($read === 'processIncoming' ? 0 : new IncomingChunkResult(0, false), $result);
-        self::assertLessThan(1.0, $this->secondsSince($start));
+        // Well before the call's own two-second bound, with room for a pause of 0.8 s on a slow runner.
+        self::assertLessThan(1.5, $this->secondsSince($start));
     }
 
     /**
@@ -117,8 +120,18 @@ final class ConcurrentReadTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $connection = $this->connect($transport);
-        // The reply takes 0.3 s: the request holds the read that long.
-        $request = $this->startReadingOnAnotherFiber('request', $connection, $transport, replyDelay: 0.3);
+        // The server answers only once the test has checked the wait: the request holds the read until then.
+        $holder = new class {
+            public ?string $replyTo = null;
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($holder): array {
+            $holder->replyTo = $replyTo;
+
+            return [];
+        };
+        $request = async(static fn(): string => $connection->request('svc.echo', 'hi', 5_000)->await()->payload);
+        delay(0.01);
+        self::assertFalse($request->isComplete(), 'the request is waiting for its reply');
 
         $start = hrtime(true);
         try {
@@ -128,8 +141,12 @@ final class ConcurrentReadTest extends TestCase
             // Expected.
         }
 
-        self::assertLessThan(0.25, $this->secondsSince($start));
+        // A wait that ignored its cancellation would last as long as the request's read: five seconds, until the
+        // request gives up, since the reply only comes below.
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertFalse($request->isComplete(), 'the request is still waiting for its reply');
+        self::assertNotNull($holder->replyTo);
+        $transport->pushFrame(implode('', $transport->replyFrame($holder->replyTo, 'echo:hi')));
         self::assertSame('echo:hi', $request->await());
     }
 
@@ -348,7 +365,7 @@ final class ConcurrentReadTest extends TestCase
         };
         $connection = $this->connect(
             $transport,
-            requestTimeoutMs: 800,
+            requestTimeoutMs: 10_000,
             connectionListener: static function (ConnectionEvent $event) use ($listener): void {
                 if ($event === ConnectionEvent::Reconnected && $listener->drainSeconds === null && $listener->connection !== null) {
                     $start = hrtime(true);
@@ -364,9 +381,9 @@ final class ConcurrentReadTest extends TestCase
 
         $transport->dropConnection();
 
-        $reader->await(new TimeoutCancellation(3));
+        $reader->await(new TimeoutCancellation(15));
         self::assertNotNull($listener->drainSeconds);
-        self::assertLessThan(0.4, $listener->drainSeconds, 'well within the 0.8 s budget');
+        self::assertLessThan(2.0, $listener->drainSeconds, 'well within the 10 s budget');
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
@@ -384,27 +401,32 @@ final class ConcurrentReadTest extends TestCase
         delay(0.01);
         $b = async(static function () use ($connection): float {
             $start = hrtime(true);
-            $connection->processIncoming(new TimeoutCancellation(3))->await();
+            $connection->processIncoming(new TimeoutCancellation(10))->await();
 
             return (hrtime(true) - $start) / 1e9;
         });
         delay(0.01);
 
-        // The server goes away and refuses dials for 1 s: A's read fails and A runs the reconnect.
+        // The server goes away and refuses dials until the test lets them through below: A's read fails and A
+        // runs the reconnect.
         $transport->refuseDials();
         $transport->dropConnection();
-        EventLoop::delay(1.0, static fn() => $transport->acceptDials());
 
-        self::assertLessThan(0.5, $b->await(new TimeoutCancellation(2)));
+        // A read that waited for the whole reconnect would still be waiting when the five seconds below ran out.
+        self::assertLessThan(2.0, $b->await(new TimeoutCancellation(5)));
         self::assertSame(ConnectionState::Connecting, $connection->state(), 'the reconnect is still backing off');
+        $transport->acceptDials();
         $a->await(new TimeoutCancellation(3));
         self::assertSame(ConnectionState::Open, $connection->state());
     }
 
     /**
      * Starts a read on another fiber and returns once that read holds the socket. The server answers it
-     * $replyDelay seconds later: a request gets its reply ("echo:hi"); the heartbeat's read gets $frames
-     * (by default a PONG).
+     * $replyDelay seconds after that: a request gets its reply ("echo:hi"); the heartbeat's read gets $frames
+     * (by default a PONG). The delay runs from the moment the read is known to wait, so that a slow runner
+     * cannot bring the answer in before it. The heartbeat's read waits only as long as the ping interval allows
+     * (50 ms when the heartbeat is off, two seconds at most), so a test that needs that read to deliver the answer
+     * gives the connection a longer interval.
      *
      * @return Future<mixed>
      */
@@ -416,19 +438,31 @@ final class ConcurrentReadTest extends TestCase
         float $replyDelay = 0.03,
     ): Future {
         if ($reader === 'request') {
-            $transport->responseDelay = $replyDelay;
-            $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $subject === 'svc.echo' && $replyTo !== null
-                ? $transport->replyFrame($replyTo, 'echo:' . $payload)
-                : [];
+            $request = new class {
+                public ?string $replyTo = null;
+            };
+            $transport->responder = static function (string $subject, ?string $replyTo) use ($request): array {
+                if ($subject === 'svc.echo') {
+                    $request->replyTo = $replyTo;
+                }
+
+                return [];
+            };
             $other = async(static fn(): string => $connection->request('svc.echo', 'hi', 2_000)->await()->payload);
+            $answer = static function () use ($transport, $request): void {
+                if ($request->replyTo !== null) {
+                    $transport->pushFrame(implode('', $transport->replyFrame($request->replyTo, 'echo:hi')));
+                }
+            };
         } else {
             // What the heartbeat's timer runs once its PING is written.
-            EventLoop::delay($replyDelay, static fn() => $transport->pushFrame($frames));
             $other = async(static fn(): mixed => (new \ReflectionMethod(NatsConnection::class, 'consumeHeartbeatResponse'))->invoke($connection));
+            $answer = static fn() => $transport->pushFrame($frames);
         }
 
         delay(0.01);
         self::assertFalse($other->isComplete(), 'the other read is waiting for the server');
+        EventLoop::delay($replyDelay, $answer);
 
         return $other;
     }

@@ -190,7 +190,8 @@ final class CloseIntentTest extends TestCase
 
     /**
      * disconnect() while connect() retries a failed first dial (retryOnFailedInitialConnect, reconnect
-     * disabled) stops the retries at once - their backoff is cut short - and connect() fails.
+     * disabled) stops the retries at once - their backoff is cut short - and connect() fails. The backoff is
+     * ten seconds, so a connect() that sat it out would take five times the bound below.
      */
     public function testDisconnectDuringTheInitialConnectRetriesWinsAtOnce(): void
     {
@@ -201,8 +202,8 @@ final class CloseIntentTest extends TestCase
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
                 maxReconnectAttempts: 10,
-                reconnectDelayMs: 1_000,
-                reconnectMaxDelayMs: 1_000,
+                reconnectDelayMs: 10_000,
+                reconnectMaxDelayMs: 10_000,
                 reconnectJitterMs: 0,
                 pingIntervalSeconds: 0,
                 connectionListener: $recorder->connectionListener(),
@@ -213,7 +214,7 @@ final class CloseIntentTest extends TestCase
         $this->opened[] = $connection;
         $transport->refuseDials();
         $connect = $connection->connect();
-        // The first dial was refused; the next retry is a second away.
+        // The first dial was refused; the next retry is ten seconds away.
         $this->waitUntil(static fn(): bool => count($transport->connectCalls) === 1);
         delay(0.02);
 
@@ -227,7 +228,7 @@ final class CloseIntentTest extends TestCase
             self::assertSame('Connect was aborted before the connection opened', $e->getMessage());
         }
 
-        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start), 'the backoff was cut short');
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertCount(1, $transport->connectCalls, 'no dial after the close');
         self::assertSame([ConnectionEvent::Closed], $recorder->events);
@@ -238,18 +239,20 @@ final class CloseIntentTest extends TestCase
      * has ended, so a connect() issued after it dials afresh. The reconnect used to go on dialling after
      * disconnect() returned, and that connect() failed with "Recovery was aborted before the connection
      * opened". In a synchronous application the reconnect never got the event-loop time to end at all, and
-     * every connect() failed that way.
+     * every connect() failed that way. The held dial never ends by itself, so a disconnect() that waited for it
+     * instead of stopping it would return only at the bound on that wait, the connect timeout: ten seconds here,
+     * five times the bound below.
      */
     public function testConnectAfterDisconnectDialsAfreshWhileTheReconnectItStoppedWasDialling(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport);
+        $connection = $this->connect($transport, connectTimeoutMs: 10_000);
         $reader = $this->startRecoveryHeldMidDial($connection, $transport);
 
         $start = hrtime(true);
         $connection->disconnect()->await();
 
-        self::assertLessThan(0.2, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start), 'it stopped the dial rather than waiting for it');
         self::assertSame(1, $transport->dialsCancelled, 'the dial was stopped');
         $connection->connect()->await(new TimeoutCancellation(1));
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -452,25 +455,27 @@ final class CloseIntentTest extends TestCase
     /**
      * A connect() racing a close still fails at once (#145): issued while disconnect() waits for the
      * reconnect it stopped, it cannot join that reconnect, which will never open the connection. Once
-     * disconnect() has returned, connect() dials afresh.
+     * disconnect() has returned, connect() dials afresh. The dial is held until the test lets it through, and
+     * the connect timeout that bounds disconnect()'s wait for it is ten seconds, so a connect() that joined the
+     * reconnect would still be waiting when its own five-second bound below ran out.
      */
     public function testConnectRacingADisconnectThatWaitsForTheStoppedReconnectFailsAtOnce(): void
     {
         $inner = new ReconnectingTransport();
-        $connection = $this->connect(new UncancellableDialTransport($inner));
+        $connection = $this->connect(new UncancellableDialTransport($inner), connectTimeoutMs: 10_000);
         $reader = $this->startRecoveryHeldMidDial($connection, $inner);
         $disconnect = $connection->disconnect();
         delay(0.02);
 
         $start = hrtime(true);
         try {
-            $connection->connect()->await(new TimeoutCancellation(0.5));
+            $connection->connect()->await(new TimeoutCancellation(5));
             self::fail('expected ConnectionException');
         } catch (ConnectionException $e) {
             self::assertSame('Recovery was aborted before the connection opened', $e->getMessage());
         }
 
-        self::assertLessThan(0.1, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         $inner->releaseDial();
         $disconnect->await(new TimeoutCancellation(1));
         $reader->await(new TimeoutCancellation(1));
@@ -480,7 +485,8 @@ final class CloseIntentTest extends TestCase
 
     /**
      * disconnect() called from a listener that runs inside the reconnect does not wait for that reconnect,
-     * which waits for the listener to return: it would wait out its whole bound.
+     * which waits for the listener to return: it would wait out its whole bound, the connect timeout, which is
+     * ten seconds here, or the listener's own five-second bound on the call, which leaves no time measured.
      */
     public function testDisconnectFromAListenerInsideTheReconnectDoesNotWaitForIt(): void
     {
@@ -496,18 +502,18 @@ final class CloseIntentTest extends TestCase
             }
 
             $start = hrtime(true);
-            $connection->disconnect()->await(new TimeoutCancellation(2));
+            $connection->disconnect()->await(new TimeoutCancellation(5));
             $holder->disconnectSeconds = (hrtime(true) - $start) / 1e9;
         };
-        $connection = $this->connect($transport, connectionListener: $listener);
+        $connection = $this->connect($transport, connectionListener: $listener, connectTimeoutMs: 10_000);
         $holder->connection = $connection;
         $transport->refuseDials();
         $transport->dropConnection();
 
-        $connection->processIncoming()->await(new TimeoutCancellation(2));
+        $connection->processIncoming()->await(new TimeoutCancellation(10));
 
         self::assertNotNull($holder->disconnectSeconds);
-        self::assertLessThan(0.2, $holder->disconnectSeconds);
+        self::assertLessThan(2.0, $holder->disconnectSeconds);
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
@@ -592,7 +598,7 @@ final class CloseIntentTest extends TestCase
     /**
      * disconnect() while the reconnect is writing its "attempt failed" log line - through a logger that
      * suspends, like an async stream under backpressure - still stops the reconnect at once, not when
-     * its backoff delay ends.
+     * its backoff delay ends: ten seconds later, five times the bound below.
      */
     public function testCloseWhileTheReconnectLogIsWrittenStillStopsTheReconnectAtOnce(): void
     {
@@ -614,8 +620,8 @@ final class CloseIntentTest extends TestCase
                 connectTimeoutMs: 500,
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1_000,
-                reconnectDelayMs: 1_000,
-                reconnectMaxDelayMs: 1_000,
+                reconnectDelayMs: 10_000,
+                reconnectMaxDelayMs: 10_000,
                 reconnectJitterMs: 0,
                 pingIntervalSeconds: 0,
                 logger: $logger,
@@ -632,7 +638,7 @@ final class CloseIntentTest extends TestCase
         $connection->disconnect()->await();
         $reader->await();
 
-        self::assertLessThan(0.3, $this->secondsSince($start));
+        self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
@@ -722,9 +728,13 @@ final class CloseIntentTest extends TestCase
         $transport = new ReconnectingTransport();
         $connection = $this->retryingInitialConnect($transport, new LifecycleRecorder(), 5);
         $transport->refuseDials();
-        $this->acceptDialsAfter($transport, 0.05);
+        $connect = $connection->connect();
+        // Dials are let through once three have been refused, rather than after a fixed time: a pause before
+        // the retries' backoff timers would otherwise let the second dial through.
+        $this->waitUntil(static fn(): bool => count($transport->connectCalls) >= 3);
+        $transport->acceptDials();
 
-        $connection->connect()->await();
+        $connect->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertGreaterThan(2, count($transport->connectCalls), 'refused more than once before it got through');

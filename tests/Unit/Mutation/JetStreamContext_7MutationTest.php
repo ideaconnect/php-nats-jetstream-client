@@ -8,6 +8,8 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
+use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -21,9 +23,10 @@ use PHPUnit\Framework\TestCase;
  *  - LogicalNot on the `if (!$read->consumedBytes)` idle-sleep guard. The real code sleeps 1 ms ONLY
  *    on a genuinely idle read and loops immediately on a byte-consuming (partial-frame) read; the
  *    mutant inverts that, paying a 1 ms sleep per chunk of a multi-chunk payload. We feed a payload
- *    split into >1001 one-byte chunks against a ~1001 ms internal deadline (expiresMs=1): the real
- *    path drains it in well under the deadline and returns the message, whereas a 1 ms-per-chunk
- *    mutant blows the deadline and throws instead of returning the message.
+ *    split into one-byte chunks through a transport that counts the chunks read after the event loop
+ *    ran a tick ({@see LoopTickCountingTransport}): the real path reads them back to back and counts
+ *    none, whereas each of the mutant's sleeps lets the loop tick, so every chunk after the first
+ *    counts. The count does not depend on how fast the machine is (#176).
  *
  * All frames are driven through the in-process FakeTransport (no sockets, no Docker); the collect
  * loop itself pumps the reads.
@@ -32,7 +35,7 @@ final class JetStreamContext_7MutationTest extends TestCase
 {
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
-    private function connect(FakeTransport $transport): NatsClient
+    private function connect(TransportInterface $transport): NatsClient
     {
         $client = new NatsClient(new NatsOptions(), $transport);
         $client->connect()->await();
@@ -106,15 +109,16 @@ final class JetStreamContext_7MutationTest extends TestCase
 
     // kills LogicalNot @ 888 (directGetBatch idle-sleep guard)
     //
-    // One data message (terminated by Nats-Num-Pending: 0) split into >1001 one-byte transport chunks,
-    // against a ~1001 ms internal deadline (expiresMs=1). Every read consumes a byte without completing
-    // the frame, so the real code (idle-sleep ONLY when no bytes were consumed) drains the whole payload
-    // in well under the deadline and returns the message. The mutant sleeps 1 ms on every byte-consuming
-    // read, accruing >1001 ms before the frame completes, so it stalls and throws instead of returning.
-    // Asserting the message IS returned therefore fails on the mutant.
+    // One data message (terminated by Nats-Num-Pending: 0) split into one-byte transport chunks. Every
+    // read consumes a byte without completing the frame, so the real code (idle-sleep ONLY when no bytes
+    // were consumed) reads chunk after chunk without letting the event loop tick between them, and
+    // returns the message. The mutant sleeps 1 ms on every byte-consuming read, and the loop ticks during
+    // each sleep: the transport counts every chunk after the first as read after a tick, where the real
+    // code counts none. The 6 s progress bound (expiresMs=5000) gives the real code all the time it needs,
+    // however slow the machine is (#176).
     public function testDirectGetBatchDrainsChunkedMessageWithoutPerChunkIdleSleep(): void
     {
-        $body = str_repeat('x', 2000);
+        $body = str_repeat('x', 300);
         $headers = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\nNats-Num-Pending: 0\r\n\r\n";
         $frame = sprintf(
             "HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n",
@@ -124,44 +128,59 @@ final class JetStreamContext_7MutationTest extends TestCase
             $body,
         );
 
-        $chunks = str_split($frame); // one byte per transport read: >2100 partial-progress reads
-        self::assertGreaterThan(1001, count($chunks), 'the payload must span more chunks than the ~1001 ms deadline tolerates as 1 ms sleeps');
+        $chunks = str_split($frame); // one byte per transport read: hundreds of partial-progress reads
 
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = $this->connect($transport);
+        $counting = new LoopTickCountingTransport($transport);
+        $client = $this->connect($counting);
         foreach ($chunks as $chunk) {
             $transport->pushReadChunk($chunk);
         }
+        $counting->reset(); // count the message's chunks only, not the handshake's
 
-        $messages = $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 1)->await();
+        $messages = $client->jetStream()->directGetBatch('ORDERS', ['batch' => 10], 5_000)->await();
 
-        self::assertCount(1, $messages, 'the chunked batch message must be drained and returned, not lost to a per-chunk idle sleep');
+        self::assertCount(1, $messages, 'the chunked batch message must be drained and returned');
         self::assertSame($body, $messages[0]->payload);
+        self::assertSame(count($chunks), $counting->chunksRead, 'every byte of the message must be read as its own chunk');
+        self::assertSame(
+            0,
+            $counting->chunksReadAfterALoopTick,
+            'the collect loop must read the next chunk at once, not idle-sleep 1 ms per partial chunk',
+        );
     }
 
     // kills LogicalNot @ 2097 (fetchBatch idle-sleep guard)
     //
-    // Same shape as the directGetBatch case, through fetchBatch: one message split into >1001 one-byte
-    // chunks against a ~1001 ms deadline (expiresMs=1, batch=1). The real path drains it fast and
-    // returns the message; the 1 ms-per-chunk mutant blows the deadline with the frame still incomplete,
-    // breaks with an empty batch, and throws the 408 "no messages" error instead of returning.
+    // Same shape as the directGetBatch case, through fetchBatch (batch=1): one message split into
+    // one-byte chunks. The real path reads the chunks back to back and returns the message; each of the
+    // 1 ms-per-chunk mutant's sleeps lets the event loop tick, so the transport counts every chunk after
+    // the first as read after a tick. The 6 s deadline (expiresMs=5000) gives the real code all the time
+    // it needs, however slow the machine is (#176).
     public function testFetchBatchDrainsChunkedMessageWithoutPerChunkIdleSleep(): void
     {
-        $body = str_repeat('y', 2000);
+        $body = str_repeat('y', 300);
         $frame = sprintf("MSG _INBOX.JS.FETCH.a 1 %d\r\n%s\r\n", strlen($body), $body);
 
-        $chunks = str_split($frame);
-        self::assertGreaterThan(1001, count($chunks), 'the payload must span more chunks than the ~1001 ms deadline tolerates as 1 ms sleeps');
+        $chunks = str_split($frame); // one byte per transport read: hundreds of partial-progress reads
 
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = $this->connect($transport);
+        $counting = new LoopTickCountingTransport($transport);
+        $client = $this->connect($counting);
         foreach ($chunks as $chunk) {
             $transport->pushReadChunk($chunk);
         }
+        $counting->reset(); // count the message's chunks only, not the handshake's
 
-        $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 1)->await();
+        $messages = $client->jetStream()->fetchBatch('ORDERS', 'PROC', 1, 5_000)->await();
 
-        self::assertCount(1, $messages, 'the chunked fetch message must be drained and returned, not lost to a per-chunk idle sleep');
+        self::assertCount(1, $messages, 'the chunked fetch message must be drained and returned');
         self::assertSame($body, $messages[0]->payload);
+        self::assertSame(count($chunks), $counting->chunksRead, 'every byte of the message must be read as its own chunk');
+        self::assertSame(
+            0,
+            $counting->chunksReadAfterALoopTick,
+            'the collect loop must read the next chunk at once, not idle-sleep 1 ms per partial chunk',
+        );
     }
 }

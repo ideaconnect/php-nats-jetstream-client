@@ -5905,12 +5905,13 @@ final class JetStreamContextTest extends TestCase
         $client = new NatsClient($options, $transport);
         $client->connect()->await();
 
-        // 100 ms heartbeat -> 200 ms watchdog threshold.
-        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 100_000_000)->await();
+        // 500 ms heartbeat -> 1 s watchdog threshold.
+        $client->jetStream()->subscribeOrderedConsumer('EVENTS', static function (NatsMessage $message): void {}, null, 500_000_000)->await();
 
-        // Feed a heartbeat roughly every 10 ms for ~500 ms (past two thresholds). Each frame rearms the
-        // watchdog with a ~20x margin on the feed gap, so a slow CI must not produce a false recreate.
-        $deadlineNs = hrtime(true) + 500_000_000;
+        // Feed a heartbeat roughly every 10 ms for ~1.6 s, past the threshold and the watchdog tick after it.
+        // Each frame rearms the watchdog with a ~100x margin on the feed gap, so even a pause of 0.8 s on a slow
+        // CI leaves a gap shorter than the threshold and must not produce a false recreate.
+        $deadlineNs = hrtime(true) + 1_600_000_000;
         while (hrtime(true) < $deadlineNs) {
             $transport->pushReadChunk($hbFrame);
             $client->processIncoming()->await();
@@ -9752,12 +9753,13 @@ final class JetStreamContextTest extends TestCase
             static function (NatsMessage $message): void {},
             'deliver.dur',
             null,
-            ['idle_heartbeat' => 100_000_000],
+            ['idle_heartbeat' => 500_000_000],
         )->await();
 
-        // Feed a frame every ~20ms for ~260ms: far inside the 100ms heartbeat interval, while the
-        // watchdog (2 x 100ms threshold) gets several chances to tick.
-        for ($i = 1; $i <= 13; $i++) {
+        // Feed a frame every ~20ms for ~1.6s: far inside the 500ms heartbeat interval, so even a pause of 0.8 s
+        // on a slow CI leaves a gap shorter than the watchdog's 1 s threshold (2 x 500ms), while the watchdog
+        // gets three chances to tick.
+        for ($i = 1; $i <= 80; $i++) {
             $transport->pushReadChunk("MSG deliver.dur 2 \$JS.ACK.ORDERS.DUR.$i.$i.$i.0.0 1\r\nx\r\n");
             $client->processIncoming()->await();
             delay(0.02);

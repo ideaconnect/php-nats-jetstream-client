@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Unit;
 
 use Amp\ByteStream\ClosedException;
 use Amp\CancelledException;
+use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
@@ -75,8 +76,8 @@ final class ReconnectedListenerTest extends TestCase
 
     /**
      * The listener drops the new connection and reads: the read meets EOF, reconnects again at once and returns
-     * without error. It used to join the reconnect that was waiting for the listener, wait out its 0.5 s and
-     * fail with CancelledException, and the connection stayed Open on the dead socket.
+     * without error. It used to join the reconnect that was waiting for the listener, wait out its budget (5 s
+     * here) and fail with CancelledException, and the connection stayed Open on the dead socket.
      */
     public function testReadInAReconnectedListenerThatMeetsEofReconnectsAgain(): void
     {
@@ -84,7 +85,7 @@ final class ReconnectedListenerTest extends TestCase
         $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection) use ($transport): int {
             $transport->dropConnection();
 
-            return $connection->processIncoming(new TimeoutCancellation(0.5))->await();
+            return $connection->processIncoming(new TimeoutCancellation(5))->await();
         });
         $connection = $this->connect($transport, connectionListener: $action->listener());
         $action->connection = $connection;
@@ -92,7 +93,7 @@ final class ReconnectedListenerTest extends TestCase
         $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
 
         self::assertNull($action->failure);
-        self::assertLessThan(0.3, self::secondsTaken($action), 'the read did not wait out its budget');
+        self::assertLessThan(2.0, self::secondsTaken($action), 'the read did not wait out its budget');
         $this->assertReconnectedAgain($connection, $transport);
         self::assertSame(self::TWO_RECONNECTS, $action->recorder->events);
     }
@@ -117,8 +118,8 @@ final class ReconnectedListenerTest extends TestCase
 
     /**
      * The server ends the new connection with a fatal -ERR, which the listener reads: the read reconnects again,
-     * then fails with the server's error at once. It used to wait out its 0.5 s first, and the connection stayed
-     * on the connection the server had ended.
+     * then fails with the server's error at once. It used to wait out its budget (5 s here) first, and the
+     * connection stayed on the connection the server had ended.
      */
     public function testFatalErrReadInAReconnectedListenerReconnectsAgain(): void
     {
@@ -127,7 +128,7 @@ final class ReconnectedListenerTest extends TestCase
             $transport->silence();
             $transport->pushFrame(self::STALE);
 
-            return $connection->processIncoming(new TimeoutCancellation(0.5))->await();
+            return $connection->processIncoming(new TimeoutCancellation(5))->await();
         });
         $connection = $this->connect($transport, connectionListener: $action->listener());
         $action->connection = $connection;
@@ -136,7 +137,7 @@ final class ReconnectedListenerTest extends TestCase
 
         self::assertInstanceOf(ConnectionException::class, $action->failure);
         self::assertSame("Server sent error frame: 'Stale Connection'", $action->failure->getMessage());
-        self::assertLessThan(0.3, self::secondsTaken($action), 'the read did not wait out its budget');
+        self::assertLessThan(2.0, self::secondsTaken($action), 'the read did not wait out its budget');
         $this->assertReconnectedAgain($connection, $transport);
     }
 
@@ -213,8 +214,8 @@ final class ReconnectedListenerTest extends TestCase
 
     /**
      * A flush the listener makes on the dead new connection reconnects and fails at once with "Connection lost
-     * before the server answered the PING", as anywhere else. It used to time out after its 0.5 s, leaving the
-     * connection Open on the dead socket.
+     * before the server answered the PING", as anywhere else. It used to time out after its budget (5 s here),
+     * leaving the connection Open on the dead socket.
      */
     public function testFlushInAReconnectedListenerOnADeadNewConnectionReconnects(): void
     {
@@ -223,20 +224,20 @@ final class ReconnectedListenerTest extends TestCase
             $transport->dropConnection();
             $connection->flush()->await();
         });
-        $connection = $this->connect($transport, requestTimeoutMs: 500, connectionListener: $action->listener());
+        $connection = $this->connect($transport, requestTimeoutMs: 5_000, connectionListener: $action->listener());
         $action->connection = $connection;
 
         $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
 
         self::assertInstanceOf(ConnectionException::class, $action->failure);
         self::assertSame('Connection lost before the server answered the PING', $action->failure->getMessage());
-        self::assertLessThan(0.3, self::secondsTaken($action), 'the flush did not wait out its budget');
+        self::assertLessThan(2.0, self::secondsTaken($action), 'the flush did not wait out its budget');
         $this->assertReconnectedAgain($connection, $transport);
     }
 
     /**
      * A subscribe the listener makes on the dead new connection reconnects and subscribes on the next
-     * connection. It used to time out after its 0.5 s, and the subscription was dropped.
+     * connection. It used to time out after its budget (5 s here), and the subscription was dropped.
      */
     public function testSubscribeInAReconnectedListenerOnADeadNewConnectionSubscribesOnTheNextOne(): void
     {
@@ -246,7 +247,7 @@ final class ReconnectedListenerTest extends TestCase
 
             return $connection->subscribe('orders', static function (): void {})->await();
         });
-        $connection = $this->connect($transport, requestTimeoutMs: 500, connectionListener: $action->listener());
+        $connection = $this->connect($transport, requestTimeoutMs: 5_000, connectionListener: $action->listener());
         $action->connection = $connection;
 
         $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
@@ -254,7 +255,7 @@ final class ReconnectedListenerTest extends TestCase
         self::assertNull($action->failure);
         self::assertIsInt($action->result);
         self::assertSame(['SUB orders ' . $action->result], $transport->controlLinesStartingWith('SUB orders', 2));
-        self::assertLessThan(0.3, self::secondsTaken($action), 'the subscribe did not wait out its budget');
+        self::assertLessThan(2.0, self::secondsTaken($action), 'the subscribe did not wait out its budget');
         $this->assertReconnectedAgain($connection, $transport);
     }
 
@@ -282,7 +283,7 @@ final class ReconnectedListenerTest extends TestCase
     /**
      * A failed initial connect that the reconnect completes is announced as Connected, once the reconnect is
      * over, like a Reconnected: a read in its listener that meets EOF reconnects at once. It used to wait out its
-     * 0.5 s, and the connection stayed Open on the dead socket.
+     * budget (5 s here), and the connection stayed Open on the dead socket.
      */
     public function testReadInAConnectedListenerOfARecoveredInitialConnectThatMeetsEofReconnects(): void
     {
@@ -290,17 +291,17 @@ final class ReconnectedListenerTest extends TestCase
         $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection) use ($transport): int {
             $transport->dropConnection();
 
-            return $connection->processIncoming(new TimeoutCancellation(0.5))->await();
+            return $connection->processIncoming(new TimeoutCancellation(5))->await();
         }, ConnectionEvent::Connected);
         $connection = $this->unconnected($transport, $action->listener());
         $action->connection = $connection;
         $transport->refuseDials();
         $this->acceptDialsAfter($transport, 0.05);
 
-        $connection->connect()->await(new TimeoutCancellation(3));
+        $connection->connect()->await(new TimeoutCancellation(10));
 
         self::assertNull($action->failure);
-        self::assertLessThan(0.3, self::secondsTaken($action), 'the read did not wait out its budget');
+        self::assertLessThan(2.0, self::secondsTaken($action), 'the read did not wait out its budget');
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertTrue($transport->sessionLive(), 'not left Open on the dead socket');
         self::assertSame(1, $transport->epoch());
@@ -336,20 +337,24 @@ final class ReconnectedListenerTest extends TestCase
         );
     }
 
-    /** disconnect() from the listener closes the connection once, and nothing reopens it. */
+    /**
+     * disconnect() from the listener closes the connection once, and nothing reopens it. It does not wait for
+     * the reconnect that called the listener: that wait would last until the ten-second connect timeout, or the
+     * listener's own five-second bound on the call.
+     */
     public function testDisconnectFromAReconnectedListenerClosesOnce(): void
     {
         $transport = new ReconnectingTransport();
         $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection): void {
-            $connection->disconnect()->await(new TimeoutCancellation(1));
+            $connection->disconnect()->await(new TimeoutCancellation(5));
         });
-        $connection = $this->connect($transport, connectionListener: $action->listener());
+        $connection = $this->connect($transport, connectionListener: $action->listener(), connectTimeoutMs: 10_000);
         $action->connection = $connection;
 
         $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
 
         self::assertNull($action->failure);
-        self::assertLessThan(0.2, self::secondsTaken($action));
+        self::assertLessThan(2.0, self::secondsTaken($action));
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected, ConnectionEvent::Closed], $action->recorder->events);
         self::assertSame(1, $transport->epoch());
@@ -405,7 +410,7 @@ final class ReconnectedListenerTest extends TestCase
     /**
      * A connect() that joined a failing first dial is settled before the Connected listener of the reconnect
      * that completed the connect runs, as on a direct connect: a listener that waits for it does not wait for
-     * itself. It used to wait out its 1 s.
+     * itself. It used to wait out its whole bound, five seconds here.
      */
     public function testConnectedListenerOfARecoveredInitialConnectCanAwaitAConnectThatJoinedTheDial(): void
     {
@@ -415,7 +420,7 @@ final class ReconnectedListenerTest extends TestCase
             public ?Future $connect = null;
         };
         $action = new ListenerAction(new LifecycleRecorder(), static function () use ($joining): void {
-            $joining->connect?->await(new TimeoutCancellation(1));
+            $joining->connect?->await(new TimeoutCancellation(5));
         }, ConnectionEvent::Connected);
         $connection = $this->unconnected($transport, $action->listener());
         $action->connection = $connection;
@@ -431,10 +436,10 @@ final class ReconnectedListenerTest extends TestCase
         $transport->releaseDial();
         $this->acceptDialsAfter($transport, 0.05);
 
-        $owner->await(new TimeoutCancellation(3));
+        $owner->await(new TimeoutCancellation(10));
 
         self::assertNull($action->failure);
-        self::assertLessThan(0.3, self::secondsTaken($action));
+        self::assertLessThan(2.0, self::secondsTaken($action));
         self::assertSame(ConnectionState::Open, $connection->state());
     }
 
@@ -581,16 +586,19 @@ final class ReconnectedListenerTest extends TestCase
      * disconnect() while the Reconnected listener is busy returns without waiting for it and announces one
      * Closed; the listener's next operation fails with "Connection is not open", and the message the reconnect
      * received is not delivered after the close. disconnect() used to wait for the listener, the reconnect still
-     * counting as in flight.
+     * counting as in flight, until the connect timeout (ten seconds here) bounded its wait.
      */
     public function testDisconnectWhileTheReconnectedListenerRunsDoesNotWaitForIt(): void
     {
         $transport = new ReconnectingTransport();
-        $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection): void {
-            delay(0.2);
+        /** @var DeferredFuture<null> $listenerDone */
+        $listenerDone = new DeferredFuture();
+        $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection) use ($listenerDone): void {
+            // Busy until the test has measured the disconnect().
+            $listenerDone->getFuture()->await();
             $connection->flush()->await();
         });
-        $connection = $this->connect($transport, connectionListener: $action->listener());
+        $connection = $this->connect($transport, connectionListener: $action->listener(), connectTimeoutMs: 10_000);
         $action->connection = $connection;
         $delivered = [];
         $sid = $connection->subscribe('updates', static function (NatsMessage $message) use (&$delivered): void {
@@ -608,12 +616,14 @@ final class ReconnectedListenerTest extends TestCase
         $this->waitUntil(static fn(): bool => $action->recorder->events === [ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected]);
 
         $start = hrtime(true);
-        $connection->disconnect()->await();
+        // A disconnect() that waited for the listener would wait for good: the listener goes on only below.
+        $connection->disconnect()->await(new TimeoutCancellation(5));
         $seconds = $this->secondsSince($start);
         $listenerStillBusy = $action->seconds === null;
+        $listenerDone->complete();
         $reader->await(new TimeoutCancellation(3));
 
-        self::assertLessThan(0.1, $seconds, 'did not wait for the listener');
+        self::assertLessThan(2.0, $seconds, 'did not wait for the listener');
         self::assertTrue($listenerStillBusy);
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected, ConnectionEvent::Closed], $action->recorder->events);

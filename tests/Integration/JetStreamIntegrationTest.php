@@ -638,7 +638,10 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
-     * Verifies TERM and WPI tokens influence pull-consumer redelivery workflow.
+     * Verifies a WPI (inProgress) brings no immediate redelivery and leaves the message to be redelivered later,
+     * and that a TERM stops redelivery. The WPI probe runs well inside the 3 s ack_wait, when a message that got no
+     * WPI would not be redelivered yet either, so it only rules out an immediate redelivery: it would still pass
+     * if the WPI did nothing. JetStreamContextTest::testAckHelpersPublishProtocolTokens pins the +WPI token.
      */
     public function testJetStreamTermAndInProgressTokens(): void
     {
@@ -663,7 +666,8 @@ final class JetStreamIntegrationTest extends TestCase
             'max_deliver' => 3,
         ])->await();
 
-        // WPI should extend in-flight processing and delay redelivery.
+        // A WPI must not bring an immediate redelivery. Run inside ack_wait, the probe cannot tell whether the WPI
+        // pushed the redelivery back.
         $js->publish($subject, '{"event":"wpi"}')->await();
         $first = $js->fetchNext($stream, $consumer, 4_000)->await();
         self::assertSame('{"event":"wpi"}', $first->payload);
@@ -696,13 +700,15 @@ final class JetStreamIntegrationTest extends TestCase
         self::assertSame('{"event":"wpi"}', $redelivered->payload);
         $js->ack($redelivered)->await();
 
-        // TERM should stop further redeliveries for a message.
+        // TERM should stop further redeliveries for a message. The probe runs once ack_wait (3 s) is over,
+        // when a message that was not acknowledged at all would have been redelivered: before it, the probe
+        // could only tell a TERM from a NAK.
         $js->publish($subject, '{"event":"term"}')->await();
         $toTerm = $js->fetchNext($stream, $consumer, 4_000)->await();
         self::assertSame('{"event":"term"}', $toTerm->payload);
         $js->term($toTerm)->await();
 
-        delay(1.3);
+        delay(3.5);
         try {
             $js->fetchBatch($stream, $consumer, 1, 700)->await();
             self::fail('Expected TERM-ed message to stop redelivery.');
@@ -934,9 +940,17 @@ final class JetStreamIntegrationTest extends TestCase
         $subscriber->flush()->await();
 
         // Publish one message, then do NOT pump: the server's push MSG stays buffered on the socket
-        // until drain()'s flush-phase read consumes and delivers it during Draining.
+        // until drain()'s flush-phase read consumes and delivers it during Draining. The drain starts once
+        // the server has pushed it, which it then counts as waiting for an ack, rather than after a fixed
+        // pause: a server slower than that pause would push it after the drain's UNSUB, to no one.
         $adminJs->publish($subject, '{"event":"drain-ack"}')->await();
-        delay(0.3);
+        $deadline = $this->monotonic() + 5.0;
+        $ackPending = (int) ($adminJs->getConsumer($stream, $consumer)->await()->raw['num_ack_pending'] ?? 0);
+        while ($ackPending < 1 && $this->monotonic() < $deadline) {
+            delay(0.05);
+            $ackPending = (int) ($adminJs->getConsumer($stream, $consumer)->await()->raw['num_ack_pending'] ?? 0);
+        }
+        self::assertGreaterThanOrEqual(1, $ackPending, 'the server must push the message, and count it as waiting for an ack, before the drain starts');
 
         $subscriber->drain()->await();
 

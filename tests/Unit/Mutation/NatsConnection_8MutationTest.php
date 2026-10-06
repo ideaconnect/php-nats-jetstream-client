@@ -12,6 +12,8 @@ use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
+use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -36,7 +38,7 @@ final class NatsConnection_8MutationTest extends TestCase
         ];
     }
 
-    private function connect(FakeTransport $transport, ?NatsOptions $options = null): NatsConnection
+    private function connect(TransportInterface $transport, ?NatsOptions $options = null): NatsConnection
     {
         $connection = new NatsConnection($options ?? new NatsOptions(), $transport);
         $connection->connect()->await();
@@ -166,18 +168,21 @@ final class NatsConnection_8MutationTest extends TestCase
      * split across many partial chunks (each consuming bytes but completing no frame yet) must drain
      * immediately, without a 1 ms sleep per chunk (#119).
      *
-     * FALSIFIABILITY: the 300-byte reply is fed as ~327 one-byte chunks under a 60 ms request budget.
+     * FALSIFIABILITY: the 300-byte reply is fed as ~347 one-byte chunks, and the transport counts the
+     * chunks read after the event loop ran a tick since the chunk before ({@see LoopTickCountingTransport}).
      * On the real path every partial read reports consumedBytes=true and the guard `if (!consumedBytes)`
-     * skips the sleep, so the whole frame drains in a few ms and the reply is collected. The mutation
-     * inverts the guard to `if (consumedBytes)`, sleeping 1 ms on every partial chunk (~327 ms) - the
-     * 60 ms budget expires with the frame still incomplete and requestMany() returns []. Only the real
-     * path collects the reply.
+     * skips the sleep, so the wait loop reads chunk after chunk without letting the loop tick: the count
+     * is 0. The mutation inverts the guard to `if (consumedBytes)`, sleeping 1 ms on every partial chunk,
+     * and the loop ticks during each sleep: every chunk after the first counts. The count does not depend
+     * on how fast the machine is, and the 5 s request budget gives the real path all the time it needs to
+     * collect the reply (#176).
      *
      * kills LogicalNot @ line 1863.
      */
     public function testRequestManyDrainsChunkedReplyWithoutIdleSleepPerPartialChunk(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
+        $counting = new LoopTickCountingTransport($transport);
 
         $payload = str_repeat('x', 300);
 
@@ -203,24 +208,28 @@ final class NatsConnection_8MutationTest extends TestCase
             return str_split($frame); // one byte per chunk: ~347 partial reads before completion
         };
 
-        $connection = $this->connect($transport);
+        $connection = $this->connect($counting);
+        $counting->reset(); // count the reply's chunks only, not the handshake's
 
         $startedNs = hrtime(true);
         // Outer bound: fail loudly rather than hang if a regression parks the caller.
         $messages = await(
-            [async(static fn (): array => $connection->requestMany('request.subject', 'ping', null, 1, 60)->await())],
-            new TimeoutCancellation(5.0),
+            [async(static fn (): array => $connection->requestMany('request.subject', 'ping', null, 1, 5_000)->await())],
+            new TimeoutCancellation(10.0),
         )[0];
         $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;
 
-        // kills LogicalNot @ line 1863: the reply is collected only when partial reads do NOT idle-sleep.
-        self::assertCount(
-            1,
-            $messages,
-            'the chunked reply must be drained inside the request budget, not idle-sleep 1 ms per partial chunk',
-        );
+        self::assertCount(1, $messages, 'the chunked reply must be collected');
         self::assertInstanceOf(NatsMessage::class, $messages[0]);
         self::assertSame($payload, $messages[0]->payload, 'the multi-chunk reply must reassemble byte-for-byte');
-        self::assertLessThan(2.0, $elapsedSeconds, 'the request must terminate promptly, not hang');
+        self::assertGreaterThan(300, $counting->chunksRead, 'the reply must arrive as one-byte chunks');
+        // kills LogicalNot @ line 1863: only a loop that idle-sleeps on partial reads lets the event loop tick
+        // between them.
+        self::assertSame(
+            0,
+            $counting->chunksReadAfterALoopTick,
+            'the wait loop must read the next chunk at once, not idle-sleep 1 ms per partial chunk',
+        );
+        self::assertLessThan(2.0, $elapsedSeconds, 'the request must return once its reply is in, not at the end of its budget');
     }
 }

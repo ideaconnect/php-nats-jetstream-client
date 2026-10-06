@@ -3152,12 +3152,14 @@ final class KeyValueBucketTest extends TestCase
      * replay whose revisions keep arriving (each gap shorter than the bound) must complete WITHOUT
      * throwing even when the TOTAL replay time exceeds the bound - only a genuinely stalled server (no
      * progress for the whole interval) throws. Revisions are fed spaced apart at runtime: each resets
-     * the stall clock, and the total elapsed (~0.6 s) exceeds the 0.5 s bound, so a whole-replay
-     * deadline would have thrown here.
+     * the stall clock, and the total elapsed (~2.25 s) exceeds the 2 s bound, so a whole-replay
+     * deadline would have thrown here before the replay caught up. Each gap (0.15 s) leaves 1.85 s
+     * of the bound, so a slow runner that blocks the event loop for up to 1.8 s between two
+     * revisions does not stall the replay.
      */
     public function testHistoryDoesNotThrowWhileReplayKeepsMakingProgress(): void
     {
-        $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":6,"config":{"deliver_subject":"dlv","ack_policy":"none"}}';
+        $createReply = '{"stream_name":"KV_cfg","name":"HIST","num_pending":15,"config":{"deliver_subject":"dlv","ack_policy":"none"}}';
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -3170,29 +3172,34 @@ final class KeyValueBucketTest extends TestCase
         $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
-        // Start the replay with a 0.5 s PROGRESS bound but do not await yet.
-        $future = $client->jetStream()->keyValue('cfg')->history('theme', 0.5);
+        // Start the replay with a 2 s PROGRESS bound but do not await yet.
+        $future = $client->jetStream()->keyValue('cfg')->history('theme', 2.0);
 
-        // Feed six revisions 0.1 s apart (each gap < 0.5 s bound); num_pending decrements to 0 on the
-        // last so the replay catches up. Total elapsed ~0.6 s > 0.5 s bound.
-        for ($i = 1; $i <= 6; $i++) {
-            delay(0.1);
-            $numPending = 6 - $i;
+        // Feed fifteen revisions 0.15 s apart (each gap < 2 s bound); num_pending decrements to 0 on the
+        // last so the replay catches up. Total elapsed ~2.25 s > 2 s bound.
+        for ($i = 1; $i <= 15; $i++) {
+            delay(0.15);
+            $numPending = 15 - $i;
+            $value = 'v' . $i;
             $transport->pushReadChunk(sprintf(
-                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.%d.%d.%d.0.%d 2\r\nv%d\r\n",
+                "MSG dlv 2 \$JS.ACK.KV_cfg.HIST.%d.%d.%d.0.%d %d\r\n%s\r\n",
                 $i,
                 4 + $i,
                 $i,
                 $numPending,
-                $i,
+                strlen($value),
+                $value,
             ));
         }
 
         $entries = $future->await();
 
-        // The replay completed with all six revisions, in order, without a stall error.
-        self::assertCount(6, $entries);
-        self::assertSame(['v1', 'v2', 'v3', 'v4', 'v5', 'v6'], array_map(static fn (KeyValueEntry $e): ?string => $e->value, $entries));
+        // The replay completed with all fifteen revisions, in order, without a stall error.
+        self::assertCount(15, $entries);
+        self::assertSame(
+            array_map(static fn(int $i): string => 'v' . $i, range(1, 15)),
+            array_map(static fn(KeyValueEntry $e): ?string => $e->value, $entries),
+        );
     }
 
     /**

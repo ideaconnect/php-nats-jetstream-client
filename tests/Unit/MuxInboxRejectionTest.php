@@ -125,14 +125,14 @@ final class MuxInboxRejectionTest extends TestCase
 
         $start = hrtime(true);
         try {
-            $connection->request('svc.echo', 'two', 2_000)->await();
+            $connection->request('svc.echo', 'two', 10_000)->await();
             self::fail('expected the second request to fail');
         } catch (ConnectionException $e) {
             self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
             self::assertStringContainsString('(maximum subscriptions exceeded)', $e->getMessage());
         }
 
-        self::assertLessThan(0.5, self::secondsSince($start), 'it did not wait out its timeout');
+        self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
         self::assertCount(2, self::muxInstallWrites($server), 'it tried to subscribe the mux again');
         self::assertCount(1, $server->controlLines('PUB svc.echo'), 'only the first request, sent before the server answered its SUB, went out');
     }
@@ -419,7 +419,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->unsubscribe($appSid)->await();
 
             $calls = [
-                'request' => static fn(): Future => $connection->request('svc.echo', 'two', 1_000),
+                'request' => static fn(): Future => $connection->request('svc.echo', 'two', 10_000),
                 'read' => static fn(): Future => $connection->processIncoming(new TimeoutCancellation(2)),
             ];
             // A negative count makes the other read first and the request $hops hops after it.
@@ -439,9 +439,9 @@ final class MuxInboxRejectionTest extends TestCase
             self::assertInstanceOf(NatsMessage::class, $reply);
             self::assertSame('echo:two', $reply->payload);
             self::assertLessThan(
-                0.5,
+                2.0,
                 self::secondsSince($start),
-                sprintf('with the other read %d hop(s) %s the request, it waited out its budget', abs($hops), $hops < 0 ? 'before' : 'after'),
+                sprintf('with the other read %d hop(s) %s the request, it waited out its ten-second budget', abs($hops), $hops < 0 ? 'before' : 'after'),
             );
             $connection->disconnect()->await();
         }
@@ -483,12 +483,12 @@ final class MuxInboxRejectionTest extends TestCase
         try {
             $start = hrtime(true);
             try {
-                $connection->request('svc.echo', 'one', 2_000)->await();
+                $connection->request('svc.echo', 'one', 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
                 self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
             }
-            self::assertLessThan(0.5, self::secondsSince($start));
+            self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
 
             $connection->unsubscribe($appSid)->await();
             self::assertSame('echo:two', $connection->request('svc.echo', 'two', 1_000)->await()->payload);
@@ -551,12 +551,12 @@ final class MuxInboxRejectionTest extends TestCase
         try {
             $start = hrtime(true);
             try {
-                $client->request('svc.echo', 'one', 2_000)->await();
+                $client->request('svc.echo', 'one', 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
                 self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
             }
-            self::assertLessThan(0.5, self::secondsSince($start));
+            self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
             self::assertNotSame([], $recorder->errorsContaining('maximum subscriptions exceeded'), 'the loop reported the -ERR');
 
             $server->limit = PHP_INT_MAX;
@@ -995,24 +995,27 @@ final class MuxInboxRejectionTest extends TestCase
      * Another subscription's rejection arrives while the first mux SUB still waits behind earlier writes, so the
      * client drops that mux before the server has seen it. A request issued then does not join the set-up of the
      * dropped mux and wait, until its timeout, for a confirmation nothing will send: it subscribes a new one, in a
-     * write that follows the dropped one's on the socket and unsubscribes it, and gets its reply.
+     * write that follows the dropped one's on the socket and unsubscribes it, and gets its reply. The mux SUB is
+     * held up until the second request has been made.
      */
     public function testARequestAfterTheMuxIsDroppedDuringItsSubWriteSubscribesANewOne(): void
     {
         $server = $this->echoServer();
         $connection = $this->connect($server);
         [$stop, $loop] = $this->startReadLoop($connection);
-        $server->stallNextWriteContaining('SUB _INBOX.', 0.1);
+        $server->stallNextWriteContaining('SUB _INBOX.', 30.0);
 
         try {
-            $first = $connection->request('svc.echo', 'one', 1_000);
+            $first = $connection->request('svc.echo', 'one', 10_000);
             delay(0.02);
             // Read by the loop while the mux SUB is still held up.
             $server->pushFrame("-ERR 'maximum subscriptions exceeded'\r\n");
             delay(0.02);
 
             $start = hrtime(true);
-            $second = $connection->request('svc.echo', 'two', 1_000);
+            $second = $connection->request('svc.echo', 'two', 10_000);
+            delay(0.01);
+            $server->releaseStalledWrites();
             [$errors, $replies] = awaitAll(['first' => $first, 'second' => $second]);
             $seconds = self::secondsSince($start);
         } finally {
@@ -1022,7 +1025,7 @@ final class MuxInboxRejectionTest extends TestCase
 
         self::assertSame(['second'], array_keys($replies));
         self::assertSame('echo:two', $replies['second']->payload);
-        self::assertLessThan(0.5, $seconds, 'the second request did not wait out its timeout');
+        self::assertLessThan(2.0, $seconds, 'the second request did not wait out its ten-second timeout');
         self::assertSame(['first'], array_keys($errors), 'the first request failed: its mux was dropped');
         self::assertStringContainsString(self::MUX_DROPPED, $errors['first']->getMessage());
         $installs = self::muxInstallWrites($server);
@@ -1086,21 +1089,22 @@ final class MuxInboxRejectionTest extends TestCase
     /**
      * A request on a new connection does not wait for a mux set-up still under way for the connection a terminal
      * close ended: it subscribes the mux on the new connection. The request whose set-up outlived the close reports
-     * the closed connection and is not sent on the new one.
+     * the closed connection and is not sent on the new one. That set-up is held up until the new request is done.
      */
     public function testARequestAfterACloseAndConnectDoesNotJoinASetUpLeftFromTheClosedConnection(): void
     {
         $server = $this->echoServer();
         $connection = $this->connect($server);
-        $server->stallNextWriteContaining('SUB _INBOX.', 0.2, completesAfterClose: true);
-        $first = $connection->request('svc.echo', 'one', 1_000);
+        $server->stallNextWriteContaining('SUB _INBOX.', 30.0, completesAfterClose: true);
+        $first = $connection->request('svc.echo', 'one', 10_000);
         delay(0.01);
         $connection->disconnect()->await();
         $connection->connect()->await();
 
         $start = hrtime(true);
-        self::assertSame('echo:two', $connection->request('svc.echo', 'two', 1_000)->await()->payload);
-        self::assertLessThan(0.15, self::secondsSince($start), 'it did not wait for the set-up of the closed connection');
+        self::assertSame('echo:two', $connection->request('svc.echo', 'two', 10_000)->await()->payload);
+        self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait for the set-up of the closed connection');
+        $server->releaseStalledWrites();
 
         try {
             $first->await();
@@ -1301,12 +1305,12 @@ final class MuxInboxRejectionTest extends TestCase
 
         $start = hrtime(true);
         try {
-            $connection->request('svc.echo', 'one', 1_000)->await();
+            $connection->request('svc.echo', 'one', 10_000)->await();
             self::fail('expected the request to fail');
         } catch (ConnectionException $e) {
             self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
         }
-        self::assertLessThan(0.5, self::secondsSince($start));
+        self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertSame(1, $server->epoch());
         self::assertNotSame([], $recorder->errorsContaining('maximum subscriptions exceeded'));
@@ -1331,12 +1335,12 @@ final class MuxInboxRejectionTest extends TestCase
         foreach (['one', 'two'] as $payload) {
             $start = hrtime(true);
             try {
-                $connection->request('svc.echo', $payload, 1_000)->await();
+                $connection->request('svc.echo', $payload, 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
                 self::assertStringContainsString('was rejected by the server (permissions violation)', $e->getMessage());
             }
-            self::assertLessThan(0.5, self::secondsSince($start));
+            self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
         }
 
         self::assertCount(1, self::muxInstallWrites($server), 'the latch kept the second request from subscribing again');
@@ -1360,12 +1364,12 @@ final class MuxInboxRejectionTest extends TestCase
         try {
             $start = hrtime(true);
             try {
-                $connection->request('svc.echo', 'one', 1_000)->await();
+                $connection->request('svc.echo', 'one', 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
                 self::assertStringContainsString('was rejected by the server (permissions violation)', $e->getMessage());
             }
-            self::assertLessThan(0.5, self::secondsSince($start));
+            self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
         } finally {
             $stop->cancel();
             $loop->await();

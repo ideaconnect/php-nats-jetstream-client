@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\TimeoutCancellation;
@@ -20,6 +21,7 @@ use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
@@ -49,6 +51,49 @@ final class ServiceTestCtorArgHandler implements ServiceEndpointHandlerInterface
     public function handle(NatsMessage $message): string
     {
         return $this->required . ':' . $message->payload;
+    }
+}
+
+/**
+ * A cancellation that passes everything on to the one it wraps and, once given a hook, runs it right after the
+ * next subscribe(): it tells a test when the code it hands this cancellation to starts waiting on it.
+ */
+final class ServiceTestSubscribeHookCancellation implements Cancellation
+{
+    private ?\Closure $onNextSubscribe = null;
+
+    public function __construct(private readonly Cancellation $inner) {}
+
+    public function onNextSubscribe(\Closure $hook): void
+    {
+        $this->onNextSubscribe = $hook;
+    }
+
+    public function subscribe(\Closure $callback): string
+    {
+        $id = $this->inner->subscribe($callback);
+        $hook = $this->onNextSubscribe;
+        $this->onNextSubscribe = null;
+        if ($hook !== null) {
+            $hook();
+        }
+
+        return $id;
+    }
+
+    public function unsubscribe(string $id): void
+    {
+        $this->inner->unsubscribe($id);
+    }
+
+    public function isRequested(): bool
+    {
+        return $this->inner->isRequested();
+    }
+
+    public function throwIfRequested(): void
+    {
+        $this->inner->throwIfRequested();
     }
 }
 
@@ -2437,9 +2482,15 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * run(): cancelling while the loop backs off from a connection-level failure exits at once and stops the
-     * service. The server drops the client as stale while the loop reads; the reconnect that starts holds its
-     * dial, and the loop, which may not wait for it (waitForReconnect off), fails each read and backs off.
+     * run(): cancelling while the loop backs off from a connection-level failure ends the backoff at once and
+     * stops the service. The server drops the client as stale while the loop reads; the reconnect that starts
+     * holds its dial, and the loop, which may not wait for it (waitForReconnect off), fails each read and backs
+     * off for 20 ms. Each pass subscribes to the loop's cancellation to wait for its read, and within the same
+     * event-loop tick the read fails and the backoff starts, so a cancel sent in the next tick after that
+     * subscribe lands in a backoff with nearly all of its 20 ms ahead. A timer due 10 ms after the subscribe must
+     * not have fired by the time run() returns: a backoff that ignored the cancellation would let it fire first.
+     * Which of the two comes first, unlike an elapsed time, does not depend on how late the runner fires its
+     * timers.
      */
     public function testRunCancellationDuringReconnectBackoffStopsService(): void
     {
@@ -2451,8 +2502,9 @@ final class ServiceTest extends TestCase
         $service = $client->service('echo', '1.0.0')
             ->addEndpoint('echo', 'svc.echo', static fn(NatsMessage $m): string => $m->payload);
         $deferred = new DeferredCancellation();
-        $runner = async(static function () use ($service, $deferred): void {
-            $service->run(cancellation: $deferred->getCancellation())->await();
+        $cancellation = new ServiceTestSubscribeHookCancellation($deferred->getCancellation());
+        $runner = async(static function () use ($service, $cancellation): void {
+            $service->run(cancellation: $cancellation)->await();
         });
 
         $this->waitFor(static fn(): bool => $transport->sidFor('svc.echo') !== null);
@@ -2461,11 +2513,18 @@ final class ServiceTest extends TestCase
         $this->waitFor(static fn(): bool => $client->state() === ConnectionState::Connecting);
         delay(0.1);
 
-        $start = hrtime(true);
-        $deferred->cancel();
-        $runner->await(new TimeoutCancellation(1.0));
+        $halfwayTimerFired = false;
+        $cancellation->onNextSubscribe(static function () use ($deferred, &$halfwayTimerFired): void {
+            EventLoop::defer(static function () use ($deferred): void {
+                $deferred->cancel();
+            });
+            EventLoop::delay(0.01, static function () use (&$halfwayTimerFired): void {
+                $halfwayTimerFired = true;
+            });
+        });
+        $runner->await(new TimeoutCancellation(5.0));
 
-        self::assertLessThan(0.1, (hrtime(true) - $start) / 1e9, 'cancellation must end the backoff at once');
+        self::assertFalse($halfwayTimerFired, 'the cancellation must end the 20 ms backoff at once, before a timer due 10 ms into it');
         self::assertSame([], (new \ReflectionProperty($service, 'subscriptionSids'))->getValue($service));
         self::assertFalse((new \ReflectionProperty($service, 'started'))->getValue($service));
 

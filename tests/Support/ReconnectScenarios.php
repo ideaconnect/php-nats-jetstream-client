@@ -50,6 +50,7 @@ trait ReconnectScenarios
         int $reconnectDelayMs = 5,
         int $reconnectMaxDelayMs = 20,
         ?\Closure $errorListener = null,
+        int $connectTimeoutMs = 500,
     ): NatsConnection {
         $connection = new NatsConnection(
             $this->options(
@@ -62,6 +63,7 @@ trait ReconnectScenarios
                 $reconnectDelayMs,
                 $reconnectMaxDelayMs,
                 $errorListener,
+                $connectTimeoutMs,
             ),
             $transport,
         );
@@ -93,9 +95,10 @@ trait ReconnectScenarios
         int $reconnectDelayMs,
         int $reconnectMaxDelayMs,
         ?\Closure $errorListener,
+        int $connectTimeoutMs = 500,
     ): NatsOptions {
         return new NatsOptions(
-            connectTimeoutMs: 500,
+            connectTimeoutMs: $connectTimeoutMs,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: true,
             maxReconnectAttempts: $maxReconnectAttempts,

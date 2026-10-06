@@ -1,12 +1,24 @@
+# NATS fixtures for the integration tests, Behat and the examples (scripts/run-tests-e2e.sh).
+#
+# The servers run without debug or trace logging (-D, -V). Trace logging writes every inbound payload in
+# full (max_traced_msg_len defaults to 0) through Docker's log pipeline while the timing-sensitive suites
+# run, and nothing reads it: no test reads server logs, and CI prints them only when a server fails to
+# start (scripts/wait-for-nats-services.sh), whose errors are logged without -D or -V. To trace a server
+# while debugging, add "-DV" to its command and recreate it: `docker compose up -d --force-recreate <name>`.
+#
+# Readiness is checked by scripts/wait-for-nats-services.sh, not by these healthchecks: nothing in the
+# repository reads the health status (no depends_on condition, no `docker compose up --wait`). They
+# therefore probe every 30 s instead of every 2 s, which was 4 container execs a second across the 8
+# servers, and still mark a server unhealthy after the same 2 minutes of failed probes.
 services:
   nats:
     image: nats:2.12-alpine
-    command: ["-js", "-m", "8222", "-DV"]
+    command: ["-js", "-m", "8222"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     ports:
       - "14222:4222"
@@ -14,12 +26,12 @@ services:
 
   nats-token:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/token.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/token.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
@@ -29,12 +41,12 @@ services:
 
   nats-userpass:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/userpass.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/userpass.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
@@ -44,12 +56,12 @@ services:
 
   nats-tls:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/tls.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/tls.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
@@ -60,12 +72,12 @@ services:
 
   nats-tls-upgrade:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/tls-upgrade.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/tls-upgrade.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
@@ -76,12 +88,12 @@ services:
 
   nats-nkey:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/nkey.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/nkey.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
@@ -91,12 +103,12 @@ services:
 
   nats-jwt:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/jwt.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/jwt.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
@@ -107,12 +119,12 @@ services:
 
   nats-ws:
     image: nats:2.12-alpine
-    command: ["--config", "/etc/nats-config/ws.conf", "-DV"]
+    command: ["--config", "/etc/nats-config/ws.conf"]
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
-      interval: 2s
+      interval: 30s
       timeout: 2s
-      retries: 60
+      retries: 4
       start_period: 5s
     volumes:
       - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro

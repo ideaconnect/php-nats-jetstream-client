@@ -15,6 +15,32 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` The E2E job runs the unit suite once instead of twice, and the Docker fixtures do less background
+  work (#176). The job no longer runs the unit suite inside `composer test:e2e`: its coverage step runs it right
+  after, together with the integration suite, and the Unit + Static jobs run it on PHP 8.2 to 8.5. The skipped
+  pass took about 3 minutes and gave the timing flakes in #176 one more place to hit. `scripts/run-tests-e2e.sh`
+  gained `SKIP_UNIT_TESTS` for this; without it the local flow is unchanged. The compose servers no longer
+  run with debug and trace logging (`-DV`), which wrote every inbound payload through Docker's log pipeline
+  and was never read, and their healthchecks probe every 30 s instead of every 2 s (nothing reads the health
+  status; readiness comes from `scripts/wait-for-nats-services.sh`). That script now also waits for the
+  WebSocket server (`nats-ws`, monitoring port 18229), which it had left out. The unused `workflow_dispatch`
+  input `integration-repeat-count` is gone: no job read it. Dev-only, no library change.
+- `[docs]` Timing-bound tests no longer depend on how fast the runner is or how late a timer fires (#176).
+  About 100 unit tests and 11 integration tests bounded elapsed time close to what they measured, or relied on
+  a timer firing in time, so a busy CI runner could fail them although the code was fine. Several did; the rest
+  were found before they could, by checking how much room each bound left. They now decide by the order
+  of events or by which of two timers fires first, measure from the event that matters (a dial is stopped by its
+  own refused attempt, through a new `StopsDialOnRefusalConnector` test double, and timed from that stop), count
+  idle sleeps instead of timing chunked reads (a new `LoopTickCountingTransport`
+  test double), or keep their bounds far from what the broken behavior takes. Each changed test still fails when
+  its bug is put back. The integration suite's recoverable client no longer gives a connection up after one late
+  PONG, which made a busy NATS container add a reconnect. Two `WaitForReconnectTest` tests that could no longer
+  fail since 2.10.0 were reworked so they can. Dev-only, no library change.
+
 ## [2.11.0] - 2026-10-05
 
 ### Upgrade notes

@@ -35,15 +35,15 @@ use function Amp\delay;
  *   - {@see $rejectAuthentication}: the next handshakes are refused with an authorization -ERR;
  *   - {@see $closeDelay}: close() takes a while, like a TLS or WebSocket close handshake;
  *   - stallNextWriteContaining(): the next write containing a needle is held up, like a socket under
- *     backpressure;
+ *     backpressure, until its time is up or the test calls releaseStalledWrites();
  *   - failNextWriteContaining(): the next write containing a needle finds the socket dead - failing with
  *     a TransportClosedException, or with the error the test gives, such as the raw stream error a
  *     built-in transport's socket throws.
  *
  * Reads and writes belong to the session they started on, like a real socket's: one still pending
  * when that session ends fails, even if a new session is live by then - at once, like a real socket's,
- * unless the test asks for a write whose failure surfaces only later. Responses held back by
- * {@see $responseDelay} end with their session too.
+ * unless the test asks for a write whose failure surfaces only later. Responses and PONGs held back by
+ * {@see $responseDelay} and {@see $pongDelay} end with their session too.
  *
  * Reads block like an idle socket until a frame arrives, the session ends or the caller's cancellation
  * fires. A {@see $responder} answers published messages with raw frames; {@see replyFrame()} builds a
@@ -77,6 +77,12 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
 
     /** Seconds the responder's frames are held back (a slow server); 0 delivers them at once. */
     public float $responseDelay = 0.0;
+
+    /**
+     * Seconds the PONGs answering PINGs after a session's handshake PING are held back (a slow server); 0
+     * answers them at once. The handshake's own PONG always goes out at once.
+     */
+    public float $pongDelay = 0.0;
 
     /** Whether PINGs after a session's handshake PING are answered (the handshake's always is). */
     public bool $answerPings = true;
@@ -137,8 +143,13 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
      */
     private array $stalledWrites = [];
 
-    /** Writes whose stall is still running, those that outlive their session included. */
-    private int $writesStalled = 0;
+    /**
+     * Every stall still running, keyed by its timer, those that outlive their session included: what
+     * {@see writesStalled()} counts and {@see releaseStalledWrites()} ends.
+     *
+     * @var array<string, DeferredFuture<null>>
+     */
+    private array $runningStalls = [];
 
     /** @var array<string, true> Timers of the live session's delayed responses: cancelled when it ends. */
     private array $delayedDeliveries = [];
@@ -252,17 +263,21 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
             }
 
             $pongs = [];
+            $laterPongs = [];
             $responses = [];
             foreach ($frames as $frame) {
                 if ($frame['op'] === 'PUB' || $frame['op'] === 'HPUB') {
                     $responses = [...$responses, ...$this->answer($frame)];
+                } elseif ($frame['op'] === 'PING' && !$this->handshakePending) {
+                    $laterPongs = [...$laterPongs, ...$this->answer($frame)];
                 } else {
                     $pongs = [...$pongs, ...$this->answer($frame)];
                 }
             }
 
-            // Only the responder is slow: protocol PONGs (the handshake's included) go out at once.
+            // Only the responder and later PONGs can be slow: the handshake's PONG goes out at once.
             $this->deliver($epoch, $pongs, 0.0);
+            $this->deliver($epoch, $laterPongs, $this->pongDelay);
             $this->deliver($epoch, $responses, $this->responseDelay);
 
             if ($this->afterWrite !== null) {
@@ -344,6 +359,7 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
      * The stall ends early, failing the write, when its session ends - as a real socket's pending write
      * fails when the socket closes. With $outlivesSession it runs its full course anyway, and only then
      * fails: a transport whose close leaves a pending write to fail later, which TransportInterface allows.
+     * Either kind also ends early, as if its time were up, when the test calls releaseStalledWrites().
      */
     public function stallNextWriteContaining(string $needle, float $seconds, bool $outlivesSession = false): void
     {
@@ -353,7 +369,24 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     /** How many writes are stalled right now (see {@see stallNextWriteContaining()}). */
     public function writesStalled(): int
     {
-        return $this->writesStalled;
+        return count($this->runningStalls);
+    }
+
+    /**
+     * Ends now every stall still running, as if its time were up, those that outlive their session included: a
+     * stalled write whose session is still live completes, and one whose session has ended fails, as it would
+     * have at the end of its time. For a test that holds a write up, with a stall longer than it lasts, until it
+     * has done what must happen while the write waits, rather than racing the stall's timer.
+     */
+    public function releaseStalledWrites(): void
+    {
+        foreach ($this->runningStalls as $timer => $released) {
+            EventLoop::cancel($timer);
+            if (!$released->isComplete()) {
+                $released->complete();
+            }
+        }
+        $this->stalledWrites = [];
     }
 
     /**
@@ -607,8 +640,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     }
 
     /**
-     * Holds the calling write for $seconds, or - unless it outlives its session - until the session ends.
-     * The timer is referenced, like the writable watcher of a real socket's pending write.
+     * Holds the calling write for $seconds or until {@see releaseStalledWrites()}, and, unless it outlives its
+     * session, no longer than the session lasts. The timer is referenced, like the writable watcher of a real
+     * socket's pending write.
      */
     private function stall(float $seconds, bool $outlivesSession): void
     {
@@ -619,17 +653,16 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
                 $released->complete();
             }
         });
+        $this->runningStalls[$timer] = $released;
         if (!$outlivesSession) {
             $this->stalledWrites[$timer] = $released;
         }
 
-        $this->writesStalled++;
         try {
             $released->getFuture()->await();
         } finally {
-            $this->writesStalled--;
             EventLoop::cancel($timer);
-            unset($this->stalledWrites[$timer]);
+            unset($this->stalledWrites[$timer], $this->runningStalls[$timer]);
         }
     }
 
