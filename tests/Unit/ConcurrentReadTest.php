@@ -10,8 +10,11 @@ use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
@@ -33,6 +36,10 @@ use function Amp\delay;
  * never hand the event loop control: no timer or socket read ran again - that other read's included - and
  * the process spun at 100% CPU for good. The loops below are capped, so the old behaviour fails them
  * instead of hanging the suite.
+ *
+ * The other way round, the application's read can deliver what an operation waits for while that operation
+ * is between its reads: a SubscriptionQueue polled with a timeout, pausing, or the pipelined pull engine,
+ * writing its next pull request. The operation takes it before it reads again (#174).
  */
 final class ConcurrentReadTest extends TestCase
 {
@@ -186,6 +193,166 @@ final class ConcurrentReadTest extends TestCase
 
         self::assertSame('job-1', $job?->payload, 'the loop never let the request\'s read finish');
         self::assertSame('echo:hi', $request->await());
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function pollsWithATimeout(): iterable
+    {
+        yield 'next() with a timeout' => ['next'];
+        yield 'fetchAll(1) with a timeout' => ['fetchAll'];
+    }
+
+    /**
+     * A queue polled with a timeout returns a message that another fiber's read delivers while the poll
+     * pauses between reads (#174). The application's processIncoming() holds the socket read when the poll
+     * starts, so the poll's first read waits for it and finds nothing. The message that ends that read is
+     * for another subscription, whose handler defers a second read of the application's together with the
+     * queue's message: the deferred callback runs in the next event-loop tick, before any timer, and so
+     * while the poll pauses for 1 ms. The poll used to start another read before it looked at the queue, and
+     * that read waited on a socket with nothing more to come until the whole timeout ran out.
+     */
+    #[DataProvider('pollsWithATimeout')]
+    public function testPollReturnsAMessageAnotherReadDeliversDuringItsPause(string $poll): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->connectClient($transport);
+        $queue = $client->subscribeQueue('jobs')->await();
+        $other = $client->subscribe('other', static function () use ($transport, $client, $queue): void {
+            EventLoop::defer(static function () use ($transport, $client, $queue): void {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+                async(static fn(): int => $client->processIncoming()->await())->ignore();
+            });
+        })->await();
+        // The application's read holds the socket when the poll starts; the message that ends it is for "other".
+        $reader = async(static fn(): int => $client->processIncoming()->await());
+        delay(0.01);
+        EventLoop::delay(0.05, static fn() => $transport->pushFrame(ReconnectingTransport::msgFrame('other', $other, 'o1')));
+        self::assertFalse($reader->isComplete(), 'the application\'s read holds the socket when the poll starts');
+
+        $start = hrtime(true);
+        $result = $poll === 'next'
+            ? $queue->setTimeout(5.0)->next()?->payload
+            : array_map(static fn(NatsMessage $message): string => $message->payload, $queue->setTimeout(5.0)->fetchAll(1));
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        self::assertSame($poll === 'next' ? 'job-1' : ['job-1'], $result);
+        self::assertLessThan(2.5, $elapsed, 'the poll returned the message once it was there, not at the end of its 5 s timeout');
+        self::assertSame(1, $reader->await(), 'the application\'s first read brought the other subscription\'s message');
+    }
+
+    /** @return iterable<string, array{SlowConsumerPolicy}> */
+    public static function slowConsumerPolicies(): iterable
+    {
+        yield 'DropOldest' => [SlowConsumerPolicy::DropOldest];
+        yield 'DropNewest' => [SlowConsumerPolicy::DropNewest];
+        yield 'Error' => [SlowConsumerPolicy::Error];
+    }
+
+    /**
+     * fetchAll() takes what another fiber's read delivered during its pause before it reads again, also
+     * when that does not complete the call, so its own next read has the queue's whole buffer. The queue
+     * holds 2 messages. The application's second read fills it during the poll's pause, as in the test
+     * above, and the poll's own read then brings 2 more. The poll used to read with its buffer still full,
+     * and the 2 that read brought overflowed it: DropOldest dropped the first 2, DropNewest the last 2, and
+     * Error failed the call with a SlowConsumerException.
+     */
+    #[DataProvider('slowConsumerPolicies')]
+    public function testFetchAllTakesWhatAnotherReadDeliveredDuringItsPauseBeforeReadingOn(SlowConsumerPolicy $policy): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, maxPendingMessagesPerSubscription: 2, slowConsumerPolicy: $policy), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $queue = $client->subscribeQueue('jobs')->await();
+        $other = $client->subscribe('other', static function () use ($transport, $client, $queue): void {
+            EventLoop::defer(static function () use ($transport, $client, $queue): void {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j1') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j2'));
+                async(static fn(): int => $client->processIncoming()->await())->ignore();
+                // The next 2 come a little later, for the poll's own read.
+                EventLoop::delay(0.1, static fn() => $transport->pushFrame(
+                    ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j3') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j4'),
+                ));
+            });
+        })->await();
+        $reader = async(static fn(): int => $client->processIncoming()->await());
+        delay(0.01);
+        EventLoop::delay(0.05, static fn() => $transport->pushFrame(ReconnectingTransport::msgFrame('other', $other, 'o1')));
+        self::assertFalse($reader->isComplete(), 'the application\'s read holds the socket when the poll starts');
+
+        $messages = $queue->setTimeout(5.0)->fetchAll(4);
+
+        self::assertSame(['j1', 'j2', 'j3', 'j4'], array_map(static fn(NatsMessage $message): string => $message->payload, $messages));
+        self::assertSame(0, $queue->droppedCount());
+        self::assertSame(1, $reader->await(), 'the application\'s first read brought the other subscription\'s message');
+    }
+
+    /** @return iterable<string, array{float}> */
+    public static function secondPullRequestWrites(): iterable
+    {
+        yield 'written at once' => [0.0];
+        yield 'held up 100 ms' => [0.1];
+    }
+
+    /**
+     * The pipelined pull engine behind PullConsumerIterator::handle() hands over a batch that another
+     * fiber's read delivered while the engine issued its next pull, the same shape as #174. The
+     * application's processIncoming() loop runs beside the engine. The server answers the first pull at once
+     * and holds the second, the stream being empty, and the application's read delivers the first pull's
+     * message while the engine waits for the write of the second pull's request. The test transport's
+     * writes take a few event-loop hops; one held up 100 ms is like a socket under backpressure. The engine
+     * looked at its head pull only before it issued pulls, so it went on to read with the batch already
+     * there, and the handler got the message only at the first pull's deadline: its 5 s expiry plus 1 s.
+     */
+    #[DataProvider('secondPullRequestWrites')]
+    public function testPipelinedPullEngineHandsOverABatchAnotherReadDeliveredWhileItIssued(float $stall): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->connectClient($transport);
+        $pulls = new class {
+            public int $count = 0;
+            public bool $stallArmed = false;
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport, $pulls): array {
+            if (!str_starts_with($subject, '$JS.API.CONSUMER.MSG.NEXT.S.C') || $replyTo === null || ++$pulls->count > 1) {
+                return [];
+            }
+
+            $sid = $transport->sidFor($replyTo);
+            self::assertNotNull($sid);
+
+            return [ReconnectingTransport::msgFrame('orders.new', $sid, 'a', '$JS.ACK.S.C.1.1.1.0.0')];
+        };
+        $transport->afterWrite = static function (string $bytes) use ($transport, $pulls, $stall): void {
+            // Written after the first pull request: hold up the second.
+            if ($stall > 0.0 && !$pulls->stallArmed && str_contains($bytes, 'CONSUMER.MSG.NEXT')) {
+                $pulls->stallArmed = true;
+                $transport->stallNextWriteContaining('CONSUMER.MSG.NEXT', $stall);
+            }
+        };
+        $run = new class {
+            public bool $over = false;
+            public ?float $handledAfter = null;
+        };
+        $reader = async(static function () use ($client, $run): void {
+            while (!$run->over) {
+                $client->processIncoming()->await();
+            }
+        });
+        $reader->ignore();
+        delay(0.01);
+
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(1)->setDepth(2)->setExpiresMs(5_000);
+        $start = hrtime(true);
+        $processed = $iterator->handle(static function () use ($iterator, $run, $start): void {
+            $run->handledAfter = (hrtime(true) - $start) / 1e9;
+            $iterator->stop();
+        })->await(new TimeoutCancellation(10));
+        $run->over = true;
+
+        self::assertSame(1, $processed);
+        self::assertNotNull($run->handledAfter);
+        self::assertLessThan(3.0, $run->handledAfter, 'the handler got the message once it was there, not at the first pull\'s 6 s deadline');
+        self::assertSame(2, $pulls->count, 'both pulls were issued before the first one was handed over');
     }
 
     /**

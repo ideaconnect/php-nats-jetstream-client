@@ -15,7 +15,62 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.12.0] - 2026-10-06
+
+### Upgrade notes
+
+- **Custom transports.** `TransportInterface::readLine()` must keep every byte it has not returned when its
+  cancellation ends it, a partial frame included: the connection cancels a read not only at a deadline but also to
+  wake an operation whose result another fiber delivered meanwhile, and then reads on (#174). The built-in transports
+  do, and the rule always held in practice, since every non-blocking poll and the heartbeat cancel their reads after
+  a short bound. A transport that lost bytes on cancellation would now corrupt the stream in normal operation.
+
+### Fixed
+
+- `[bugfix]` An operation that reads the socket while it waits for a result of its own, a `SubscriptionQueue` poll,
+  `fetchBatch()`/`fetchNext()`, `directGetBatch()`, the pull consumer or Key/Value `keys()`/`history()`, got a result
+  that another fiber's read delivered only with the server's next bytes or at its deadline when that delivery reached
+  it while the operation's read was already waiting (#174). That happened in three ways: the delivery was still under
+  way when the read started, held up in the handler of another subscription that awaits an HTTP or database call, say,
+  or in the write of the PONG a server PING ahead of the message is owed; it came in the few event-loop hops between
+  the operation's check and the start of its read; or it came with the reconnect the read waited for. On a real server
+  the first costs the whole deadline, the server pinging only every two minutes, and the third about two seconds. An
+  operation's read now ends without reading as soon as anything is delivered to the operation's subscription,
+  wherever the read waits: on the socket, whose read it cancels, behind another fiber's read, or for a reconnect; the
+  operation then looks again. Application reads, `processIncoming()` and `readIncoming()`, are unchanged, and so is
+  the order of deliveries: an operation gets its message once the in-order delivery reaches it, so a handler ahead of
+  it that outlasts the operation's deadline still makes it time out.
+- `[bugfix]` `request()` and `requestMany()` got a reply that another fiber's read delivered only with the server's
+  next bytes or at their timeout in the same three cases (#174). Their replies come on the one reply inbox every
+  request shares, so their read ends on their own reply instead, as the waiter that takes it fires: another request's
+  reply does not end it. A request cancelled right after its reply arrived throws the caller's own cancellation, with
+  its reason.
+- `[bugfix]` `flush()`, `rtt()`, the flushes of `drain()` and `drainSubscription()` and the confirmation of the reply
+  inbox end their read as soon as their PONG is in, whichever fiber's read took it, also when that read's dispatch
+  had to wait before it reached the PONG, for the write of the PONG it owed the server for a PING ahead of it, say
+  (#174). They used to wait for the server's next bytes or their deadline. A flush whose PING went out before the
+  connection dropped fails with `Connection lost before the server answered the PING` as soon as the reconnect's
+  first attempt clears the pong slots, rather than once the reconnect is over or at the flush's deadline.
+- `[bugfix]` An operation's read that waited for a reconnect looks again before it reads the new socket, whether or
+  not the reconnect delivered anything to it (#174). The pipelined pull consumer, which re-issues the pulls the old
+  server forgot once it sees the reconnect, used to read the new socket first and re-pull only at the lost pull's
+  deadline, its expiry plus a second.
+- `[bugfix]` `SubscriptionQueue::next()` with a timeout, and `fetchAll()` with a limit and a timeout, returned a
+  message that another fiber's read delivered while they paused between reads (an application's
+  `processIncoming()` loop, say) only once the timeout ran out (#174). They started another read before they
+  looked at the queue, and that read waited on the socket, with the message already there, for the server's
+  next bytes or the whole timeout. They now take what arrived before they read again. `next()` had this shape
+  since 1.0.0, `fetchAll()` since 2.0.0.
+- `[bugfix]` `SubscriptionQueue::fetchAll()` also takes what such a read delivered during its pause when that
+  does not complete the call, so its own next read has the queue's whole buffer (#174). When that delivery had
+  filled the queue, the messages the next read brought overflowed it: they or the earlier ones were dropped, or
+  under `SlowConsumerPolicy::Error` the call failed with a `SlowConsumerException`.
+- `[bugfix]` The pipelined pull engine behind `PullConsumerIterator::handle()` handed over a batch that another
+  fiber's read delivered while the engine waited for the write of a pull request (an application's
+  `processIncoming()` loop, say, with the socket under backpressure) only at that pull's deadline, its expiry
+  plus 1 s, or with the server's next bytes. It looked at its oldest pull only before it issued pulls, and
+  then read with that pull's batch already there. It now looks again before it reads. The review of #174
+  found this; the engine had the same shape since it arrived in 2.7.0.
 
 ### Testing & CI
 

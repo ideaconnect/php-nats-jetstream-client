@@ -303,7 +303,8 @@ final class NatsClient
      *           part of the supported API.
      *
      * @param int|null $ownSid The operation's own subscription, whose overflow or failing handler still fails
-     *        the operation.
+     *        the operation, and whose next delivery, by whichever fiber's read, ends the read without reading
+     *        ({@see NatsConnection::readIncomingForOperation()}): call this right after looking for the result.
      * @param bool $alwaysReport Report every overflow and every handler that throws while the read delivers,
      *        whatever the options say, the messages behind it still delivered, and an -ERR the server keeps the
      *        connection open for: for a read whose caller would only swallow them, such as a serving loop. Such

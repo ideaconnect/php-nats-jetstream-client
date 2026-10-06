@@ -201,20 +201,21 @@ final class SubscriptionQueue
         $deadline = $this->monotonicSeconds() + $this->timeout;
 
         try {
+            // The queue is checked before every further read, not only right after one: another fiber's
+            // read (an application's processIncoming() loop, say) can deliver to it during the pause below,
+            // and a read started then would wait on the socket, with the message already here, for the
+            // server's next bytes or the whole timeout (#174). A delivery that reaches the queue while the
+            // read waits ends that read without reading, and the check runs then as well.
             do {
                 $read = $this->client->readIncomingForOperation($cancellation, $this->sid)->await();
 
-                if ($this->messages->count() > 0) {
-                    break;
-                }
-
-                if (!$read->consumedBytes) {
+                if ($this->bufferIsEmpty() && !$read->consumedBytes) {
                     // Genuinely idle read: yield so the deadline can fire without a busy-spin. A read
                     // that consumed bytes but did not complete a message yet (a large payload arriving
                     // in chunks) loops immediately - no 1 ms sleep is paid per partial chunk (#119).
                     delay(0.001, cancellation: $cancellation);
                 }
-            } while ($this->monotonicSeconds() < $deadline);
+            } while ($this->bufferIsEmpty() && $this->monotonicSeconds() < $deadline);
         } catch (CancelledException) {
             // Timeout elapsed without a message.
         }
@@ -238,9 +239,7 @@ final class SubscriptionQueue
         $collected = [];
 
         // Drain anything already buffered first.
-        while (!$this->messages->isEmpty() && ($limit === null || count($collected) < $limit)) {
-            $collected[] = $this->messages->dequeue();
-        }
+        $this->takeBuffered($collected, $limit);
 
         if ($limit !== null && count($collected) >= $limit) {
             return $collected;
@@ -270,9 +269,7 @@ final class SubscriptionQueue
 
                 $frames = $read->frames;
 
-                while (!$this->messages->isEmpty() && ($limit === null || count($collected) < $limit)) {
-                    $collected[] = $this->messages->dequeue();
-                }
+                $this->takeBuffered($collected, $limit);
 
                 if ($frames === 0 && $this->messages->isEmpty()) {
                     if (!$hasTimeout) {
@@ -287,6 +284,13 @@ final class SubscriptionQueue
                         // consumed bytes but completed no frame yet (a large payload arriving in chunks)
                         // loops immediately - no 1 ms sleep is paid per partial chunk (#119).
                         delay(0.001, cancellation: $cancellation);
+
+                        // Another fiber's read (an application's processIncoming() loop, say) can deliver
+                        // to this queue during that pause. Take it now, so that a call it completes ends
+                        // here instead of starting a read that would wait on the socket, with the messages
+                        // already here, for the server's next bytes or the whole window (#174). A delivery
+                        // that reaches the queue while the read waits ends that read without reading.
+                        $this->takeBuffered($collected, $limit);
                     }
                 }
             }
@@ -295,10 +299,32 @@ final class SubscriptionQueue
         }
 
         // Final drain of any remaining buffered messages.
+        $this->takeBuffered($collected, $limit);
+
+        return $collected;
+    }
+
+    /**
+     * Whether the polling buffer holds no message.
+     *
+     * @phpstan-impure Reads the buffer, which any read fills while the caller is suspended: its own, or another
+     *                 fiber's, such as an application's processIncoming() loop.
+     */
+    private function bufferIsEmpty(): bool
+    {
+        return $this->messages->isEmpty();
+    }
+
+    /**
+     * Moves buffered messages into $collected, oldest first, until it holds $limit of them.
+     *
+     * @param list<NatsMessage> $collected
+     * @param-out list<NatsMessage> $collected
+     */
+    private function takeBuffered(array &$collected, ?int $limit): void
+    {
         while (!$this->messages->isEmpty() && ($limit === null || count($collected) < $limit)) {
             $collected[] = $this->messages->dequeue();
         }
-
-        return $collected;
     }
 }

@@ -302,6 +302,34 @@ final class NatsConnection
      */
     private DeferredFuture $readSlotReleased;
     /**
+     * The wake-up of each subscription an operation's read waits on ({@see nextDeliveryTo()}). The next delivery to
+     * the sid, whichever fiber makes it, cancels it and removes it; so do the subscription's removal and a terminal
+     * close. Created when an operation reads for its own subscription, and shared by every read made for that sid
+     * until it fires. A read keeps the one it was given: a cancellation fires at most once and is never reset, and the
+     * next read gets a new one, so no later state can match the one a read started from (#174).
+     *
+     * @var array<int, DeferredCancellation>
+     */
+    private array $deliveryWakes = [];
+    /**
+     * The wake-ups a terminal close released while a reconnect was still in flight, kept until that reconnect has
+     * published its outcome ({@see recoverConnection()}). Fired at the close, they woke an operation waiting for the
+     * reconnect before its error was out whenever a listener the close calls suspended, and the operation went on to
+     * fail with "Connection is not open" instead of the reconnect's own error. Kept referenced, since a
+     * DeferredCancellation cancels itself when it is destroyed.
+     *
+     * @var list<DeferredCancellation>
+     */
+    private array $wakesAfterRecovery = [];
+    /**
+     * The wake-up of each pong slot a read waits for ({@see wakeOnPong()}): one per slot, whichever reader asks, so that
+     * a flush, a drain's flush or a mux confirmation that reads many chunks before its PONG does not pile a callback per
+     * read onto the slot. A slot that completed is forgotten with its last reader.
+     *
+     * @var \WeakMap<DeferredFuture<null>, Cancellation>|null
+     */
+    private ?\WeakMap $pongWakes = null;
+    /**
      * Set by disconnect()/drain() to signal user close-intent. The reconnect paths bail when it is set
      * so an in-flight heartbeat/read-path recovery cannot re-open a connection the user just closed
      * (#84). Cleared on a fresh connect().
@@ -1211,6 +1239,19 @@ final class NatsConnection
         // Terminal close: no PONG will ever arrive for a queued PING, so parked flush/rtt waiters
         // must observe the close instead of idling out their deadlines (#117).
         $this->failPongWaiters(new ConnectionException('Connection closed before the server answered the PING'));
+        // Nothing more will be delivered to the subscriptions released above: an operation's read still waiting for
+        // one looks again, and finds the connection closed.
+        $wakes = array_values($this->deliveryWakes);
+        $this->deliveryWakes = [];
+        if ($this->reconnecting !== null) {
+            array_push($this->wakesAfterRecovery, ...$wakes);
+
+            return;
+        }
+
+        foreach ($wakes as $wake) {
+            $wake->cancel();
+        }
     }
 
     /**
@@ -2535,11 +2576,19 @@ final class NatsConnection
      * An -ERR the server keeps the connection open for still fails the operation: it names no subscription,
      * and it is often the answer to what the operation itself sent, its SUB or its PUB.
      *
+     * With $ownSid the read also ends, without reading and with nothing consumed, as soon as anything is delivered
+     * to that subscription after this call, by whichever fiber's read: the read of another fiber whose delivery was
+     * still under way, the one that took the socket during the hops before this read's own fiber started, or the
+     * one that recovered a lost connection this read waited for. The read would otherwise wait on the socket, with
+     * what the operation waits for already delivered, for the server's next bytes or the operation's deadline
+     * (#174). The operation then looks again: call this right after looking for the result, with no await in
+     * between, since what is delivered before the call does not end the read.
+     *
      * @internal For the library's own operations (JetStream, Key/Value, polling queues, services);
      *           applications read with {@see readIncoming()} or {@see processIncoming()}.
      *
      * @param int|null $ownSid The operation's own subscription, whose overflow or failing handler still fails
-     *        the operation.
+     *        the operation, and whose next delivery ends the read.
      * @param bool $alwaysReport Report every overflow and every handler that throws while the read delivers,
      *        whatever the options say, the messages behind it still delivered, and an -ERR the server keeps the
      *        connection open for: for a read whose caller would only swallow them, such as a serving loop. Such
@@ -2553,6 +2602,23 @@ final class NatsConnection
      */
     public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
     {
+        // Taken here, in the operation's fiber, before the read's own fiber starts a few event-loop hops later: a
+        // delivery made during those hops ends the read as well.
+        return $this->operationRead($cancellation, $ownSid, $alwaysReport, $ownSid === null ? null : $this->nextDeliveryTo($ownSid));
+    }
+
+    /**
+     * {@see readIncomingForOperation()} with the wake-up given: for request() and requestMany(), whose replies come on
+     * the reply inbox every request shares, so that their read ends on their own reply rather than on any delivery to
+     * that inbox.
+     *
+     * @param Cancellation|null $wake Fires once what the operation waits for may have arrived ({@see readChunk()}).
+     * @return Future<IncomingChunkResult>
+     *
+     * @phpstan-impure Mutates connection state, like readIncoming().
+     */
+    private function operationRead(?Cancellation $cancellation, ?int $ownSid, bool $alwaysReport, ?Cancellation $wake): Future
+    {
         return $this->readChunk(
             $cancellation,
             \Fiber::getCurrent(),
@@ -2561,7 +2627,82 @@ final class NatsConnection
             reportHandlerFailures: $alwaysReport || !$this->options->handlerErrorsFailOperations,
             reportFailuresKeepingTheConnection: $alwaysReport,
             deliverLeftovers: $alwaysReport,
+            wake: $wake,
         );
+    }
+
+    /**
+     * What an operation's read for $sid waits on besides its deadline ({@see readIncomingForOperation()}): a
+     * cancellation that the next delivery to $sid fires, whichever fiber's read makes it, and the subscription's
+     * removal. Null when $sid has no subscription, since nothing will be delivered to it.
+     */
+    private function nextDeliveryTo(int $sid): ?Cancellation
+    {
+        if (!isset($this->subscriptions[$sid])) {
+            return null;
+        }
+
+        return ($this->deliveryWakes[$sid] ??= new DeferredCancellation())->getCancellation();
+    }
+
+    /**
+     * Ends the reads of operations waiting for a delivery to $sid ({@see nextDeliveryTo()}): one was just made, or the
+     * subscription is gone. The next read for $sid gets a new wake-up.
+     */
+    private function wakeReadsWaitingFor(int $sid): void
+    {
+        $wake = $this->deliveryWakes[$sid] ?? null;
+        if ($wake === null) {
+            return;
+        }
+
+        unset($this->deliveryWakes[$sid]);
+        $wake->cancel();
+    }
+
+    /**
+     * The wake-up of a read that waits for a pong slot ({@see readChunk()}): fires once the slot completes, with its PONG
+     * or with the end of the connection, whichever fiber completes it. A slot completes once and stays complete, so the
+     * wake-up can be taken at any time: one taken after the slot completed fires at once.
+     *
+     * @param DeferredFuture<null> $slot
+     */
+    private function wakeOnPong(DeferredFuture $slot): Cancellation
+    {
+        $this->pongWakes ??= new \WeakMap();
+        $known = $this->pongWakes[$slot] ?? null;
+        if ($known !== null) {
+            return $known;
+        }
+
+        $wake = new DeferredCancellation();
+        $slot->getFuture()->finally($wake->cancel(...))->ignore();
+
+        return $this->pongWakes[$slot] = $wake->getCancellation();
+    }
+
+    /**
+     * What a wait of an operation's read waits with ({@see readChunk()}): the caller's cancellation and the read's
+     * wake-up, whichever of the two are given.
+     */
+    private static function waitWith(?Cancellation $cancellation, ?Cancellation $wake): ?Cancellation
+    {
+        if ($wake === null || $cancellation === null) {
+            return $wake ?? $cancellation;
+        }
+
+        return new CompositeCancellation($cancellation, $wake);
+    }
+
+    /**
+     * Whether a wait of an operation's read ended because its wake-up fired ({@see readChunk()}). Not when the caller's
+     * own cancellation fired as well: the caller's deadline wins, as before there was a wake-up.
+     *
+     * @phpstan-impure Reads cancellations that other fibers fire while the read is suspended.
+     */
+    private static function wokenUp(?Cancellation $wake, ?Cancellation $cancellation): bool
+    {
+        return ($wake?->isRequested() ?? false) && !($cancellation?->isRequested() ?? false);
     }
 
     /**
@@ -2589,7 +2730,17 @@ final class NatsConnection
      *        the read would take the read slot, or wait for another fiber's read, the read returns without reading.
      *        The caller checks for its PONG before each read, but the read runs on a fiber of its own, and before
      *        that fiber starts another fiber's read can take the PONG and free the read slot: the read then waited
-     *        on a socket with nothing more to come until the caller's deadline.
+     *        on a socket with nothing more to come until the caller's deadline. A slot still pending is also the
+     *        read's wake-up ({@see wakeOnPong()}), unless $wake is given: a slot that completes while the read waits
+     *        ends it as well, such as one that another fiber's dispatch completes once the write of a PONG it owed the
+     *        server let it go on, or one that a reconnect fails, its PONG gone with the old socket.
+     * @param Cancellation|null $wake An operation's wake-up: fires once what the operation waits for may have arrived
+     *        since the operation last looked for it, whichever fiber's read delivered it. The caller takes it in its own
+     *        fiber, right after it looked. The read then ends without reading, and returns as one that waited for
+     *        another fiber's read does, wherever it is: about to wait for a reconnect, waiting for one, about to take
+     *        the read slot, waiting for another fiber's read, or waiting on the socket, whose read it cancels. A
+     *        transport's read that is cancelled has consumed nothing: what it had not returned is still there for the
+     *        next read. Not once the read has bytes: it delivers them, as any read does.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -2603,13 +2754,53 @@ final class NatsConnection
         bool $reportFailuresKeepingTheConnection = false,
         bool $deliverLeftovers = false,
         ?DeferredFuture $pongSlot = null,
+        ?Cancellation $wake = null,
     ): Future {
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot): IncomingChunkResult {
+        if ($wake === null && $pongSlot !== null && !$pongSlot->isComplete()) {
+            // A slot still pending is the read's wake-up. One already complete is not: that read returns at the slot
+            // check below, once any reconnect it waits for is over. Made its wake-up, it fired before the read began, and
+            // a caller that loops until something else happens (awaitMuxConfirmation()) polled through the whole
+            // reconnect, a look every millisecond.
+            $wake = $this->wakeOnPong($pongSlot);
+        }
+
+        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake): IncomingChunkResult {
+            // What the read waits with: the caller's cancellation, and the operation's wake-up. Every wait below
+            // subscribes to it before it suspends, and the checks before each wait run with no suspension between
+            // them and the wait, so a wake-up that fires at any point either ends the wait or is seen by a check.
+            $waitCancellation = self::waitWith($cancellation, $wake);
+
+            // Delivered during the hops before this fiber started.
+            if (self::wokenUp($wake, $cancellation)) {
+                return new IncomingChunkResult(0, false);
+            }
+
             if ($this->state !== ConnectionState::Open && $this->state !== ConnectionState::Draining) {
                 // The recovery future resolves only once the recovery has finalized the state, so a
                 // reader waiting here still never touches the new socket during the subscription
                 // replay window (#148).
-                $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
+                try {
+                    $this->awaitOpenConnection($waitCancellation, $caller, acceptDraining: true);
+                } catch (CancelledException $cancelled) {
+                    // Delivered while the connection was down: by the reconnect's delivery of what it read, or by
+                    // a delivery still under way when the connection dropped.
+                    if (!self::wokenUp($wake, $cancellation)) {
+                        // The caller's own exception when both fired: the wake-up's may have won inside the composite.
+                        $cancellation?->throwIfRequested();
+
+                        throw $cancelled;
+                    }
+
+                    return new IncomingChunkResult(0, false);
+                }
+
+                // An operation's read that waited for a reconnect returns without reading, whether or not the
+                // reconnect delivered anything to it: the operation may have to act on the new connection first, as
+                // the pull engine re-issues the pulls the old server forgot, and would otherwise read the new socket
+                // until the server's next bytes or its deadline before it looked.
+                if ($wake !== null) {
+                    return new IncomingChunkResult(0, false);
+                }
             }
 
             // A serving loop's read first delivers what an earlier read left queued: one that stopped at a
@@ -2634,14 +2825,31 @@ final class NatsConnection
                 return new IncomingChunkResult(0, false);
             }
 
+            // Delivered by the reconnect waited for above, or by another fiber's read meanwhile.
+            if (self::wokenUp($wake, $cancellation)) {
+                return new IncomingChunkResult(0, false);
+            }
+
             if ($this->readInProgress) {
                 // Another fiber owns the socket read - a request waiting for its reply, the heartbeat, a
                 // flush - and the transport allows one read at a time. Wait for that read to finish,
                 // bounded by this read's cancellation, and return without reading: it delivers what it
                 // reads. Returning at once let a loop of reads run on futures that finish straight away,
                 // which never hand the event loop control: no timer or socket read ran again, that other
-                // read's included, and the process spun at 100% CPU.
-                $this->readSlotReleased->getFuture()->await($cancellation);
+                // read's included, and the process spun at 100% CPU. An operation's wake-up ends the wait
+                // too: what that read delivers can be all the operation waits for, and the read can go on
+                // for a long time after, in a handler that awaits.
+                try {
+                    $this->readSlotReleased->getFuture()->await($waitCancellation);
+                } catch (CancelledException $cancelled) {
+                    if (!self::wokenUp($wake, $cancellation)) {
+                        $cancellation?->throwIfRequested();
+
+                        throw $cancelled;
+                    }
+
+                    return new IncomingChunkResult(0, false);
+                }
 
                 // Unless it stopped at a throwing handler: what it left queued is delivered here, as above.
                 if ($deliverLeftovers && $this->pendingDirty !== [] && !$this->leftoversBelongToAClose()) {
@@ -2656,9 +2864,18 @@ final class NatsConnection
 
             $readError = null;
             try {
-                $chunk = $this->transport->readLine($cancellation)->await();
+                $chunk = $this->transport->readLine($waitCancellation)->await();
             } catch (CancelledException $cancelledException) {
-                throw $cancelledException;
+                if (!self::wokenUp($wake, $cancellation)) {
+                    $cancellation?->throwIfRequested();
+
+                    throw $cancelledException;
+                }
+
+                // Delivered by a delivery still under way in another fiber - one whose handler awaits, or whose
+                // dispatch waits for the PONG it owes the server - while this read waited on the socket: it ends
+                // with nothing read, and the bytes still on the socket stay there for the next read.
+                $chunk = '';
             } catch (\Throwable $e) {
                 $readError = $e;
                 $chunk = '';
@@ -2682,8 +2899,18 @@ final class NatsConnection
                     $this->emitErrorSafely($readError);
                     // A recovery another fiber already runs (typically the heartbeat's) is joined only
                     // until this read's own cancellation fires: a request whose read failed must not
-                    // outlive its timeout waiting for the whole backoff schedule.
-                    $this->recoverConnection(joinCancellation: $cancellation, failedGeneration: $generation, cause: $readError);
+                    // outlive its timeout waiting for the whole backoff schedule. Nor an operation's
+                    // read its wake-up: what it waits for can come meanwhile, in a delivery still under
+                    // way when the connection dropped. A recovery this read runs itself is not cut short.
+                    try {
+                        $this->recoverConnection(joinCancellation: $waitCancellation, failedGeneration: $generation, cause: $readError);
+                    } catch (CancelledException $cancelled) {
+                        if (!self::wokenUp($wake, $cancellation)) {
+                            $cancellation?->throwIfRequested();
+
+                            throw $cancelled;
+                        }
+                    }
                 } else {
                     // ...and end it now: the PONG the flush waits for died with the socket, so the flush
                     // would otherwise keep reading a dead socket until drain()'s budget ran out.
@@ -2692,6 +2919,10 @@ final class NatsConnection
 
                 return new IncomingChunkResult(0, false);
             }
+
+            // Done waiting: let go of the composite, so that what this read delivers to its own subscription fires a
+            // wake-up nobody is subscribed to, with no CancelledException made and no callback queued.
+            $waitCancellation = null;
 
             if ($chunk === '') {
                 return new IncomingChunkResult(0, false);
@@ -2746,10 +2977,13 @@ final class NatsConnection
                 try {
                     // A recovery another fiber already runs is joined only until this read's own cancellation
                     // fires, as on the read-failure path above.
-                    $this->recoverConnection(joinCancellation: $cancellation, failedGeneration: $generation, cause: $parseError);
+                    $this->recoverConnection(joinCancellation: self::waitWith($cancellation, $wake), failedGeneration: $generation, cause: $parseError);
                 } catch (CancelledException $cancelled) {
-                    // The read's deadline ended the wait; a failure already on its way still wins.
-                    if ($failure === null) {
+                    // The read's deadline ended the wait, unless the read's wake-up did: then the recovered frames are
+                    // delivered and the operation looks again. A failure already on its way still wins.
+                    if (!self::wokenUp($wake, $cancellation) && $failure === null) {
+                        $cancellation?->throwIfRequested();
+
                         throw $cancelled;
                     }
                 } catch (\Throwable $recoveryError) {
@@ -3395,14 +3629,20 @@ final class NatsConnection
         // $deferred->isComplete() so a reply delivered in the same tick the deadline fires is
         // returned instead of being discarded as a spurious timeout.
         $replyReceived = false;
+        // Fired with the reply: this request's read ends without reading, wherever it waits then, since the reply is
+        // all it waits for. The reply can come in another fiber's delivery still under way, or in a reconnect's
+        // (#174). Not a delivery to the reply inbox, which every request shares: that would end every request's read
+        // at each reply.
+        $replyArrived = new DeferredCancellation();
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118). The
         // handler body is unchanged and idempotent: a coalesced duplicate arriving in the same drain
         // batch (before the finally removes the waiter) is ignored by the isComplete() guard.
-        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived): void {
+        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived, $replyArrived): void {
             if (!$deferred->isComplete()) {
                 $deferred->complete($message);
                 $replyReceived = true;
+                $replyArrived->cancel();
             }
         });
 
@@ -3459,7 +3699,7 @@ final class NatsConnection
                 }
 
                 try {
-                    $read = $this->readIncomingForOperation($waitCancellation)->await();
+                    $read = $this->operationRead($waitCancellation, null, false, $replyArrived->getCancellation())->await();
                 } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
                         throw $e;
@@ -3579,10 +3819,13 @@ final class NatsConnection
         /** @var DeferredFuture<null> $replyTick */
         $replyTick = new DeferredFuture();
         $replyTick->getFuture()->ignore();
+        // Rotated with the tick, for the read: the read in flight ends without reading at each delivery, wherever it
+        // waits then, as request()'s does on its reply (#174).
+        $replyWake = new DeferredCancellation();
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118); the
         // collector body (incl. the #160 cap and #135 tick rotation) is unchanged.
-        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, $maxResponses): void {
+        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, &$replyWake, $maxResponses): void {
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
@@ -3600,6 +3843,10 @@ final class NatsConnection
             $replyTick = new DeferredFuture();
             $replyTick->getFuture()->ignore();
             $tick->complete();
+
+            $wake = $replyWake;
+            $replyWake = new DeferredCancellation();
+            $wake->cancel();
         });
 
         try {
@@ -3680,7 +3927,7 @@ final class NatsConnection
                 }
 
                 try {
-                    $read = $this->readIncomingForOperation($sliceCancellation)->await();
+                    $read = $this->operationRead($sliceCancellation, null, false, $replyWake->getCancellation())->await();
                 } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
                         throw $e;
@@ -4051,6 +4298,12 @@ final class NatsConnection
         } finally {
             $this->recoveryFiber = null;
             $this->reconnecting = null;
+            // After $deferred settled above, so that its waiters get the reconnect's outcome before they are woken.
+            $wakes = $this->wakesAfterRecovery;
+            $this->wakesAfterRecovery = [];
+            foreach ($wakes as $wake) {
+                $wake->cancel();
+            }
             // Wake any publishers parked on a sealed flush (#165). The connection state is finalized
             // by now - Open on success, Closed on every failure/close/auth path - so on wake they route
             // by it: write directly if Open, or fail loudly via bufferFrame() if Closed. Completing
@@ -6035,6 +6288,14 @@ final class NatsConnection
         } finally {
             unset($this->dispatchingSids[$sid]);
 
+            // An operation reading for this subscription looks again ({@see nextDeliveryTo()}): its result may be in,
+            // whichever read made this delivery, the operation's own, another fiber's or a reconnect's. Once per pass:
+            // on an operation's own subscription the handler is the library's, and a pass there suspends only in an
+            // error listener that a dropped message is reported to, when this fires once the pass is over.
+            if ($deliveredThisPass > 0) {
+                $this->wakeReadsWaitingFor($sid);
+            }
+
             // drainSubscription() left this subscription's removal to this delivery: remove it once
             // everything queued has been handed over. A delivery cut short - a handler that threw, or
             // drain()'s budget - leaves the rest to the next pass, or to drain()'s report and teardown.
@@ -6095,5 +6356,7 @@ final class NatsConnection
         unset($this->unboundedSids[$sid]);
         unset($this->subscriptionRejectionHandlers[$sid]);
         unset($this->removeAfterDelivery[$sid]);
+        // Nothing more will be delivered to it: an operation's read still waiting for a delivery looks again.
+        $this->wakeReadsWaitingFor($sid);
     }
 }

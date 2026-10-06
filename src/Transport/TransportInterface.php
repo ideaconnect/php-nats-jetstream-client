@@ -51,7 +51,10 @@ interface TransportInterface
      * empty string MUST be reserved for "no bytes available without EOF" (e.g. no socket yet). A
      * supplied non-null cancellation MUST be honored (a read timeout surfaces as an Amp
      * CancelledException, never as EOF); with a null cancellation the read may suspend until data
-     * arrives or the peer closes.
+     * arrives or the peer closes. A read that its cancellation ends MUST have consumed nothing it does
+     * not keep: the bytes it has not returned, a partial frame included, are there for the next read.
+     * The connection cancels a read not only at a deadline but also to wake an operation whose result
+     * another fiber delivered meanwhile, and then reads on (#174).
      *
      * @return Future<string>
      */
