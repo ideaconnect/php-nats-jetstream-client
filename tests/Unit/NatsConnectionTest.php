@@ -33,6 +33,7 @@ use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
@@ -3870,9 +3871,12 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Verifies max outstanding pings triggers reconnect path and preserves open state. With maxPingsOut=0 the
-     * restarted timer reconnects again on its next tick, so what the first reconnect left is recorded as it is
-     * announced, rather than after a pause that would have to end before that next tick.
+     * Verifies max outstanding pings triggers reconnect path and preserves open state: once the reconnect of the
+     * first tick has returned, the client is Open on server "S2", after 2 connect calls. With maxPingsOut=0 the
+     * restarted timer reconnects again on its next tick, so this is sampled by a microtask that the Reconnected
+     * listener queues. The event loop runs it as soon as the tick hands control back, which the tick does once the
+     * reconnect has returned, and before any timer, the next tick included. The listener itself cannot sample the
+     * state, as it is only ever called while the connection is Open.
      */
     public function testMaxPingsOutTriggersReconnect(): void
     {
@@ -3891,8 +3895,10 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $atReconnect = new class {
+        $afterReconnect = new class {
             public ?NatsClient $client = null;
+            public bool $announced = false;
+            public ?ConnectionState $state = null;
             public ?int $connects = null;
             public ?string $serverId = null;
         };
@@ -3904,23 +3910,33 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
                 pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
-                connectionListener: static function (ConnectionEvent $event) use ($transport, $atReconnect): void {
-                    if ($event === ConnectionEvent::Reconnected && $atReconnect->connects === null) {
-                        $atReconnect->connects = count($transport->connectCalls);
-                        $atReconnect->serverId = $atReconnect->client?->serverInfo()?->serverId;
+                connectionListener: static function (ConnectionEvent $event) use ($transport, $afterReconnect): void {
+                    if ($event !== ConnectionEvent::Reconnected || $afterReconnect->announced) {
+                        return;
                     }
+
+                    $afterReconnect->announced = true;
+                    EventLoop::queue(static function () use ($transport, $afterReconnect): void {
+                        $afterReconnect->state = $afterReconnect->client?->state();
+                        $afterReconnect->connects = count($transport->connectCalls);
+                        $afterReconnect->serverId = $afterReconnect->client?->serverInfo()?->serverId;
+                    });
                 },
             ),
             $transport,
         );
-        $atReconnect->client = $client;
+        $afterReconnect->client = $client;
         $client->connect()->await();
 
         // The ping timer fires once; with maxPingsOut=0 this must trigger a reconnect.
-        self::awaitUntil(static fn(): bool => $atReconnect->connects !== null, 'the reconnect of the first tick');
+        self::awaitUntil(
+            static fn(): bool => $afterReconnect->connects !== null,
+            'the end of the reconnect of the first tick',
+        );
 
-        self::assertSame(2, $atReconnect->connects);
-        self::assertSame('S2', $atReconnect->serverId);
+        self::assertSame(ConnectionState::Open, $afterReconnect->state);
+        self::assertSame(2, $afterReconnect->connects);
+        self::assertSame('S2', $afterReconnect->serverId);
 
         $client->disconnect()->await();
     }
@@ -6768,6 +6784,14 @@ final class NatsConnectionTest extends TestCase
         self::assertStringContainsString('HPUB orders.created ', implode('', $transport->writes));
     }
 
+    /**
+     * With maxPingsOut 0 and reconnect enabled, the ping watchdog reconnects at its first tick, and once that
+     * reconnect has returned the connection is Open after 2 connect calls. The restarted timer reconnects again on
+     * its next tick, so the state and the count are sampled by a microtask that the Reconnected listener queues. The
+     * event loop runs it as soon as the tick hands control back, which the tick does once the reconnect has
+     * returned, and before any timer, the next tick included. The listener itself cannot sample the state, as it is
+     * only ever called while the connection is Open.
+     */
     public function testPingTimerReconnectsWhenMaxOutstandingPingsExceeded(): void
     {
         $transport = new class implements TransportInterface {
@@ -6824,8 +6848,9 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $atReconnect = new class {
+        $afterReconnect = new class {
             public ?NatsConnection $connection = null;
+            public bool $announced = false;
             public ?ConnectionState $state = null;
             public ?int $connects = null;
         };
@@ -6837,24 +6862,32 @@ final class NatsConnectionTest extends TestCase
                 maxReconnectAttempts: 1,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
-                connectionListener: static function (ConnectionEvent $event) use ($transport, $atReconnect): void {
-                    if ($event === ConnectionEvent::Reconnected && $atReconnect->connects === null) {
-                        $atReconnect->state = $atReconnect->connection?->state();
-                        $atReconnect->connects = count($transport->connectCalls);
+                connectionListener: static function (ConnectionEvent $event) use ($transport, $afterReconnect): void {
+                    if ($event !== ConnectionEvent::Reconnected || $afterReconnect->announced) {
+                        return;
                     }
+
+                    $afterReconnect->announced = true;
+                    EventLoop::queue(static function () use ($transport, $afterReconnect): void {
+                        $afterReconnect->state = $afterReconnect->connection?->state();
+                        $afterReconnect->connects = count($transport->connectCalls);
+                    });
                 },
             ),
             $transport,
         );
-        $atReconnect->connection = $connection;
+        $afterReconnect->connection = $connection;
         $connection->connect()->await();
 
-        // One tick + reconnect, recorded as the reconnect is announced: maxPingsOut=0 reconnects on every tick,
-        // so the restarted timer's next tick reconnects again.
-        self::awaitUntil(static fn(): bool => $atReconnect->connects !== null, 'the reconnect of the first tick');
+        // One tick + reconnect, sampled once that reconnect has returned: maxPingsOut=0 reconnects on every tick, so
+        // the restarted timer's next tick reconnects again.
+        self::awaitUntil(
+            static fn(): bool => $afterReconnect->connects !== null,
+            'the end of the reconnect of the first tick',
+        );
 
-        self::assertSame(ConnectionState::Open, $atReconnect->state);
-        self::assertSame(2, $atReconnect->connects);
+        self::assertSame(ConnectionState::Open, $afterReconnect->state);
+        self::assertSame(2, $afterReconnect->connects);
 
         $connection->disconnect()->await();
     }
@@ -6916,7 +6949,13 @@ final class NatsConnectionTest extends TestCase
         self::assertSame('S3', $connection->serverInfo()?->serverId);
     }
 
-    public function testPingTimerWriteFailureReconnectsWhenEnabled(): void
+    /**
+     * A failed write of the handshake's PING, the first PING written, makes the reconnect loop dial again when
+     * reconnect is enabled. connect() hands the failure to that reconnect and waits for it, so once connect() has
+     * returned the connection is Open after 2 connect calls. That is read before any heartbeat tick: the new
+     * connection never answers a heartbeat PING, so the fourth tick would give up on it (maxPingsOut 3).
+     */
+    public function testHandshakePingWriteFailureReconnectsWhenEnabled(): void
     {
         $transport = new class implements TransportInterface {
             /** @var list<string> */
@@ -6974,14 +7013,6 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        // The first PING write fails - the handshake's - and the reconnect loop dials again. What that left is recorded
-        // as the open is announced (Connected: the connection was never open before): the new connection never
-        // answers a heartbeat PING, so a later tick gives up on it in turn.
-        $atReconnect = new class {
-            public ?NatsConnection $connection = null;
-            public ?ConnectionState $state = null;
-            public ?int $connects = null;
-        };
         $connection = new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0.05,
@@ -6990,22 +7021,15 @@ final class NatsConnectionTest extends TestCase
                 maxReconnectAttempts: 1,
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
-                connectionListener: static function (ConnectionEvent $event) use ($transport, $atReconnect): void {
-                    if (($event === ConnectionEvent::Connected || $event === ConnectionEvent::Reconnected) && $atReconnect->connects === null) {
-                        $atReconnect->state = $atReconnect->connection?->state();
-                        $atReconnect->connects = count($transport->connectCalls);
-                    }
-                },
             ),
             $transport,
         );
-        $atReconnect->connection = $connection;
+        // The first PING write, the handshake's, fails, and connect() returns once the reconnect it handed that
+        // failure to has returned.
         $connection->connect()->await();
 
-        self::awaitUntil(static fn(): bool => $atReconnect->connects !== null, 'the open after the failed PING write');
-
-        self::assertSame(ConnectionState::Open, $atReconnect->state);
-        self::assertSame(2, $atReconnect->connects);
+        self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertCount(2, $transport->connectCalls);
 
         $connection->disconnect()->await();
     }
@@ -7283,6 +7307,12 @@ final class NatsConnectionTest extends TestCase
 
     // ─── Idle heartbeat does not self-disconnect (P0-2) ─────────────────
 
+    /**
+     * An idle connection, never read by the application, stays Open through three heartbeat PINGs with maxPingsOut 1
+     * and reconnect disabled. A tick writes its PING only if the PONG of the previous tick's PING has been read, and
+     * otherwise gives up on the connection, which closes it: here only the heartbeat's own self-read reads PONGs. The
+     * PINGs are counted, leaving out the one the handshake writes.
+     */
     public function testIdleConnectionStaysOpenViaHeartbeatSelfRead(): void
     {
         // Live-server fake: every PING write produces a PONG on the next read. The application
@@ -7342,16 +7372,20 @@ final class NatsConnectionTest extends TestCase
             $transport,
         );
         $connection->connect()->await();
+        // The handshake wrote a PING of its own: only the ones after it are the heartbeat's.
+        $handshakePings = $transport->pings;
 
-        // Let several heartbeat ticks elapse without any application processIncoming() calls: counted, not timed.
-        // A connection that did not read its own PONGs would be closed at the second.
+        // Let three heartbeat ticks pass without any application processIncoming() call: counted, not timed. Without
+        // the self-read the connection would be closed at the second tick, and with a self-read that skipped the
+        // second tick, at the third.
         self::awaitUntil(
-            static fn(): bool => $transport->pings >= 3 || $connection->state() !== ConnectionState::Open,
+            static fn(): bool => $transport->pings - $handshakePings >= 3
+                || $connection->state() !== ConnectionState::Open,
             'three heartbeat PINGs',
         );
 
         self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertGreaterThanOrEqual(3, $transport->pings);
+        self::assertGreaterThanOrEqual(3, $transport->pings - $handshakePings);
 
         $connection->disconnect()->await();
     }
