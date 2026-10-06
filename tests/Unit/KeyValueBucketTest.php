@@ -3197,8 +3197,8 @@ final class KeyValueBucketTest extends TestCase
         // The replay completed with all fifteen revisions, in order, without a stall error.
         self::assertCount(15, $entries);
         self::assertSame(
-            array_map(static fn (int $i): string => 'v' . $i, range(1, 15)),
-            array_map(static fn (KeyValueEntry $e): ?string => $e->value, $entries),
+            array_map(static fn(int $i): string => 'v' . $i, range(1, 15)),
+            array_map(static fn(KeyValueEntry $e): ?string => $e->value, $entries),
         );
     }
 

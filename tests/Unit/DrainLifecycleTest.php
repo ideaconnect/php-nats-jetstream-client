@@ -2210,9 +2210,13 @@ final class DrainLifecycleTest extends TestCase
     /**
      * drain() alongside an application's processIncoming() loop that stopped at a throwing handler, with the
      * message read behind it still queued, ends once the server has answered its PING and that message's
-     * handler, which awaits, has run. A flush that delivered such a message before it read would wait out its
-     * whole budget: while the handler awaited, the loop's read would take the PONG and park the loop's next
-     * read, and the flush would then wait for that read, on a socket with nothing more to come.
+     * handler, which awaits, has run.
+     *
+     * It fails on a flush whose read delivers such a message before it reads and then reads without checking
+     * again whether its PONG is in: while the handler awaited, the loop's read would take the PONG and park the
+     * loop's next read, and the flush would wait for that read, on a socket with nothing more to come, until its
+     * whole budget ran out. A flush read that delivered first but still checked for its PONG would end promptly,
+     * so delivering first is not caught on its own.
      */
     public function testDrainEndsPromptlyAlongsideALoopThatLeftAMessageQueuedBehindAThrowingHandler(): void
     {
