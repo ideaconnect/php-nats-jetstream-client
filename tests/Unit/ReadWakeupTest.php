@@ -541,6 +541,64 @@ final class ReadWakeupTest extends TestCase
         self::assertLessThan(10, $callbacks, sprintf('the flush left %d callbacks on its pending pong slot after %d reads', $callbacks, $chunks));
     }
 
+    /**
+     * An operation's read that waited for a reconnect looks again before it reads the new socket, whether or not the
+     * reconnect delivered anything to it: the pipelined pull consumer re-issues the pulls the old server forgot once
+     * it sees the reconnect, at the top of its loop. Its pump read waited for the reconnect that the application's read
+     * ran, nothing came for its inbox, and the read went on to the new socket: the consumer re-pulled only at the lost
+     * pull's deadline, its 3 s expiry plus a second. It re-pulls within a second of the drop now.
+     */
+    public function testAPullConsumerWhoseReadWaitedForAReconnectRePullsAtOnce(): void
+    {
+        $transport = new ReconnectingTransport();
+        $pulls = new class {
+            /** @var list<int> The session each pull request was made on. */
+            public array $epochs = [];
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport, $pulls): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if (str_starts_with($subject, '$JS.API.CONSUMER.MSG.NEXT.')) {
+                $pulls->epochs[] = $transport->epoch();
+
+                // The first session's pull stays pending; the server the client reconnects to has a message.
+                return $transport->epoch() === 0 ? [] : [ReconnectingTransport::msgFrame('evt.s', (int) $transport->sidFor($replyTo), 'm1', '$JS.ACK.S.C.1.1.1.0.0')];
+            }
+
+            return $transport->replyFrame($replyTo, 'ok');
+        };
+        $client = $this->connectClient($transport);
+        $client->request('svc.warm', 'x')->await();
+        $stop = new DeferredCancellation();
+        $this->startApplicationReadLoop($client, $stop);
+        delay(0.01);
+
+        $handled = new class {
+            /** Seconds on the monotonic clock when the handler got the message. */
+            public ?float $at = null;
+        };
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(1)->setDepth(1)->setExpiresMs(3_000);
+        $run = $iterator->handle(static function () use ($iterator, $handled): void {
+            $handled->at ??= hrtime(true) / 1e9;
+            $iterator->stop();
+        });
+        $this->waitUntil(static fn(): bool => $pulls->epochs !== []);
+        delay(0.05);
+
+        $transport->refuseDials();
+        $transport->dropConnection();
+        $dropped = hrtime(true) / 1e9;
+        EventLoop::delay(0.06, static fn() => $transport->acceptDials());
+        $run->await(new TimeoutCancellation(8));
+        $stop->cancel();
+
+        self::assertSame([0, 1], $pulls->epochs, 'one pull on the first session, one on the second');
+        self::assertNotNull($handled->at);
+        self::assertLessThan(1.0, $handled->at - $dropped, 'the consumer re-pulled once the reconnect was over, not at the lost pull\'s deadline');
+    }
+
     /** @return iterable<string, array{string}> */
     public static function pollsThatWait(): iterable
     {

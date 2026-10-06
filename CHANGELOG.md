@@ -51,6 +51,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   (#174). They used to wait for the server's next bytes or their deadline. A flush whose PING went out before the
   connection dropped fails with `Connection lost before the server answered the PING` as soon as the reconnect's
   first attempt clears the pong slots, rather than once the reconnect is over or at the flush's deadline.
+- `[bugfix]` An operation's read that waited for a reconnect looks again before it reads the new socket, whether or
+  not the reconnect delivered anything to it (#174). The pipelined pull consumer, which re-issues the pulls the old
+  server forgot once it sees the reconnect, used to read the new socket first and re-pull only at the lost pull's
+  deadline, its expiry plus a second.
 - `[bugfix]` `SubscriptionQueue::next()` with a timeout, and `fetchAll()` with a limit and a timeout, returned a
   message that another fiber's read delivered while they paused between reads (an application's
   `processIncoming()` loop, say) only once the timeout ran out (#174). They started another read before they

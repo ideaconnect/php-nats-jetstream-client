@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 2681 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 2682 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -2283,6 +2283,7 @@ The wake-up of an operation's read (#174): the read of an operation waiting for 
 - `testAFlushGetsThePongADispatchWaitingOnAPongWriteBrings` - The application's read takes a chunk holding a server PING and, behind it, the PONG the flush waits for; the dispatch waits for the write of its own PONG, held up until the flush's read takes the socket. flush() returns within 1 s of its 2 s deadline, once that write goes on and the dispatch takes its PONG.
 - `testARequestWaitingForANewReplyInboxDoesNotPollThroughAReconnect` - A request waiting for a new reply inbox to be confirmed while another fiber's read runs a reconnect with dials refused, the fence slot it reads for already failed by the reconnect's first attempt: it looks at its cancellation fewer than 30 times in 0.3 s of the outage (`tests/Support/CountingCancellation.php` counts the looks), and is sent once the new connection confirms the inbox. A slot already complete made a wake-up polled every millisecond. Guard.
 - `testAFlushReadingManyChunksBeforeItsPongDoesNotPileCallbacksOntoItsSlot` - A flush that reads 2,000 chunks before its PONG leaves fewer than 10 callbacks on its pong slot: one wake-up per slot, not one per read. Guard.
+- `testAPullConsumerWhoseReadWaitedForAReconnectRePullsAtOnce` - A pipelined pull consumer with one pull pending when the connection drops and the application's read runs the reconnect, dials refused for 60 ms: it re-pulls on the new session and handles the message within 1 s of the drop. Its pump read used to go on to the new socket, and it re-pulled at the lost pull's deadline, 4 s.
 - `testAnOperationWaitingForAReconnectThatGivesUpGetsItsErrorWhenTheClosedListenerSuspends` - A reconnect that gives up after three refused dials while the Closed listener suspends: the poll fails with "Reconnect attempts exhausted" and its cause (#172), not with "Connection is not open" from a wake-up fired at the close.
 - `testAnIdleOperationReadsTheSocketOnceForItsWholeWait` - (next() / fetchAll(1)) A 0.3 s wait on an idle connection makes exactly one socket read: nothing wakes an idle operation. Guard.
 - `testADeliveryToAnotherSubscriptionDoesNotEndAnOperationsRead` - A delivery to another subscription, made by the held-up delivery, leaves the poll's read the only one on the socket; the poll then gets its own message. Guard.
