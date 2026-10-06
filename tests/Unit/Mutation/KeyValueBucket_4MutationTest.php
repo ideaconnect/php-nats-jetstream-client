@@ -8,6 +8,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -34,14 +35,15 @@ final class KeyValueBucket_4MutationTest extends TestCase
      *
      * keys() drains a single key-record HMSG frame that arrives as ~360 one-byte transport chunks.
      * REAL code: every byte-consuming read reports consumedBytes=true, so `!$read->consumedBytes` is
-     * false and NO 1 ms idle sleep is paid per chunk (#119) - the whole frame drains near-instantly,
-     * well inside the 0.2 s progress bound, so keys() returns ['email'].
+     * false and NO 1 ms idle sleep is paid per chunk (#119) - the reads follow each other without the
+     * event loop ticking between them, and keys() returns ['email'].
      *
-     * MUTANT (`if ($read->consumedBytes)`): every partial-frame read now DOES sleep 1 ms. With ~360
-     * one-byte chunks the accrued idle sleeps blow past the 0.2 s bound before the frame ever completes,
-     * so the progress deadline fires mid-frame and keys() throws a JetStreamException instead of
-     * returning - the assertSame() below then fails, killing the mutant. (A tight per-record timeout is
-     * used so the mutant's per-chunk sleeps overshoot deterministically; the real path pays none.)
+     * MUTANT (`if ($read->consumedBytes)`): every partial-frame read now DOES sleep 1 ms, and the event
+     * loop ticks during each sleep. The transport counts the chunks read after a tick
+     * ({@see LoopTickCountingTransport}): none on the real code, every chunk of the record after the
+     * first on the mutant, so the assertSame(0, ...) below fails, killing the mutant. The count does not
+     * depend on how fast the machine is, and the 5 s progress bound gives the real code all the time it
+     * needs to collect the key (#176).
      */
     public function testKeysDrainsChunkedRecordWithoutIdleSleepPerChunk(): void
     {
@@ -59,28 +61,31 @@ final class KeyValueBucket_4MutationTest extends TestCase
             "PONG\r\n",
         ]);
 
+        $counting = new LoopTickCountingTransport($transport);
+
         // Small request timeout so a mis-delivered mux reply fails fast instead of hanging the 10 s default.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $transport);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $counting);
         $client->connect()->await();
 
         // A single live headers-only delivery on the deliver subscription (sid 2). Its $JS.ACK last
         // token is num_pending=0, so completing this one frame signals "caught up". The X-Pad header
-        // inflates the frame to ~360 bytes so, split one byte per chunk, a per-chunk 1 ms sleep would
-        // accrue ~360 ms - far past the 0.2 s bound - while the real path pays nothing.
+        // inflates the frame to ~360 bytes, so split one byte per chunk it takes ~360 reads, and a mutant
+        // that sleeps 1 ms per partial read lets the event loop tick ~360 times.
         $hdrs = "NATS/1.0\r\nNats-Sequence: 7\r\nX-Pad: " . str_repeat('a', 260) . "\r\n\r\n";
         $h = strlen($hdrs);
         $frame = sprintf("HMSG \$KV.cfg.email 2 \$JS.ACK.KV_cfg.KEYS.1.7.1.0.0 %d %d\r\n%s\r\n", $h, $h, $hdrs);
 
         $chunks = str_split($frame); // one byte per chunk: many partial-progress reads before completion
-        self::assertGreaterThan(200, count($chunks), 'need enough chunks that a per-chunk sleep overshoots the bound');
+        self::assertGreaterThan(200, count($chunks), 'the record must span many one-byte chunks');
 
         // Mux request inbox (#118): echo the CONSUMER.CREATE reply on the request's captured reply-to
         // (mux sid, learned from the wildcard SUB), then release the chunked deliver frame - one transport
         // byte per read - ONLY once the deliver subscription is written. Emitting the chunks on the deliver
         // SUB (rather than pre-seeding them) keeps them from being consumed and dropped while the
-        // CONSUMER.CREATE request is still in flight (its reply would otherwise land behind them).
+        // CONSUMER.CREATE request is still in flight (its reply would otherwise land behind them). The count
+        // of reads after a loop tick starts there too, so it covers the record's chunks only.
         $muxSid = 1;
-        $transport->onWrite = static function (string $bytes) use ($consumerReply, $chunks, &$muxSid): array {
+        $transport->onWrite = static function (string $bytes) use ($consumerReply, $chunks, &$muxSid, $counting): array {
             $head = strtok($bytes, "\r\n");
             if ($head === false) {
                 return [];
@@ -92,6 +97,8 @@ final class KeyValueBucket_4MutationTest extends TestCase
                 if (str_starts_with($subject, '_INBOX.') && str_ends_with($subject, '.*')) {
                     $muxSid = (int) ($parts[2] ?? 1); // learn the mux inbox sid from its wildcard SUB
                 } elseif (str_starts_with($subject, '_INBOX.KV.KEYS')) {
+                    $counting->reset();
+
                     return $chunks; // deliver subscription live: release the record one byte per read
                 }
 
@@ -108,13 +115,19 @@ final class KeyValueBucket_4MutationTest extends TestCase
             return [];
         };
 
-        // 0.2 s progress bound: the real path drains all chunks well inside it; a mutant that sleeps 1 ms
-        // per chunk cannot.
-        $keys = $client->jetStream()->keyValue('cfg')->keys(0.2)->await();
+        // A 5 s progress bound: the real path drains all chunks long before it, however slow the machine.
+        $keys = $client->jetStream()->keyValue('cfg')->keys(5.0)->await();
 
-        // REAL behavior: the chunked record is drained with no per-chunk idle sleep, so the live key is
-        // collected and returned. On the mutant keys() throws before this point.
+        // The chunked record is drained and its live key collected and returned.
         self::assertSame(['email'], $keys);
+        self::assertSame(count($chunks), $counting->chunksRead, 'every byte of the record must be read as its own chunk');
+        // REAL behavior: no per-chunk idle sleep, so the event loop never ticks between two of the record's
+        // reads. The mutant sleeps 1 ms after each partial read and the loop ticks every time.
+        self::assertSame(
+            0,
+            $counting->chunksReadAfterALoopTick,
+            'keys() must read the next chunk at once, not idle-sleep 1 ms per partial chunk',
+        );
 
         // Tear down and quiesce any residual TimeoutCancellation/delay timers the replay left pending.
         $client->disconnect()->await();
