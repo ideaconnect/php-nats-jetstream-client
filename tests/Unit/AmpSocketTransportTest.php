@@ -373,6 +373,10 @@ final class AmpSocketTransportTest extends TestCase
      * A dial stopped while Amp's retry connector pauses between attempts - 2 s after a refused first attempt -
      * ends at once, and leaves no socket behind, even once the pause is over and the port answers again. The
      * pause ignores the cancellation, and used to hold the dial, and a close waiting for it, for its length.
+     *
+     * The time is measured from the moment the stop fires to the moment the call ends, so a stop timer that
+     * fires late, or a slow start of the dial, does not count against it. A dial held by the pause ends about
+     * 1.9 s after the stop.
      */
     public function testDialStoppedDuringTheRetryPauseEndsAtOnceAndLeavesNoSocket(): void
     {
@@ -383,19 +387,27 @@ final class AmpSocketTransportTest extends TestCase
 
         $transport = new AmpSocketTransport(new NatsOptions());
         $stop = new DeferredCancellation();
-        EventLoop::delay(0.1, static function () use ($stop): void {
+        // Amp's first attempt is refused within a few milliseconds, so the stop lands in the 2 s pause after it.
+        $stoppedAt = null;
+        EventLoop::delay(0.1, static function () use ($stop, &$stoppedAt): void {
+            $stoppedAt = hrtime(true);
             $stop->cancel();
         });
 
-        $start = hrtime(true);
         try {
             $transport->connect('nats://' . $address, 1_000, $stop->getCancellation())->await();
             self::fail('expected CancelledException');
         } catch (CancelledException) {
             // Stopped.
         }
+        $endedAt = hrtime(true);
 
-        self::assertLessThan(0.5, (hrtime(true) - $start) / 1e9);
+        self::assertNotNull($stoppedAt, 'only the stop cancels the dial');
+        self::assertLessThan(
+            1.0,
+            ($endedAt - $stoppedAt) / 1e9,
+            'the dial must end as soon as it is stopped, not when the retry pause is over',
+        );
 
         // The port answers again before Amp's pause is over: its next attempt leaves no socket installed.
         $server = listen('tcp://' . $address);
