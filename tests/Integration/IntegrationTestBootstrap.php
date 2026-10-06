@@ -23,6 +23,13 @@ trait IntegrationTestBootstrap
      * whose dials can be refused, with a fast heartbeat so a dead socket is noticed - and recovered in
      * the heartbeat's own fiber - while the caller merely waits.
      *
+     * The heartbeat notices the severed socket because its next PING write fails (or its read meets the
+     * EOF), never because PONGs are missing, so it is not allowed to give up on unanswered PINGs: with
+     * maxPingsOut 1 every PONG had to be read before the next tick, 50 ms later, and a server that once
+     * took longer to answer, as one on a loaded CI runner does now and then, cost the live connection an
+     * extra reconnect, which then failed the tests that count them. A thousand ticks is 50 s of silence,
+     * longer than any test lasts.
+     *
      * @return array{NatsClient, GatedDialTransport}
      */
     protected function connectRecoverableClient(bool $waitForReconnect = true): array
@@ -35,7 +42,7 @@ trait IntegrationTestBootstrap
             reconnectMaxDelayMs: 50,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0.05,
-            maxPingsOut: 1,
+            maxPingsOut: 1_000,
             waitForReconnect: $waitForReconnect,
         );
         $transport = new GatedDialTransport(new SeveringTransport(new AmpSocketTransport($options)));

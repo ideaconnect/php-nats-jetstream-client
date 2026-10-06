@@ -696,13 +696,15 @@ final class JetStreamIntegrationTest extends TestCase
         self::assertSame('{"event":"wpi"}', $redelivered->payload);
         $js->ack($redelivered)->await();
 
-        // TERM should stop further redeliveries for a message.
+        // TERM should stop further redeliveries for a message. The probe runs once ack_wait (3 s) is over,
+        // when a message that was not acknowledged at all would have been redelivered: before it, the probe
+        // could only tell a TERM from a NAK.
         $js->publish($subject, '{"event":"term"}')->await();
         $toTerm = $js->fetchNext($stream, $consumer, 4_000)->await();
         self::assertSame('{"event":"term"}', $toTerm->payload);
         $js->term($toTerm)->await();
 
-        delay(1.3);
+        delay(3.5);
         try {
             $js->fetchBatch($stream, $consumer, 1, 700)->await();
             self::fail('Expected TERM-ed message to stop redelivery.');
@@ -934,9 +936,17 @@ final class JetStreamIntegrationTest extends TestCase
         $subscriber->flush()->await();
 
         // Publish one message, then do NOT pump: the server's push MSG stays buffered on the socket
-        // until drain()'s flush-phase read consumes and delivers it during Draining.
+        // until drain()'s flush-phase read consumes and delivers it during Draining. The drain starts once
+        // the server has pushed it, which it then counts as waiting for an ack, rather than after a fixed
+        // pause: a server slower than that pause would push it after the drain's UNSUB, to no one.
         $adminJs->publish($subject, '{"event":"drain-ack"}')->await();
-        delay(0.3);
+        $deadline = $this->monotonic() + 5.0;
+        while (
+            (int) ($adminJs->getConsumer($stream, $consumer)->await()->raw['num_ack_pending'] ?? 0) < 1
+            && $this->monotonic() < $deadline
+        ) {
+            delay(0.05);
+        }
 
         $subscriber->drain()->await();
 

@@ -1515,6 +1515,13 @@ final class NatsClientIntegrationTest extends TestCase
         } catch (TimeoutException $e) {
             self::assertStringContainsString('Request timed out', $e->getMessage());
             self::assertStringContainsString($subject, $e->getMessage());
+
+            // The responder must have received the request, but on a slow runner it may get it only after
+            // the requester's 300 ms are up: wait for it rather than expect it within them.
+            $deadline = $this->monotonic() + 5.0;
+            while ($received === 0 && $this->monotonic() < $deadline) {
+                delay(0.01);
+            }
         } finally {
             $serverPumpCancellation->cancel();
             $serverPump->await();
@@ -2152,7 +2159,9 @@ final class NatsClientIntegrationTest extends TestCase
                 self::assertSame('Connection is not open', $e->getMessage());
             }
 
-            self::assertLessThan(0.1, $this->monotonic() - $start);
+            // A request that waited would wait out its 5 s timeout, since dials stay refused until the end
+            // of the test, and fail with a TimeoutException instead. The bound leaves a slow runner room.
+            self::assertLessThan(2.0, $this->monotonic() - $start);
         } finally {
             $transport->acceptDials();
             $client->disconnect()->await();
