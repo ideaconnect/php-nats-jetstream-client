@@ -2594,6 +2594,23 @@ final class NatsConnection
      */
     public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
     {
+        // Taken here, in the operation's fiber, before the read's own fiber starts a few event-loop hops later: a
+        // delivery made during those hops ends the read as well.
+        return $this->operationRead($cancellation, $ownSid, $alwaysReport, $ownSid === null ? null : $this->nextDeliveryTo($ownSid));
+    }
+
+    /**
+     * {@see readIncomingForOperation()} with the wake-up given: for request() and requestMany(), whose replies come on
+     * the reply inbox every request shares, so that their read ends on their own reply rather than on any delivery to
+     * that inbox.
+     *
+     * @param Cancellation|null $wake Fires once what the operation waits for may have arrived ({@see readChunk()}).
+     * @return Future<IncomingChunkResult>
+     *
+     * @phpstan-impure Mutates connection state, like readIncoming().
+     */
+    private function operationRead(?Cancellation $cancellation, ?int $ownSid, bool $alwaysReport, ?Cancellation $wake): Future
+    {
         return $this->readChunk(
             $cancellation,
             \Fiber::getCurrent(),
@@ -2602,9 +2619,7 @@ final class NatsConnection
             reportHandlerFailures: $alwaysReport || !$this->options->handlerErrorsFailOperations,
             reportFailuresKeepingTheConnection: $alwaysReport,
             deliverLeftovers: $alwaysReport,
-            // Taken here, in the operation's fiber, before the read's own fiber starts a few event-loop hops later: a
-            // delivery made during those hops ends the read as well.
-            wake: $ownSid === null ? null : $this->nextDeliveryTo($ownSid),
+            wake: $wake,
         );
     }
 
@@ -3566,14 +3581,20 @@ final class NatsConnection
         // $deferred->isComplete() so a reply delivered in the same tick the deadline fires is
         // returned instead of being discarded as a spurious timeout.
         $replyReceived = false;
+        // Fired with the reply: this request's read ends without reading, wherever it waits then, since the reply is
+        // all it waits for. The reply can come in another fiber's delivery still under way, or in a reconnect's
+        // (#174). Not a delivery to the reply inbox, which every request shares: that would end every request's read
+        // at each reply.
+        $replyArrived = new DeferredCancellation();
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118). The
         // handler body is unchanged and idempotent: a coalesced duplicate arriving in the same drain
         // batch (before the finally removes the waiter) is ignored by the isComplete() guard.
-        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived): void {
+        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived, $replyArrived): void {
             if (!$deferred->isComplete()) {
                 $deferred->complete($message);
                 $replyReceived = true;
+                $replyArrived->cancel();
             }
         });
 
@@ -3630,7 +3651,7 @@ final class NatsConnection
                 }
 
                 try {
-                    $read = $this->readIncomingForOperation($waitCancellation)->await();
+                    $read = $this->operationRead($waitCancellation, null, false, $replyArrived->getCancellation())->await();
                 } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
                         throw $e;
@@ -3750,10 +3771,13 @@ final class NatsConnection
         /** @var DeferredFuture<null> $replyTick */
         $replyTick = new DeferredFuture();
         $replyTick->getFuture()->ignore();
+        // Rotated with the tick, for the read: the read in flight ends without reading at each delivery, wherever it
+        // waits then, as request()'s does on its reply (#174).
+        $replyWake = new DeferredCancellation();
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118); the
         // collector body (incl. the #160 cap and #135 tick rotation) is unchanged.
-        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, $maxResponses): void {
+        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, &$replyWake, $maxResponses): void {
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
@@ -3771,6 +3795,10 @@ final class NatsConnection
             $replyTick = new DeferredFuture();
             $replyTick->getFuture()->ignore();
             $tick->complete();
+
+            $wake = $replyWake;
+            $replyWake = new DeferredCancellation();
+            $wake->cancel();
         });
 
         try {
@@ -3851,7 +3879,7 @@ final class NatsConnection
                 }
 
                 try {
-                    $read = $this->readIncomingForOperation($sliceCancellation)->await();
+                    $read = $this->operationRead($sliceCancellation, null, false, $replyWake->getCancellation())->await();
                 } catch (CancelledException $e) {
                     if ($cancellation !== null && $cancellation->isRequested()) {
                         throw $e;

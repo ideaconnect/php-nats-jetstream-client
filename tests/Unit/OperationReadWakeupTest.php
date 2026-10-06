@@ -109,12 +109,15 @@ final class OperationReadWakeupTest extends TestCase
     {
         yield 'SubscriptionQueue::next()' => ['next', 'handler'];
         yield 'SubscriptionQueue::fetchAll(1)' => ['fetchAll', 'handler'];
+        yield 'request()' => ['request', 'handler'];
+        yield 'requestMany(max 1)' => ['requestMany', 'handler'];
         yield 'JetStreamContext::fetchBatch(1)' => ['fetchBatch', 'handler'];
         yield 'JetStreamContext::directGetBatch()' => ['directGet', 'handler'];
         yield 'PullConsumerIterator::handle()' => ['pullConsumer', 'handler'];
         yield 'KeyValueBucket::keys()' => ['kvKeys', 'handler'];
         yield 'KeyValueBucket::history()' => ['kvHistory', 'handler'];
         yield 'guard: next() behind a handler that makes a request()' => ['next', 'request'];
+        yield 'guard: request() behind a handler that makes a request()' => ['request', 'request'];
     }
 
     /**
@@ -139,6 +142,8 @@ final class OperationReadWakeupTest extends TestCase
     {
         yield 'SubscriptionQueue::next()' => ['next'];
         yield 'SubscriptionQueue::fetchAll(1)' => ['fetchAll'];
+        yield 'request()' => ['request'];
+        yield 'requestMany(max 1)' => ['requestMany'];
         yield 'JetStreamContext::fetchBatch(1)' => ['fetchBatch'];
         yield 'JetStreamContext::directGetBatch()' => ['directGet'];
         yield 'PullConsumerIterator::handle()' => ['pullConsumer'];
@@ -174,6 +179,10 @@ final class OperationReadWakeupTest extends TestCase
         yield 'fetchBatch(1), a request() around it' => ['fetchBatch', 'request'];
         yield 'directGetBatch(), a processIncoming() around it' => ['directGet', 'processIncoming'];
         yield 'directGetBatch(), a request() around it' => ['directGet', 'request'];
+        yield 'guard: request(), a processIncoming() around it' => ['request', 'processIncoming'];
+        yield 'guard: request(), a request() around it' => ['request', 'request'];
+        yield 'guard: requestMany(max 1), a processIncoming() around it' => ['requestMany', 'processIncoming'];
+        yield 'guard: requestMany(max 1), a request() around it' => ['requestMany', 'request'];
         yield 'PullConsumerIterator::handle(), a processIncoming() around it' => ['pullConsumer', 'processIncoming'];
         yield 'PullConsumerIterator::handle(), a request() around it' => ['pullConsumer', 'request'];
         yield 'KeyValueBucket::keys(), a processIncoming() around it' => ['kvKeys', 'processIncoming'];
@@ -188,6 +197,9 @@ final class OperationReadWakeupTest extends TestCase
      * loop holds the socket. The server answers a request or a pull as soon as it is written; a queue's message is on the
      * socket before the reads start, or arrives as the other party. Each run is fresh, and the operation must have its
      * result within half a second, a third of its 1.5 s deadline: the failures list every hop count where it did not.
+     *
+     * The guards, request() and requestMany(), look at the read slot themselves before they read, and wait on their
+     * reply, or the slot, while another fiber reads: no hop count catches them out.
      */
     #[DataProvider('operationsAndTheReadsAroundThem')]
     public function testOperationEndsPromptlyWhateverTheHopsBetweenItAndAnotherParty(string $operation, string $other): void
@@ -218,6 +230,7 @@ final class OperationReadWakeupTest extends TestCase
     {
         yield "SubscriptionQueue::next(), waiting behind the application's read when the connection drops" => ['next', 'behind'];
         yield "SubscriptionQueue::fetchAll(1), waiting behind the application's read when the connection drops" => ['fetchAll', 'behind'];
+        yield "request(), waiting behind the application's read when the connection drops" => ['request', 'behind'];
         yield "JetStreamContext::fetchBatch(1), waiting behind the application's read when the connection drops" => ['fetchBatch', 'behind'];
         yield 'SubscriptionQueue::next(), called while the reconnect is under way' => ['next', 'during'];
         yield 'SubscriptionQueue::fetchAll(1), called while the reconnect is under way' => ['fetchAll', 'during'];

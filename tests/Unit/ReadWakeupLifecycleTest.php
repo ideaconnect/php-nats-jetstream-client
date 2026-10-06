@@ -529,6 +529,81 @@ final class ReadWakeupLifecycleTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{int, bool}> */
+    public static function concurrentRequests(): iterable
+    {
+        foreach ([5, 20] as $n) {
+            yield $n . ' requests, no other reader' => [$n, false];
+            yield $n . " requests, the application's read loop" => [$n, true];
+        }
+    }
+
+    /**
+     * N requests wait on the reply inbox they all share, and the server answers them one at a time, 20 ms apart, in
+     * reverse order. Each gets its own reply as it comes, within 0.3 s of the answer: a request's wake-up is its own
+     * reply, so another request's reply does not end its read, and the reads of the socket stay few.
+     */
+    #[DataProvider('concurrentRequests')]
+    public function testConcurrentRequestsGetTheirRepliesAsTheyCome(int $n, bool $loop): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = $this->watchedClient($watched);
+        $inboxes = new class {
+            /** @var array<string, string> Reply subject of each request, by its payload. */
+            public array $byPayload = [];
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $inboxes): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if ($subject === 'svc.warm') {
+                return $transport->replyFrame($replyTo, 'ok');
+            }
+
+            $inboxes->byPayload[$payload] = $replyTo;
+
+            return [];
+        };
+        $client->request('svc.warm', 'x', 1_000)->await();
+        $stop = new DeferredCancellation();
+        if ($loop) {
+            $this->startApplicationReadLoop($client, $stop);
+            $this->awaitRead($watched);
+        }
+
+        $start = hrtime(true);
+        $requests = [];
+        for ($i = 0; $i < $n; $i++) {
+            $payload = 'q' . $i;
+            $requests[$payload] = $client->request('svc.slow', $payload, 5_000)->map(fn(NatsMessage $message): array => [$message->payload, $this->secondsSince($start)]);
+        }
+        $this->waitUntil(static fn(): bool => count($inboxes->byPayload) === $n);
+        $readsBefore = $watched->reads;
+        $order = array_reverse(array_keys($inboxes->byPayload));
+        foreach ($order as $k => $payload) {
+            $replyTo = $inboxes->byPayload[$payload];
+            EventLoop::delay(0.02 * ($k + 1), static function () use ($transport, $replyTo, $payload): void {
+                $transport->pushFrame(ReconnectingTransport::msgFrame($replyTo, (int) $transport->sidFor($replyTo), 'r-' . $payload));
+            });
+        }
+        $results = \Amp\Future\await($requests);
+        $reads = $watched->reads - $readsBefore;
+        $stop->cancel();
+
+        $wrong = [];
+        foreach ($results as $payload => [$reply, $at]) {
+            $due = 0.02 * ((int) array_search($payload, $order, true) + 1);
+            if ($reply !== 'r-' . $payload || $at > $due + 0.3) {
+                $wrong[] = sprintf('%s: %s at %.3f s, due at %.3f s', $payload, $reply, $at, $due);
+            }
+        }
+        self::report(sprintf('%d requests, loop %s: %d socket reads for %d replies%s', $n, $loop ? 'yes' : 'no', $reads, $n, $wrong === [] ? '' : "\n    " . implode("\n    ", $wrong)));
+        self::assertSame([], $wrong, 'every request got its own reply as it came');
+        self::assertLessThan(4 * $n + 10, $reads, 'the reads of the socket stayed few');
+    }
+
     /**
      * Drops the connection with dials refused for 60 ms, and has the server send job-1 on the replayed SUB as soon as
      * the reconnect has written it.

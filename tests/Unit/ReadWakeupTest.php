@@ -487,6 +487,143 @@ final class ReadWakeupTest extends TestCase
         $stop->cancel();
     }
 
+    /** @return iterable<string, array{string}> */
+    public static function requestsOnTheSharedInbox(): iterable
+    {
+        yield 'request()' => ['request'];
+        yield 'requestMany(max 1)' => ['requestMany'];
+    }
+
+    /**
+     * Every request's reply comes on the one mux inbox, so a request's read wakes on its own reply, not on a delivery to
+     * the inbox: here a late reply for a request that is gone, delivered by the application's delivery held up ahead of
+     * it, does not end the read of the request still waiting, which then gets its own reply on that same read.
+     */
+    #[DataProvider('requestsOnTheSharedInbox')]
+    public function testARequestsReadIsNotEndedByAReplyForAnotherRequest(string $operation): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = $this->connectWatched($watched);
+        $server = new class {
+            /** The reply subject of the request the server holds the reply of. */
+            public ?string $heldReplyTo = null;
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport, $server): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if ($subject === 'svc.held') {
+                $server->heldReplyTo = $replyTo;
+
+                return [];
+            }
+
+            return $transport->replyFrame($replyTo, 'ok');
+        };
+        $hold = new HeldUpDelivery();
+        // Subscribed ahead of the reply inbox, so its sid is the lower one: the inbox's delivery waits behind its handler.
+        $slowSid = $client->subscribe('slow', $hold->handler())->await();
+        // Sets the reply inbox up.
+        $client->request('svc.warm', 'x', 1_000)->await();
+
+        $stop = new DeferredCancellation();
+        $this->startApplicationReadLoop($client, $stop);
+        $this->awaitRead($watched);
+        $result = $operation === 'request'
+            ? $client->request('svc.held', 'x', 3_000)->map(static fn(NatsMessage $message): array => [$message->payload])
+            : $client->requestMany('svc.held', 'x', null, 1, 3_000)->map(self::payloads(...));
+        $this->waitUntil(static fn(): bool => $server->heldReplyTo !== null);
+        $replyTo = (string) $server->heldReplyTo;
+        $inboxSid = (int) $transport->sidFor($replyTo);
+        $staleReplyTo = substr($replyTo, 0, (int) strrpos($replyTo, '.')) . '.ffffff';
+
+        $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $slowSid, 's') . ReconnectingTransport::msgFrame($staleReplyTo, $inboxSid, 'late'));
+        $hold->began->getFuture()->await(new TimeoutCancellation(2));
+        $watched->onRead = $hold->endWhenARead();
+        // The late reply is delivered as the handler returns, before anything else runs.
+        $hold->returned->getFuture()->await(new TimeoutCancellation(2));
+        $readsAfterTheLateReply = $watched->reads;
+        // Room for a wake-up, had that delivery fired one, to end the request's read and the request to read again.
+        delay(0.02);
+
+        self::assertSame('a read taking the socket', $hold->endedBy, "the request's read took the socket during the hold-up");
+        self::assertSame($readsAfterTheLateReply, $watched->reads, "the request's read is still the one on the socket");
+        self::assertFalse($result->isComplete());
+
+        $transport->pushFrame(ReconnectingTransport::msgFrame($replyTo, $inboxSid, 'reply-1'));
+        self::assertSame(['reply-1'], $result->await(new TimeoutCancellation(2)));
+        $stop->cancel();
+    }
+
+    /**
+     * The caller's own cancellation fires in the same delivery that brought the request's reply, right after it. The
+     * request throws a CancelledException either way, and it is the caller's own, with the reason the caller gave. The
+     * reply's wake-up cancels the read first, and a read that rethrew the first cancellation it met handed the caller the
+     * wake-up's exception, without the reason.
+     */
+    public function testARequestCancelledRightAfterItsReplyArrivedThrowsTheCallersOwnCancellation(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = $this->connectWatched($watched);
+        $server = new class {
+            public ?string $heldReplyTo = null;
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport, $server): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if ($subject === 'svc.held') {
+                $server->heldReplyTo = $replyTo;
+
+                return [];
+            }
+
+            return $transport->replyFrame($replyTo, 'ok');
+        };
+        $hold = new HeldUpDelivery();
+        // Subscribed ahead of the reply inbox, so the inbox's delivery waits behind its handler.
+        $slowSid = $client->subscribe('slow', $hold->handler())->await();
+        $client->request('svc.warm', 'x', 1_000)->await();
+        $callerCancel = new DeferredCancellation();
+        // Subscribed after the reply inbox: delivered right after the reply, in the same pass.
+        $cancellerSid = $client->subscribe('canceller', static function () use ($callerCancel): void {
+            $callerCancel->cancel(new \RuntimeException('the caller gave up'));
+        })->await();
+
+        $stop = new DeferredCancellation();
+        $this->startApplicationReadLoop($client, $stop);
+        $this->awaitRead($watched);
+        $result = $client->request('svc.held', 'x', 3_000, $callerCancel->getCancellation());
+        $result->ignore();
+        $this->waitUntil(static fn(): bool => $server->heldReplyTo !== null);
+        $replyTo = (string) $server->heldReplyTo;
+        $inboxSid = (int) $transport->sidFor($replyTo);
+
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('slow', $slowSid, 's')
+            . ReconnectingTransport::msgFrame($replyTo, $inboxSid, 'reply-1')
+            . ReconnectingTransport::msgFrame('canceller', $cancellerSid, 'c'),
+        );
+        $hold->began->getFuture()->await(new TimeoutCancellation(2));
+        $watched->onRead = $hold->endWhenARead();
+
+        $thrown = null;
+        try {
+            $result->await(new TimeoutCancellation(5));
+        } catch (CancelledException $e) {
+            $thrown = $e;
+        }
+        $stop->cancel();
+
+        self::assertSame('a read taking the socket', $hold->endedBy, "the request's read took the socket during the hold-up");
+        self::assertNotNull($thrown, 'the caller cancelled the request');
+        self::assertSame('the caller gave up', $thrown->getPrevious()?->getMessage(), 'the caller gets its own cancellation, with its reason');
+    }
+
     /**
      * A wake-up is only a reason to look again: what the operation looks at is its own state. Here another poller of the
      * same queue takes the message the delivery brought before the woken poll looks. The poll finds nothing, returns
@@ -801,6 +938,15 @@ final class ReadWakeupTest extends TestCase
         }
 
         return substr($bytes, 0, $size);
+    }
+
+    /**
+     * @param list<NatsMessage> $messages
+     * @return list<string>
+     */
+    private static function payloads(array $messages): array
+    {
+        return array_map(static fn(NatsMessage $message): string => $message->payload, $messages);
     }
 
     /** Writes a throwaway self-signed certificate and its key, in one PEM file, for the TLS test server. */

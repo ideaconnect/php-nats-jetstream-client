@@ -40,6 +40,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   operation then looks again. Application reads, `processIncoming()` and `readIncoming()`, are unchanged, and so is
   the order of deliveries: an operation gets its message once the in-order delivery reaches it, so a handler ahead of
   it that outlasts the operation's deadline still makes it time out.
+- `[bugfix]` `request()` and `requestMany()` got a reply that another fiber's read delivered only with the server's
+  next bytes or at their timeout in the same three cases (#174). Their replies come on the one reply inbox every
+  request shares, so their read ends on their own reply instead, as the waiter that takes it fires: another request's
+  reply does not end it. A request cancelled right after its reply arrived throws the caller's own cancellation, with
+  its reason.
 - `[bugfix]` `SubscriptionQueue::next()` with a timeout, and `fetchAll()` with a limit and a timeout, returned a
   message that another fiber's read delivered while they paused between reads (an application's
   `processIncoming()` loop, say) only once the timeout ran out (#174). They started another read before they
