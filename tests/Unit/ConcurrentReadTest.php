@@ -10,8 +10,11 @@ use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
@@ -230,6 +233,52 @@ final class ConcurrentReadTest extends TestCase
 
         self::assertSame($poll === 'next' ? 'job-1' : ['job-1'], $result);
         self::assertLessThan(2.5, $elapsed, 'the poll returned the message once it was there, not at the end of its 5 s timeout');
+        self::assertSame(1, $reader->await(), 'the application\'s first read brought the other subscription\'s message');
+    }
+
+    /** @return iterable<string, array{SlowConsumerPolicy}> */
+    public static function slowConsumerPolicies(): iterable
+    {
+        yield 'DropOldest' => [SlowConsumerPolicy::DropOldest];
+        yield 'DropNewest' => [SlowConsumerPolicy::DropNewest];
+        yield 'Error' => [SlowConsumerPolicy::Error];
+    }
+
+    /**
+     * fetchAll() takes what another fiber's read delivered during its pause before it reads again, also
+     * when that does not complete the call, so its own next read has the queue's whole buffer. The queue
+     * holds 2 messages. The application's second read fills it during the poll's pause, as in the test
+     * above, and the poll's own read then brings 2 more. The poll used to read with its buffer still full,
+     * and the 2 that read brought overflowed it: DropOldest dropped the first 2, DropNewest the last 2, and
+     * Error failed the call with a SlowConsumerException.
+     */
+    #[DataProvider('slowConsumerPolicies')]
+    public function testFetchAllTakesWhatAnotherReadDeliveredDuringItsPauseBeforeReadingOn(SlowConsumerPolicy $policy): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, maxPendingMessagesPerSubscription: 2, slowConsumerPolicy: $policy), $transport);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $queue = $client->subscribeQueue('jobs')->await();
+        $other = $client->subscribe('other', static function () use ($transport, $client, $queue): void {
+            EventLoop::defer(static function () use ($transport, $client, $queue): void {
+                $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j1') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j2'));
+                async(static fn(): int => $client->processIncoming()->await())->ignore();
+                // The next 2 come a little later, for the poll's own read.
+                EventLoop::delay(0.1, static fn() => $transport->pushFrame(
+                    ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j3') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'j4'),
+                ));
+            });
+        })->await();
+        $reader = async(static fn(): int => $client->processIncoming()->await());
+        delay(0.01);
+        EventLoop::delay(0.05, static fn() => $transport->pushFrame(ReconnectingTransport::msgFrame('other', $other, 'o1')));
+        self::assertFalse($reader->isComplete(), 'the application\'s read holds the socket when the poll starts');
+
+        $messages = $queue->setTimeout(5.0)->fetchAll(4);
+
+        self::assertSame(['j1', 'j2', 'j3', 'j4'], array_map(static fn(NatsMessage $message): string => $message->payload, $messages));
+        self::assertSame(0, $queue->droppedCount());
         self::assertSame(1, $reader->await(), 'the application\'s first read brought the other subscription\'s message');
     }
 

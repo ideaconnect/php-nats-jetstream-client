@@ -25,6 +25,10 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   looked at the queue, and that read waited on the socket, with the message already there, for the server's
   next bytes or the whole timeout. They now take what arrived before they read again. `next()` had this shape
   since 1.0.0, `fetchAll()` since 2.0.0.
+- `[bugfix]` `SubscriptionQueue::fetchAll()` also takes what such a read delivered during its pause when that
+  does not complete the call, so its own next read has the queue's whole buffer (#174). When that delivery had
+  filled the queue, the messages the next read brought overflowed it: they or the earlier ones were dropped, or
+  under `SlowConsumerPolicy::Error` the call failed with a `SlowConsumerException`.
 
 ### Testing & CI
 
