@@ -239,8 +239,9 @@ final class CloseIntentTest extends TestCase
      * has ended, so a connect() issued after it dials afresh. The reconnect used to go on dialling after
      * disconnect() returned, and that connect() failed with "Recovery was aborted before the connection
      * opened". In a synchronous application the reconnect never got the event-loop time to end at all, and
-     * every connect() failed that way. The held dial ends by itself only at the connect timeout, ten seconds
-     * here, so a disconnect() that waited for it instead of stopping it would take five times the bound below.
+     * every connect() failed that way. The held dial never ends by itself, so a disconnect() that waited for it
+     * instead of stopping it would return only at the bound on that wait, the connect timeout: ten seconds here,
+     * five times the bound below.
      */
     public function testConnectAfterDisconnectDialsAfreshWhileTheReconnectItStoppedWasDialling(): void
     {

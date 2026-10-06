@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\CancelledException;
+use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
@@ -117,21 +119,24 @@ final class ConnectionEndingFrameTest extends TestCase
     /**
      * The request waits for that reconnect no longer than its own timeout allows, and fails with the
      * server's error even when the timeout ends the wait; the reconnect carries on without it. Its dial is
-     * held until the test lets it through, and only the ten-second connect timeout would end it otherwise.
+     * held until the test lets it through, whatever the connect timeout, so a request that waited for the
+     * reconnect past its own timeout would never end: the test stops waiting for it after five seconds.
      */
     public function testRequestThatMeetsAFatalErrWaitsForTheReconnectOnlyWithinItsTimeout(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 300, connectTimeoutMs: 10_000);
+        $connection = $this->connect($transport, requestTimeoutMs: 300);
         $this->answerFirstRequestWithStaleConnection($transport);
         $transport->holdNextDial();
 
         $start = hrtime(true);
         try {
-            $connection->request('svc', 'one')->await();
+            $connection->request('svc', 'one')->await(new TimeoutCancellation(5));
             self::fail('expected ConnectionException');
         } catch (ConnectionException $e) {
             self::assertSame("Server sent error frame: 'Stale Connection'", $e->getMessage());
+        } catch (CancelledException) {
+            self::fail('the request still waited for the held reconnect after 5 s, past its own 300 ms timeout');
         }
         $elapsed = $this->secondsSince($start);
 
@@ -147,13 +152,13 @@ final class ConnectionEndingFrameTest extends TestCase
     /**
      * A request that may not wait for a reconnect does not wait for this one either: it fails at once, and
      * the reconnect has started by then, so the next operation does not reach the old socket. The reconnect's
-     * dial is held until the test lets it through, so a request that waited for it would take its whole ten
-     * seconds.
+     * dial is held until the test lets it through, so a request that waited for it would wait out its whole
+     * ten-second timeout, five times the bound below.
      */
     public function testRequestThatMeetsAFatalErrWithWaitingDisabledFailsAtOnce(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, waitForReconnect: false, requestTimeoutMs: 10_000, connectTimeoutMs: 10_000);
+        $connection = $this->connect($transport, waitForReconnect: false, requestTimeoutMs: 10_000);
         $this->answerFirstRequestWithStaleConnection($transport);
         $transport->holdNextDial();
 

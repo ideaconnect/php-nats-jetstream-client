@@ -3152,9 +3152,10 @@ final class KeyValueBucketTest extends TestCase
      * replay whose revisions keep arriving (each gap shorter than the bound) must complete WITHOUT
      * throwing even when the TOTAL replay time exceeds the bound - only a genuinely stalled server (no
      * progress for the whole interval) throws. Revisions are fed spaced apart at runtime: each resets
-     * the stall clock, and the total elapsed (~1.5 s) exceeds the 1 s bound, so a whole-replay
-     * deadline would have thrown here. Each gap (0.1 s) is short enough that a slow runner pausing
-     * for 0.8 s between two revisions does not stall the replay.
+     * the stall clock, and the total elapsed (~2.25 s) exceeds the 2 s bound, so a whole-replay
+     * deadline would have thrown here before the replay caught up. Each gap (0.15 s) leaves 1.85 s
+     * of the bound, so a slow runner that blocks the event loop for up to 1.8 s between two
+     * revisions does not stall the replay.
      */
     public function testHistoryDoesNotThrowWhileReplayKeepsMakingProgress(): void
     {
@@ -3171,13 +3172,13 @@ final class KeyValueBucketTest extends TestCase
         $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
         $client->connect()->await();
 
-        // Start the replay with a 1 s PROGRESS bound but do not await yet.
-        $future = $client->jetStream()->keyValue('cfg')->history('theme', 1.0);
+        // Start the replay with a 2 s PROGRESS bound but do not await yet.
+        $future = $client->jetStream()->keyValue('cfg')->history('theme', 2.0);
 
-        // Feed fifteen revisions 0.1 s apart (each gap < 1 s bound); num_pending decrements to 0 on the
-        // last so the replay catches up. Total elapsed ~1.5 s > 1 s bound.
+        // Feed fifteen revisions 0.15 s apart (each gap < 2 s bound); num_pending decrements to 0 on the
+        // last so the replay catches up. Total elapsed ~2.25 s > 2 s bound.
         for ($i = 1; $i <= 15; $i++) {
-            delay(0.1);
+            delay(0.15);
             $numPending = 15 - $i;
             $value = 'v' . $i;
             $transport->pushReadChunk(sprintf(

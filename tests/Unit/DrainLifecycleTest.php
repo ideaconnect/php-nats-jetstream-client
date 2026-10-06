@@ -2269,11 +2269,17 @@ final class DrainLifecycleTest extends TestCase
     }
 
     /**
-     * A drain called while a service's run() delivers a read - a handler that awaits, and a message queued
-     * behind it whose handler awaits longer - ends once the server has answered its PING and both handlers
-     * have run. A flush that delivered the queued message before it read, as the loop's read does with what an
-     * earlier read left queued, would wait out its whole budget: while that handler awaited, the loop would
-     * read the PONG and park its next read, and the flush would then wait for that read.
+     * A drain called while a service's run() delivers a read (a handler that awaits, with a message queued
+     * behind it whose handler awaits longer) ends well within its budget, once the server has answered its PING
+     * and both handlers have run.
+     *
+     * It fails on a flush whose read delivers that queued message before it reads, as the loop's read does with
+     * what an earlier read left queued, and then reads without checking again whether its PONG is in: while
+     * that handler awaited, the loop would read the PONG and park its next read, and the flush would wait for
+     * that read until its whole budget ran out. A flush read that delivered first but still checked for its
+     * PONG before it read or waited for another fiber's read, as every read for a PONG does, would end promptly,
+     * so delivering first is not caught on its own. Skipping that check on its own is caught by
+     * testFlushEndsPromptlyWheneverAnotherFibersReadStartsAroundIt.
      */
     #[DataProvider('drainsWhileAServiceLoopDelivers')]
     public function testADrainEndsPromptlyWhileAServiceLoopDeliversARead(string $drain): void

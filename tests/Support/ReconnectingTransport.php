@@ -143,8 +143,13 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
      */
     private array $stalledWrites = [];
 
-    /** Writes whose stall is still running, those that outlive their session included. */
-    private int $writesStalled = 0;
+    /**
+     * Every stall still running, keyed by its timer, those that outlive their session included: what
+     * {@see writesStalled()} counts and {@see releaseStalledWrites()} ends.
+     *
+     * @var array<string, DeferredFuture<null>>
+     */
+    private array $runningStalls = [];
 
     /** @var array<string, true> Timers of the live session's delayed responses: cancelled when it ends. */
     private array $delayedDeliveries = [];
@@ -354,6 +359,7 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
      * The stall ends early, failing the write, when its session ends - as a real socket's pending write
      * fails when the socket closes. With $outlivesSession it runs its full course anyway, and only then
      * fails: a transport whose close leaves a pending write to fail later, which TransportInterface allows.
+     * Either kind also ends early, as if its time were up, when the test calls releaseStalledWrites().
      */
     public function stallNextWriteContaining(string $needle, float $seconds, bool $outlivesSession = false): void
     {
@@ -363,17 +369,18 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     /** How many writes are stalled right now (see {@see stallNextWriteContaining()}). */
     public function writesStalled(): int
     {
-        return $this->writesStalled;
+        return count($this->runningStalls);
     }
 
     /**
-     * Ends now every stall of the live session that would end with it, as if its time were up: the stalled
-     * writes complete. For a test that holds a write up, with a stall longer than it lasts, until it has done
-     * what must happen while the write waits, rather than racing the stall's timer.
+     * Ends now every stall still running, as if its time were up, those that outlive their session included: a
+     * stalled write whose session is still live completes, and one whose session has ended fails, as it would
+     * have at the end of its time. For a test that holds a write up, with a stall longer than it lasts, until it
+     * has done what must happen while the write waits, rather than racing the stall's timer.
      */
     public function releaseStalledWrites(): void
     {
-        foreach ($this->stalledWrites as $timer => $released) {
+        foreach ($this->runningStalls as $timer => $released) {
             EventLoop::cancel($timer);
             if (!$released->isComplete()) {
                 $released->complete();
@@ -633,8 +640,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     }
 
     /**
-     * Holds the calling write for $seconds, or - unless it outlives its session - until the session ends.
-     * The timer is referenced, like the writable watcher of a real socket's pending write.
+     * Holds the calling write for $seconds or until {@see releaseStalledWrites()}, and, unless it outlives its
+     * session, no longer than the session lasts. The timer is referenced, like the writable watcher of a real
+     * socket's pending write.
      */
     private function stall(float $seconds, bool $outlivesSession): void
     {
@@ -645,17 +653,16 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
                 $released->complete();
             }
         });
+        $this->runningStalls[$timer] = $released;
         if (!$outlivesSession) {
             $this->stalledWrites[$timer] = $released;
         }
 
-        $this->writesStalled++;
         try {
             $released->getFuture()->await();
         } finally {
-            $this->writesStalled--;
             EventLoop::cancel($timer);
-            unset($this->stalledWrites[$timer]);
+            unset($this->stalledWrites[$timer], $this->runningStalls[$timer]);
         }
     }
 
