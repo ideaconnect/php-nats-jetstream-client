@@ -11,6 +11,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -396,8 +397,9 @@ final class ServerErrorKeepingConnectionTest extends TestCase
 
     /**
      * An operation's read, such as a request's, reports a handler that throws and delivers the rest, as a serving
-     * loop's read does (#173). With handlerErrorsFailOperations it still throws the handler's failure and leaves
-     * the rest queued, as every operation's read did before that option.
+     * loop's read does (#173). With handlerErrorsFailOperations it still throws the handler's failure, as every
+     * operation's read did before that option, once it has delivered the other subscription's message; only the
+     * rest of the failing subscription stays queued (#177).
      */
     #[DataProvider('handlerFailuresFailingOperationsOrNot')]
     public function testAnOperationsReadReportsAHandlerThatThrowsUnlessConfiguredToFail(bool $failOperations): void
@@ -423,16 +425,17 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             self::assertSame('handler a', $e->getMessage());
         }
 
-        self::assertSame(['a:x'], $seen);
+        self::assertSame(['a:x', 'b:z'], $seen, "b's message is delivered before the failure is thrown; a's next message stays queued (#177)");
         self::assertSame([], $recorder->errors);
     }
 
     /**
-     * The read of a serving loop first delivers what an earlier read left queued - one that stopped at a
-     * throwing handler - although the socket has nothing more to give it. Those messages used to wait for the
-     * server's next bytes, since a read that finds nothing new delivers nothing.
+     * Your own read delivers the other subscriptions' messages before it throws a handler's exception (#177): only
+     * the failing subscription's own remainder stays queued. The read of a serving loop then delivers that
+     * remainder although the socket has nothing more to give it. Your read used to stop at the throwing handler
+     * and leave every message behind it queued, for every subscription, until a read received bytes.
      */
-    public function testAReadForAServingLoopDeliversWhatAnEarlierReadLeftQueued(): void
+    public function testYourOwnReadThrowsAfterDeliveringTheOtherSubscriptionsAndAServingReadDeliversTheRemainder(): void
     {
         $recorder = new LifecycleRecorder();
         $seen = [];
@@ -443,21 +446,21 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         } catch (\RuntimeException $e) {
             self::assertSame('handler a', $e->getMessage());
         }
-        self::assertSame(['a:x'], $seen);
+        self::assertSame(['a:x', 'b:z'], $seen, "b's message is delivered before the exception is thrown");
 
         $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
 
-        self::assertSame(['a:x', 'a:y', 'b:z'], $seen);
+        self::assertSame(['a:x', 'b:z', 'a:y'], $seen, "a's remainder is delivered by the serving read");
         self::assertFalse($read->consumedBytes, 'nothing more was read');
         self::assertSame([], $recorder->errors);
     }
 
     /**
-     * The same once it has waited for another fiber's read that stopped at a throwing handler: it delivers what
-     * that read left queued before it returns, instead of leaving it to its own next read, which a loop that is
-     * stopping never makes.
+     * A serving loop's read that has waited for another fiber's read, whose delivery is held up in a handler that
+     * awaits, delivers what that read has queued and not reached before it returns, instead of leaving it to its own
+     * next read, which a loop that is stopping never makes.
      */
-    public function testAReadForAServingLoopThatWaitedForAnotherFibersReadDeliversWhatThatReadLeftQueued(): void
+    public function testAReadForAServingLoopThatWaitedForAnotherFibersReadDeliversWhatThatReadHasNotReached(): void
     {
         $recorder = new LifecycleRecorder();
         $transport = new ReconnectingTransport();
@@ -469,11 +472,10 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         ), $transport);
         $connection->connect()->await();
         $seen = [];
-        $sidA = $connection->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
+        $hold = new HeldUpDelivery(fallbackSeconds: 2.0);
+        $sidA = $connection->subscribe('a', static function (NatsMessage $message) use (&$seen, $hold): void {
             $seen[] = 'a:' . $message->payload;
-            if ($message->payload === 'x') {
-                throw new \RuntimeException('handler a');
-            }
+            $hold->holdUp();
         })->await();
         $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
             $seen[] = 'b:' . $message->payload;
@@ -486,21 +488,18 @@ final class ServerErrorKeepingConnectionTest extends TestCase
 
         $transport->pushFrame(
             ReconnectingTransport::msgFrame('a', $sidA, 'x')
-            . ReconnectingTransport::msgFrame('a', $sidA, 'y')
             . ReconnectingTransport::msgFrame('b', $sidB, 'z'),
         );
         $read = $serving->await();
+        $heldWhenItReturned = $hold->held;
+        $hold->end('the end of the test');
         // Awaited before the assertions below: had one of them failed first, this read's failure would be reported
         // in whichever test ran next.
-        try {
-            $other->await();
-            self::fail('expected the other read to fail with the handler\'s exception');
-        } catch (\RuntimeException $e) {
-            self::assertSame('handler a', $e->getMessage());
-        }
+        self::assertSame(2, $other->await(), 'the other read delivered what it read once its handler returned');
 
+        self::assertTrue($heldWhenItReturned, "the other read's delivery was still held up in a's handler when the serving read returned");
         self::assertFalse($read->consumedBytes, 'the other fiber read the socket');
-        self::assertSame(['a:x', 'a:y', 'b:z'], $seen, 'what that read left queued was delivered before this one returned');
+        self::assertSame(['a:x', 'b:z'], $seen, "b's message, which that read had not reached, was delivered before this one returned");
         self::assertSame([], $recorder->errors);
         $connection->disconnect()->await();
     }

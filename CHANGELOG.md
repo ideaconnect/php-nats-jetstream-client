@@ -15,6 +15,42 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- Your own read, `processIncoming()` or `readIncoming()`, now delivers the messages it brought for the other
+  subscriptions before it throws a handler's exception; only the failing subscription's own later messages stay
+  queued, until the next read that receives anything (or a serving loop's read) continues with them: on an
+  otherwise idle connection that is the server's next `PING`, by default two minutes away. Under
+  `handlerErrorsFailOperations: true` an operation's read does the same before it fails the operation, and a
+  handler's `CancelledException` no longer ends the operation's wait when the operation's own result arrived in
+  the same read behind it: the result is delivered first and the operation completes with it. A second
+  subscription whose handler throws in the same read has its exception passed to the `errorListener` and logged
+  at error level, since one read throws one exception; it used to be thrown by the next read that received
+  bytes, so without an `errorListener` or a logger it is now seen nowhere. Code that relied on nothing behind a
+  throwing handler being delivered until it read again now sees those handlers run within the read that throws,
+  and a handler behind the failing one that awaits, or an `errorListener` that awaits while a second failure of
+  the same read is reported, delays the exception by as long.
+
+### Fixed
+
+- `[bugfix]` A message left queued by a handler that threw in another fiber's read waited for the next read
+  that received bytes (#177). The application's `processIncoming()` read a chunk holding a message whose handler
+  threw and, behind it, the message an operation waited for; the delivery stopped at the failing handler, and
+  nothing delivered the rest until the server sent more, so `SubscriptionQueue::next()`, `fetchAll()`,
+  `request()`, `requestMany()` and `fetchBatch()` waited out their whole deadline with their result queued the
+  whole time, and the pipelined pull consumer re-pulled at every expiry with its message queued the whole time;
+  on a real server, which pings only every two minutes, that is the whole deadline every time. A read that
+  throws a handler's exception now delivers everything else it queued first: the other subscriptions' messages,
+  in sid order, so the operation's wake-up fires as usual and it returns its result at once. The failing
+  subscription's later messages still stay queued, in order, for the next read that receives anything: your own
+  read then throws again if the next handler throws, so each failure of that subscription reaches you one read
+  at a time, and an operation's or a background read that delivers them reports the failure instead. A serving
+  loop's read, as `Service::run()` makes, still delivers what an earlier or a concurrent read has queued and not
+  reached: the later sids of a delivery that another fiber's handler holds up, awaiting, and the rest of a
+  subscription whose handler threw.
+
 ## [2.12.0] - 2026-10-06
 
 ### Upgrade notes

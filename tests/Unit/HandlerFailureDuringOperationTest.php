@@ -277,7 +277,8 @@ final class HandlerFailureDuringOperationTest extends TestCase
 
     /**
      * Your own reads still throw a handler's exception, whatever the option says: processIncoming() is how an
-     * application dispatches, and the failure is its own to handle.
+     * application dispatches, and the failure is its own to handle. The read delivers the later subscription's
+     * message before it throws (#177); it used to leave it queued.
      */
     #[DataProvider('eitherWay')]
     public function testYourOwnReadStillThrowsAHandlerFailure(bool $failOperations): void
@@ -285,7 +286,7 @@ final class HandlerFailureDuringOperationTest extends TestCase
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
         $client = $this->clientReportingTo($transport, $recorder, $failOperations);
-        [$frames] = $this->poisonAndLater($client);
+        [$frames, $later] = $this->poisonAndLater($client);
         $transport->pushFrame($frames);
 
         try {
@@ -296,6 +297,7 @@ final class HandlerFailureDuringOperationTest extends TestCase
         }
 
         self::assertSame([], $recorder->errorsContaining(self::FAILURE));
+        self::assertSame(['u1'], $later->payloads, 'delivered by the read that threw');
     }
 
     private function clientReportingTo(ReconnectingTransport $transport, LifecycleRecorder $recorder, bool $failOperations = false): NatsClient

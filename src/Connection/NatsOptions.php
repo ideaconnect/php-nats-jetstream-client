@@ -141,9 +141,13 @@ final class NatsOptions
       *        of the operation's own subscription that throws still fails it. Set `true` for the behavior
       *        before this option existed: any handler's exception fails the operation whose read delivered
       *        to it, even a request whose reply had already arrived, and a handler's CancelledException can
-      *        end an operation's wait early, as it did then. processIncoming() and readIncoming() throw a
-      *        handler's exception either way. Service::run(), the heartbeat, a reconnect and
-      *        drain()/drainSubscription() report it either way.
+      *        end an operation's wait early, as it did then, unless the operation's own result arrived in
+      *        the same read behind it: the read delivers it first and the operation completes with it. The
+      *        read still delivers the other subscriptions' messages behind the failing one before it throws;
+      *        only the failing subscription's later messages wait for the next read that receives anything,
+      *        on an idle connection the server's next PING (#177). processIncoming() and readIncoming()
+      *        throw a handler's exception either way, after the same delivery. Service::run(), the heartbeat,
+      *        a reconnect and drain()/drainSubscription() report it either way.
      */
     public function __construct(
         public readonly array $servers = [self::DEFAULT_SERVER],
