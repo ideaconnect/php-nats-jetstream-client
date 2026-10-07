@@ -15,6 +15,43 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.19.0] - 2026-10-07
+
+### Fixed
+
+- `[bugfix]` A JetStream pull fetch (`fetchBatch()`, `fetchNext()`), a pull consumer run (`PullConsumerIterator::handle()`)
+  or a batched Direct Get (`directGetBatch()`, `directGetLastForSubjects()`) whose reply-inbox `SUB` the server rejected
+  for the connection's subscription limit learnt of it only when its own read met the `-ERR 'maximum subscriptions
+  exceeded'` (#175). When another fiber's read took it - the heartbeat's while the `SUB` write was held up, an
+  application's `processIncoming()` loop's - the `-ERR`, which names no subject, was reported to the error listener and
+  nothing else happened: the fetch waited out its expiry plus a second and reported an empty pull (`JetStreamException`
+  408, `No messages received within timeout`), which callers treat as no messages; the Direct Get batch reported a
+  stalled batch after the same wait; the pull engine, whose rejection handler the connection called only for an `-ERR`
+  naming its subject, retired pull after pull at their deadlines. Measured through symfony-nats-messenger on 2.10.3: an
+  empty batch after 1.6 s, the connection open, the `-ERR` only on the listener. The inboxes now get the shared reply
+  inbox's rule, generalised (`NatsConnection::subscribeGuarded()`, `@internal`, exposed on `NatsClient`): a `PING` is
+  written behind the inbox's `SUB` in the same write, and the inbox counts as held by the server once that `PING`'s
+  `PONG` or a delivery on it arrives; a limit `-ERR` read before that, by whichever fiber, drops the inbox, writes its
+  `UNSUB` (the `-ERR` may have been another `SUB`'s, and the server then still holds the inbox) and tells the operation,
+  which fails at once: the fetch and the Direct Get batch with a `ConnectionException` naming the inbox and the limit
+  (`JetStream pull fetch failed: the server may have rejected its reply-inbox subscription "_INBOX.JS.FETCH.<nuid>"
+  because the connection is at its subscription limit (maximum subscriptions exceeded). A retry subscribes a new one.`),
+  the pull engine through its fail-fast latch (#167), whose `JetStreamException` now says the limit when that is the
+  cause. A reconnect replays such an inbox with a `PING` behind it again, with the same consequence, also when the
+  inbox's own `SUB` write failed and the reconnect it started replays it: the subscribe then reports the rejection,
+  not a closed connection, and the replay writes the inbox's `UNSUB`. As for the shared reply inbox, several inboxes
+  unconfirmed at once - two fetches, a fetch and the reply inbox - cannot be told apart by the `-ERR`, so each is
+  treated as rejected and each operation fails; an operation whose own read meets the `-ERR` still fails with the
+  server's error, as before; a `subscribe()` of the application's beyond the limit behaves as before. A permissions
+  violation naming a fetch's or a Direct Get's inbox now fails the call at once as well, quoting it, where the call
+  waited out its deadline. `markSubscriptionUnbounded()` and `onSubscriptionRejected()` leave a sid that is no longer
+  registered alone, so a rejection read between the `SUB` write and those calls leaves nothing behind. Callers that
+  catch only `JetStreamException` around a fetch or a Direct Get batch, treating an empty result as routine, now see a
+  `ConnectionException` at the subscription limit, on a connection that stays open.
+  Verified on nats-server 2.12 with `max_subscriptions: 3`: with an application loop reading and the `SUB` write held
+  up for 0.5 s, the fetch failed as soon as the write completed (0.50 s after it was issued) and a retry with a free
+  slot got the stored message, where it reported an empty pull after 2.50 s.
+
 ## [2.18.0] - 2026-10-07
 
 ### Fixed

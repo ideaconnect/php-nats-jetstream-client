@@ -252,6 +252,39 @@ final class NatsConnection
      * @var array<int, \Closure(string):void>
      */
     private array $subscriptionRejectionHandlers = [];
+    /**
+     * Sids subscribed through {@see subscribeGuarded()}: the reply inboxes of the JetStream pull fetch, the pull
+     * pipeline and the batched Direct Get, whose rejection by the subscription limit must reach the operation
+     * waiting on them, whichever fiber's read meets the -ERR (#175). Each gets the reply inbox's rule: a PING is
+     * written right behind its SUB, and the sid is unconfirmed ({@see $unconfirmedSids}) until that PING's PONG or a
+     * delivery on it. {@see resubscribeAll()} replays them the same way. Cleared with the sid's state.
+     *
+     * @var array<int, true>
+     */
+    private array $guardedSids = [];
+    /**
+     * The guarded sids the server is not yet known to hold, each with the pong slot of the PING written behind its
+     * SUB ({@see $muxFence} for the reply inbox's). The server answers a SUB it rejects ahead of that PONG, and a
+     * rejected SUB delivers nothing, so until the PONG or a delivery arrives a 'maximum subscriptions exceeded' -ERR,
+     * which names no subject, may be the one rejecting the SUB: such an -ERR rejects every sid still here
+     * ({@see rejectUnconfirmedSubscriptions()}). A sid leaves the map when it is confirmed or rejected, and with
+     * its state; a confirmed sid costs nothing afterwards.
+     *
+     * @var array<int, DeferredFuture<null>>
+     */
+    private array $unconfirmedSids = [];
+    /**
+     * Sids of guarded subscriptions the client treated as rejected whose UNSUB is still to be written: when the -ERR
+     * was another SUB's after all, the server still holds the subscription, and the UNSUB frees its slot. Written
+     * on the connection the -ERR was read on, when the operation that owned the sid unsubscribes it
+     * ({@see unsubscribe()}, {@see releaseRejectedSubscription()}), or by the replay for a replayed sid the new
+     * server rejected ({@see finishReplayWindow()}). A sid still queued once that connection is gone is forgotten
+     * ({@see connectOnce()}): the server dropped whatever it held with the connection. The server ignores an UNSUB
+     * for a sid it does not hold.
+     *
+     * @var list<int>
+     */
+    private array $guardedSidsToRelease = [];
     private int $outstandingPings = 0;
     private ?string $pingTimerId = null;
     /**
@@ -1315,6 +1348,11 @@ final class NatsConnection
         $this->terminalCloses++;
         $this->unboundedSids = [];
         $this->subscriptionRejectionHandlers = [];
+        // The guarded inboxes went with their subscriptions, and the server dropped whatever it held with the
+        // connection: nothing is left to confirm, reject or release (#175).
+        $this->guardedSids = [];
+        $this->unconfirmedSids = [];
+        $this->guardedSidsToRelease = [];
         $this->removeAfterDelivery = [];
         $this->reconnectBuffer = '';
         $this->parser = new ProtocolParser();
@@ -2140,7 +2178,7 @@ final class NatsConnection
     }
 
     /**
-     * Body of {@see subscribe()}, also used for the mux reply inbox.
+     * Body of {@see subscribe()}, also used for the mux reply inbox and the guarded inboxes ({@see subscribeGuarded()}).
      *
      * @param callable(NatsMessage):void $handler
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the subscribe.
@@ -2201,14 +2239,116 @@ final class NatsConnection
             }
 
             // A terminal close released it, and a connect() opened a fresh connection since: nothing
-            // subscribed it there. (The reply inbox's registration also goes when the server rejects its
-            // replayed SUB; ensureMuxInbox() reports that instead.)
+            // subscribed it there. (The reply inbox's and a guarded inbox's registration also go when the
+            // server rejects their replayed SUB; ensureMuxInbox() and subscribeGuarded() report that instead.)
             if (!isset($this->subscriptionMeta[$sid])) {
                 throw new ConnectionException(sprintf('Subscribe to "%s" failed: the connection was closed', $subject), 0, $writeError);
             }
         }
 
         return $sid;
+    }
+
+    /**
+     * Subscribes a reply inbox whose rejection by the connection's subscription limit must reach the operation
+     * waiting on it, whichever fiber's read meets the -ERR: the JetStream pull fetch, the pull pipeline and the
+     * batched Direct Get inboxes (#175). It is the reply inbox's rule ({@see ensureMuxInbox()}, {@see $muxFence}),
+     * generalised: a PING is written right behind the SUB, in the same write, and the sid is unconfirmed
+     * ({@see $unconfirmedSids}) until the PONG answering that PING or a delivery on it, both of which prove the
+     * server holds it. The server answers a SUB it rejects with 'maximum subscriptions exceeded' ahead of that
+     * PONG, and the -ERR names no subject, so one read before the sid is confirmed is taken as the SUB's: the
+     * subscription is dropped, an UNSUB is owed for it ({@see $guardedSidsToRelease}, since the -ERR may have
+     * been another SUB's after all), and $onRejected is called with the -ERR text, in the dispatch of the -ERR,
+     * before any read it ended returns ({@see rejectUnconfirmedSubscriptions()}). The -ERR then fails the read that
+     * met it, or is reported, as it always did. $onRejected is also the sid's rejection handler for a permissions
+     * violation naming its subject ({@see markSubscriptionRejectionHandler()}), which leaves the subscription for
+     * the operation to unsubscribe, as before.
+     *
+     * Several SUBs unconfirmed at once - two fetches, a fetch and the reply inbox - cannot be told apart by an -ERR
+     * that names none: each is treated as rejected and each operation fails, as the reply inbox is dropped. The
+     * window is one round trip, plus the time the SUB write waits behind earlier writes. A reconnect replays the
+     * subscription with a PING behind it again ({@see resubscribeAll()}), with the same consequence. The
+     * registration is recorded before the SUB is written, so whichever fiber reads the server's answer finds it.
+     *
+     * The subscribe part behaves as {@see subscribe()}: it waits for a reconnect in flight, within the request
+     * timeout, and a failed write leaves the registration for the reconnect to replay. When the new server rejects
+     * that replay, the replay's drain drops the registration, $onRejected called, and this reports the rejection,
+     * with a ConnectionException naming the subject and the limit, where {@see subscribeInternal()} sees a closed
+     * connection - as {@see ensureMuxInbox()} reports a dropped reply inbox; the replay writes the UNSUB
+     * ({@see finishReplayWindow()}). Otherwise the caller unsubscribes the sid when its operation ends, whether or
+     * not it was rejected: {@see unsubscribe()} then writes the UNSUB a rejection owes.
+     *
+     * @internal Low-level mechanism for the JetStream reply inboxes; not general API.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @param \Closure(string): void $onRejected Called with the -ERR text once the server may have rejected, or has
+     *        rejected, the subscription; at most once for the limit. It must not suspend: it runs inside the
+     *        dispatch of the -ERR.
+     * @return Future<int>
+     */
+    public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected): Future
+    {
+        $caller = \Fiber::getCurrent();
+
+        return async(function () use ($subject, $handler, $onRejected, $caller): int {
+            // Recorded here as well, so that a rejection read while this fiber waits in its subscribe - by the
+            // drain of the reconnect a failed write started - is told from a connection that closed.
+            /** @var string|null $rejection */
+            $rejection = null;
+            $recordingRejection = static function (string $error) use ($onRejected, &$rejection): void {
+                $rejection ??= $error;
+                $onRejected($error);
+            };
+
+            try {
+                return $this->subscribeInternal(
+                    $subject,
+                    $handler,
+                    null,
+                    $caller,
+                    registered: function (int $sid) use ($recordingRejection): void {
+                        $this->guardedSids[$sid] = true;
+                        $this->subscriptionRejectionHandlers[$sid] = $recordingRejection;
+                        // Queued in the step that hands its PING to the transport, as every PING's slot is, so that
+                        // whatever PINGs other fibers write, this slot completes on the PONG answering that PING.
+                        $this->unconfirmedSids[$sid] = $this->enqueuePongSlot();
+                    },
+                    after: $this->codec->encodePing(),
+                );
+            } catch (ConnectionException $e) {
+                throw $this->guardedSubscribeFailure($subject, $rejection, $e);
+            }
+        });
+    }
+
+    /**
+     * The error a guarded subscribe fails with ({@see subscribeGuarded()}): $failure itself, unless the server
+     * rejected the subscription while the subscribe waited - the SUB write failed, the reconnect replayed the SUB,
+     * and the new server rejected it, which dropped the registration - and the connection is open: then
+     * {@see subscribeInternal()} reports a closed connection, and this says what happened instead, as
+     * {@see ensureMuxInbox()} does for the reply inbox, with $failure as the cause.
+     *
+     * @param string|null $rejection The -ERR text the rejection handler recorded, or null while it recorded none.
+     */
+    private function guardedSubscribeFailure(string $subject, ?string $rejection, ConnectionException $failure): ConnectionException
+    {
+        if ($rejection === null || $this->state !== ConnectionState::Open) {
+            return $failure;
+        }
+
+        if ($this->isSubscriptionLimitError($rejection)) {
+            return new ConnectionException(
+                sprintf(
+                    'Subscribe to "%s" failed: the server may have rejected it because the connection is at its '
+                    . 'subscription limit (maximum subscriptions exceeded)',
+                    $subject,
+                ),
+                0,
+                $failure,
+            );
+        }
+
+        return new ConnectionException(sprintf('Subscribe to "%s" failed: the server rejected it: %s', $subject, $rejection), 0, $failure);
     }
 
     /**
@@ -2220,21 +2360,34 @@ final class NatsConnection
      * {@see subscribe()}, before any reply can be enqueued. Memory is then bounded by the caller's
      * in-flight concurrency, not by the queue cap (#159).
      *
+     * A sid that is no longer registered is left alone: another fiber's read can have dropped it between the
+     * SUB write and this call, when the server rejected it ({@see subscribeGuarded()}), and nothing is queued
+     * for a sid that is gone.
+     *
      * @internal Low-level mechanism for the JetStream request/pull inboxes; not general API.
      */
     public function markSubscriptionUnbounded(int $sid): void
     {
+        if (!isset($this->subscriptions[$sid])) {
+            return;
+        }
+
         $this->unboundedSids[$sid] = true;
     }
 
     /**
      * Registers a callback invoked (with the raw -ERR text) when the server rejects this sid's
      * subscription with an async permissions violation. See {@see $subscriptionRejectionHandlers}.
+     * A sid that is no longer registered is left alone, as by {@see markSubscriptionUnbounded()}.
      *
      * @internal Low-level mechanism for long-lived JetStream reply inboxes; not general API.
      */
     public function markSubscriptionRejectionHandler(int $sid, \Closure $handler): void
     {
+        if (!isset($this->subscriptions[$sid])) {
+            return;
+        }
+
         $this->subscriptionRejectionHandlers[$sid] = $handler;
     }
 
@@ -2255,12 +2408,17 @@ final class NatsConnection
      * nats.go Unsubscribe() (#134). Use {@see drainSubscription()} (or a full {@see drain()}) for the
      * lossless path that delivers the backlog first.
      *
+     * For a guarded inbox the client treated as rejected ({@see subscribeGuarded()}), already dropped, this
+     * writes the UNSUB the rejection owes, on an open connection ({@see releaseRejectedSubscription()}).
+     *
      * @return Future<void>
      */
     public function unsubscribe(int $sid, ?int $maxMessages = null): Future
     {
         return async(function () use ($sid, $maxMessages): void {
             if (!isset($this->subscriptionMeta[$sid])) {
+                $this->releaseRejectedSubscription($sid);
+
                 return;
             }
 
@@ -3586,6 +3744,90 @@ final class NatsConnection
     }
 
     /**
+     * Records that the server holds the guarded inbox whose fence PONG completed $slot, if $slot is one
+     * ({@see $unconfirmedSids}): the server answered the PING written behind that inbox's SUB without rejecting the
+     * SUB first. The slot completes as any slot does, by the caller.
+     *
+     * @param DeferredFuture<null> $slot The pong slot the PONG just read completes.
+     */
+    private function confirmSubscriptionFencedBy(DeferredFuture $slot): void
+    {
+        $sid = array_search($slot, $this->unconfirmedSids, true);
+        if ($sid !== false) {
+            unset($this->unconfirmedSids[$sid]);
+        }
+    }
+
+    /**
+     * Treats every guarded inbox the server is not yet known to hold as rejected by the 'maximum subscriptions
+     * exceeded' -ERR just read ({@see subscribeGuarded()}, #175), the way {@see dropUnconfirmedMux()} treats the reply
+     * inbox: its handler is called with the -ERR text first, so that the operation finds the rejection recorded when
+     * it looks again, then the subscription is dropped, which ends the operation's read waiting for a delivery on it
+     * ({@see dropSubscriptionState()}, the wake-up of #174) wherever it waits, and the UNSUB the rejection owes is
+     * queued ({@see $guardedSidsToRelease}), for the operation's unsubscribe() or, in a reconnect's replay, for the
+     * replay to write. When several inboxes are unconfirmed at once none can be told apart, so each is treated as
+     * rejected, as documented.
+     *
+     * Called in the dispatch of the -ERR, before the read that met it fails or reports, whichever fiber's read it
+     * is: the operation's own, which then fails with the server's error as it always did, or another's.
+     */
+    private function rejectUnconfirmedSubscriptions(string $error): void
+    {
+        foreach (array_keys($this->unconfirmedSids) as $sid) {
+            $handler = $this->subscriptionRejectionHandlers[$sid] ?? null;
+            if ($handler !== null) {
+                try {
+                    $handler($error);
+                } catch (\Throwable) {
+                    // A throwing handler must never break frame dispatch.
+                }
+            }
+
+            $this->dropSubscriptionState($sid);
+            $this->guardedSidsToRelease[] = $sid;
+        }
+    }
+
+    /**
+     * Writes the UNSUB owed by a guarded inbox the client treated as rejected ({@see rejectUnconfirmedSubscriptions()}),
+     * when the operation that owned it unsubscribes it ({@see unsubscribe()}): the -ERR may have been another SUB's
+     * after all, and the server then still holds the inbox, in a slot this frees. On a connection that is not open
+     * the sid is forgotten instead: the connection the server held it on is gone, or closing, and a replayed inbox
+     * the new server rejected got its UNSUB from the replay ({@see finishReplayWindow()}). A failed write is not
+     * thrown, as in unsubscribe(): the server dropped the subscription with the connection.
+     */
+    private function releaseRejectedSubscription(int $sid): void
+    {
+        if (!$this->takeOwedRelease($sid) || $this->state !== ConnectionState::Open) {
+            return;
+        }
+
+        try {
+            $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
+        } catch (\Throwable) {
+            // The socket is dead, and the server dropped the subscription with the connection.
+        }
+    }
+
+    /**
+     * Removes $sid from the UNSUBs owed by rejected guarded inboxes ({@see $guardedSidsToRelease}), for the caller
+     * that writes its UNSUB; whether it was owed.
+     */
+    private function takeOwedRelease(int $sid): bool
+    {
+        if (!in_array($sid, $this->guardedSidsToRelease, true)) {
+            return false;
+        }
+
+        $this->guardedSidsToRelease = array_values(array_filter(
+            $this->guardedSidsToRelease,
+            static fn(int $queued): bool => $queued !== $sid,
+        ));
+
+        return true;
+    }
+
+    /**
      * Mints a per-request suffix token unique within the connection epoch. Sequential (not random) so
      * uniqueness is guaranteed by construction, not probabilistically; the random $muxBase provides
      * unguessability - an attacker cannot address "<base>.<n>" without knowing the base (#118).
@@ -4379,6 +4621,10 @@ final class NatsConnection
         // epoch's PING must never be completed by a PONG from this new connection, and its own
         // PONG died with the old socket - error the waiters (flush/rtt) out instead (#117).
         $this->failPongWaiters(new ConnectionException('Connection lost before the server answered the PING'));
+        // The UNSUBs owed by guarded inboxes treated as rejected on the connection this one replaces (#175) are
+        // moot: the server dropped whatever it held with that connection, and a replayed inbox the new server
+        // rejects is released by the replay itself ({@see finishReplayWindow()}).
+        $this->guardedSidsToRelease = [];
 
         $server = $this->nextServer();
         $this->connectedServer = $server;
@@ -4989,6 +5235,9 @@ final class NatsConnection
                 if (!isset($this->subscriptionMeta[$sid])) {
                     $frames .= $this->codec->encodeUnsubscribe($sid);
                     unset($replayed[$sid]);
+                    // This UNSUB is the one a guarded inbox the replay's drain treated as rejected owes (#175): its
+                    // operation's unsubscribe() then has nothing left to write.
+                    $this->takeOwedRelease($sid);
 
                     continue;
                 }
@@ -5058,7 +5307,9 @@ final class NatsConnection
      * count inside the reconnect critical section, where publishes buffer and nothing
      * dispatches (#137). The byte stream is identical to the per-sid version - each SUB is
      * immediately followed by its UNSUB re-arm, in registration order - except that the mux
-     * reply-inbox SUB is followed by a PING, which confirms it.
+     * reply-inbox SUB and each guarded inbox's SUB ({@see subscribeGuarded()}, #175) are followed by a PING,
+     * which confirms them: until its PONG a 'maximum subscriptions exceeded' -ERR the drain below reads drops
+     * the mux and rejects the guarded inbox, its operation told, as on a first subscribe.
      *
      * @return array<int, array{max: ?int, received: int}> The sids re-subscribed, with the auto-unsubscribe
      *         max each was replayed with and the messages it had received by then.
@@ -5098,11 +5349,17 @@ final class NatsConnection
                 // The new server may reject the mux like any replayed SUB, so it is unconfirmed until the PONG of
                 // this PING. A subscription limit rejects every SUB from the first one it refuses, so an -ERR for
                 // the limit ahead of that PONG means the mux is refused too, while those of the SUBs replayed
-                // after it come behind the PONG: a mux that keeps its slot is not dropped for them. The slot is
-                // alone in the queue - connectOnce() cleared it, and nothing else writes a PING until the
-                // connection is Open - so the PONG is this PING's.
+                // after it come behind the PONG: a mux that keeps its slot is not dropped for them. The queue
+                // holds only this replay's slots - connectOnce() cleared it, and nothing else writes a PING until
+                // the connection is Open - in the order of their PINGs, so each PONG is its own PING's.
                 $this->muxConfirmed = false;
                 $this->muxFence = $this->enqueuePongSlot();
+                $buffer .= $this->codec->encodePing();
+            } elseif (isset($this->guardedSids[$sid])) {
+                // A guarded inbox gets the same rule (#175): unconfirmed again until the PONG of the PING replayed
+                // behind its SUB, and rejected, its operation told, by a limit -ERR ahead of that PONG, which the
+                // drain below reads. The slot replaced here is the old connection's, failed by connectOnce().
+                $this->unconfirmedSids[$sid] = $this->enqueuePongSlot();
                 $buffer .= $this->codec->encodePing();
             }
         }
@@ -5483,6 +5740,11 @@ final class NatsConnection
                 $this->confirmMux();
             }
 
+            if ($slot !== null) {
+                // The same for the PING written behind a guarded inbox's SUB (#175): its PONG confirms that inbox.
+                $this->confirmSubscriptionFencedBy($slot);
+            }
+
             if ($slot !== null && !$slot->isComplete()) {
                 $slot->complete();
             }
@@ -5538,6 +5800,9 @@ final class NatsConnection
                     $rejectedSubject = $subjectMatch[1];
                     foreach ($this->subscriptionMeta as $rejectedSid => $meta) {
                         if ($meta['subject'] === $rejectedSubject && isset($this->subscriptionRejectionHandlers[$rejectedSid])) {
+                            // A guarded inbox the server has rejected by name has nothing left to confirm or to
+                            // take for the limit's (#175); its owner fails and unsubscribes it.
+                            unset($this->unconfirmedSids[$rejectedSid]);
                             try {
                                 ($this->subscriptionRejectionHandlers[$rejectedSid])($error);
                             } catch (\Throwable) {
@@ -5554,9 +5819,17 @@ final class NatsConnection
                 return;
             }
 
-            $muxSid = $this->muxSid;
-            if ($muxSid !== null && !$this->muxConfirmed && $this->isSubscriptionLimitError($error)) {
-                $this->dropUnconfirmedMux($muxSid);
+            if ($this->isSubscriptionLimitError($error)) {
+                // The -ERR names no subject: it rejects the SUB whose answer the server owed next, which is any SUB
+                // written with a PING behind it whose PONG has not arrived: the reply inbox's, and each guarded
+                // inbox's (#175). Both are dropped before the read fails or reports, so that whichever fiber's read
+                // met the -ERR, the operations waiting on them fail at their next look rather than at their deadlines.
+                $muxSid = $this->muxSid;
+                if ($muxSid !== null && !$this->muxConfirmed) {
+                    $this->dropUnconfirmedMux($muxSid);
+                }
+
+                $this->rejectUnconfirmedSubscriptions($error);
             }
 
             $serverError = new ConnectionException('Server sent error frame: ' . $error);
@@ -5580,6 +5853,11 @@ final class NatsConnection
                 // that an -ERR later in the same chunk finds it. Not a delivery of the server the connection
                 // left (#182): it says nothing about the replayed mux, which the new server's fence PONG confirms.
                 $this->confirmMux();
+            }
+
+            if (!$stale && isset($this->unconfirmedSids[$sid])) {
+                // The same for a guarded inbox (#175): a delivery on it proves the server holds it.
+                unset($this->unconfirmedSids[$sid]);
             }
 
             [$rawHeaders, $payload] = $this->extractHeadersAndPayload($frame);
@@ -5975,8 +6253,12 @@ final class NatsConnection
     /**
      * Returns true for the -ERR rejecting a SUB beyond the connection's subscription limit. It names neither the
      * subject nor the sid, so only the order of the server's answers can tie it to a SUB ({@see $muxConfirmed}).
+     * The one classifier of that -ERR: the JetStream operations whose guarded inbox's rejection handler got its
+     * text ({@see subscribeGuarded()}) ask it, through NatsClient, rather than match the text themselves.
+     *
+     * @internal Low-level mechanism for the JetStream reply inboxes; not general API.
      */
-    private function isSubscriptionLimitError(string $error): bool
+    public function isSubscriptionLimitError(string $error): bool
     {
         return strtolower(trim($error, " '\t\r\n\0\x0B")) === 'maximum subscriptions exceeded';
     }
@@ -6775,6 +7057,10 @@ final class NatsConnection
         // Hygiene: the slow-consumer exemption flag must never outlive its sid (#118).
         unset($this->unboundedSids[$sid]);
         unset($this->subscriptionRejectionHandlers[$sid]);
+        // Nor the guard of a guarded inbox (#175): nothing is left to confirm or reject once the sid is gone. The
+        // pong slot of the PING behind its SUB stays queued, since that PING's PONG is still owed.
+        unset($this->guardedSids[$sid]);
+        unset($this->unconfirmedSids[$sid]);
         unset($this->removeAfterDelivery[$sid]);
         // Nothing more will be delivered to it: an operation's read still waiting for a delivery looks again.
         $this->wakeReadsWaitingFor($sid);

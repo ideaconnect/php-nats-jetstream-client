@@ -142,10 +142,32 @@ final class NatsClient
     }
 
     /**
+     * Subscribes a reply inbox whose rejection by the connection's subscription limit must reach the operation
+     * waiting on it, whichever fiber's read meets the -ERR (#175): the JetStream pull fetch, pull pipeline and
+     * batched Direct Get inboxes. A PING is written behind the SUB and the inbox counts as held by the server once
+     * that PING's PONG, or a delivery on the inbox, arrives; a 'maximum subscriptions exceeded' -ERR read before
+     * that drops the subscription, writes its UNSUB and calls $onRejected with the -ERR text, as does a permissions
+     * violation naming the subject (which leaves the subscription for the caller to unsubscribe). Several inboxes
+     * unconfirmed at once are all treated as rejected by such an -ERR. A SUB whose write failed is replayed by the
+     * reconnect; when the new server rejects the replay, the subscribe itself fails with a ConnectionException
+     * naming the subject and the limit, $onRejected called first. See {@see NatsConnection::subscribeGuarded()}.
+     *
+     * @internal Low-level mechanism for the JetStream reply inboxes; not part of the supported API.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @param \Closure(string): void $onRejected Must not suspend: it runs inside the dispatch of the -ERR.
+     * @return Future<int>
+     */
+    public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected): Future
+    {
+        return $this->connection->subscribeGuarded($subject, $handler, $onRejected);
+    }
+
+    /**
      * Exempts a subscription from the slow-consumer pending-queue bound (its replies are never
      * dropped). For the muxed request inbox (#118) and the pipelined pull inbox (#120), where a
      * dropped reply silently breaks a request/pull. Synchronous so it applies in the same tick the
-     * sid was returned by {@see subscribe()}.
+     * sid was returned by {@see subscribe()}. A sid no longer registered is left alone.
      *
      * @internal Low-level mechanism for the JetStream request/pull inboxes; not general API.
      */
@@ -164,6 +186,19 @@ final class NatsClient
     public function onSubscriptionRejected(int $sid, \Closure $handler): void
     {
         $this->connection->markSubscriptionRejectionHandler($sid, $handler);
+    }
+
+    /**
+     * Whether a server -ERR text is the one rejecting a SUB beyond the connection's subscription limit
+     * ('maximum subscriptions exceeded'), which names no subject, as the connection classifies it
+     * ({@see NatsConnection::isSubscriptionLimitError()}): for the rejection handler of {@see subscribeGuarded()},
+     * which is also called with a permissions violation naming the subject.
+     *
+     * @internal Low-level mechanism for the JetStream reply inboxes; not part of the supported API.
+     */
+    public function isSubscriptionLimitError(string $serverError): bool
+    {
+        return $this->connection->isSubscriptionLimitError($serverError);
     }
 
     /**

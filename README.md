@@ -584,6 +584,10 @@ $client->disconnect()->await();
 
 When a pull request ends with a terminal JetStream status frame and no user message is delivered, `fetchNext()` / `fetchBatch()` raise `JetStreamException` with the server status code and description, for example `JetStream pull request ended with status 404: No Messages`.
 
+At the connection's subscription limit the server rejects the fetch's reply inbox with `-ERR 'maximum subscriptions exceeded'`, which names no subject, and keeps the connection open. The client writes a `PING` behind the inbox's `SUB`, in the same write: the `PONG` answering it, or a delivery on the inbox, confirms that the server holds the inbox. A limit `-ERR` read before that fails the fetch at once, whichever read meets it: the fetch's own read fails it with the server's error (`Server sent error frame: 'maximum subscriptions exceeded'`); the heartbeat's read, or an application's `processIncoming()` loop's, fails it with a `ConnectionException` naming the inbox and the limit (`JetStream pull fetch failed: the server may have rejected its reply-inbox subscription "_INBOX.JS.FETCH.<nuid>" because the connection is at its subscription limit (maximum subscriptions exceeded). A retry subscribes a new one.`). Either way the inbox is unsubscribed, the connection stays open, and a retry once a subscription slot is free works. Such an `-ERR` cannot be told from another unconfirmed inbox's, so several inboxes unconfirmed at once - two fetches, a fetch and the shared reply inbox of `request()` - are all treated as rejected, and each call fails. A reconnect replays the inbox with a `PING` behind it again, under the same rule: a fetch whose replayed inbox the new server rejects fails with the limit error, its `SUB` write failed and replayed or not, and the replay unsubscribes the inbox. A permissions violation naming the inbox fails the fetch at once as well, quoting it. Before this rule a fetch learnt of the rejection only through its own read: when another read took the `-ERR`, it waited out its expiry and reported an empty pull (a 408) (#175).
+
+_Verified by: [JetStreamInboxRejectionTest](tests/Unit/JetStreamInboxRejectionTest.php) (`testAFetchWhoseInboxSubIsRejectedWhileTheHeartbeatReadsTheErrFailsAtOnce`, `testAFetchWhoseInboxSubIsRejectedWhileAnApplicationLoopReadsTheErrFailsAtOnce`, `testTheOperationsOwnReadMeetingTheErrFailsItWithTheServersErrorAsBefore`, `testThePongBehindTheSubConfirmsTheInboxWhichALaterLimitErrLeavesAlone`, `testADeliveryOnTheInboxConfirmsItBeforeThePongBehindItsSub`, `testTwoInboxesUnconfirmedAtOnceAreBothTreatedAsRejected`, `testAnInboxUnconfirmedTogetherWithTheReplyInboxIsTreatedAsRejectedWithIt`, `testAPermissionsViolationNamingTheInboxFailsTheOperationAtOnce`, `testAFetchWhoseReplayedInboxIsRejectedByTheNewServerFailsWithTheLimitError`, `testAFetchWhoseSubWriteFailedAndWhoseReplayIsRejectedFailsWithTheLimitError`)._
+
 For exactly-once-style processing use `ackSync()` instead of `ack()`: it sends the `+ACK` as a request and waits for the server to confirm the acknowledgement was durably recorded (double-ack). It throws if the delivered message carries no reply subject, and throws `TimeoutException` if no confirmation arrives within the optional timeout.
 
 _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testAckSyncSendsAckAsRequestAndAwaitsConfirmation`, `testAckSyncThrowsForEmptyReplySubject`)._
@@ -1578,6 +1582,7 @@ $client->disconnect()->await();
 Notes:
 1. A partial batch is valid. If the server delivers some messages and then ends the pull with a terminal status, the delivered messages are returned.
 2. A terminal status only becomes an exception when no user message was delivered for that pull request.
+3. At the connection's subscription limit the fetch fails at once instead of reporting an empty batch after its expiry: with a `ConnectionException` naming its inbox when another read meets the server's `-ERR`, with the server's error when its own read does - see [JetStream Pull Consumer (Fetch + ACK)](#jetstream-pull-consumer-fetch--ack) (#175).
 
 ### Stream Purge and List
 
@@ -1759,6 +1764,15 @@ stream to a private inbox, terminated by a 204 end-of-batch marker (or a final m
 hang the call. `directGetBatch()` returns a `list<NatsMessage>`; an error status (e.g. `408`) is
 raised as a `JetStreamException`.
 
+At the connection's subscription limit the batch fails at once instead of reporting a stalled batch
+after `$expiresMs` plus a second: with a `ConnectionException` naming its inbox (`Direct Get batch for
+stream "<stream>" failed: the server may have rejected its reply-inbox subscription
+"_INBOX.JS.DGET.<nuid>" because the connection is at its subscription limit (maximum subscriptions
+exceeded). A retry subscribes a new one.`) when another read meets the server's `-ERR`, with the
+server's error when its own read does. The inbox is confirmed by a `PING` behind its `SUB`, as a pull
+fetch's is, under the same rules - several inboxes unconfirmed at once are all treated as rejected
+(see [JetStream Pull Consumer (Fetch + ACK)](#jetstream-pull-consumer-fetch--ack), #175).
+
 - `directGetLastForSubjects(string $stream, array $subjects, int $expiresMs = 5000)` fetches the
   latest message for each named subject in one round trip (`multi_last`). It expects **exact**
   subjects: a subject containing `*` or `>` is rejected with a `JetStreamException`. An empty
@@ -1784,7 +1798,7 @@ $range = $js->directGetBatch('EVENTS', ['seq' => 1, 'batch' => 10])->await();
 echo count($range) . ' messages' . PHP_EOL;
 ```
 
-_Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testDirectGetBatchCollectsUntilEob`, `testDirectGetLastForSubjects`, `testDirectGetBatchSurfacesError`, `testDirectGetLastForSubjectsWithEmptySubjectsReturnsEmpty`, `testDirectGetLastForSubjectsRejectsWildcardSubjectWithStar`, `testDirectGetLastForSubjectsRejectsWildcardSubjectWithGreaterThan`, `testDirectGetBatchRejectsZeroExpiresMs`); [JetStreamIntegrationTest::testJetStreamBatchedDirectGet](tests/Integration/JetStreamIntegrationTest.php)._
+_Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testDirectGetBatchCollectsUntilEob`, `testDirectGetLastForSubjects`, `testDirectGetBatchSurfacesError`, `testDirectGetLastForSubjectsWithEmptySubjectsReturnsEmpty`, `testDirectGetLastForSubjectsRejectsWildcardSubjectWithStar`, `testDirectGetLastForSubjectsRejectsWildcardSubjectWithGreaterThan`, `testDirectGetBatchRejectsZeroExpiresMs`); [JetStreamInboxRejectionTest](tests/Unit/JetStreamInboxRejectionTest.php) (`testADirectGetBatchWhoseInboxSubIsRejectedWhileAnotherReadBringsTheErrFailsAtOnce`, `testAPermissionsViolationNamingTheInboxFailsTheOperationAtOnce`); [JetStreamIntegrationTest::testJetStreamBatchedDirectGet](tests/Integration/JetStreamIntegrationTest.php)._
 
 ### Atomic Batch Publish
 
@@ -1958,6 +1972,10 @@ echo "Processed {$totalProcessed} messages total." . PHP_EOL;
 
 $client->disconnect()->await();
 ```
+
+The run's reply inbox (`_INBOX.JS.PULL.<nuid>.*`) is confirmed by a `PING` behind its `SUB`, as a pull fetch's is (see [JetStream Pull Consumer (Fetch + ACK)](#jetstream-pull-consumer-fetch--ack)). At the connection's subscription limit a limit `-ERR` read before that confirmation, whichever fiber's read meets it, fails `handle()` fast with a `JetStreamException` (`Pull consumer reply inbox "_INBOX.JS.PULL.<nuid>.*" may have been rejected by the server because the connection is at its subscription limit ('maximum subscriptions exceeded'). ...`), the inbox released, where the engine used to retire pull after pull at their deadlines (#175); a permissions violation naming the inbox fails it the same way (#167). Start the consumer again once a subscription slot is free.
+
+_Verified by: [JetStreamInboxRejectionTest](tests/Unit/JetStreamInboxRejectionTest.php) (`testAPullConsumerWhoseInboxSubIsRejectedWhileAnotherReadBringsTheErrFailsFast`, `testAPullConsumerWhoseReplayedInboxIsRejectedByTheNewServerFailsWithTheLimitError`); [PullPipelineTest::testPermissionRejectedPullInboxFailsFastInsteadOfSpinning](tests/Unit/PullPipelineTest.php)._
 
 ### Pull Consumer Priority Groups
 
@@ -2162,7 +2180,7 @@ When a connection drops and `reconnectEnabled` is `true`:
 Server `-ERR` frames come in three kinds:
 
 - **Reported.** `Invalid Subject`, `Permissions Violation for Publish to ...` and `Permissions Violation for Subscription to ...` neither fail a read nor close the connection: they are passed to the `errorListener` once the read that brought them has queued the rest of what it read. When the subscription the server refused is the shared reply inbox, request/reply fails fast until the connection closes for good - see [Request/Reply](#requestreply).
-- **Failing the read, keeping the connection.** `maximum subscriptions exceeded`, `Invalid Publish Subject` and any other `Permissions Violation` (such as `... for Publish with Reply of ...`) fail the read that brought them, `flush()` and `rtt()` included, and the connection stays open. The heartbeat's read, a service's `run()`, the flushes of `drain()`, `drainSubscription()` and a service's `drain()`, and a reconnect's replay report them to the `errorListener` instead and carry on, the flushes reading on to their `PONG`. So a reconnect whose replayed SUB the server rejects completes; a rejection that arrives after the replay's short poll fails the read that brings it. When the server rejects the shared reply inbox for the subscription limit, the next request subscribes it again - see [Request/Reply](#requestreply). If the server closes the connection anyway, as it does after `maximum subscriptions exceeded` when an account's subscription limit is lowered, the EOF ends it.
+- **Failing the read, keeping the connection.** `maximum subscriptions exceeded`, `Invalid Publish Subject` and any other `Permissions Violation` (such as `... for Publish with Reply of ...`) fail the read that brought them, `flush()` and `rtt()` included, and the connection stays open. The heartbeat's read, a service's `run()`, the flushes of `drain()`, `drainSubscription()` and a service's `drain()`, and a reconnect's replay report them to the `errorListener` instead and carry on, the flushes reading on to their `PONG`. So a reconnect whose replayed SUB the server rejects completes; a rejection that arrives after the replay's short poll fails the read that brings it. When the server rejects the shared reply inbox for the subscription limit, the next request subscribes it again - see [Request/Reply](#requestreply). The JetStream pull fetch, pull consumer and batched Direct Get inboxes are confirmed the same way, by a `PING` behind their `SUB`: a limit `-ERR` read before that fails the call at once, whichever read meets it, and the inbox is unsubscribed - see [JetStream Pull Consumer (Fetch + ACK)](#jetstream-pull-consumer-fetch--ack) (#175). If the server closes the connection anyway, as it does after `maximum subscriptions exceeded` when an account's subscription limit is lowered, the EOF ends it.
 - **Fatal.** Any other `-ERR` - `Stale Connection`, `Authorization Violation`, `Maximum Payload Violation`, ... - comes right before the server closes the connection. `Stale Connection`, for one, goes to a client that stopped answering its pings, which a synchronous application that sat idle for a few minutes meets on its next call. The connection then ends like one whose read failed, wherever the `-ERR` is read, the heartbeat's own read included: it reconnects, or with reconnect off closes for good, and the read that brought the `-ERR` fails with the server's error once the connection is Closed or, with reconnect on, once the reconnect is done or that read's own timeout runs out (it does not wait with `waitForReconnect: false`). A fatal `-ERR` read together with one of the others still ends the connection.
 
 A server `PING` whose `PONG` the socket would not take ends the connection like a fatal `-ERR` (during a `drain()` it ends the drain's flush instead). Nothing else a frame raises ends the connection. _Verified by: [ConnectionEndingFrameTest](tests/Unit/ConnectionEndingFrameTest.php), [ServerErrorKeepingConnectionTest](tests/Unit/ServerErrorKeepingConnectionTest.php), [DrainLifecycleTest](tests/Unit/DrainLifecycleTest.php) (`testDrainFlushStillEndsAtOnceAtAPongTheSocketWouldNotTake`, `testAServiceReadingDuringADrainReportsAPongTheSocketWouldNotTakeOnce`)._
