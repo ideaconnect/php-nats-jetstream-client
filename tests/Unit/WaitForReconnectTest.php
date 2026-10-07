@@ -18,6 +18,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
@@ -656,12 +657,13 @@ final class WaitForReconnectTest extends TestCase
     }
 
     /**
-     * A serving loop's read delivers what an earlier read left queued before it reads. When a handler it runs
-     * awaits while the connection drops and another fiber's read reconnects, it waits for that reconnect before
-     * it reads, like any reader (#148). Reading at once would take the PONG of the reconnect's handshake: the
-     * attempt would fail, and with one attempt allowed the connection would close.
+     * A serving loop's read delivers what another read has queued and not reached before it reads: here the message
+     * behind a handler that awaits in the application's read. When a handler the serving read runs awaits while the
+     * connection drops and another fiber's read reconnects, it waits for that reconnect before it reads, like any
+     * reader (#148). Reading at once would take the PONG of the reconnect's handshake: the attempt would fail, and
+     * with one attempt allowed the connection would close.
      */
-    public function testAServingReadDeliveringWhatAnEarlierReadLeftQueuedLeavesTheHandshakeToTheRecovery(): void
+    public function testAServingReadDeliveringWhatAnotherReadHasNotReachedLeavesTheHandshakeToTheRecovery(): void
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
@@ -674,21 +676,16 @@ final class WaitForReconnectTest extends TestCase
             errorListener: $recorder->errorListener(),
         );
         $seen = [];
-        $sidA = $connection->subscribe('a', static function (): void {
-            throw new \RuntimeException('handler a');
-        })->await();
+        $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
+        $sidA = $connection->subscribe('a', $hold->handler())->await();
         $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
             delay(0.05);
             $seen[] = $message->payload;
         })->await();
-        // A read stops at a's throwing handler and leaves b's message queued.
+        // The application's read is held up in a's handler, which awaits, and leaves b's message queued.
         $transport->pushFrame(ReconnectingTransport::msgFrame('a', $sidA, 'x') . ReconnectingTransport::msgFrame('b', $sidB, 'y'));
-        try {
-            $connection->processIncoming()->await();
-            self::fail('expected the handler failure');
-        } catch (\RuntimeException $e) {
-            self::assertSame('handler a', $e->getMessage());
-        }
+        $heldUp = async(static fn(): int => $connection->processIncoming()->await());
+        $hold->began->getFuture()->await(new TimeoutCancellation(2));
 
         // The serving read delivers that message, and b's handler awaits. Meanwhile the connection drops and
         // another fiber's read reconnects at once; the new connection's CONNECT write takes 100 ms, so its
@@ -710,6 +707,8 @@ final class WaitForReconnectTest extends TestCase
         $transport->pushFrame(ReconnectingTransport::msgFrame('b', $sidB, 'z'));
         self::assertTrue($serving->await(new TimeoutCancellation(1))->consumedBytes);
         self::assertSame(['y', 'z'], $seen);
+        $hold->end('the end of the test');
+        self::assertSame(2, $heldUp->await(), "the application's read ends once its handler returns");
     }
 
     /**

@@ -1682,6 +1682,8 @@ final class DrainLifecycleTest extends TestCase
      * A drain that ran out of time waiting for a reconnect winds down without a connection. A
      * drainSubscription() issued then, past that drain's deadline, delivers like the drain does: a
      * throwing handler ends its delivery, and the rest is reported as discarded instead of delivered past it.
+     * The application's read that met the chunk delivered to both subscriptions before it threw (#177): it
+     * threw slow's first failure, reported orders' first, and left each subscription's remainder queued.
      */
     public function testDrainSubscriptionDuringADrainWindingDownPastItsDeadlineStopsAfterAThrowingHandler(): void
     {
@@ -1699,7 +1701,8 @@ final class DrainLifecycleTest extends TestCase
         $orders = $connection->subscribe('orders', static function (NatsMessage $message): void {
             throw new \RuntimeException('handler failed on ' . $message->payload);
         })->await();
-        // One chunk: the first handler failure leaves everything after it queued.
+        // One chunk: the application's read stops each subscription at its first failure and leaves the rest of
+        // each queued, 'busy' for slow and bad2 and bad3 for orders (#177).
         $transport->pushFrame(
             ReconnectingTransport::msgFrame('slow', $slow, 'boom')
             . ReconnectingTransport::msgFrame('slow', $slow, 'busy')
@@ -1708,6 +1711,7 @@ final class DrainLifecycleTest extends TestCase
             . ReconnectingTransport::msgFrame('orders', $orders, 'bad3'),
         );
         $this->expectHandlerFailure($connection, 'handler failed on boom');
+        self::assertSame(['handler failed on bad1'], $recorder->errorsContaining('handler failed'), "orders' first failure was reported by the read that threw slow's");
         // A reconnect parked mid-dial: it neither reopens the connection nor, stopped, delivers anything.
         $reader = $this->startRecoveryHeldMidDial($connection, $transport);
 
@@ -1723,9 +1727,9 @@ final class DrainLifecycleTest extends TestCase
 
         self::assertNotNull($drainSubscription->future);
         $drainSubscription->future->await();
-        self::assertSame(['handler failed on bad1'], $recorder->errorsContaining('handler failed'));
+        self::assertSame(['handler failed on bad1', 'handler failed on bad2'], $recorder->errorsContaining('handler failed'), 'the drainSubscription() stopped at bad2');
         self::assertSame(
-            [sprintf('drainSubscription: 2 buffered message(s) for sid %d were discarded undelivered', $orders)],
+            [sprintf('drainSubscription: 1 buffered message(s) for sid %d were discarded undelivered', $orders)],
             $recorder->errorsContaining('drainSubscription'),
         );
         self::assertSame(ConnectionState::Closed, $connection->state());
@@ -2208,9 +2212,9 @@ final class DrainLifecycleTest extends TestCase
     }
 
     /**
-     * drain() alongside an application's processIncoming() loop that stopped at a throwing handler, with the
-     * message read behind it still queued, ends once the server has answered its PING and that message's
-     * handler, which awaits, has run.
+     * drain() alongside an application's processIncoming() loop that stopped at a throwing handler, with the rest
+     * of that handler's subscription still queued (a read that throws leaves only that, #177: its next message's
+     * handler here awaits), ends once the server has answered its PING and that handler has run.
      *
      * It fails on a flush whose read delivers such a message before it reads and then reads without checking
      * again whether its PONG is in: while the handler awaited, the loop's read would take the PONG and park the
@@ -2218,7 +2222,7 @@ final class DrainLifecycleTest extends TestCase
      * whole budget ran out. A flush read that delivered first but still checked for its PONG would end promptly,
      * so delivering first is not caught on its own.
      */
-    public function testDrainEndsPromptlyAlongsideALoopThatLeftAMessageQueuedBehindAThrowingHandler(): void
+    public function testDrainEndsPromptlyAlongsideALoopThatLeftTheRestOfAFailingSubscriptionQueued(): void
     {
         $transport = new ReconnectingTransport();
         $client = new NatsClient(new NatsOptions(
@@ -2229,13 +2233,15 @@ final class DrainLifecycleTest extends TestCase
         $this->opened[] = $client;
         $client->connect()->await();
         $seen = [];
-        $sidA = $client->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
-            $seen[] = 'a:' . $message->payload;
-            throw new \RuntimeException('handler a');
-        })->await();
-        $sidB = $client->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+        $sid = $client->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
+            if ($message->payload === 'x') {
+                $seen[] = 'a:x';
+
+                throw new \RuntimeException('handler a');
+            }
+
             delay(0.05);
-            $seen[] = 'b:' . $message->payload;
+            $seen[] = 'a:' . $message->payload;
         })->await();
         $stop = new DeferredCancellation();
         $loop = async(static function () use ($client, $stop): void {
@@ -2247,11 +2253,11 @@ final class DrainLifecycleTest extends TestCase
                 }
             }
         });
-        $transport->pushFrame(ReconnectingTransport::msgFrame('a', $sidA, 'x') . ReconnectingTransport::msgFrame('b', $sidB, 'y'));
+        $transport->pushFrame(ReconnectingTransport::msgFrame('a', $sid, 'x') . ReconnectingTransport::msgFrame('a', $sid, 'y'));
         $this->waitUntil(static function () use (&$seen): bool {
             return $seen === ['a:x'];
         });
-        // The loop is parked in its next read, b's message queued.
+        // The loop is parked in its next read, a's second message queued.
         delay(0.02);
         $this->answerTheNextPingAfter($transport, 0.01);
 
@@ -2259,7 +2265,7 @@ final class DrainLifecycleTest extends TestCase
         $client->drain()->await();
 
         self::assertLessThan(1.0, $this->secondsSince($start), 'the drain did not wait out its 2 s budget');
-        self::assertSame(['a:x', 'b:y'], $seen);
+        self::assertSame(['a:x', 'a:y'], $seen);
         $stop->cancel();
         $loop->await(new TimeoutCancellation(1));
     }
@@ -2802,7 +2808,7 @@ final class DrainLifecycleTest extends TestCase
         };
     }
 
-    /** Delivers the frames pushed so far, whose first handler fails: the rest stay queued behind it. */
+    /** Delivers the frames pushed so far, whose first handler fails: the rest of that subscription stays queued behind it. */
     private function expectHandlerFailure(NatsConnection $connection, string $message = 'handler failed'): void
     {
         $failure = null;

@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Unit;
 
 use Amp\DeferredFuture;
 use Amp\Future;
+use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
@@ -16,6 +17,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\SlowConsumerException;
+use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\OperationsThatRead;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
@@ -760,22 +762,28 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
         $client = $this->errorPolicyClient($transport, $recorder, requestTimeoutMs: 100);
-        $failing = $client->subscribe('failing', static function (): void {
-            throw new \RuntimeException('handler failed');
-        })->await();
+        $hold = new HeldUpDelivery(fallbackSeconds: 2.0);
+        $slow = $client->subscribe('slow', $hold->handler())->await();
         $queue = $this->fullQueue($client, $transport);
-        $later = $this->recordingSubscription($client, 'updates');
-        // Your read stops at the failing handler: the rest stays queued for the drain.
+        $later = new class {
+            public int $sid = 0;
+            /** @var list<string> */
+            public array $payloads = [];
+        };
+        $later->sid = $client->subscribe('updates', static function (NatsMessage $message) use ($later, $hold): void {
+            $later->payloads[] = $message->payload;
+            // Only the drain's backlog pass can get here while slow's handler holds the application's read up: let
+            // that handler go, so that the read ends and the drain can tear down.
+            $hold->end("the drain's delivery reaching updates");
+        })->await();
+        // Your read is held up in slow's handler, which awaits: the rest stays queued for the drain.
         $transport->pushFrame(
-            ReconnectingTransport::msgFrame('failing', $failing, 'x')
+            ReconnectingTransport::msgFrame('slow', $slow, 's')
             . ReconnectingTransport::msgFrame('backlog', $queue->sid, 'b3')
             . ReconnectingTransport::msgFrame('updates', $later->sid, 'u1'),
         );
-        try {
-            $client->processIncoming()->await();
-        } catch (\RuntimeException) {
-            // The failing handler.
-        }
+        $heldUp = async(static fn(): int => $client->processIncoming()->await());
+        $hold->began->getFuture()->await(new TimeoutCancellation(2));
         $transport->refuseDials();
         $transport->dropConnection();
         $reader = async(static fn(): int => $client->processIncoming()->await());
@@ -784,9 +792,11 @@ final class SlowConsumerErrorPolicyTest extends TestCase
 
         $client->drain()->await();
 
+        self::assertSame("the drain's delivery reaching updates", $hold->endedBy);
         self::assertSame(['u1'], $later->payloads);
         self::assertSame(['Subscription queue overflow for sid ' . $queue->sid], $recorder->errorsContaining('overflow'));
         self::assertSame([], $recorder->errorsContaining('drain deadline exceeded'));
+        self::assertSame(3, $heldUp->await(), 'the held-up read ends once its handler returns');
     }
 
     /**
@@ -1054,21 +1064,16 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
         $client = $this->errorPolicyClient($transport, $recorder);
-        $failing = $client->subscribe('failing', static function (): void {
-            throw new \RuntimeException('handler failed');
-        })->await();
+        $hold = new HeldUpDelivery(fallbackSeconds: 2.0);
+        $slow = $client->subscribe('slow', $hold->handler())->await();
         $queue = $this->fullQueue($client, $transport);
-        // Your read stops at the failing handler: the message for the full queue stays queued behind it.
+        // Your read is held up in slow's handler, which awaits: the message for the full queue stays queued behind it.
         $transport->pushFrame(
-            ReconnectingTransport::msgFrame('failing', $failing, 'x')
+            ReconnectingTransport::msgFrame('slow', $slow, 's')
             . ReconnectingTransport::msgFrame('backlog', $queue->sid, 'b3'),
         );
-        try {
-            $client->processIncoming()->await();
-            self::fail('expected the handler failure');
-        } catch (\RuntimeException $e) {
-            self::assertSame('handler failed', $e->getMessage());
-        }
+        $heldUp = async(static fn(): int => $client->processIncoming()->await());
+        $hold->began->getFuture()->await(new TimeoutCancellation(2));
         self::assertSame(0, $queue->droppedCount(), 'b3 is still queued');
         $transport->handshakeTrailer = ReconnectingTransport::INFO;
 
@@ -1079,6 +1084,8 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         self::assertCount(2, $transport->connectCalls, 'the first attempt succeeded');
         self::assertSame(['Subscription queue overflow for sid ' . $queue->sid], $recorder->errorsContaining('overflow'));
         self::assertSame(1, $queue->droppedCount());
+        $hold->end('the end of the test');
+        self::assertSame(2, $heldUp->await(), 'the held-up read ends once its handler returns');
     }
 
     /** @return iterable<string, array{string}> */

@@ -2580,14 +2580,15 @@ final class ServiceTest extends TestCase
     }
 
     /**
-     * run(): a request another fiber's read brought - a request() that waited for its reply - behind a message
-     * whose handler throws is answered without waiting for the server to send more. With handlerErrorsFailOperations
-     * that read fails with the handler's exception and leaves the rest queued, and the loop's read, which waited for
-     * it, delivers the rest. It used to wait for the server's next bytes, up to the heartbeat interval, and was lost
-     * when the service stopped first. (By default the request()'s read reports the failure and delivers the rest
-     * itself: see HandlerFailureDuringOperationTest.)
+     * A service's request that another fiber's read brings - a request() that waited for its reply - behind a message
+     * whose handler throws is answered without waiting for the server to send more, while the service's run() loop
+     * waits for that read. With handlerErrorsFailOperations that read fails the request() with the handler's exception,
+     * but delivers the service's request first (#177), so the endpoint answers before the request() fails, and nothing
+     * is reported. The request used to wait for the server's next bytes, up to the heartbeat interval, and was lost
+     * when the service stopped first. (By default the request()'s read reports the failure and delivers the rest as
+     * well: see HandlerFailureDuringOperationTest.)
      */
-    public function testRunAnswersARequestAnotherFibersReadLeftQueuedBehindAThrowingHandler(): void
+    public function testARequestAnotherFibersReadBringsBehindAThrowingHandlerIsAnsweredBeforeThatReadFails(): void
     {
         $errors = [];
         $transport = new ReconnectingTransport();
@@ -2617,6 +2618,8 @@ final class ServiceTest extends TestCase
         } catch (\RuntimeException $e) {
             self::assertSame('poison handler', $e->getMessage());
         }
+        self::assertSame([0], self::epochsOfWritesContaining($transport, 'run:hello'), 'answered once');
+        self::assertSame([], $errors, 'thrown to the request, not reported');
         $stop->cancel();
         $runner->await();
     }

@@ -14,6 +14,7 @@ use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
@@ -1053,10 +1054,10 @@ final class CloseIntentTest extends TestCase
 
     /**
      * A serving loop's read - the read a service's run() makes - while a disconnect() is closing the connection
-     * leaves what an earlier read left queued to the close, which discards it (#134): what a read that stopped at a
-     * throwing handler left behind, before the serving read started or while it waited for that read. With a close
-     * that takes a while, a TLS or WebSocket one, the serving read used to deliver it to its handler after
-     * disconnect() had been called.
+     * leaves what an earlier read has queued and not reached to the close, which discards it (#134): here the
+     * message behind a handler that awaits in the application's read, one that started before the serving read or
+     * one the serving read waited for. With a close that takes a while, a TLS or WebSocket one, the serving read
+     * used to deliver it to its handler after disconnect() had been called.
      */
     #[DataProvider('leftoversDuringADisconnect')]
     public function testServingReadDuringADisconnectLeavesWhatAnEarlierReadLeftQueuedToTheClose(bool $whileItWaits): void
@@ -1064,9 +1065,8 @@ final class CloseIntentTest extends TestCase
         $transport = new ReconnectingTransport();
         $connection = $this->connect($transport);
         $seen = [];
-        $sidA = $connection->subscribe('a', static function (): void {
-            throw new \RuntimeException('handler a');
-        })->await();
+        $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
+        $sidA = $connection->subscribe('a', $hold->handler())->await();
         $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
             $seen[] = $message->payload;
         })->await();
@@ -1077,7 +1077,7 @@ final class CloseIntentTest extends TestCase
         };
         $transport->closeDelay = 0.2;
 
-        // A plain read stops at a's throwing handler and leaves b's message queued.
+        // A plain read is held up in a's handler, which awaits, and leaves b's message queued.
         $plainRead = $connection->processIncoming(new TimeoutCancellation(2));
         if ($whileItWaits) {
             // The serving read waits for the plain read, which reads the messages once the close is under way.
@@ -1089,9 +1089,9 @@ final class CloseIntentTest extends TestCase
                 $transport->pushFrame($messages);
             };
         } else {
-            // The plain read is over when the close starts, and the serving read starts with it.
+            // The plain read is held up when the close starts, and the serving read starts with it.
             $transport->pushFrame($messages);
-            $this->assertFailsWithTheHandlersException($plainRead);
+            $hold->began->getFuture()->await(new TimeoutCancellation(2));
             $transport->beforeClose = static function () use ($transport, $connection, $holder): void {
                 $transport->beforeClose = null;
                 $holder->serving = $connection->readIncomingForOperation(new TimeoutCancellation(2), alwaysReport: true);
@@ -1099,27 +1099,18 @@ final class CloseIntentTest extends TestCase
         }
 
         $connection->disconnect()->await(new TimeoutCancellation(3));
-        $this->assertFailsWithTheHandlersException($plainRead);
+        self::assertTrue($hold->held, "the plain read is still held up in a's handler");
         self::assertInstanceOf(Future::class, $holder->serving);
         try {
             $holder->serving->await(new TimeoutCancellation(3));
         } catch (\Throwable) {
             // The close ended its read of the socket.
         }
+        $hold->end('the end of the test');
+        self::assertSame(2, $plainRead->await(new TimeoutCancellation(3)), 'the plain read ends once its handler returns');
 
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame([], $seen, 'discarded by disconnect()');
-    }
-
-    /** @param Future<int> $read */
-    private function assertFailsWithTheHandlersException(Future $read): void
-    {
-        try {
-            $read->await(new TimeoutCancellation(3));
-            self::fail('expected the handler\'s exception');
-        } catch (\RuntimeException $e) {
-            self::assertSame('handler a', $e->getMessage());
-        }
     }
 
     /** A connection that retries a failed first dial (retryOnFailedInitialConnect, reconnect disabled). */

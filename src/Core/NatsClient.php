@@ -308,10 +308,11 @@ final class NatsClient
      * @param bool $alwaysReport Report every overflow and every handler that throws while the read delivers,
      *        whatever the options say, the messages behind it still delivered, and an -ERR the server keeps the
      *        connection open for: for a read whose caller would only swallow them, such as a serving loop. Such
-     *        a read also delivers what an earlier read left queued, unless a disconnect() is closing the connection,
-     *        which discards it. A read that receives anything during the close still delivers it with what it
-     *        received, as any read does. A failure that ends the connection is still thrown, once the connection
-     *        has recovered.
+     *        a read also delivers what an earlier or a concurrent read has queued and not reached - the later sids
+     *        of a delivery held up in another fiber's handler, the rest of a subscription whose handler threw in
+     *        the application's read - unless a disconnect() is closing the connection, which discards it. A read
+     *        that receives anything during the close still delivers it with what it received, as any read does. A
+     *        failure that ends the connection is still thrown, once the connection has recovered.
      * @return Future<IncomingChunkResult>
      */
     public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
