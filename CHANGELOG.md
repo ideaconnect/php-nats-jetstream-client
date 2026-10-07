@@ -15,6 +15,50 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- An operation that reads the socket while it waits for a result of its own - a `SubscriptionQueue` poll,
+  `fetchBatch()`/`fetchNext()`, `directGetBatch()`, the pull consumer, or Key/Value `keys()`/`history()` - now
+  takes what is already queued for its own subscription before it reads or waits for another fiber's read (#179).
+  This reverses the 2.12.0 note that "an operation gets its message once the in-order delivery reaches it, so a
+  handler ahead of it that outlasts the operation's deadline still makes it time out": an operation now returns at
+  once what an earlier or a concurrent read has already queued for it, even while a handler ahead of it, in another
+  fiber, is still running. In particular this is what lets a user handler poll a `SubscriptionQueue` of its own for
+  a message delivered in the same chunk: the handler's own message is ahead of the queue's in that chunk, the
+  queue's message is queued behind the handler's delivery, and the poll now takes it from inside the handler instead
+  of reading the socket and timing out. The reorder is only ever of the operation's own subscription ahead of
+  another subscription's message queued with it; order within a subscription, and between the other subscriptions,
+  is unchanged, and NATS guarantees order only within a subscription. `request()` and `requestMany()`, whose replies
+  share one inbox, are unchanged, and so are your own `processIncoming()` and `readIncoming()`.
+- The take is only ever of what is ALREADY queued when the operation looks, so two shapes are unchanged by it. A
+  poll whose own read brings the chunk (no other fiber reads) still runs any handler ahead of its message in that
+  read's own delivery pass, and returns the message once that handler returns, however long it takes: nothing is
+  queued for the poll until the pass reaches it. And while a reconnect is under way the operation still waits for it
+  first, within its own timeout, as before 2.13.0: the take sits next to the in-order delivery of what a read left
+  queued, after the wait for a reconnect, so a message already queued for the operation is taken once the connection
+  is back, not during the outage. (The take was placed there, rather than ahead of the reconnect wait, to keep the
+  reconnect path exactly as 2.13.0 shipped it; a message an operation received before the drop is delivered during
+  the outage only when another fiber's delivery of it is still under way, as 2.13.0's #174 note describes.) An
+  overflow of the operation's own subscription met by the take fails the operation, not the read that queued the
+  chunk; a poll concurrent with its own `unsubscribe()` may still return a message the connection received before
+  the `UNSUB` went out.
+
+### Fixed
+
+- `[bugfix]` A handler that polled a `SubscriptionQueue` of its own for a message delivered in the same chunk waited
+  out its whole timeout, and the message reached the queue only once the handler returned (#179). The chunk held the
+  handler's own message ahead of the queue's; the in-order delivery was suspended inside the handler, so the queued
+  message was not delivered until the handler returned, and the poll read the socket with it already queued and
+  returned `null` (or `[]`, or a fetch's expiry) at its deadline. The same shape without a handler - an operation
+  whose message was queued behind a delivery held up in another fiber's awaiting handler - got it, since 2.12.0, only
+  when that delivery reached it. An operation's read now takes what is already queued for its own subscription first,
+  before it reads or waits for another fiber's read, delivering that one subscription with the read's own rules (its
+  own overflow or failing handler still fails it) and returning so the operation looks again; the other
+  subscriptions' queued messages stay in order for the delivery under way. It is skipped while that subscription's own
+  delivery is under way further up the stack, and while a `disconnect()` is closing the connection.
+
 ## [2.14.0] - 2026-10-07
 
 ### Upgrade notes

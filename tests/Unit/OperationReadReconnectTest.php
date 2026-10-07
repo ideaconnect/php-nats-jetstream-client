@@ -87,39 +87,59 @@ final class OperationReadReconnectTest extends TestCase
         yield 'KeyValueBucket::history()' => ['kvHistory'];
     }
 
+    /** @return iterable<string, array{string}> The operations whose reply shares the mux inbox, not an own sid. */
+    public static function requestOperations(): iterable
+    {
+        yield 'request()' => ['request'];
+        yield 'requestMany(max 1)' => ['requestMany'];
+    }
+
     /**
-     * The application's read took a chunk holding, ahead of the operation's message, a message for a lower-sid
-     * subscription whose handler awaits, as one making an HTTP or a database call does. The operation's read takes the
-     * socket during the hold-up, and the connection drops with dials refused for 2 s: that read is the first to
-     * notice, and starts the reconnect. The handler returns 50 ms later, and the delivery brings the operation's
-     * message during the outage. The operation, with a 1 s deadline (the JetStream pulls and the Direct Get batch
-     * expire after 1 s, their deadline a second later; the Key/Value replays take 1 s as their progress timeout),
-     * returns its message within 1 s, and the connection is Open again once the server lets dials through. It used to
-     * return after the whole outage: its read ran the reconnect inline and only then looked again.
+     * @return iterable<string, array{string}> The own-sid operations whose result the new connection can bring on its
+     *         own: a poll's subscription is replayed, the pull engine re-issues its pull, a Key/Value replay re-creates
+     *         its consumer. fetchBatch() and directGetBatch() are one-shot requests that do not re-issue after a
+     *         reconnect, so their result cannot arrive on the new connection; their own-sid take is covered by
+     *         {@see OperationTakesItsQueuedMessageTest} and their reconnect deadline by
+     *         {@see testAnOperationWhoseOwnReadRunsTheReconnectEndsAtItsOwnDeadline()} (fetchBatch).
      */
-    #[DataProvider('operations')]
-    public function testAnOperationWhoseOwnReadRunsTheReconnectGetsWhatADeliveryStillUnderWayBrings(string $operation): void
+    public static function ownSidOperations(): iterable
+    {
+        yield 'SubscriptionQueue::next()' => ['next'];
+        yield 'SubscriptionQueue::fetchAll(1)' => ['fetchAll'];
+        yield 'PullConsumerIterator::handle()' => ['pullConsumer'];
+        yield 'KeyValueBucket::keys()' => ['kvKeys'];
+        yield 'KeyValueBucket::history()' => ['kvHistory'];
+    }
+
+    /**
+     * A request() or requestMany() whose reply was already in flight on the mux inbox when the connection dropped: the
+     * application's read took a chunk holding, ahead of the reply, a message for a lower-sid subscription whose handler
+     * awaits. The operation's read takes the socket during the hold-up, and the connection drops with dials refused for
+     * 2 s: that read is the first to notice, and starts the reconnect. The handler returns 50 ms later, and the delivery
+     * brings the reply during the outage. The operation, with a 1 s deadline, returns within 1 s, and the connection is
+     * Open again once the server lets dials through. It used to return after the whole outage: its read ran the reconnect
+     * inline and only then looked again. A reply shares the mux inbox, not an own sid, so #179's own-sid take does not
+     * reach it; the own-sid operations are {@see testAnOwnSidOperationWhoseOwnReadRunsTheReconnectGetsItsResultOnTheNewConnection()}.
+     */
+    #[DataProvider('requestOperations')]
+    public function testARequestWhoseOwnReadRunsTheReconnectGetsTheReplyStillUnderWay(string $operation): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $client = $this->connectWatched($watched);
         $hold = new HeldUpDelivery(fallbackSeconds: 5.0);
-        // Subscribed first: the lowest sid, so its message is delivered ahead of the operation's.
+        // Subscribed first: the lowest sid, so its message is delivered ahead of the reply.
         $slowSid = $client->subscribe('slow', $hold->handler())->await();
         $lead = ReconnectingTransport::msgFrame('slow', $slowSid, 's');
         self::scriptAnswers($transport, $lead);
         // Sets the reply inbox up before the application's read starts.
         $client->request('svc.warm', 'x', 1_000)->await();
-        $queue = self::isPoll($operation) ? $client->subscribeQueue('jobs')->await() : null;
         $stop = new DeferredCancellation();
         $this->startApplicationReadLoop($client, $stop);
         $this->awaitRead($watched);
-        if ($queue !== null) {
-            $transport->pushFrame($lead . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
-        }
 
         $start = hrtime(true);
-        $result = self::startOperation($operation, $client, $queue, 1.0);
+        $result = self::startOperation($operation, $client, null, 1.0);
         $hold->began->getFuture()->await(new TimeoutCancellation(2));
         // The application's read is held up in the handler, so the read that takes the socket is the operation's.
         $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
@@ -136,6 +156,105 @@ final class OperationReadReconnectTest extends TestCase
         self::assertLessThan(1.0, $elapsed, sprintf('%s returned after %.3f s, with a 1 s deadline and a 2 s outage', $operation, $elapsed));
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open, 4.0);
         self::assertSame(1, $transport->epoch(), 'the reconnect the read started reopened the connection');
+    }
+
+    /**
+     * An own-sid operation whose own read is the first to notice a lost connection: its result arrives on the new
+     * connection, once the reconnect has replayed the operation's subscription (a poll's) or the pull engine has
+     * re-issued its pull (a fetch's, a Key/Value replay's). Nothing is queued for the operation when it looks - with
+     * #179 a queued own-sid message would be taken before the drop, so this staging delivers the result only on the new
+     * connection (the server answers the result on epoch 1) - so the operation's own read, the sole reader, goes to the
+     * socket, is the one that notices the drop, and starts the reconnect. With dials refused for 0.2 s and a 2 s
+     * deadline, the operation returns its result once the connection is back, on the second session. It used to return
+     * after the whole outage: its read ran the reconnect inline and only then looked again.
+     *
+     * The during-outage form of this (a delivery still under way bringing the result before the reconnect) no longer
+     * applies to an own-sid operation: #179 takes a message queued before the drop at once, so a result that reaches an
+     * own subscription during an outage can only be one the new connection brings. The deadline and waiting-disabled
+     * paths (nothing delivered) are {@see testAnOperationWhoseOwnReadRunsTheReconnectEndsAtItsOwnDeadline()} and
+     * {@see testWithWaitingDisabledAnOperationWhoseOwnReadRunsTheReconnectFailsAtOnce()}.
+     */
+    #[DataProvider('ownSidOperations')]
+    public function testAnOwnSidOperationWhoseOwnReadRunsTheReconnectGetsItsResultOnTheNewConnection(string $operation): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = $this->connectWatched($watched);
+        $server = new class {
+            /** The Key/Value replay consumer's deliver subject, until its SUB is replayed on the new connection. */
+            public ?string $deliver = null;
+        };
+        // Setup (svc.warm, a Key/Value consumer) is answered on either connection; the operation's RESULT is answered
+        // only on the new connection (epoch 1), so nothing is queued for the operation on the first one.
+        $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $server): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if ($subject === 'svc.warm') {
+                return $transport->replyFrame($replyTo, 'ok');
+            }
+
+            $sid = $transport->sidFor($replyTo);
+            if ($sid === null) {
+                return [];
+            }
+
+            if (str_starts_with($subject, '$JS.API.CONSUMER.CREATE.KV_b')) {
+                /** @var array{config: array{deliver_subject: string}} $request */
+                $request = json_decode($payload, true, flags: JSON_THROW_ON_ERROR);
+                $server->deliver = $request['config']['deliver_subject'];
+
+                return $transport->replyFrame($replyTo, (string) json_encode(['stream_name' => 'KV_b', 'name' => 'c1', 'config' => $request['config'], 'num_pending' => 1]));
+            }
+
+            if ($transport->epoch() < 1) {
+                // The result waits for the new connection: the operation's own read stays on the socket until the drop.
+                return [];
+            }
+
+            return match (true) {
+                str_starts_with($subject, '$JS.API.CONSUMER.MSG.NEXT.') => [ReconnectingTransport::msgFrame('evt.s', $sid, 'm1', self::ACK_SUBJECT)],
+                str_starts_with($subject, '$JS.API.DIRECT.GET.') => [ReconnectingTransport::hmsgFrame($replyTo, $sid, self::DIRECT_GET_HEADERS, 'v1')],
+                default => [],
+            };
+        };
+        $transport->afterWrite = static function (string $bytes) use ($transport, $server): void {
+            $deliver = $server->deliver;
+            if ($deliver !== null && $transport->epoch() >= 1 && str_contains($bytes, 'SUB ' . $deliver . ' ')) {
+                $server->deliver = null;
+                $transport->pushFrame(ReconnectingTransport::msgFrame('$KV.b.k', (int) $transport->sidFor($deliver), 'v1', self::KV_ACK_SUBJECT));
+            }
+        };
+        $client->request('svc.warm', 'x', 1_000)->await();
+        $queue = self::isPoll($operation) ? $client->subscribeQueue('jobs')->await() : null;
+        if ($queue !== null) {
+            // The poll's message arrives once its SUB is replayed on the new connection.
+            $jobsSent = false;
+            $previous = $transport->afterWrite;
+            $transport->afterWrite = static function (string $bytes) use ($transport, $queue, &$jobsSent, $previous): void {
+                $previous($bytes);
+                if (!$jobsSent && $transport->epoch() === 1 && str_contains($bytes, 'SUB jobs ')) {
+                    $jobsSent = true;
+                    $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+                }
+            };
+        }
+
+        $start = hrtime(true);
+        $result = self::startOperation($operation, $client, $queue, 2.0);
+        // The operation's own read is the sole reader, so it is the one on the socket when the connection drops.
+        $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
+        $transport->refuseDials();
+        $transport->dropConnection();
+        $this->acceptDialsAfter($transport, 0.2);
+        [$payloads, $elapsed, $error] = $this->settle($result, $start);
+
+        self::assertNull($error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? ''));
+        self::assertSame([self::RESULTS[$operation]], $payloads);
+        self::assertLessThan(2.0, $elapsed, sprintf('%s returned after %.3f s, with a 2 s deadline', $operation, $elapsed));
+        $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open, 4.0);
+        self::assertSame(1, $transport->epoch(), 'the operation\'s own read ran the reconnect that reopened the connection');
     }
 
     /** @return iterable<string, array{string, float}> */

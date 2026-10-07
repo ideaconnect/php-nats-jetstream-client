@@ -305,6 +305,10 @@ final class NatsClient
      * @param int|null $ownSid The operation's own subscription, whose overflow or failing handler still fails
      *        the operation, and whose next delivery, by whichever fiber's read, ends the read without reading
      *        ({@see NatsConnection::readIncomingForOperation()}): call this right after looking for the result.
+     *        What an earlier read has already queued for it, behind a delivery held up in a lower sid's handler
+     *        that awaits, the handler the operation itself runs in included, is delivered first, and the read
+     *        returns without reading (#179); the other subscriptions' queued messages stay in order for that
+     *        delivery.
      * @param bool $alwaysReport Report every overflow and every handler that throws while the read delivers,
      *        whatever the options say, the messages behind it still delivered, and an -ERR the server keeps the
      *        connection open for: for a read whose caller would only swallow them, such as a serving loop. Such

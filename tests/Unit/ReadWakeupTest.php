@@ -41,7 +41,10 @@ use function Amp\Socket\listen;
 
 /**
  * The wake-up of an operation's read (#174): the read of an operation that waits for a result of its own ends without
- * reading as soon as that result may have come in another fiber's delivery, wherever the read waits then.
+ * reading as soon as that result may have come in another fiber's delivery, wherever the read waits then. Since #179 an
+ * operation also takes what is already queued for its subscription before it reads or waits - behind a handler that
+ * awaits, a second fiber's read, or a reconnect it would join - so a read is woken only where its result was not yet
+ * queued when it looked: a dispatch held up before the message is queued, or one that arrives while the read waits.
  * {@see OperationReadWakeupTest} shows each operation getting its result in time; these tests pin what those do not:
  *
  *  - A read the wake-up cancels has consumed nothing: the built-in transports leave every byte they did not return
@@ -173,12 +176,13 @@ final class ReadWakeupTest extends TestCase
     }
 
     /**
-     * Problem 1 of #174 on a real socket, through the built-in socket transport: a poll's read waits on the socket while
-     * the application's delivery that brings its message is held up behind a handler that awaits. The delivery goes on,
-     * and the wake-up cancels the poll's read, which returns the message long before its 3 s deadline. The server sends
-     * nothing meanwhile, so nothing else could end that read: the old read returned at the deadline.
+     * #179 on a real socket, through the built-in socket transport: the application's read takes a chunk holding, ahead
+     * of the poll's message, a message for a handler that awaits, so the poll's message is queued behind that delivery.
+     * The poll takes it at once, without a socket read, and before the handler ahead of it is let go - the order decides
+     * it: {@see HeldUpDelivery::$held} is still true when the message is in. Before #179 the poll read the socket with
+     * its message already queued and returned it only once the handler went on, or at its deadline.
      */
-    public function testAnOperationsReadOnARealSocketEndsWithTheDeliveryThatBringsItsResult(): void
+    public function testAnOperationOnARealSocketTakesItsQueuedMessageWithoutReading(): void
     {
         [$client, $server, $watched] = $this->connectToLoopbackServer();
         $hold = new HeldUpDelivery();
@@ -190,58 +194,53 @@ final class ReadWakeupTest extends TestCase
         $this->startApplicationReadLoop($client, $stop);
         $server->send(ReconnectingTransport::msgFrame('slow', $slowSid, 's') . ReconnectingTransport::msgFrame('jobs', $jobsSid, 'job-1'));
         $hold->began->getFuture()->await(new TimeoutCancellation(2));
-        $watched->onRead = $hold->endWhenARead();
 
+        $readsBefore = $watched->reads;
         $start = hrtime(true);
         $message = $queue->setTimeout(3.0)->next();
         $elapsed = $this->secondsSince($start);
+        $heldWhenDone = $hold->held;
+        $reads = $watched->reads - $readsBefore;
+        $hold->end('the end of the test');
         $stop->cancel();
 
-        self::assertSame('a read taking the socket', $hold->endedBy, "the poll's read took the socket during the hold-up");
         self::assertSame('job-1', $message?->payload);
+        self::assertTrue($heldWhenDone, 'the poll returned before the handler ahead of it was let go');
+        self::assertSame(0, $reads, 'the poll delivered its queued message without reading the real socket');
         self::assertLessThan(1.5, $elapsed, sprintf('next() returned after %.3f s, its deadline being 3 s', $elapsed));
-        self::assertGreaterThanOrEqual(1, $watched->cancelledReads, "the wake-up ended the poll's read of the socket");
     }
 
     /**
-     * The same on a real socket, with bytes on the socket when the wake-up cancels the poll's read: a subscription
-     * delivered right after the poll's, in the same held-up delivery, sends the first half of a 120 KB message, which
-     * the server has on the socket before the wake-up reaches the read, since the event loop polls the socket only once
-     * its queued callbacks have run. The cancelled read leaves those bytes on the socket: the next read hands them to
-     * the parser, and the message arrives whole with its second half.
+     * The same on a real socket, and the next poll then reads a large message whole: the poll takes its queued job-1
+     * without a read (#179); the handler is let go; the server sends a 120 KB message, and the next poll reads it off
+     * the real socket, in as many reads as the transport takes, and hands the parser a whole frame.
      */
-    public function testAnOperationsReadWokenWithBytesOnARealSocketLeavesThemForTheNextRead(): void
+    public function testAnOperationOnARealSocketTakesItsQueuedMessageThenReadsTheNextWhole(): void
     {
         [$client, $server, $watched] = $this->connectToLoopbackServer();
         $hold = new HeldUpDelivery();
         $client->subscribe('slow', $hold->handler())->await();
         $queue = $client->subscribeQueue('jobs')->await();
         $large = self::distinctBytes(120_000, 3);
-        $largeFrame = '';
-        $client->subscribe('tail', static function () use ($server, &$largeFrame): void {
-            $server->send(substr($largeFrame, 0, intdiv(strlen($largeFrame), 2)));
-        })->await();
-        [$slowSid, $jobsSid, $tailSid] = $this->sidsAtTheServer($client, $server, 'slow', 'jobs', 'tail');
-        $largeFrame = ReconnectingTransport::msgFrame('jobs', $jobsSid, $large);
+        [$slowSid, $jobsSid] = $this->sidsAtTheServer($client, $server, 'slow', 'jobs');
 
         $stop = new DeferredCancellation();
         $this->startApplicationReadLoop($client, $stop);
-        $server->send(
-            ReconnectingTransport::msgFrame('slow', $slowSid, 's')
-            . ReconnectingTransport::msgFrame('jobs', $jobsSid, 'job-1')
-            . ReconnectingTransport::msgFrame('tail', $tailSid, 't'),
-        );
+        $server->send(ReconnectingTransport::msgFrame('slow', $slowSid, 's') . ReconnectingTransport::msgFrame('jobs', $jobsSid, 'job-1'));
         $hold->began->getFuture()->await(new TimeoutCancellation(2));
-        $watched->onRead = $hold->endWhenARead();
 
+        $readsBefore = $watched->reads;
         $first = $queue->setTimeout(3.0)->next();
-        $watched->onRead = null;
+        $heldWhenDone = $hold->held;
+        $reads = $watched->reads - $readsBefore;
 
-        self::assertSame('a read taking the socket', $hold->endedBy, "the poll's read took the socket during the hold-up");
         self::assertSame('job-1', $first?->payload);
-        self::assertGreaterThanOrEqual(1, $watched->cancelledReads, "the wake-up ended the poll's read, the bytes on the socket notwithstanding");
+        self::assertTrue($heldWhenDone, 'the queued message was taken before the handler was let go');
+        self::assertSame(0, $reads, 'without a socket read');
 
-        $server->send(substr($largeFrame, intdiv(strlen($largeFrame), 2)));
+        // The handler is let go; a large message then arrives and is read whole over the real socket.
+        $hold->end('the end of the test');
+        $server->send(ReconnectingTransport::msgFrame('jobs', $jobsSid, $large));
         $second = $queue->setTimeout(3.0)->next();
         $stop->cancel();
 
@@ -251,12 +250,13 @@ final class ReadWakeupTest extends TestCase
     }
 
     /**
-     * The wake-up also ends an operation's wait for another fiber's read, which can go on long after the delivery that
-     * brings the operation's result: here the application's delivery, held up behind a handler that awaits, brings the
-     * poll's message while a second application read holds the socket, with nothing coming from the server. The poll
-     * returns the message at once; it used to wait for that read, up to the read's deadline.
+     * The own-sid delivery takes precedence over an operation's wait for another fiber's read (#179): the application's
+     * delivery, held up behind a handler that awaits, has the poll's message queued behind it, and a second application
+     * read holds the socket. The poll takes its queued message at once - before the handler ahead of it is let go, and
+     * without reading or waiting for the other read, which still holds the socket. It used to wait for that read, up to
+     * the read's deadline, since nothing came from the server.
      */
-    public function testAnOperationWaitingForAnotherFibersReadGetsWhatADeliveryStillUnderWayBrings(): void
+    public function testAnOperationTakesItsQueuedMessageWithoutWaitingForAnotherFibersRead(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
@@ -281,19 +281,17 @@ final class ReadWakeupTest extends TestCase
         $reading->getFuture()->await(new TimeoutCancellation(2));
         $watched->onRead = null;
 
-        $poll = async(static fn(): ?NatsMessage => $queue->setTimeout(3.0)->next());
-        // The poll goes to wait for the read the second application read holds.
-        delay(0.05);
-        self::assertFalse($poll->isComplete());
         $readsBefore = $watched->reads;
         $start = hrtime(true);
-        $hold->end('the test');
-        $message = $poll->await(new TimeoutCancellation(5));
+        $message = $queue->setTimeout(3.0)->next();
         $elapsed = $this->secondsSince($start);
+        $heldWhenDone = $hold->held;
+        $hold->end('the test');
 
         self::assertSame('job-1', $message?->payload);
-        self::assertLessThan(1.0, $elapsed, sprintf('the poll returned %.3f s after the delivery went on', $elapsed));
-        self::assertSame($readsBefore, $watched->reads, 'the poll returned without reading the socket');
+        self::assertTrue($heldWhenDone, 'the poll took its queued message before the handler ahead of it was let go');
+        self::assertLessThan(1.0, $elapsed, sprintf('the poll returned %.3f s in', $elapsed));
+        self::assertSame($readsBefore, $watched->reads, 'the poll returned without reading the socket, the other read still holding it');
         self::assertFalse($holder->isComplete(), 'the other read still holds the socket');
         $stop->cancel();
     }
@@ -337,27 +335,42 @@ final class ReadWakeupTest extends TestCase
     }
 
     /**
-     * The same when the operation's own read meets the dropped connection while another fiber already runs the
-     * reconnect, here the heartbeat's, after the server stopped answering: the read joins that reconnect, and the
-     * delivery still under way brings the poll's message meanwhile. The poll returns it during the outage.
+     * The operation's own read joins a reconnect and gets its message after it: the application's read is parked in a
+     * handler that awaits, so the poll's own read holds the socket, with nothing queued for it (#179 leaves its wait on
+     * the socket intact). The server stops answering and refuses dials, the heartbeat gives the connection up and
+     * reconnects, closing the socket the poll's read waits on, and that read joins the reconnect. The server sends the
+     * poll's message right after the replayed SUB, and the poll, whose read joined the reconnect, returns it once the
+     * connection is back.
      */
-    public function testAnOperationWhoseReadJoinsAReconnectGetsWhatADeliveryStillUnderWayBrings(): void
+    public function testAnOperationWhoseReadJoinsAReconnectGetsItsMessageAfterTheReplay(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $client = new NatsClient($this->options(true, 2_000, 1_000, 0.05, 1, null, 5, 20, null), $watched);
         $this->opened[] = $client;
         $client->connect()->await();
-        $hold = new HeldUpDelivery(fallbackSeconds: 2.5);
+        $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
         $slowSid = $client->subscribe('slow', $hold->handler())->await();
         $queue = $client->subscribeQueue('jobs')->await();
+        $server = new class {
+            public bool $sent = false;
+        };
+        $transport->afterWrite = static function () use ($transport, $server, $queue): void {
+            if ($server->sent || $transport->epoch() < 1 || $transport->sidFor('jobs') === null) {
+                return;
+            }
+
+            // The reconnect has replayed the SUB the poll's message comes on.
+            $server->sent = true;
+            $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+        };
 
         $stop = new DeferredCancellation();
         $this->startApplicationReadLoop($client, $stop);
         $this->awaitRead($watched);
-        $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $slowSid, 's') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+        // The application's read is parked in slow's handler, with nothing queued for the poll.
+        $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $slowSid, 's'));
         $hold->began->getFuture()->await(new TimeoutCancellation(2));
-        $cancelledBefore = $watched->cancelledReads;
         $readsBefore = $watched->reads;
 
         $poll = async(static fn(): ?NatsMessage => $queue->setTimeout(3.0)->next());
@@ -368,18 +381,19 @@ final class ReadWakeupTest extends TestCase
         $transport->silence();
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Connecting && $watched->readsUnderWay === 0);
         delay(0.05);
-        self::assertFalse($poll->isComplete());
+        self::assertFalse($poll->isComplete(), 'the poll is still waiting for the reconnect its read joined');
         $start = hrtime(true);
-        $hold->end('the test');
+        $transport->acceptDials();
         $message = $poll->await(new TimeoutCancellation(5));
         $elapsed = $this->secondsSince($start);
-
-        self::assertSame($cancelledBefore, $watched->cancelledReads, "the poll's read ended with the socket, not by a cancellation");
-        self::assertSame(ConnectionState::Connecting, $client->state(), 'the connection is still down');
-        self::assertSame('job-1', $message?->payload);
-        self::assertLessThan(1.0, $elapsed, sprintf('the poll returned %.3f s after the delivery went on', $elapsed));
-        $transport->acceptDials();
+        $hold->end('the test');
         $stop->cancel();
+
+        self::assertGreaterThan($readsBefore, $watched->reads, "the poll's own read was on the socket when it dropped");
+        self::assertSame(1, $transport->epoch(), 'the connection was reconnected once');
+        self::assertTrue($server->sent, 'the server sent the message right after the replayed SUB');
+        self::assertSame('job-1', $message?->payload);
+        self::assertLessThan(2.0, $elapsed, sprintf('the poll returned %.3f s after dials were accepted', $elapsed));
     }
 
     /**
@@ -807,38 +821,42 @@ final class ReadWakeupTest extends TestCase
     }
 
     /**
-     * A wake-up is only a reason to look again: what the operation looks at is its own state. Here another poller of the
-     * same queue takes the message the delivery brought before the woken poll looks. The poll finds nothing, returns
-     * nothing wrong, and waits on: once the application's read loop stops, the poll's read takes the socket and stays
-     * there, the only read under way, where a spin would read again, or look again without reading, every millisecond.
-     * It returns the next message.
+     * A wake-up is only a reason to look again: what the operation looks at is its own state. The poll waits behind the
+     * application's read, with nothing queued for it (#179 leaves its wait intact), and the message is not yet queued
+     * when it looks. The application's read then delivers the message to the queue, and another poller takes it before
+     * the woken poll resumes: a higher sid's handler, delivered after the queue's message in the same read, queues the
+     * steal, and that steal runs before the wake-up reaches the waiting read, which is one event-loop hop later
+     * (through the composite cancellation the read waits with). The poll finds nothing, returns nothing wrong, and
+     * waits on: once the application's read loop stops, its read takes the socket and stays there, the only read under
+     * way, where a spin would read or look again every millisecond. It returns the next message.
      */
     public function testAWakeUpThatFindsNothingCostsOneLookAndTheOperationWaitsOn(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $client = $this->connectWatched($watched);
-        $hold = new HeldUpDelivery();
-        $slowSid = $client->subscribe('slow', $hold->handler())->await();
         $queue = $client->subscribeQueue('jobs')->await();
         $stolen = new class {
             public ?string $payload = null;
         };
-        // Queued as the handler returns, ahead of the wake-up that the delivery of job-1 behind it fires.
-        $hold->beforeReturning = static function () use ($queue, $stolen): void {
+        // Subscribed after the queue, so its sid is higher and it is delivered after the queue's message: it queues the
+        // steal to run before the wake-up the queue's delivery fires.
+        $tickSid = $client->subscribe('tick', static function () use ($queue, $stolen): void {
             EventLoop::queue(static function () use ($queue, $stolen): void {
                 $stolen->payload = $queue->fetch()?->payload;
             });
-        };
+        })->await();
 
         $stop = new DeferredCancellation();
         $loop = $this->startApplicationReadLoop($client, $stop);
         $this->awaitRead($watched);
-        $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $slowSid, 's') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
-        $hold->began->getFuture()->await(new TimeoutCancellation(2));
-        $watched->onRead = $hold->endWhenARead();
 
         $poll = async(static fn(): ?NatsMessage => $queue->setTimeout(3.0)->next());
+        // The poll goes to wait behind the application's read, with nothing queued for it.
+        delay(0.05);
+        self::assertFalse($poll->isComplete());
+        // The application's read delivers job-1 to the queue; tick's handler, delivered after it, queues the steal.
+        $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1') . ReconnectingTransport::msgFrame('tick', $tickSid, 't'));
         $this->waitUntil(static fn(): bool => $stolen->payload !== null);
         // The application's read loop stops, so the poll's read is the one to take the socket.
         $stop->cancel();
@@ -848,7 +866,6 @@ final class ReadWakeupTest extends TestCase
         // A poll that spun would read, or look, about once a millisecond meanwhile.
         delay(0.05);
 
-        self::assertSame('a read taking the socket', $hold->endedBy, "the poll's read took the socket during the hold-up");
         self::assertSame('job-1', $stolen->payload, 'the other poller took the message');
         self::assertFalse($poll->isComplete(), 'the woken poll found nothing, and waits on');
         self::assertSame(1, $watched->readsUnderWay, "the poll's read waits on the socket");

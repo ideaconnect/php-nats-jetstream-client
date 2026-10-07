@@ -69,10 +69,16 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         $this->closeOpenedConnections();
     }
 
-    /** @return iterable<string, array{string, int}> */
+    /**
+     * @return iterable<string, array{string, int}> Only request() here: its reply shares the mux inbox, so a reply
+     *         still in flight when the connection dropped is delivered during the outage whatever the hops. An own-sid
+     *         operation's queued message is taken before the drop (#179), so it cannot be the subject of a during-outage
+     *         delivery at various hops; its reconnect-gets-result path is
+     *         {@see OperationReadReconnectTest::testAnOwnSidOperationWhoseOwnReadRunsTheReconnectGetsItsResultOnTheNewConnection()}.
+     */
     public static function hopsAfterTheDrop(): iterable
     {
-        foreach (['next' => [0, 1, 3, 8], 'request' => [0, 8], 'fetchBatch' => [0, 8]] as $operation => $hops) {
+        foreach (['request' => [0, 8]] as $operation => $hops) {
             foreach ($hops as $count) {
                 yield sprintf('%s, the delivery goes on %d hop(s) after the drop', $operation, $count) => [$operation, $count];
             }
@@ -80,10 +86,10 @@ final class OperationReadReconnectLifecycleTest extends TestCase
     }
 
     /**
-     * The application's delivery, held up in a lower-sid handler with the operation's message queued behind it, goes
-     * on $hops event-loop hops after the connection drops: before the operation's read has met the EOF, while it
-     * reports it, or once it waits for the reconnect it started. The operation gets its message while the second
-     * session is still refused (dials refused for 0.5 s), and the connection comes back on its own.
+     * The reply, held up in a lower-sid handler with the operation's reply queued behind it on the mux inbox, goes on
+     * $hops event-loop hops after the connection drops: before the operation's read has met the EOF, while it reports
+     * it, or once it waits for the reconnect it started. The operation gets its reply while the second session is still
+     * refused (dials refused for 0.5 s), and the connection comes back on its own.
      */
     #[DataProvider('hopsAfterTheDrop')]
     public function testTheDeliveryThatBringsTheResultEndsTheWaitWhateverTheHopsAfterTheDrop(string $operation, int $hops): void
@@ -124,10 +130,15 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected], $recorder->events);
     }
 
-    /** @return iterable<string, array{string, string}> */
+    /**
+     * @return iterable<string, array{string, string}> Only request() here: its reply shares the mux inbox, so a reply
+     *         still in flight is delivered during the outage as the reconnect writes its CONNECT or its SUB. An own-sid
+     *         operation's queued message is taken before the drop (#179), so its reconnect-gets-result path is the
+     *         new-connection one, {@see OperationReadReconnectTest::testAnOwnSidOperationWhoseOwnReadRunsTheReconnectGetsItsResultOnTheNewConnection()}.
+     */
     public static function momentsOfTheReconnect(): iterable
     {
-        foreach (['next', 'request'] as $operation) {
+        foreach (['request'] as $operation) {
             yield $operation . ', as the first dial goes through' => [$operation, 'CONNECT'];
             yield $operation . ', during the subscription replay' => [$operation, 'SUB '];
         }
@@ -452,10 +463,12 @@ final class OperationReadReconnectLifecycleTest extends TestCase
     }
 
     /**
-     * The event loop stalls for 0.2 s - the test blocks it right after the drop, or a listener does - with the poll's
-     * message due 50 ms into the outage (0.6 s, dials refused) from a delivery held up in a lower-sid handler. The
-     * poll gets its message once the loop runs again, while the second session is still refused, and the reconnect
-     * completes.
+     * The event loop stalls for 0.2 s - the test blocks it right after the drop, or a listener does - while the poll's
+     * own read runs the reconnect it started (0.6 s, dials refused). Nothing is queued for the poll before the drop
+     * (with #179 a queued own-sid message would be taken before the drop, so it cannot be the subject of a during-outage
+     * delivery), so the poll's own read is the one that notices the drop and its message arrives on the new connection
+     * once the SUB is replayed: the poll gets it once the loop runs again and the connection is back, and the reconnect
+     * completes, whatever the stall.
      */
     #[DataProvider('stalls')]
     public function testAStallOfTheEventLoopAroundTheDropChangesNothing(string $point): void
@@ -483,35 +496,33 @@ final class OperationReadReconnectLifecycleTest extends TestCase
             }
         };
         $client = $this->lifecycleClient($watched, $recorder, errorListener: $errorListener, connectionListener: $connectionListener);
-        $hold = new HeldUpDelivery(fallbackSeconds: 5.0);
-        $slowSid = $client->subscribe('slow', $hold->handler())->await();
-        $lead = ReconnectingTransport::msgFrame('slow', $slowSid, 's');
-        self::scriptServer($transport, $lead);
         $queue = $client->subscribeQueue('jobs')->await();
-        $stop = new DeferredCancellation();
-        self::startApplicationReadLoop($client, $stop);
-        self::awaitRead($watched);
-        $transport->pushFrame($lead . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+        // Nothing is queued for the poll before the drop; its message arrives on the new connection once its SUB is
+        // replayed. The poll's own read is the sole reader, so it is the one that notices the drop and runs the reconnect.
+        $jobsSent = false;
+        $transport->afterWrite = static function (string $bytes) use ($transport, $queue, &$jobsSent): void {
+            if (!$jobsSent && $transport->epoch() === 1 && str_contains($bytes, 'SUB jobs ')) {
+                $jobsSent = true;
+                $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+            }
+        };
 
         $start = hrtime(true);
         $result = self::startOperation('next', $client, $queue, 2.5);
-        $hold->began->getFuture()->await(new TimeoutCancellation(3));
         $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
         $transport->refuseDials();
         $transport->dropConnection();
         if ($point === 'afterDrop') {
             $stall();
         }
-        EventLoop::delay(0.05, static fn() => $hold->end('the test'));
         $this->acceptDialsAfter($transport, 0.6);
         [$payloads, $elapsed, $error] = $this->settle($result, $start);
         $epochOnReturn = $transport->epoch();
-        $stop->cancel();
 
         self::assertTrue($stalled, 'the loop stalled ' . $point);
         self::assertNull($error, sprintf('the poll threw %s', $error?->getMessage() ?? ''));
         self::assertSame(['job-1'], $payloads);
-        self::assertSame(0, $epochOnReturn, sprintf('the poll returned after %.3f s, once the reconnect was over', $elapsed));
+        self::assertSame(1, $epochOnReturn, sprintf('the poll returned after %.3f s, once the reconnect reopened the connection', $elapsed));
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open && $client->statistics()->reconnects === 1, 4.0);
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected], $recorder->events);
     }

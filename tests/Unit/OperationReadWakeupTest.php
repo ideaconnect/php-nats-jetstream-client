@@ -34,9 +34,10 @@ use function Amp\delay;
  *
  *  - A delivery still under way: the application's own read took a chunk that holds, ahead of the operation's
  *    message, a message for a subscription with a lower sid, whose handler awaits something other than NATS. The
- *    read slot is free meanwhile, so the operation reads the socket, and the delivery that brings its message
- *    completes while it waits there. In the second form a server PING ahead of the operation's message, whose PONG
- *    the socket takes only after a while, holds the dispatch of the chunk up the same way.
+ *    operation's message is queued behind that delivery, and the operation takes it at once, before the handler is
+ *    let go (#179). In the second form a server PING ahead of the operation's message, whose PONG the socket takes
+ *    only after a while, holds the dispatch of the chunk up before the message is queued: the operation reads the
+ *    socket, and the delivery that brings its message, once the PONG goes out, wakes that read.
  *  - The hop window: between the operation's check and the moment its read takes the read slot, a few event-loop
  *    hops later, another fiber's read takes and delivers the operation's message.
  *  - A reconnect: the operation's read waits for a reconnect that another fiber's read runs, and that reconnect
@@ -128,13 +129,21 @@ final class OperationReadWakeupTest extends TestCase
      * The guards hold the same staging with a handler that makes a request() of its own: the reason the read slot is
      * free during a delivery. That request must get its reply, and the operation its message, without either waiting
      * for the other.
+     *
+     * With the message queued behind the awaiting handler, the operation takes it at once and the handler is still held
+     * when the result is in (#179): the operation never waits for the handler to be let go.
      */
     #[DataProvider('operationsBehindAHandlerThatAwaits')]
     public function testOperationGetsWhatADeliveryUnderWayInAnotherFiberBrings(string $operation, string $handlerAwaits): void
     {
-        [$payloads, $elapsed, $error, $endedBy] = $this->runBehindAHeldUpDelivery($operation, $handlerAwaits);
+        [$payloads, $elapsed, $error, $endedBy, $heldWhenDone] = $this->runBehindAHeldUpDelivery($operation, $handlerAwaits);
 
         $this->assertPrompt($operation, $payloads, $elapsed, $error, self::PROMPT, 'the handler was let go by ' . $endedBy);
+        if ($handlerAwaits === 'handler' && $operation !== 'request' && $operation !== 'requestMany') {
+            // request() and requestMany() read with no own sid and are out of #179's scope: they still read the socket
+            // and wake on their reply, letting the hold go. The own-sid operations take their queued message at once.
+            self::assertTrue($heldWhenDone, 'the operation took its queued message while the handler ahead of it was still held (#179)');
+        }
     }
 
     /** @return iterable<string, array{string}> */
@@ -327,8 +336,8 @@ final class OperationReadWakeupTest extends TestCase
      * message is not delivered yet. A queue poll starts once the hold-up began; the other operations start first, and the
      * server answers what they write with that chunk.
      *
-     * @return array{list<string>, float, ?string, string} The operation's payloads, the seconds it took, what it threw,
-     *         and what ended the hold-up.
+     * @return array{list<string>, float, ?string, string, bool} The operation's payloads, the seconds it took, what it
+     *         threw, what ended the hold-up, and whether the handler ahead of it was still held when the result was in.
      */
     private function runBehindAHeldUpDelivery(string $operation, string $lead): array
     {
@@ -498,8 +507,13 @@ final class OperationReadWakeupTest extends TestCase
             $hold->began->getFuture()->await(new TimeoutCancellation(2));
         }
 
+        $heldWhenDone = false;
         try {
             $outcome = $this->runOperation($operation, $client, $queue);
+            // Captured before the hold is let go below: with the message queued behind the handler, the operation takes
+            // it at once and the handler is still held when its result is in (#179). The 'ping' and 'request' leads let
+            // the hold go as part of getting the result, so this only holds for the plain 'handler' lead.
+            $heldWhenDone = $hold->held;
             if ($lead === 'request') {
                 // The handler's own request has to end as well, and in time.
                 try {
@@ -523,7 +537,7 @@ final class OperationReadWakeupTest extends TestCase
             self::report(sprintf("  the handler's own request got %s after %.3f s", $hold->innerReply, $hold->innerSeconds));
         }
 
-        return [...$outcome, $hold->endedBy];
+        return [...$outcome, $hold->endedBy, $heldWhenDone];
     }
 
     /**

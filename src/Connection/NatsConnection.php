@@ -2643,6 +2643,16 @@ final class NatsConnection
      * server keeps the connection open for still fails the operation: it names no subscription, and it is often
      * the answer to what the operation itself sent, its SUB or its PUB.
      *
+     * With $ownSid the read first takes what is already queued for that subscription, before it reads or waits for
+     * another fiber's read (#179): an earlier read can have queued the operation's message behind a delivery it has not
+     * finished, held up in the handler of a lower sid that awaits, which is the handler the operation itself runs in
+     * when a handler polls a SubscriptionQueue, or one awaiting an HTTP or a database call in another fiber. That one
+     * subscription is delivered, with the rules below for its overflow and its handler, and the read returns without
+     * reading, so that the operation looks again; the other subscriptions' queued messages stay in order for the
+     * delivery under way. Not while that subscription's own delivery is under way, which delivers it, and not what a
+     * disconnect() under way is to discard ({@see leftoversBelongToAClose()}). An operation used to get its message
+     * once the in-order delivery reached it, so a handler ahead of it that outlasted its deadline made it time out.
+     *
      * With $ownSid the read also ends, without reading and with nothing consumed, as soon as anything is delivered
      * to that subscription after this call, by whichever fiber's read: the read of another fiber whose delivery was
      * still under way, the one that took the socket during the hops before this read's own fiber started, or the
@@ -2785,6 +2795,13 @@ final class NatsConnection
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that asked for the read.
      * @param bool $reportOverflows Report a full subscription queue the read runs into instead of throwing
      *        it, except one of $ownSid ({@see dispatchFrames()}).
+     * @param int|null $ownSid The operation's own subscription ({@see readIncomingForOperation()}). What an earlier
+     *        read has queued for it and not reached is delivered first, before the read-slot decision and after a
+     *        wait for another fiber's read, next to the leftovers a serving loop's read delivers, and the read then
+     *        returns without reading ({@see deliverQueuedForOwnSid()}, #179): that message is behind a delivery
+     *        held up in a lower sid's handler, which can be the very handler the operation runs in, and nothing else
+     *        would deliver it before that handler returned. Only that one subscription: the others' queued messages
+     *        stay in order for the delivery under way.
      * @param bool $reportHandlerFailures Report a handler that throws while the read delivers, and deliver
      *        the rest of its subscription too, instead of throwing its exception once the other subscriptions'
      *        messages are delivered ({@see deliverPending()}), unless it is a handler of $ownSid: for a drain,
@@ -2899,6 +2916,18 @@ final class NatsConnection
                 $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
             }
 
+            // An operation's read first takes what an earlier read has queued for the operation's own subscription
+            // and not reached (#179): a message behind a delivery held up in the handler of a lower sid, awaiting. That
+            // handler can be the one the operation runs in, a handler polling a SubscriptionQueue, whose message came
+            // in the same chunk as the handler's own: nothing would deliver it before the handler returned, and the
+            // handler waits for it. Only that subscription is delivered, the others' queued messages stay in order for
+            // the delivery under way, and the read returns without reading, so that the operation looks again. Not a
+            // subscription whose own delivery is under way, which delivers it, and not what a disconnect() under way
+            // is to discard, as for the leftovers above.
+            if ($ownSid !== null && $this->deliverQueuedForOwnSid($ownSid, $reportOverflows, $reportHandlerFailures)) {
+                return new IncomingChunkResult(0, false);
+            }
+
             // The PONG this read is for is already in: another fiber's read took it after the caller last checked.
             if ($pongSlot?->isComplete() ?? false) {
                 return new IncomingChunkResult(0, false);
@@ -2934,6 +2963,12 @@ final class NatsConnection
                 // is delivered here, as above.
                 if ($deliverLeftovers && $this->pendingDirty !== [] && !$this->leftoversBelongToAClose()) {
                     $this->deliverPending($reportOverflows, $ownSid, $reportHandlerFailures);
+                }
+
+                // And what that read queued for the operation's own subscription behind a handler it is held up in,
+                // as above (#179): the operation then finds it as it looks again, rather than reading once more first.
+                if ($ownSid !== null) {
+                    $this->deliverQueuedForOwnSid($ownSid, $reportOverflows, $reportHandlerFailures);
                 }
 
                 return new IncomingChunkResult(0, false);
@@ -5506,8 +5541,58 @@ final class NatsConnection
             $failure = $e;
         }
 
-        // The first handler failure held by the pass is thrown below; the others are reported, as the frame
-        // failures behind the one dispatchFrames() rethrows are (#128). One that ended the pass outright wins.
+        $this->throwWhatThePassHeld($failure, $heldFailures, $held);
+    }
+
+    /**
+     * Delivers what is queued for an operation's own subscription ahead of the operation's read ({@see readChunk()},
+     * #179), when there is something to deliver and nothing else will: the sid is dirty, no delivery to it is under
+     * way further up some fiber's stack (that one resumes and delivers it, in order), and the queued messages are not
+     * a disconnect()'s to discard ({@see leftoversBelongToAClose()}). The one subscription is delivered with the rules
+     * an operation's read delivers it with ({@see drainPendingForSid()}): its handler is the library's and never
+     * suspends, except in an error listener a dropped message is reported to; its overflow and its handler's failure
+     * are the operation's own, held and thrown as {@see deliverPending()} throws them. The delivery fires the
+     * subscription's wake-up as any delivery does, so other reads waiting for it look again as well - this read
+     * among them, since it waits with that wake-up ({@see readChunk()}'s $waitCancellation): the wake-up firing
+     * here already ends this read at its next check, and the read's explicit return on a true result below is the
+     * same outcome made plain, not a second mechanism.
+     *
+     * @return bool Whether anything was delivered: the read then returns without reading, and the operation looks.
+     */
+    private function deliverQueuedForOwnSid(int $ownSid, bool $reportOverflows, bool $reportHandlerFailures): bool
+    {
+        if (!isset($this->pendingDirty[$ownSid]) || isset($this->dispatchingSids[$ownSid]) || $this->leftoversBelongToAClose()) {
+            return false;
+        }
+
+        $held = [];
+        $heldFailures = [];
+        $failure = null;
+        $delivered = 0;
+        try {
+            $delivered = $this->drainPendingForSid($ownSid, $held, $heldFailures, $reportOverflows, $ownSid, $reportHandlerFailures);
+        } catch (\Throwable $e) {
+            $failure = $e;
+        }
+
+        $this->throwWhatThePassHeld($failure, $heldFailures, $held);
+
+        return $delivered > 0;
+    }
+
+    /**
+     * Throws what a delivery pass held, once the pass is over ({@see deliverPending()}, {@see deliverQueuedForOwnSid()}).
+     * The first handler failure held by the pass is thrown; the others are reported, as the frame failures behind the
+     * one dispatchFrames() rethrows are (#128). One that ended the pass outright wins. Without a failure the first held
+     * overflow is thrown and the rest are reported; with NatsOptions::$slowConsumerErrorsFailOperations the thrown one
+     * is reported as well, as a SubscriptionQueue's overflow always was before that option existed.
+     *
+     * @param \Throwable|null $failure What ended the pass outright, if anything did.
+     * @param list<\Throwable> $heldFailures The handler failures the pass held ({@see drainPendingForSid()}).
+     * @param list<SlowConsumerException> $held The overflows the pass held.
+     */
+    private function throwWhatThePassHeld(?\Throwable $failure, array $heldFailures, array $held): void
+    {
         foreach ($heldFailures as $heldFailure) {
             if ($failure === null) {
                 $failure = $heldFailure;
@@ -6283,6 +6368,9 @@ final class NatsConnection
      *        operation.
      * @param-out ($heldOverflows is null ? null : list<SlowConsumerException>) $heldOverflows
      * @param-out ($heldFailures is null ? null : list<\Throwable>) $heldFailures
+     * @return int How many messages this pass handed to the handler, a message its handler threw on included:
+     *         zero when the sid had nothing to deliver, is already being delivered further up the stack, or was
+     *         dropped at its auto-unsubscribe cap before a delivery ({@see deliverQueuedForOwnSid()}).
      */
     private function drainPendingForSid(
         int $sid,
@@ -6291,10 +6379,10 @@ final class NatsConnection
         bool $reportOverflows = false,
         ?int $ownSid = null,
         bool $reportHandlerFailures = false,
-    ): void {
+    ): int {
         $queue = $this->pendingMessages[$sid] ?? null;
         if ($queue === null) {
-            return;
+            return 0;
         }
 
         if (!isset($this->subscriptions[$sid])) {
@@ -6302,7 +6390,7 @@ final class NatsConnection
             // instead of retaining state that drainAllPending() would re-scan.
             unset($this->pendingMessages[$sid], $this->pendingDirty[$sid]);
 
-            return;
+            return 0;
         }
 
         if ($queue->isEmpty()) {
@@ -6312,14 +6400,14 @@ final class NatsConnection
             // non-empty) holds even when a reentrant drain emptied this sid earlier in the same pass.
             unset($this->pendingDirty[$sid]);
 
-            return;
+            return 0;
         }
 
         if (isset($this->dispatchingSids[$sid])) {
             // Already delivering this sid further up the stack (a handler awaited and suspended). Do
             // not re-enter: the suspended loop resumes and drains whatever we enqueued meanwhile, so
             // ordering holds and a handler is never invoked on top of itself.
-            return;
+            return 0;
         }
 
         $this->dispatchingSids[$sid] = true;
@@ -6455,6 +6543,8 @@ final class NatsConnection
                 unset($this->pendingDirty[$sid]);
             }
         }
+
+        return $deliveredThisPass;
     }
 
     /**
