@@ -13,7 +13,8 @@ use IDCT\NATS\Exception\JetStreamException;
  * It decouples the engine (which lives on JetStreamContext, the only holder of the client handle)
  * from the mutable iterator: everything the engine needs to shape pull requests and drive the
  * lifecycle is frozen here at handle() time, EXCEPT the pin id and the stop/drain flags, which stay
- * live through {@see PullPipelineControl} so a handler can mutate them mid-run (#120).
+ * live through {@see PullPipelineControl} so a handler can mutate them mid-run (#120), along with the
+ * run's stop/drain wake-ups that end the engine's waits (#181).
  *
  * @internal Not part of the supported public API.
  */

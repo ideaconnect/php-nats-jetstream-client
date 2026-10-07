@@ -15,6 +15,29 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.17.0] - 2026-10-07
+
+### Fixed
+
+- `[bugfix]` A `PullConsumerIterator::stop()` or `drain()` from another fiber - a signal handler's timer, a supervisor -
+  while the pull engine waited on the socket for its in-flight pulls, or in its idle backoff, was seen only when that
+  wait ended on its own (#181): at the earliest pull's deadline, its expiry plus a second (4 s with the default 3 s
+  expiry, 31 s with a 30 s one), or at the end of the backoff, up to 500 ms. A call from inside the handler was
+  unaffected. Each `handle()` run now gives the engine two one-shot wake-ups, one per flag, which `stop()` and `drain()`
+  fire right after setting their flag; the engine's pump read and idle backoff wait with each wake-up while it has not
+  fired, so the wait ends at once and the flag is seen at the top of the loop. `stop()` ends the run at once, with the
+  pull inbox released as on every exit, and a `stop()` that lands while a pull of a generation is written ends the
+  generation there: no further pull is written for a run about to end. `drain()` wakes the engine once, so it stops
+  issuing pulls at once and, with nothing in flight, returns at once; the pulls in flight still complete, or reach
+  their deadline, and their messages are delivered first, as before. A fired wake-up is never composed into a later
+  wait, whatever fired it, so nothing spins: a latched drain does not end the reads that follow it; a run started
+  again gets fresh wake-ups, so a stop in an earlier run cannot end a wait of the next; and a run still active when
+  `handle()` is called again on the same iterator, its wake-ups replaced and fired by Amp as they are destructed, goes
+  on as before #181, waiting to its pulls' deadlines until the shared flags end it. Start the next run only once the
+  previous run's future has resolved: the runs share the stop/drain flags, so a `handle()` while a run is active
+  clears a `stop()` that run has not seen yet. The internal `PullPipelineControl` carries the wake-ups as
+  `stopInterruption()` and `drainInterruption()`, optional in its constructor.
+
 ## [2.16.0] - 2026-10-07
 
 ### Fixed

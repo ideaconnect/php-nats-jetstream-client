@@ -1925,9 +1925,9 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/pull-consumer-batching-iteration.php`](examples/pull-consumer-batching-iteration.php)
 
-_Verified by: [PullConsumerIteratorTest](tests/Unit/PullConsumerIteratorTest.php); [JetStreamIntegrationTest::testJetStreamPullIteratorBatching](tests/Integration/JetStreamIntegrationTest.php); [features/jetstream-core/consumer_helpers.feature](features/jetstream-core/consumer_helpers.feature)._
+_Verified by: [PullConsumerIteratorTest](tests/Unit/PullConsumerIteratorTest.php); [PullConsumerWakeUpTest](tests/Unit/PullConsumerWakeUpTest.php); [JetStreamIntegrationTest::testJetStreamPullIteratorBatching](tests/Integration/JetStreamIntegrationTest.php); [features/jetstream-core/consumer_helpers.feature](features/jetstream-core/consumer_helpers.feature)._
 
-The fluent `PullConsumerIterator` drives the pipelined pull engine: it keeps up to `setDepth()` (default 2) pull round-trips in flight while your handler processes earlier ones, preserving message order, with configurable batch size, expiry, and iteration count. `setOnError()` receives errors the engine does not treat as routine, and `stop()` / `drain()` end the run from inside the handler:
+The fluent `PullConsumerIterator` drives the pipelined pull engine: it keeps up to `setDepth()` (default 2) pull round-trips in flight while your handler processes earlier ones, preserving message order, with configurable batch size, expiry, and iteration count. `setOnError()` receives errors the engine does not treat as routine, and `stop()` / `drain()` end the run from inside the handler or from another fiber (a signal handler's timer, a supervisor), ending the engine's wait on the socket at once; a `drain()` still lets the pulls already in flight complete first. Await a run's future before you call `handle()` again on the same iterator, since its runs share the stop/drain flags:
 
 ```php
 <?php
