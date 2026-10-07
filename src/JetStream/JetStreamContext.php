@@ -14,6 +14,7 @@ use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
@@ -830,8 +831,14 @@ final class JetStreamContext
             $done = false;
             /** @var array{code:int,description:string}|null $error */
             $error = null;
+            /** @var string|null $inboxRejection The -ERR the server rejected the inbox with, when it did (#175). */
+            $inboxRejection = null;
+            $operation = sprintf('Direct Get batch for stream "%s"', $stream);
 
-            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages, &$done, &$error): void {
+            // Guarded (#175): a 'maximum subscriptions exceeded' -ERR read before the server is known to hold the
+            // inbox - by this fiber's read or any other's, the heartbeat's say - records the rejection here and
+            // ends the read below, so that the call fails at once instead of waiting out its stall interval.
+            $onReply = static function (NatsMessage $msg) use (&$messages, &$done, &$error): void {
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
                 $status = (int) ($headers['Status'] ?? 0);
 
@@ -865,7 +872,20 @@ final class JetStreamContext
                 if (($headers['Nats-Num-Pending'] ?? null) === '0') {
                     $done = true;
                 }
-            })->await();
+            };
+            $onRejected = static function (string $serverError) use (&$inboxRejection): void {
+                $inboxRejection ??= $serverError;
+            };
+
+            try {
+                $sid = $this->client->subscribeGuarded($inbox, $onReply, $onRejected)->await();
+            } catch (ConnectionException $e) {
+                // The SUB write failed, and the new server rejected the reconnect's replay of the SUB: the replay
+                // recorded the rejection, and the subscribe reports it. Said in this call's terms.
+                $this->throwIfInboxRejected($operation, $inbox, $inboxRejection, $e);
+
+                throw $e;
+            }
             // Slow-consumer exemption (#118/#120 twin): a batch reply burst can exceed the per-sub
             // pending cap within ONE read chunk (readIncoming enqueues every frame of a chunk before
             // draining), and a dropped Direct Get reply is never redelivered - the 204 end-of-batch
@@ -874,6 +894,9 @@ final class JetStreamContext
             $this->client->markSubscriptionUnbounded($sid);
 
             try {
+                // Rejected while this fiber waited for the SUB write: no request is sent on a dead inbox.
+                $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
+
                 $this->client->publish($subject, $json, $inbox)->await();
 
                 // Progress-based bound: reset the stall clock on each batch frame, so a healthy-but-slow
@@ -886,6 +909,9 @@ final class JetStreamContext
                 $seen = count($messages);
 
                 while (!$done) {
+                    // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
+                    $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
+
                     $nowNs = hrtime(true);
                     if ($nowNs - $lastActivityNs >= $progressIntervalNs) {
                         // No batch frame arrived for the whole progress interval (no 204 EOB, no
@@ -904,6 +930,10 @@ final class JetStreamContext
                     $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
                     try {
                         $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
+                        // The read ends when the inbox is dropped, with the rejection recorded: fail now, not after
+                        // the idle pause (#175).
+                        $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
+
                         if (!$read->consumedBytes) {
                             // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
                             // completed no frame yet (a chunked batch payload) loops immediately so the
@@ -2393,8 +2423,14 @@ final class JetStreamContext
             // buildPullRequest() already validated the value, the is_int check only narrows the type.
             $idleHeartbeatNs = isset($pull['idle_heartbeat']) && is_int($pull['idle_heartbeat']) ? $pull['idle_heartbeat'] : null;
             $lastActivityNs = hrtime(true);
+            /** @var string|null $inboxRejection The -ERR the server rejected the inbox with, when it did (#175). */
+            $inboxRejection = null;
 
-            $sid = $this->client->subscribe($inbox, static function (NatsMessage $msg) use (&$messages, &$terminalStatus, &$lastActivityNs): void {
+            // Guarded (#175): a 'maximum subscriptions exceeded' -ERR read before the server is known to hold the
+            // inbox - by this fiber's read or any other's, the heartbeat's say - records the rejection here and
+            // ends the read below, so that the fetch fails at once, loudly, instead of waiting out its deadline
+            // and reporting an empty pull (a 408).
+            $onReply = static function (NatsMessage $msg) use (&$messages, &$terminalStatus, &$lastActivityNs): void {
                 $lastActivityNs = hrtime(true);
 
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
@@ -2414,7 +2450,20 @@ final class JetStreamContext
                 }
 
                 $messages[] = $msg;
-            })->await();
+            };
+            $onRejected = static function (string $serverError) use (&$inboxRejection): void {
+                $inboxRejection ??= $serverError;
+            };
+
+            try {
+                $sid = $this->client->subscribeGuarded($inbox, $onReply, $onRejected)->await();
+            } catch (ConnectionException $e) {
+                // The SUB write failed, and the new server rejected the reconnect's replay of the SUB: the replay
+                // recorded the rejection, and the subscribe reports it. Said in the fetch's terms.
+                $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection, $e);
+
+                throw $e;
+            }
             // Slow-consumer exemption (#118/#120 twin): one default 128 KiB read chunk can carry well
             // over the 1024-frame per-sub cap in small-payload pull deliveries, and readIncoming
             // enqueues every frame of a chunk before draining - without the exemption the head of the
@@ -2424,6 +2473,10 @@ final class JetStreamContext
             $this->client->markSubscriptionUnbounded($sid);
 
             try {
+                // Rejected while this fiber waited for the SUB write: no pull is sent for a dead inbox, whose
+                // deliveries nobody would take.
+                $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+
                 $this->client->publish($subject, $json, $inbox)->await();
 
                 // Bound the pull by the server expiry (plus slack), and - when heartbeats were
@@ -2434,6 +2487,9 @@ final class JetStreamContext
                 $lastActivityNs = hrtime(true);
 
                 while (count($messages) < $batch && $terminalStatus === null) {
+                    // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
+                    $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+
                     $nowNs = hrtime(true);
                     if ($nowNs >= $deadlineNs) {
                         break;
@@ -2462,6 +2518,10 @@ final class JetStreamContext
                     $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
                     try {
                         $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
+                        // The read ends when the inbox is dropped, with the rejection recorded: fail now, not after
+                        // the idle pause (#175).
+                        $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+
                         if (!$read->consumedBytes) {
                             // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
                             // completed no frame yet (a chunked batch payload) loops immediately so the
@@ -2620,19 +2680,31 @@ final class JetStreamContext
                 // discarding messages received past the requested batch.
             };
 
-            // A normal subscribe() so the SUB lives in subscriptionMeta and resubscribeAll() replays it
-            // on reconnect (BEFORE reconnectCount++), restoring inbox interest automatically; the
-            // unbounded mark (applied in the same tick, before any reply can enqueue) exempts it from the
-            // per-sub slow-consumer bound so a slow handler never drops a buffered reply (#120).
-            $sid = $this->client->subscribe($base . '.*', $router)->await();
-            $this->client->markSubscriptionUnbounded($sid);
-            // Fail fast on a permission-rejected pull inbox (#167's pull twin): with the SUB dead,
-            // every pull's replies are undeliverable, every retire is a silent client-side deadline
-            // (classified routine), and the engine would spin forever with zero signal on any channel.
+            // A guarded subscribe (#175): the SUB lives in subscriptionMeta and resubscribeAll() replays it on
+            // reconnect (BEFORE reconnectCount++), restoring inbox interest automatically, with a PING behind it
+            // as on this first subscribe; the unbounded mark (applied in the same tick, before any reply can
+            // enqueue) exempts it from the per-sub slow-consumer bound so a slow handler never drops a buffered
+            // reply (#120). The rejection handler fails the run fast, with a clear error, when the server rejects
+            // the inbox: by permissions (#167's pull twin), or by its subscription limit before the inbox is
+            // confirmed, whichever fiber's read met the -ERR. With the SUB dead, every pull's replies would be
+            // undeliverable, every retire a silent client-side deadline (classified routine), and the engine
+            // would spin forever with zero signal on any channel.
+            /** @var string|null $inboxRejection The -ERR the server rejected the inbox with, when it did. */
             $inboxRejection = null;
-            $this->client->onSubscriptionRejected($sid, static function (string $error) use (&$inboxRejection): void {
-                $inboxRejection = $error;
-            });
+            try {
+                $sid = $this->client->subscribeGuarded($base . '.*', $router, static function (string $error) use (&$inboxRejection): void {
+                    $inboxRejection ??= $error;
+                })->await();
+            } catch (ConnectionException $e) {
+                // The SUB write failed, and the new server rejected the reconnect's replay of the SUB (#175): the
+                // replay recorded the rejection, and the subscribe reports it. The run fails as it does below.
+                if ($inboxRejection !== null) {
+                    throw $this->pullInboxRejectedException($base, $inboxRejection, $e);
+                }
+
+                throw $e;
+            }
+            $this->client->markSubscriptionUnbounded($sid);
 
             $totalProcessed = 0;
             $issued = 0;
@@ -2674,16 +2746,13 @@ final class JetStreamContext
                         break;
                     }
 
-                    // The server permission-rejected this run's reply inbox: no reply can EVER be
-                    // delivered. Surface the configuration error loudly through handle()'s future
-                    // (mirroring request()'s #167 fail-fast) instead of polling forever.
+                    // The server rejected this run's reply inbox: no reply can EVER be delivered on it. Surface
+                    // the error loudly through handle()'s future (mirroring request()'s #167 fail-fast) instead
+                    // of polling forever: a configuration error for a permissions violation, and the connection's
+                    // subscription limit when that is the cause (#175), where the inbox may have been rejected -
+                    // the -ERR names no subject - and the run has released it.
                     if ($inboxRejection !== null) {
-                        throw new JetStreamException(
-                            'Pull consumer reply inbox "' . $base . '.*" was rejected by server permissions: '
-                            . $inboxRejection . '. Grant the account subscribe permission for the pull '
-                            . 'reply-inbox wildcard "_INBOX.JS.PULL.>" (or the configured inbox prefix) '
-                            . 'to use pull consumers.',
-                        );
+                        throw $this->pullInboxRejectedException($base, $inboxRejection);
                     }
 
                     // FIX2 (infinite only): a reconnect lost every server-side in-flight pull. Drop them
@@ -3673,6 +3742,74 @@ final class JetStreamContext
         }
 
         return $options;
+    }
+
+    /**
+     * Fails a pull fetch or a Direct Get batch whose reply inbox the server rejected, or may have rejected, as
+     * its rejection handler recorded ({@see NatsClient::subscribeGuarded()}, #175); nothing while it recorded
+     * none. For the subscription limit ({@see NatsClient::isSubscriptionLimitError()}) the error is worded like
+     * the one a request reports when the shared reply inbox is dropped: the -ERR names no subject, so the inbox
+     * may have been rejected, and a retry subscribes a new one. A permissions violation names the subject, and is
+     * quoted. Loud on purpose: an empty pull (a 408) would hide a rejected inbox as a routine timeout.
+     *
+     * @param string $operation What fails, e.g. 'JetStream pull fetch'.
+     * @param string|null $serverError The -ERR text the handler recorded, read in the operation's fiber right
+     *        before this call; null while the server has not rejected the inbox.
+     * @param \Throwable|null $previous The error the subscribe itself reported the rejection with, when it did.
+     */
+    private function throwIfInboxRejected(string $operation, string $inbox, ?string $serverError, ?\Throwable $previous = null): void
+    {
+        if ($serverError === null) {
+            return;
+        }
+
+        if ($this->client->isSubscriptionLimitError($serverError)) {
+            throw new ConnectionException(
+                $operation . ' failed: the server may have rejected its reply-inbox subscription "' . $inbox
+                . '" because the connection is at its subscription limit (maximum subscriptions exceeded). '
+                . 'A retry subscribes a new one.',
+                0,
+                $previous,
+            );
+        }
+
+        throw new ConnectionException(
+            $operation . ' failed: the server rejected its reply-inbox subscription "' . $inbox . '": ' . $serverError,
+            0,
+            $previous,
+        );
+    }
+
+    /**
+     * The error a pull consumer run fails with when the server rejected its reply inbox, as the inbox's rejection
+     * handler recorded: for the connection's subscription limit ({@see NatsClient::isSubscriptionLimitError()}),
+     * where the -ERR names no subject and the inbox may have been rejected (#175), or for a permissions violation,
+     * a configuration error (#167's pull twin). Surfaced through handle()'s future, mirroring request()'s
+     * fail-fast, instead of polling forever on an inbox no reply can reach.
+     *
+     * @param \Throwable|null $previous The error the subscribe itself reported the rejection with, when it did.
+     */
+    private function pullInboxRejectedException(string $base, string $inboxRejection, ?\Throwable $previous = null): JetStreamException
+    {
+        if ($this->client->isSubscriptionLimitError($inboxRejection)) {
+            return new JetStreamException(
+                'Pull consumer reply inbox "' . $base . '.*" may have been rejected by the server '
+                . 'because the connection is at its subscription limit (' . $inboxRejection . '). '
+                . 'Free a subscription, or raise the account\'s max_subscriptions, and start the '
+                . 'pull consumer again.',
+                0,
+                $previous,
+            );
+        }
+
+        return new JetStreamException(
+            'Pull consumer reply inbox "' . $base . '.*" was rejected by server permissions: '
+            . $inboxRejection . '. Grant the account subscribe permission for the pull '
+            . 'reply-inbox wildcard "_INBOX.JS.PULL.>" (or the configured inbox prefix) '
+            . 'to use pull consumers.',
+            0,
+            $previous,
+        );
     }
 
     /**

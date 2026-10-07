@@ -128,6 +128,10 @@ final class OperationTakesItsQueuedMessageTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $client = $this->watchedClient($watched);
+        // The fetch writes a PING behind its inbox's SUB (#175), whose PONG would end the application's parked read
+        // and make it read again: a read the count below would take for the operation's. The server leaves PINGs
+        // after the handshake unanswered, so the one chunk is the pull's answer, as the shape requires.
+        $transport->answerPings = false;
         $hold = new HeldUpDelivery(fallbackSeconds: 2.0);
         $slowSid = $client->subscribe('slow', $hold->handler())->await();
         $slowFrame = ReconnectingTransport::msgFrame('slow', $slowSid, 's');
