@@ -15,6 +15,28 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.16.0] - 2026-10-07
+
+### Fixed
+
+- `[bugfix]` A `request()` or `requestMany()` whose read was parked on the socket when another fiber's read brought the
+  `-ERR` that drops or rejects the shared reply inbox - `maximum subscriptions exceeded` before the server was known to
+  hold the inbox, or a permissions violation naming it - noticed the drop only with the server's next bytes or at its
+  deadline (#180). The client drops the inbox inline in the dispatch of that `-ERR`, and since 2.12.0 a request's read is
+  woken by its own reply alone, so nothing ended the read; the shape arises when the other fiber's dispatch is held up
+  ahead of the `-ERR`, as it is while it awaits the write of the PONG for a server PING in the same chunk (socket
+  backpressure): the read slot is free by then, the request's read takes it, and the `-ERR` drops the inbox under it. A
+  request that looked while another operation's read - a poll's, a flush's - held the socket, and so waited at its own
+  wait for the read slot rather than in a read, noticed the drop only once that read ended. The connection now fires
+  every waiting request's wake-up when it drops or rejects the inbox, whichever fiber's read meets the `-ERR`, and the
+  wake-up ends every wait the request makes, its read and its wait for the read slot alike: the request looks again at
+  once, failing with the dropped-inbox error or the permissions error, returning a reply delivered by then, or, for a
+  `requestMany()` with replies collected, returning them. A terminal close while a request waits for its reply ends the
+  request at its next look with `Connection is not open`, as a read still waiting fails on its own: this is the exit of a
+  request a rejection woke right before an error listener answered the `-ERR` with `disconnect()`, which resets the
+  rejection latch; such a request would otherwise have looked every millisecond until its deadline and ended with a
+  timeout. Nothing else is woken: polls, fetches, consumers and your own reads are not involved.
+
 ## [2.15.0] - 2026-10-07
 
 ### Upgrade notes

@@ -170,6 +170,18 @@ final class NatsConnection
      */
     private array $muxWaiters = [];
     /**
+     * The wake-up of each in-flight request's waits, keyed like {@see $muxWaiters}: request()'s fires with its reply,
+     * requestMany()'s with each reply, which rotates it ({@see renewMuxWake()}). The request reads with it, and waits
+     * with it for the read slot while another fiber's read holds the socket. The connection fires every one of them
+     * when it drops or rejects the reply inbox ({@see wakeMuxWaiters()}, #180), so that a request whose read is parked
+     * on the socket, or which waits for the read slot, while another fiber's read met the -ERR looks again at once,
+     * instead of with the server's next bytes, when that read ends, or at its deadline. Registered and removed with
+     * the waiter, so it holds nothing once a request ends.
+     *
+     * @var array<string, DeferredCancellation>
+     */
+    private array $muxWakes = [];
+    /**
      * Strictly-increasing per-connection token counter. Guarantees pairwise-distinct request tokens
      * within an epoch by construction (never reset); the random $muxBase provides unguessability (#118).
      */
@@ -218,7 +230,8 @@ final class NatsConnection
     private array $muxSidsToRelease = [];
     /**
      * Counts terminal closes ({@see releaseRuntimeState()}), so that a request that was setting the mux up when
-     * one happened reports the closed connection, even when a connect() has opened a new one since.
+     * one happened reports the closed connection, even when a connect() has opened a new one since, and so that a
+     * request waiting for its reply ends with the closed connection at its next look, whatever woke it (#180).
      */
     private int $terminalCloses = 0;
     /**
@@ -1283,9 +1296,14 @@ final class NatsConnection
         // fresh ensureMuxInbox() (new random base + sid) on the next connect(); clearing muxWaiters drops
         // any still-registered in-flight waiter - its request fiber terminates via the wait-loop state
         // gate / recovery exception, not via the map. muxTokenSeq is intentionally NOT reset (the new
-        // random base makes any cross-epoch token undeliverable regardless).
+        // random base makes any cross-epoch token undeliverable regardless). The waiters' wake-ups are
+        // dropped with them, not fired (#180): nothing waits on past a terminal close - a read on the socket
+        // fails with the closed transport, one parked for the read slot is released with it, one waiting for a
+        // recovery that gave up fails with it - and each request's loop exits on the close count anyway
+        // ({@see $terminalCloses}), as the one a rejection woke right before this close does.
         $this->forgetMux();
         $this->muxWaiters = [];
+        $this->muxWakes = [];
         // A fresh connect() may target an account/server that permits the reply-inbox wildcard, so a
         // terminal close clears the rejection latch and lets ensureMuxInbox() re-attempt the mux (#167).
         $this->muxRejected = false;
@@ -3475,6 +3493,9 @@ final class NatsConnection
      *
      * The mux is recorded before its SUB is written, so an -ERR for an earlier SUB that arrives while that write
      * still waits behind earlier writes drops it as well: the window covers that wait plus one round trip.
+     *
+     * The requests waiting on the dropped mux are woken last ({@see wakeMuxWaiters()}, #180), once the generation
+     * they check has moved on, so that each of them fails at its next look, whichever fiber's read met the -ERR.
      */
     private function dropUnconfirmedMux(int $sid): void
     {
@@ -3487,6 +3508,7 @@ final class NatsConnection
         // for a confirmation nothing is coming for. The next request subscribes a new mux instead, and its write
         // follows the dropped one's on the socket, so the UNSUB in it comes after the dropped SUB.
         $this->muxInboxSetup = null;
+        $this->wakeMuxWaiters();
     }
 
     /**
@@ -3500,22 +3522,67 @@ final class NatsConnection
     }
 
     /**
-     * Registers a request's reply-dispatch callback under its suffix token, before its PUB is written.
+     * Registers a request's reply-dispatch callback under its suffix token, before its PUB is written, together with
+     * the wake-up of the request's read ({@see $muxWakes}): the request fires it when its reply is in, and the
+     * connection fires it when it drops or rejects the reply inbox ({@see wakeMuxWaiters()}, #180). A waiter that
+     * rotates its wake-up at each reply registers the new one with {@see renewMuxWake()}.
      *
      * @param callable(NatsMessage):void $handler
+     * @param DeferredCancellation $wake What the request reads with next; fires once, like any wake-up.
      */
-    private function registerMuxWaiter(string $token, callable $handler): void
+    private function registerMuxWaiter(string $token, callable $handler, DeferredCancellation $wake): void
     {
         $this->muxWaiters[$token] = $handler;
+        $this->muxWakes[$token] = $wake;
     }
 
     /**
-     * Removes a request's waiter. Runs in the finally of both request methods, on every exit path -
-     * the removal that makes a later/duplicate reply for a terminated request undeliverable (#118).
+     * Replaces the wake-up registered for $token ({@see registerMuxWaiter()}): requestMany()'s waiter fires the one
+     * its read waits with at each reply and reads on with a new one, which is then the one a drop of the inbox has
+     * to fire. Called from the waiter, so the token is still registered.
+     */
+    private function renewMuxWake(string $token, DeferredCancellation $wake): void
+    {
+        $this->muxWakes[$token] = $wake;
+    }
+
+    /**
+     * Removes a request's waiter, with its wake-up. Runs in the finally of both request methods, on every exit
+     * path - the removal that makes a later/duplicate reply for a terminated request undeliverable (#118), and
+     * that leaves no wake-up behind for a request that is gone (#180).
      */
     private function removeMuxWaiter(string $token): void
     {
-        unset($this->muxWaiters[$token]);
+        unset($this->muxWaiters[$token], $this->muxWakes[$token]);
+    }
+
+    /**
+     * Ends the waits of the requests waiting on the reply inbox, once the client has dropped it
+     * ({@see dropUnconfirmedMux()}) or latched its rejection by permissions (#167): each request's wait ends, wherever
+     * it waits - in a read, on the socket, behind another fiber's read or for a reconnect, or at its own wait for the
+     * read slot while another fiber's read holds it - and the request looks again, as it does when its wake-up fires
+     * with its reply (#180). The top of its loop then decides as it always did: a reply delivered by then is returned,
+     * otherwise the request fails with {@see muxRejectedException()} or {@see muxDroppedException()}, and a
+     * requestMany() with replies collected returns them.
+     *
+     * Each request's own wake-up fires with its own reply alone, so a request whose read was parked on the socket while
+     * ANOTHER fiber's read met the -ERR used to notice the drop only with the server's next bytes or at its deadline:
+     * the shape arises when that fiber's dispatch is held up ahead of the -ERR, as it is while it awaits the write of
+     * the PONG for a server PING in the same chunk, with the read slot already free. Called once the state
+     * the loops check has changed, so that a woken request never looks and waits on: a wake-up fires once and stays
+     * fired, so every wait the request makes after it ends at once, and the look after each must exit. The one state
+     * change a close undoes, the rejection latch, is covered by the loops' exit on the close count
+     * ({@see $terminalCloses}). One the reply fired already stays as it is, and with no request waiting there is
+     * nothing to fire.
+     *
+     * Not called at a terminal close ({@see releaseRuntimeState()}), where the waiters are dropped instead: nothing
+     * waits on past the close, and each loop exits on the close count.
+     */
+    private function wakeMuxWaiters(): void
+    {
+        foreach ($this->muxWakes as $wake) {
+            $wake->cancel();
+        }
     }
 
     /**
@@ -3742,6 +3809,9 @@ final class NatsConnection
             : new CompositeCancellation($cancellation, $timeoutCancellation);
 
         $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
+        // The connection the request is sent on: a terminal close while the reply is awaited ends the request at its
+        // next look ({@see $terminalCloses}).
+        $closes = $this->terminalCloses;
         $token = $this->newMuxToken();
         $replyTo = $this->muxBase . '.' . $token;
 
@@ -3754,8 +3824,12 @@ final class NatsConnection
         // Fired with the reply: this request's read ends without reading, wherever it waits then, since the reply is
         // all it waits for. The reply can come in another fiber's delivery still under way, or in a reconnect's
         // (#174). Not a delivery to the reply inbox, which every request shares: that would end every request's read
-        // at each reply.
+        // at each reply. The connection fires it as well when it drops or rejects the inbox, on which no reply can
+        // come then (#180): the checks below find that out.
         $replyArrived = new DeferredCancellation();
+        // What the request waits with while it is parked behind another fiber's read, below: its budget and its
+        // wake-up, so that a drop of the inbox ends that wait as it ends a read (#180).
+        $parkedWith = new CompositeCancellation($waitCancellation, $replyArrived->getCancellation());
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118). The
         // handler body is unchanged and idempotent: a coalesced duplicate arriving in the same drain
@@ -3766,7 +3840,7 @@ final class NatsConnection
                 $replyReceived = true;
                 $replyArrived->cancel();
             }
-        });
+        }, $replyArrived);
 
         try {
             if ($headers === null) {
@@ -3781,6 +3855,15 @@ final class NatsConnection
                 // rather than discarded as a spurious timeout.
                 if ($replyReceived) {
                     break;
+                }
+
+                // The connection closed for good while the request waited - a disconnect() or a drain(), from an
+                // error listener as well, or a recovery that gave up: nothing more comes on it. A read still waiting
+                // fails the same way on its own; this is the exit of a request whose wake-up fired, since the close
+                // also reset the rejection latch below: woken by a rejection the close followed at once, it would
+                // otherwise look every millisecond until its deadline (#180).
+                if ($this->terminalCloses !== $closes) {
+                    throw new ConnectionException('Connection is not open');
                 }
 
                 // The mux reply inbox was permission-rejected mid-flight (the async -ERR was just read);
@@ -3809,12 +3892,14 @@ final class NatsConnection
                     // freeing instead of re-polling on a 1ms timer: N concurrent requests used to
                     // burn O(N x 1000/s) wakeups, each allocating a Future (#135). The slot future
                     // is captured before the re-check inside awaitFirst, so a release between the
-                    // flag check and the await completes it immediately - no lost wakeup.
+                    // flag check and the await completes it immediately - no lost wakeup. The wake-up
+                    // ends this wait too (#180): the inbox can be dropped under a request parked here,
+                    // by the dispatch of that other read, and the slot is released only when it ends.
                     try {
-                        awaitFirst([$deferred->getFuture(), $this->readSlotReleased->getFuture()], $waitCancellation);
+                        awaitFirst([$deferred->getFuture(), $this->readSlotReleased->getFuture()], $parkedWith);
                     } catch (CancelledException) {
-                        // Deadline or external cancellation while parked; the top-of-loop checks
-                        // return the reply delivered in the same tick or throw.
+                        // Deadline, external cancellation or the wake-up while parked; the top-of-loop
+                        // checks return the reply delivered in the same tick or throw.
                     }
 
                     continue;
@@ -3928,6 +4013,8 @@ final class NatsConnection
             : new CompositeCancellation($cancellation, $totalCancellation);
 
         $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
+        // As in requestInternal(): a terminal close while replies are awaited ends the collection at its next look.
+        $closes = $this->terminalCloses;
         $token = $this->newMuxToken();
         $replyTo = $this->muxBase . '.' . $token;
 
@@ -3942,12 +4029,13 @@ final class NatsConnection
         $replyTick = new DeferredFuture();
         $replyTick->getFuture()->ignore();
         // Rotated with the tick, for the read: the read in flight ends without reading at each delivery, wherever it
-        // waits then, as request()'s does on its reply (#174).
+        // waits then, as request()'s does on its reply (#174). The one registered with the waiter is the current one,
+        // which the connection fires when it drops or rejects the inbox (#180): the checks below find that out.
         $replyWake = new DeferredCancellation();
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118); the
         // collector body (incl. the #160 cap and #135 tick rotation) is unchanged.
-        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, &$replyWake, $maxResponses): void {
+        $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, &$replyWake, $maxResponses, $token): void {
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
@@ -3968,8 +4056,9 @@ final class NatsConnection
 
             $wake = $replyWake;
             $replyWake = new DeferredCancellation();
+            $this->renewMuxWake($token, $replyWake);
             $wake->cancel();
-        });
+        }, $replyWake);
 
         try {
             if ($headers === null) {
@@ -3979,6 +4068,18 @@ final class NatsConnection
             }
 
             while (true) {
+                // The connection closed for good while replies were awaited (see requestInternal()): what was
+                // collected is returned, as below for a rejection, and nothing collected fails with the closed
+                // connection. The exit of a collection whose wake-up fired right before a close that reset the
+                // rejection latch (#180).
+                if ($this->terminalCloses !== $closes) {
+                    if ($messages !== []) {
+                        break;
+                    }
+
+                    throw new ConnectionException('Connection is not open');
+                }
+
                 // The mux reply inbox was permission-rejected (the async -ERR was just read); no further
                 // reply can arrive. Return whatever this scatter-gather has already collected rather than
                 // discarding it; the clear permission error surfaces only when nothing was collected -
@@ -4038,11 +4139,16 @@ final class NatsConnection
 
                 if ($this->readInProgress) {
                     // Another fiber owns the socket read: park on the next delivery or the read
-                    // slot freeing, bounded by the same slice so stall/total still fire (#135).
+                    // slot freeing, bounded by the same slice so stall/total still fire (#135), and
+                    // ended by the current wake-up as a read is, should the inbox be dropped under a
+                    // collection parked here (#180).
                     try {
-                        awaitFirst([$replyTick->getFuture(), $this->readSlotReleased->getFuture()], $sliceCancellation);
+                        awaitFirst(
+                            [$replyTick->getFuture(), $this->readSlotReleased->getFuture()],
+                            new CompositeCancellation($sliceCancellation, $replyWake->getCancellation()),
+                        );
                     } catch (CancelledException) {
-                        // Slice/total deadline while parked; loop re-evaluates at the top.
+                        // Slice/total deadline or the wake-up while parked; loop re-evaluates at the top.
                     }
 
                     continue;
@@ -5334,13 +5440,16 @@ final class NatsConnection
                 // SUB) and latch $muxRejected: request()/requestMany() then fail fast with a clear,
                 // catchable error instead of a silent permanent timeout. The random muxBase makes the
                 // substring match unambiguous. ensureMuxInbox() records the mux before it writes the SUB,
-                // so this holds whichever read meets the -ERR, the replay of a reconnect included.
+                // so this holds whichever read meets the -ERR, the replay of a reconnect included. The
+                // requests waiting on the inbox are woken once the latch is set, so that each fails at its
+                // next look, wherever its read waits (#180).
                 if ($this->muxSid !== null && $this->muxBase !== null && str_contains($error, $this->muxBase)) {
                     // dropSubscriptionState() also clears the sid's slow-consumer exemption flag.
                     $this->dropSubscriptionState($this->muxSid);
                     $this->forgetMux();
                     $this->muxInboxSetup = null;
                     $this->muxRejected = true;
+                    $this->wakeMuxWaiters();
                 }
 
                 // Generalized #167: a permissions violation naming a subscription subject starves

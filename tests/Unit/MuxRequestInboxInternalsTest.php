@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\DeferredCancellation;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
@@ -38,8 +39,12 @@ final class MuxRequestInboxInternalsTest extends TestCase
 
         $aCalls = 0;
         $bCalls = 0;
-        $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$aCalls): void { $aCalls++; });
-        $this->invokePrivate($connection, 'registerMuxWaiter', 'b', function (NatsMessage $m) use (&$bCalls): void { $bCalls++; });
+        $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$aCalls): void {
+            $aCalls++;
+        }, new DeferredCancellation());
+        $this->invokePrivate($connection, 'registerMuxWaiter', 'b', function (NatsMessage $m) use (&$bCalls): void {
+            $bCalls++;
+        }, new DeferredCancellation());
 
         $this->invokePrivate($connection, 'dispatchMuxReply', $this->message('_INBOX.base.a'));
 
@@ -54,7 +59,9 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $this->setPrivate($connection, 'muxBase', '_INBOX.base');
 
         $calls = 0;
-        $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$calls): void { $calls++; });
+        $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$calls): void {
+            $calls++;
+        }, new DeferredCancellation());
         $this->invokePrivate($connection, 'removeMuxWaiter', 'a');
 
         // Late/duplicate reply for the now-removed token 'a', and a reply for a never-registered token.
@@ -63,6 +70,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
 
         self::assertSame(0, $calls);
         self::assertSame([], $this->getPrivate($connection, 'muxWaiters'));
+        self::assertSame([], $this->getPrivate($connection, 'muxWakes'), 'the wake-up goes with the waiter (#180)');
     }
 
     /** A reply addressed to a DIFFERENT base (wrong prefix) never reaches a waiter (the strncmp guard). */
@@ -72,7 +80,9 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $this->setPrivate($connection, 'muxBase', '_INBOX.mine');
 
         $calls = 0;
-        $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$calls): void { $calls++; });
+        $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$calls): void {
+            $calls++;
+        }, new DeferredCancellation());
 
         // Foreign base of the SAME length as muxBase, so the token-strip (strlen(base)+1) lines up on the
         // 'a' suffix: WITHOUT the prefix guard the reply would be mis-delivered to waiter 'a'; WITH it the
@@ -138,6 +148,8 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $this->setPrivate($connection, 'muxBase', '_INBOX.old');
         $this->setPrivate($connection, 'muxSid', 7);
         $this->setPrivate($connection, 'muxWaiters', ['a' => static function (): void {}]);
+        $wake = new DeferredCancellation();
+        $this->setPrivate($connection, 'muxWakes', ['a' => $wake]);
         $this->setPrivate($connection, 'unboundedSids', [7 => true]);
 
         $this->invokePrivate($connection, 'releaseRuntimeState');
@@ -145,6 +157,8 @@ final class MuxRequestInboxInternalsTest extends TestCase
         self::assertNull($this->getPrivate($connection, 'muxBase'));
         self::assertNull($this->getPrivate($connection, 'muxSid'));
         self::assertSame([], $this->getPrivate($connection, 'muxWaiters'));
+        self::assertSame([], $this->getPrivate($connection, 'muxWakes'), 'the wake-ups go with the waiters (#180)');
+        self::assertFalse($wake->isCancelled(), 'a terminal close drops the wake-ups without firing them: the reads fail with the closed connection, and a fired one would make a read return at once');
         self::assertSame([], $this->getPrivate($connection, 'unboundedSids'));
     }
 
