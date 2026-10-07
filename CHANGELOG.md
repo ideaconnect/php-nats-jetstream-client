@@ -15,6 +15,31 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A `PING`, `PONG`, `INFO`, `-ERR` or reply-inbox `MSG` read in the same chunk as a lame-duck `INFO`,
+  behind it, was handled on the connection the lame-duck failover had just opened (#182). The failover (#47) runs
+  inline in the dispatch of the `INFO`, and the dispatch then went on with the rest of the chunk as if nothing had
+  happened: the old server's `PING` was answered with a `PONG` written on the new connection; a stale `INFO`
+  overwrote the new server's info, and a second lame-duck `INFO` started a second failover, since the lame-duck flag
+  had been reset for the new connection; a `PONG` completed the new connection's oldest PONG slot - the fence behind
+  the replayed reply-inbox `SUB` - and so confirmed the replayed inbox before the new server had answered anything,
+  as a late reply of the old server on that inbox did; an `-ERR` was applied to the new connection (`maximum
+  subscriptions exceeded` dropped the replayed, still unconfirmed inbox, a permissions violation naming a subject
+  fired the replayed subscription's rejection handler) and failed the read with `Server sent error frame` although
+  the failover had succeeded. The dispatch now checks before each frame whether the chunk's connection is gone,
+  replaced or ended, and handles the rest of the chunk for the connection it was read on: its messages are still
+  queued for their subscriptions, which the failover replayed, though a late reply on the request inbox no longer
+  counts as the new server's confirmation of the replayed inbox; its `PING`, `PONG` and `INFO` are dropped; its
+  `-ERR` is reported through the error listener (`The server the connection left sent an error frame: ...`) and
+  neither applied nor thrown. When the connection ends instead - the failover failed, or the `LameDuck` listener
+  closed the connection itself - the chunk's `PING` is not answered on the closed transport either: the read returns
+  what it read, and the next one fails with the closed connection, instead of the read failing with the PONG write's
+  error. Nothing changes without a failover (reconnect disabled, or a pool of one): the chunk is handled as before.
+  Found by the review of the read wake-up (#174, 2.12.0).
+
 ## [2.17.0] - 2026-10-07
 
 ### Fixed
