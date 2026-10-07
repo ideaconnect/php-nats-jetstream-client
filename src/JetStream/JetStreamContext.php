@@ -4,7 +4,9 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\JetStream;
 
+use Amp\Cancellation;
 use Amp\CancelledException;
+use Amp\CompositeCancellation;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -2519,6 +2521,13 @@ final class JetStreamContext
      * drain() lets it complete. Infinite mode additionally survives a reconnect by re-issuing the
      * server-side-lost in-flight pulls (#120).
      *
+     * A stop() or drain() from another fiber ends the engine's wait at once: the pump read and the idle
+     * backoff wait with the run's wake-ups from the control ({@see PullPipelineControl::stopInterruption()},
+     * {@see PullPipelineControl::drainInterruption()}), each composed only while it has not fired, and the
+     * flag is seen at the top of the loop once the wait ends (#181). A wake-up a later handle() on the same
+     * iterator replaced fires without its flag; left out of the waits like any fired one, it leaves this run
+     * waiting to its deadlines as before #181, with no spin (see {@see pullWaitCancellation()}).
+     *
      * @internal Engine entry point for {@see PullConsumerIterator}; not part of the supported public API.
      *
      * @param callable(NatsMessage, JetStreamContext):void $handler
@@ -2858,7 +2867,18 @@ final class JetStreamContext
                     if (!$finite && !$ctl->isDrainRequested() && $inflight === [] && $idleDraining) {
                         if ($backoffWarranted) {
                             ++$consecutiveEmptyPulls;
-                            delay(PullConsumerIterator::idleBackoffMs($consecutiveEmptyPulls) / 1000);
+                            // The wait holds the run's wake-ups (neither flag is set here, checked just above,
+                            // so neither has fired unless a later handle() replaced it): a stop() or drain()
+                            // from another fiber ends the backoff at once instead of at its end, and the loop
+                            // top then sees the flag (#181).
+                            try {
+                                delay(
+                                    PullConsumerIterator::idleBackoffMs($consecutiveEmptyPulls) / 1000,
+                                    cancellation: self::pullWaitCancellation($ctl, null),
+                                );
+                            } catch (CancelledException) {
+                                // Woken: stop() breaks at the loop top, drain() exits there with nothing in flight.
+                            }
                         }
                         $idleDraining = false;
                         $backoffWarranted = false;
@@ -2869,12 +2889,15 @@ final class JetStreamContext
                     }
 
                     // ISSUE PHASE: fill up to the effective depth with fresh pulls. FIX1's !idleDraining
-                    // gate stops mid-generation refills; drain() and the finite budget also gate it (a
-                    // stop() is already handled by the breaks above, before and after any backoff).
+                    // gate stops mid-generation refills; drain() and the finite budget also gate it, and so
+                    // does stop(): the breaks above caught one latched before this phase, the check per pull
+                    // catches one latched while the previous pull's write was awaited, so the rest of the
+                    // generation is not written for a run about to end (#181).
                     $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered, $everPinned);
                     while (
                         count($inflight) < $effectiveDepth
                         && !$idleDraining
+                        && !$ctl->isStopRequested()
                         && !$ctl->isDrainRequested()
                         && ($cfg->iterations === null || $issued < $cfg->iterations)
                     ) {
@@ -2924,8 +2947,16 @@ final class JetStreamContext
                         continue;
                     }
 
+                    // A stop() latched while the issue phase awaited its writes has fired its wake-up
+                    // already, so the read below could not be ended by it: back to the top, which breaks
+                    // (#181). A drain() latched there needs nothing: the pulls in flight are still pumped.
+                    if ($ctl->isStopRequested()) {
+                        continue;
+                    }
+
                     // PUMP PHASE: read frames until the head pull completes or the earliest per-pull
-                    // deadline elapses (so the engine never blocks unbounded on a silent server).
+                    // deadline elapses (so the engine never blocks unbounded on a silent server), or a
+                    // stop() or drain() from another fiber wakes the engine (#181).
                     $nowNs = hrtime(true);
                     $waitUntilNs = PHP_INT_MAX;
                     foreach ($inflight as $inFlightPull) {
@@ -2948,7 +2979,14 @@ final class JetStreamContext
                         continue;
                     }
 
-                    $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
+                    // The wait ends at the deadline computed above, or when a wake-up that had not fired yet
+                    // fires: stop() then breaks at the loop top; drain() stops issuing there and goes on
+                    // pumping the pulls in flight, their reads from then on without its fired wake-up, so a
+                    // latched drain never ends a wait at once (#181).
+                    $waitCancellation = self::pullWaitCancellation(
+                        $ctl,
+                        new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9),
+                    );
                     try {
                         $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
                         if (!$read->consumedBytes) {
@@ -2957,8 +2995,9 @@ final class JetStreamContext
                             delay(0.001, cancellation: $waitCancellation);
                         }
                     } catch (CancelledException) {
-                        // This wait segment ended (the earliest deadline or heartbeat check came due):
-                        // loop to re-evaluate deadlines against any freshly buffered frames.
+                        // This wait segment ended (the earliest deadline or heartbeat check came due, or
+                        // a stop()/drain() woke the engine): loop to re-evaluate stop()/drain() and the
+                        // deadlines against any freshly buffered frames.
                     }
                 }
 
@@ -2968,6 +3007,31 @@ final class JetStreamContext
                 $this->client->unsubscribe($sid)->await();
             }
         });
+    }
+
+    /**
+     * What a wait of {@see consumePipelined()} waits with (#181): $deadline, when the wait has one (the pump
+     * read's earliest pull deadline or heartbeat miss; the idle backoff has none), plus each of the run's
+     * two wake-ups, stop()'s and drain()'s, while it has not fired yet. A fired wake-up is left out whatever
+     * fired it: composed, it would end this wait and every later one at once, a spin of reads in queued
+     * callbacks that runs ahead of every timer and socket read in the process. One fired by its own stop()
+     * or drain() has its flag set, and the flag is seen at the top of the loop. One fired with its flag
+     * unset was replaced by a later handle() on the same iterator, which Amp fires as it is destructed: this
+     * run then waits as it did before #181, to its deadlines, until the shared flags end it. The wake-ups
+     * are read in the engine's fiber right before the wait starts, with no suspension in between, so a
+     * stop() or drain() from another fiber either fired before this check or fires a wake-up this wait holds.
+     * With one part, or none, the composite forwards that part or never fires.
+     */
+    private static function pullWaitCancellation(PullPipelineControl $ctl, ?Cancellation $deadline): Cancellation
+    {
+        $parts = $deadline === null ? [] : [$deadline];
+        foreach ([$ctl->stopInterruption(), $ctl->drainInterruption()] as $wakeUp) {
+            if (!$wakeUp->isRequested()) {
+                $parts[] = $wakeUp;
+            }
+        }
+
+        return new CompositeCancellation(...$parts);
     }
 
     /**

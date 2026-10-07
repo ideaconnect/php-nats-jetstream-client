@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\JetStream\Consumers;
 
+use Amp\DeferredCancellation;
 use Amp\Future;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
@@ -61,6 +62,18 @@ final class PullConsumerIterator
 
     /** Set by drain(): stop after the in-flight batch finishes processing; do not pull again. */
     private bool $drainRequested = false;
+
+    /**
+     * The current {@see handle()} run's stop() wake-up: fired right after {@see $stopRequested} is set, so
+     * the engine's wait on the socket or in its idle backoff ends at once (#181). One per run, made where
+     * the flags are cleared; null before the first run. Firing it outside a run changes nothing. The next
+     * run's replaces it, and Amp fires the replaced one as it is destructed: a run still active then sees
+     * it fired with its flag unset and leaves it out of its waits, as it does any fired wake-up.
+     */
+    private ?DeferredCancellation $stopWakeUp = null;
+
+    /** The current run's drain() wake-up, as {@see $stopWakeUp} for {@see $drainRequested} (#181). */
+    private ?DeferredCancellation $drainWakeUp = null;
 
     /** Optional diagnostics callback fired when the consume loop stops on a non-routine error (#63). */
     private ?\Closure $onError = null;
@@ -268,22 +281,32 @@ final class PullConsumerIterator
     /**
      * Signals a running {@see handle()} loop to stop promptly: it breaks before the next pull and
      * abandons any messages remaining in the in-flight batch (already-fetched but not yet handled).
-     * Safe to call from inside the handler or from another fiber. Mirrors nats.go
+     * Safe to call from inside the handler or from another fiber: a call from another fiber - a signal
+     * handler's timer, a supervisor - also ends the engine's wait on the socket, or in its idle backoff,
+     * at once, instead of at the earliest in-flight pull's deadline (#181). Idempotent; a call outside a
+     * run has no effect on the next run, which starts with the flag cleared. Mirrors nats.go
      * `ConsumeContext.Stop()`.
      */
     public function stop(): void
     {
+        // The flag first, then the wake-up: the engine composes the wake-up into a wait only while the
+        // flag is unset, so a wait that saw the flag unset holds the wake-up, and one that did not has the
+        // flag to see at the top of its loop. Both happen in this fiber with no suspension between them.
         $this->stopRequested = true;
+        $this->stopWakeUp?->cancel();
     }
 
     /**
      * Signals a running {@see handle()} loop to drain: it finishes processing the in-flight batch
-     * (so no fetched message is dropped) and then stops without issuing another pull. Mirrors nats.go
-     * `ConsumeContext.Drain()`.
+     * (so no fetched message is dropped) and then stops without issuing another pull. From another
+     * fiber the call wakes the engine once, so it stops issuing pulls at once and, with nothing in flight,
+     * returns at once; the in-flight pulls still complete or reach their deadline first, as from inside
+     * the handler (#181). Mirrors nats.go `ConsumeContext.Drain()`.
      */
     public function drain(): void
     {
         $this->drainRequested = true;
+        $this->drainWakeUp?->cancel();
     }
 
     /**
@@ -291,20 +314,34 @@ final class PullConsumerIterator
      * pipelined engine on {@see JetStreamContext::consumePipelined()}: it clears the stop/drain flags,
      * freezes the current configuration into an immutable {@see PullPipelineConfig}, and binds a live
      * {@see PullPipelineControl} so the engine still sees stop()/drain() the handler sets mid-run and
-     * writes any captured pin back onto this iterator. The engine overlaps up to {@see setDepth()}
+     * writes any captured pin back onto this iterator. The control also carries this run's two one-shot
+     * wake-ups, which stop() and drain() fire, so a call from another fiber ends the engine's wait on
+     * the socket or in its idle backoff at once (#181); each run gets fresh ones, so a wake-up fired in
+     * an earlier run cannot end a wait of this one. The engine overlaps up to {@see setDepth()}
      * concurrent pulls while preserving order; behavior is otherwise identical to the classic serial
      * loop (finite count, 404/408/409/423 handling, #153 idle backoff, onError). The run ends when the
      * configured iteration count is reached, a terminal error occurs, or {@see stop()}/{@see drain()}
      * is signalled (#120).
+     *
+     * Start the next run only once the previous run's future has resolved: the runs of one iterator
+     * share the stop/drain flags, so a handle() while a run is still active clears a stop() or drain()
+     * that run has not seen yet, and its wake-ups replace that run's. The active run goes on, as before
+     * #181: it waits to its pulls' deadlines until the shared flags end it, and does not spin on its
+     * replaced wake-ups (Amp fires a DeferredCancellation as it is destructed; the engine leaves a fired
+     * wake-up out of its waits).
      *
      * @param callable(NatsMessage, JetStreamContext):void $handler
      * @return Future<int> Total number of messages processed.
      */
     public function handle(callable $handler): Future
     {
-        // Reset lifecycle flags so a reused iterator is not pre-stopped from an earlier run. The pin
-        // is deliberately NOT reset here: a pinned group keeps its pin across runs.
+        // Reset lifecycle flags so a reused iterator is not pre-stopped from an earlier run, and arm this
+        // run's wake-ups. The pin is deliberately NOT reset here: a pinned group keeps its pin across runs.
         $this->resetLifecycle();
+        $stopWakeUp = new DeferredCancellation();
+        $drainWakeUp = new DeferredCancellation();
+        $this->stopWakeUp = $stopWakeUp;
+        $this->drainWakeUp = $drainWakeUp;
 
         $config = new PullPipelineConfig(
             batch: $this->batch,
@@ -327,6 +364,8 @@ final class PullConsumerIterator
             setPinFn: function (?string $pinId): void {
                 $this->pinId = $pinId;
             },
+            stopInterruption: $stopWakeUp->getCancellation(),
+            drainInterruption: $drainWakeUp->getCancellation(),
         );
 
         return $this->context->consumePipelined($this->stream, $this->consumer, $config, $handler, $control);
@@ -352,7 +391,9 @@ final class PullConsumerIterator
     }
 
     /**
-     * Clears the stop/drain flags at the start of a {@see handle()} run.
+     * Clears the stop/drain flags at the start of a {@see handle()} run. The run's wake-ups are made right
+     * after, by handle() itself, and replace the previous run's (fired or not; a replaced one fires as Amp
+     * destructs it, which a run still active ignores).
      */
     private function resetLifecycle(): void
     {
