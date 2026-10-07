@@ -281,6 +281,31 @@ final class ReconnectedListenerTest extends TestCase
     }
 
     /**
+     * The listener reads a lame-duck INFO with a PING behind it in the same chunk (#182): the connection fails over,
+     * and the PING, the leaving server's, is not answered on the connection the failover opened. The dispatch used to
+     * go on with the chunk after the failover and write the PONG there.
+     */
+    public function testPingBehindALameDuckInfoReadInAReconnectedListenerIsNotAnsweredOnTheNewConnection(): void
+    {
+        $transport = new ReconnectingTransport();
+        $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection) use ($transport): int {
+            $transport->pushFrame(self::LAME_DUCK . "PING\r\n");
+
+            return $connection->processIncoming(new TimeoutCancellation(0.5))->await();
+        });
+        $connection = $this->connect($transport, connectionListener: $action->listener());
+        $action->connection = $connection;
+
+        $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
+
+        self::assertNull($action->failure);
+        self::assertSame(2, $action->result, 'the read returned both frames');
+        $this->assertReconnectedAgain($connection, $transport);
+        self::assertSame([], $transport->controlLinesStartingWith('PONG', 2), 'no PONG on the connection the failover opened');
+        self::assertSame([], $transport->controlLinesStartingWith('PONG'), 'the leaving server\'s PING was not answered at all');
+    }
+
+    /**
      * A failed initial connect that the reconnect completes is announced as Connected, once the reconnect is
      * over, like a Reconnected: a read in its listener that meets EOF reconnects at once. It used to wait out its
      * budget (5 s here), and the connection stayed Open on the dead socket.

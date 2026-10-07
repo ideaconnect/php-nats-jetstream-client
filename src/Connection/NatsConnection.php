@@ -3237,6 +3237,20 @@ final class NatsConnection
      * which outranks a full subscription queue; among equals the first wins. The caller decides from it what
      * happens to the connection, and the others are reported instead.
      *
+     * The frames are the server's that the chunk was read from, and the chunk's connection can be gone before
+     * the last of them is handled (#182): a lame-duck INFO among them fails the connection over inline
+     * ({@see handleServerInfoUpdate()}), so handling it returns with the connection replaced
+     * ({@see $connectionGeneration} moved on) or ended ({@see $terminalCloses} moved on: the failover reached no
+     * server, or the LameDuck listener closed the connection itself, with a disconnect(), say, which leaves no
+     * failover to run and moves the close count alone). The rest of the chunk is then the old server's, and is
+     * not applied to the new connection ({@see handleStaleFrame()}): its messages are still queued for their
+     * subscriptions, which the reconnect replayed, though a delivery on the reply inbox no longer counts as the
+     * new server's confirmation of the replayed inbox ({@see handleFrame()}, its $stale); its PING is not
+     * answered with a PONG on the new connection, its PONG completes no slot of the new connection's, its INFO
+     * neither overwrites the new server's info nor starts a second failover, and its -ERR is reported instead
+     * of being applied to the new connection or failing the read. Checked before each frame, since the
+     * connection goes while one of them is handled; here, so that every caller gets the rule.
+     *
      * @param list<ProtocolFrame> $frames
      * @param bool $reportOverflows Report a full subscription queue ({@see SlowConsumerException})
      *        through the error listener instead of rethrowing it - for a caller that must not fail on
@@ -3250,10 +3264,19 @@ final class NatsConnection
         $firstError = null;
         /** @var list<array{\Throwable, string}> $reports What to report, with its log level. */
         $reports = [];
+        // The connection the chunk was read on (#182).
+        $generation = $this->connectionGeneration;
+        $closes = $this->terminalCloses;
 
         foreach ($frames as $frame) {
+            // The chunk's connection is gone once a frame handled before this one has replaced or ended it.
+            $stale = $this->connectionGeneration !== $generation || $this->terminalCloses !== $closes;
+            if ($stale && !$this->handleStaleFrame($frame, $reports)) {
+                continue;
+            }
+
             try {
-                $this->handleFrame($frame, $reports);
+                $this->handleFrame($frame, $reports, $stale);
             } catch (\Throwable $e) {
                 $reportable = $reportOverflows && $e instanceof SlowConsumerException && $e->sid !== $ownSid;
                 if (!$reportable && ($firstError === null || $this->dispatchFailureRank($e) > $this->dispatchFailureRank($firstError))) {
@@ -3304,6 +3327,57 @@ final class NatsConnection
         }
 
         return $failure instanceof SlowConsumerException ? 0 : 1;
+    }
+
+    /**
+     * Decides what becomes of a frame read on a connection that is gone by the time the frame is handled, the
+     * frames behind a lame-duck INFO in its chunk ({@see dispatchFrames()}, #182): the old server's, read before
+     * the failover, with the connection now on another server, or ended because no server could be reached, or
+     * closed by the LameDuck listener itself (a disconnect() called from it), which leaves no failover to run.
+     * Returns whether {@see handleFrame()} is still to handle the frame.
+     *
+     * - MSG and HMSG are, and so is +OK, which handleFrame() ignores. The messages are the old server's deliveries,
+     *   which the reconnect does not replay, for subscriptions it did replay, so they are queued as any message is,
+     *   and handed to handleFrame() as stale: a late reply on the reply inbox still reaches the request waiting for
+     *   it, but does not confirm the replayed inbox, since a delivery of the server the connection left says nothing
+     *   about whether the new server holds the replayed SUB, no more than that server's PONG does. One for an
+     *   unknown sid is discarded, as always; after a failed failover, or a close, every sid is unknown, the close
+     *   having released them, so the old server's last messages go with the connection, as the backlog a close
+     *   discards does.
+     * - PING is dropped: a PONG written for it would go to the new server, which asked for none, and the old
+     *   server has no connection left to answer on.
+     * - PONG is dropped: it answers a PING of the old connection, whose slot is gone, since the recovery fails every
+     *   slot of the old connection at its first attempt ({@see connectOnce()} calls {@see failPongWaiters()} before
+     *   it dials) and a terminal close does the same ({@see releaseRuntimeState()}). The slots queued since are the
+     *   new connection's, the fence behind the replayed reply-inbox SUB among them, and the stale PONG would complete
+     *   the oldest of those: the reply inbox would count as confirmed before the new server had answered anything.
+     *   Nor does the old server's PONG say anything about the new server, so the heartbeat's count is left alone.
+     * - INFO is dropped: it describes the old server, and would overwrite {@see $serverInfo} with that; a second
+     *   lame-duck INFO would start a second failover, since the new connection has its own lame-duck flag.
+     * - -ERR is reported through the error listener, as a NatsException saying the server the connection left sent
+     *   it, with the server's text, and nothing else: not applied to the new connection - a 'maximum subscriptions
+     *   exceeded' would drop the replayed, still unconfirmed reply inbox, a permissions violation would fire the
+     *   replayed subscription's rejection handler - not marked as ending the connection, and not thrown, so the
+     *   read that brought the chunk does not fail for an -ERR of a server the connection has already left.
+     *
+     * @param list<array{\Throwable, string}> $reports Collects the report of an -ERR, with its log level, for
+     *        dispatchFrames() to report once the whole chunk is queued.
+     * @param-out list<array{\Throwable, string}> $reports
+     */
+    private function handleStaleFrame(ProtocolFrame $frame, array &$reports): bool
+    {
+        switch ($frame->type) {
+            case ProtocolFrameType::Ping:
+            case ProtocolFrameType::Pong:
+            case ProtocolFrameType::Info:
+                return false;
+            case ProtocolFrameType::Err:
+                $reports[] = [new NatsException('The server the connection left sent an error frame: ' . ($frame->error ?? 'unknown')), 'error'];
+
+                return false;
+            default:
+                return true;
+        }
     }
 
     /**
@@ -5353,9 +5427,12 @@ final class NatsConnection
      *
      * @param list<array{\Throwable, string}> $reports Collects what the frame reports, with its log level,
      *        for {@see dispatchFrames()} to report once the whole chunk is queued.
+     * @param bool $stale Whether the frame was read on a connection that is gone, replaced or ended while an
+     *        earlier frame of its chunk was handled ({@see handleStaleFrame()}, #182). Only a MSG, HMSG or +OK still
+     *        comes here then, and a delivery on the reply inbox is queued without confirming the replayed inbox.
      * @param-out list<array{\Throwable, string}> $reports
      */
-    private function handleFrame(ProtocolFrame $frame, array &$reports): void
+    private function handleFrame(ProtocolFrame $frame, array &$reports, bool $stale = false): void
     {
         if ($frame->type === ProtocolFrameType::Ping) {
             $drainDeadline = $this->drainDeadline;
@@ -5498,9 +5575,10 @@ final class NatsConnection
                 return;
             }
 
-            if ($sid === $this->muxSid) {
+            if ($sid === $this->muxSid && !$stale) {
                 // A delivery on the mux proves the server holds it, as its fence PONG does. Recorded here, so
-                // that an -ERR later in the same chunk finds it.
+                // that an -ERR later in the same chunk finds it. Not a delivery of the server the connection
+                // left (#182): it says nothing about the replayed mux, which the new server's fence PONG confirms.
                 $this->confirmMux();
             }
 
@@ -6345,6 +6423,13 @@ final class NatsConnection
     /**
      * Reacts to an async INFO update by emitting discovery / lame-duck lifecycle events when the
      * advertised cluster topology or shutdown state changes.
+     *
+     * The lame-duck failover (#47) runs inline, in the fiber that dispatches the INFO: this returns with the
+     * connection on another server, or ended when no server could be reached (the failure is reported), or closed
+     * when the LameDuck listener closed it itself, which leaves no failover to run. The INFO's chunk can hold more
+     * frames behind it, the old server's, and the dispatch handles them for the connection they were read on:
+     * their messages are queued, and their PING, PONG, INFO and -ERR are not applied to the new connection
+     * ({@see dispatchFrames()}, {@see handleStaleFrame()}, #182).
      */
     private function handleServerInfoUpdate(): void
     {

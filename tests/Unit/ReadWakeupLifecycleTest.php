@@ -11,6 +11,7 @@ use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Tests\Support\CountingBuffer;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
@@ -440,8 +441,21 @@ final class ReadWakeupLifecycleTest extends TestCase
 
     /**
      * Two fibers poll one queue, and one message arrives 50 ms in. One poll returns it at once; the other is woken,
-     * finds nothing, and waits on to its 2 s timeout without spinning: the socket reads and the CPU time of the whole
-     * wait are bounded.
+     * finds nothing, and waits on to its 2 s timeout without spinning: the socket reads of the whole wait are bounded,
+     * and so is how often the polls look at the queue's buffer, which is swapped for a {@see CountingBuffer}. Both
+     * polls share the buffer, so the count is theirs together: one check each as they start, and two each when the
+     * message comes - the poll that takes it finds the buffer full at both, the woken one finds it empty at both,
+     * pauses a millisecond between them, and then waits on to its timeout without looking again - six in all. A
+     * woken poll whose next wait ended at once again and again (a wake-up left fired and handed to its next read, a
+     * wait behind the application's read that returned without waiting) would look twice per pause of a millisecond,
+     * close to a thousand times or more over its wait as the loop's timer paces it, with the socket unread. Only a
+     * wait that returns to the poll is counted: a read looping on a timer inside the connection, returning to neither
+     * poll and never reading the socket, would escape the count, and no path of a poll on an open connection has such
+     * a loop. A count of the callbacks the event loop registers over the wait, which would have caught it, was tried
+     * and dropped: it is process-wide, and a reconnect attempt of a client an earlier test left behind registers its
+     * 500 handshake polls in a burst that landed in this wait on the CI runners. The test used to bound the CPU time
+     * of the whole wait (under 0.5 s) instead, which depended on the environment: under Xdebug with coverage on a
+     * busy CI runner the wait's own cost reached it.
      */
     #[DataProvider('withAndWithoutAnApplicationLoop')]
     public function testTwoPollsOfOneQueueWithOneMessage(bool $loop): void
@@ -450,15 +464,19 @@ final class ReadWakeupLifecycleTest extends TestCase
         $watched = new WatchedTransport($transport);
         $client = $this->watchedClient($watched);
         $queue = $client->subscribeQueue('jobs')->await();
+        $buffer = CountingBuffer::install($queue);
         $stop = new DeferredCancellation();
         if ($loop) {
             $this->startApplicationReadLoop($client, $stop);
             $this->awaitRead($watched);
         }
         $readsBefore = $watched->reads;
-        EventLoop::delay(0.05, static fn() => $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1')));
+        $checksAtDelivery = 0;
+        EventLoop::delay(0.05, static function () use ($transport, $queue, $buffer, &$checksAtDelivery): void {
+            $checksAtDelivery = $buffer->checks;
+            $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+        });
 
-        $cpu = self::cpuSeconds();
         $start = hrtime(true);
         $polls = [];
         foreach ([1, 2] as $i) {
@@ -469,19 +487,20 @@ final class ReadWakeupLifecycleTest extends TestCase
             });
         }
         $results = \Amp\Future\await($polls);
-        $cpu = self::cpuSeconds() - $cpu;
+        $checks = $buffer->checks;
         $reads = $watched->reads - $readsBefore;
         $stop->cancel();
 
         $got = array_values(array_filter($results, static fn(array $result): bool => $result[0] === 'job-1'));
         $none = array_values(array_filter($results, static fn(array $result): bool => $result[0] === null));
-        self::report(sprintf('two polls, loop %s: %s; %d socket reads; %.3f s CPU', $loop ? 'yes' : 'no', json_encode($results), $reads, $cpu));
+        self::report(sprintf('two polls, loop %s: %s; %d socket reads; the polls checked the buffer %d times at the delivery, %d in all', $loop ? 'yes' : 'no', json_encode($results), $reads, $checksAtDelivery, $checks));
         self::assertCount(1, $got, 'one poll got the message');
         self::assertCount(1, $none, 'the other got nothing');
         self::assertLessThan(0.5, $got[0][1], 'the message was returned at once');
         self::assertGreaterThan(1.9, $none[0][1], 'the other poll waited to its timeout');
+        self::assertGreaterThan(0, $checksAtDelivery, 'the polls checked the buffer as they started: the count sees their looks');
         self::assertLessThan(10, $reads, 'the poll that went back to waiting read the socket a bounded number of times');
-        self::assertLessThan(0.5, $cpu, 'the poll that went back to waiting did not spin');
+        self::assertLessThan(60, $checks, sprintf('the poll that went back to waiting did not spin: the two polls checked the buffer %d times in all, six when no wait ends at once', $checks));
     }
 
     /** @return iterable<string, array{string, bool}> */
@@ -732,14 +751,6 @@ final class ReadWakeupLifecycleTest extends TestCase
         EventLoop::queue(static function () use ($hops, $call): void {
             self::afterHops($hops - 1, $call);
         });
-    }
-
-    private static function cpuSeconds(): float
-    {
-        $usage = getrusage();
-
-        return ($usage['ru_utime.tv_sec'] ?? 0) + ($usage['ru_utime.tv_usec'] ?? 0) / 1e6
-            + ($usage['ru_stime.tv_sec'] ?? 0) + ($usage['ru_stime.tv_usec'] ?? 0) / 1e6;
     }
 
     /**

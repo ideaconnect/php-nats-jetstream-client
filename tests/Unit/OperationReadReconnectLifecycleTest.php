@@ -15,6 +15,8 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Tests\Support\CountingBuffer;
+use IDCT\NATS\Tests\Support\CountingCancellation;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
@@ -919,7 +921,18 @@ final class OperationReadReconnectLifecycleTest extends TestCase
 
     /**
      * An operation parked on the reconnect its read started, backing off 300 ms between refused dials, costs nothing
-     * meanwhile: in a second, no read of the dead socket, a handful of dials and next to no CPU.
+     * meanwhile: in a second, no read of the dead socket, a handful of dials, and the operation does not look again -
+     * the poll does not check its buffer, the request does not check its cancellation - until the reconnect is over.
+     * The looks are the guard against a spin of the operation: a wait for the recovery that returned at once would
+     * have it look again every millisecond, about a thousand times in the second, with the socket still unread and
+     * the dials unchanged, so neither of the other two counts would notice. A wait that polled the recovery on a
+     * timer inside the connection, without returning to the operation, would escape the look count; no path of a
+     * parked operation has such a loop, and a count of the event loop's registrations that would have caught it was
+     * tried and dropped: it is process-wide, and a reconnect attempt of a client an earlier test left behind registers
+     * its 500 handshake polls in a burst. The test used to bound the CPU time of the second instead, which depended on
+     * the environment: under Xdebug on a busy CI runner the second's own cost - three refused dials with their
+     * exceptions and listener calls, GC - reached the bound, while either spin cost less than the bound on a fast
+     * machine.
      */
     #[DataProvider('parkedOperations')]
     public function testAnOperationParkedOnTheReconnectItStartedDoesNotSpin(string $operation): void
@@ -932,7 +945,7 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         $client->request('svc.warm', 'x', 1_000)->await();
         $queue = $operation === 'next' ? $client->subscribeQueue('jobs')->await() : null;
 
-        $result = self::startOperation($operation, $client, $queue, 3.0);
+        [$result, $looksSoFar] = self::startOperationCountingItsLooks($operation, $client, $queue, 3.0);
         $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
         $transport->refuseDials();
         $transport->dropConnection();
@@ -940,18 +953,19 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         delay(0.05);
         $readsBefore = $watched->reads;
         $dialsBefore = count($transport->connectCalls);
-        $cpuBefore = self::cpuSeconds();
+        $looksBefore = $looksSoFar();
         delay(1.0);
-        $cpu = self::cpuSeconds() - $cpuBefore;
+        $looks = $looksSoFar() - $looksBefore;
         $reads = $watched->reads - $readsBefore;
         $dials = count($transport->connectCalls) - $dialsBefore;
         $transport->acceptDials();
         $this->settle($result, hrtime(true));
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open, 4.0);
 
+        self::assertGreaterThan(0, $looksBefore, sprintf('%s looked as it started: the count sees its looks', $operation));
         self::assertSame(0, $reads, 'nothing reads the dead socket while the reconnect backs off');
         self::assertLessThanOrEqual(6, $dials, sprintf('%d dials in a second of 300 ms backoffs', $dials));
-        self::assertLessThan(0.15, $cpu, sprintf('%.3f s of CPU in a second parked', $cpu));
+        self::assertLessThan(10, $looks, sprintf('%s looked again %d times in a second parked: it polled through the reconnect', $operation, $looks));
     }
 
     private function lifecycleClient(
@@ -1075,6 +1089,30 @@ final class OperationReadReconnectLifecycleTest extends TestCase
     }
 
     /**
+     * Starts $operation as {@see startOperation()} does, counting how often it looks for its result: a poll checks its
+     * buffer at each look ({@see CountingBuffer}), a request its cancellation ({@see CountingCancellation}), and neither
+     * looks while its read waits. Only the operations of {@see parkedOperations()}.
+     *
+     * @return array{Future<list<string>>, \Closure(): int} The payloads the operation got, and its looks so far.
+     */
+    private static function startOperationCountingItsLooks(string $operation, NatsClient $client, ?SubscriptionQueue $queue, float $wait): array
+    {
+        if ($operation === 'next') {
+            self::assertNotNull($queue);
+            $buffer = CountingBuffer::install($queue);
+
+            return [self::startOperation($operation, $client, $queue, $wait), static fn(): int => $buffer->checks];
+        }
+
+        self::assertSame('request', $operation);
+        $looks = new CountingCancellation();
+        $result = $client->request('svc.echo', 'hi', (int) round($wait * 1000), $looks)
+            ->map(static fn(NatsMessage $message): array => [$message->payload]);
+
+        return [$result, static fn(): int => $looks->isRequestedCalls];
+    }
+
+    /**
      * Awaits $operation: its payloads, the seconds since $start, and what it threw.
      *
      * @param Future<list<string>> $operation
@@ -1145,15 +1183,5 @@ final class OperationReadReconnectLifecycleTest extends TestCase
     private static function payloads(array $messages): array
     {
         return array_map(static fn(NatsMessage $message): string => $message->payload, $messages);
-    }
-
-    private static function cpuSeconds(): float
-    {
-        $usage = getrusage();
-        if ($usage === false) {
-            return 0.0;
-        }
-
-        return $usage['ru_utime.tv_sec'] + $usage['ru_utime.tv_usec'] / 1e6 + $usage['ru_stime.tv_sec'] + $usage['ru_stime.tv_usec'] / 1e6;
     }
 }

@@ -15,6 +15,53 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.18.0] - 2026-10-07
+
+### Fixed
+
+- `[bugfix]` A `PING`, `PONG`, `INFO`, `-ERR` or reply-inbox `MSG` read in the same chunk as a lame-duck `INFO`,
+  behind it, was handled on the connection the lame-duck failover had just opened (#182). The failover (#47) runs
+  inline in the dispatch of the `INFO`, and the dispatch then went on with the rest of the chunk as if nothing had
+  happened: the old server's `PING` was answered with a `PONG` written on the new connection; a stale `INFO`
+  overwrote the new server's info, and a second lame-duck `INFO` started a second failover, since the lame-duck flag
+  had been reset for the new connection; a `PONG` completed the new connection's oldest PONG slot - the fence behind
+  the replayed reply-inbox `SUB` - and so confirmed the replayed inbox before the new server had answered anything,
+  as a late reply of the old server on that inbox did; an `-ERR` was applied to the new connection (`maximum
+  subscriptions exceeded` dropped the replayed, still unconfirmed inbox, a permissions violation naming a subject
+  fired the replayed subscription's rejection handler) and failed the read with `Server sent error frame` although
+  the failover had succeeded. The dispatch now checks before each frame whether the chunk's connection is gone,
+  replaced or ended, and handles the rest of the chunk for the connection it was read on: its messages are still
+  queued for their subscriptions, which the failover replayed, though a late reply on the request inbox no longer
+  counts as the new server's confirmation of the replayed inbox; its `PING`, `PONG` and `INFO` are dropped; its
+  `-ERR` is reported through the error listener (`The server the connection left sent an error frame: ...`) and
+  neither applied nor thrown. When the connection ends instead - the failover failed, or the `LameDuck` listener
+  closed the connection itself - the chunk's `PING` is not answered on the closed transport either: the read returns
+  what it read, and the next one fails with the closed connection, instead of the read failing with the PONG write's
+  error. Nothing changes without a failover (reconnect disabled, or a pool of one): the chunk is handled as before.
+  Found by the review of the read wake-up (#174, 2.12.0).
+
+### Testing & CI
+
+- `[docs]` `OperationReadReconnectLifecycleTest::testAnOperationParkedOnTheReconnectItStartedDoesNotSpin` no longer
+  bounds the CPU time of the second an operation spends parked on the reconnect its read started, which depended on
+  the environment: under Xdebug with coverage on a busy CI runner the second's own cost (three refused dials with
+  their exceptions and listener calls, GC) reached the 0.15 s bound, while the same seeds passed elsewhere, and a 1 ms
+  poll cost less than the bound on a fast machine. It counts how often the operation looks for its result instead,
+  which a spin would do about a thousand times in that second and a parked operation not at all: the poll's buffer is
+  swapped for a new `CountingBuffer` test double, which counts how often `next()` checks it, and the request gets a
+  `CountingCancellation` as its cancellation. A process-wide count of the callbacks the event loop registers in that
+  second was tried as well and dropped: the reconnect attempts of clients that earlier tests leave behind register
+  their 500 handshake polls in a burst. The socket-read and dial counts stay. Dev-only, no library change.
+- `[docs]` `ReadWakeupLifecycleTest::testTwoPollsOfOneQueueWithOneMessage` no longer bounds the CPU time of the 2 s
+  that two polls of one queue spend on one message, the poll the delivery wakes finding nothing and waiting on to its
+  timeout, which depended on the environment the same way: in the Infection initial run for 2.17.0, under Xdebug with
+  coverage on the shared runner, the wait's own cost reached 0.82 s against the 0.5 s bound, while the four unit jobs
+  of the same run passed it. It counts how often the two polls check the queue's buffer instead, with the same
+  `CountingBuffer` in place of the buffer the polls share: six when no wait ends at once (one check each as the polls
+  start, two each when the message comes), and two per pause of a millisecond, close to a thousand or more over the
+  wait, for a woken poll whose next wait ended at once again and again, which the socket-read count does not see when
+  the read returns before it reads. The bound is 60; the other assertions stay. Dev-only, no library change.
+
 ## [2.17.0] - 2026-10-07
 
 ### Fixed
