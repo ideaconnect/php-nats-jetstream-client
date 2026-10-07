@@ -947,6 +947,70 @@ final class NatsConnection
     }
 
     /**
+     * Recovers a connection whose socket failed the read of one of the library's operations - a read with a
+     * wake-up ({@see readChunk()}): the read of an operation that waits for a result of its own, or a flush's
+     * read for its PONG - and waits for it the way the operation waits for a reconnect another fiber runs:
+     * within the operation's own wait. With waiting disabled it does not wait at all, and the operation fails
+     * at once with "Connection is not open", the read's error its cause, as one whose control write noticed
+     * the loss does (#178).
+     *
+     * Such a read used to run the recovery inline, as your own processIncoming() still does, so neither the
+     * operation's deadline nor its wake-up could end the wait: with the server down for two seconds, a request
+     * with a one-second timeout returned after two, and so did a poll whose message a delivery still under way
+     * brought during the outage. The recovery runs in its own fiber instead, like the one a failed control write
+     * or a connection-ending frame starts ({@see recoverAfterFailedWrite()}, {@see recoverAfterEndingFrame()}),
+     * and $waitCancellation, the operation's deadline composed with its wake-up, bounds the wait: the deadline
+     * ends it with the caller's cancellation, so that the operation times out, and the wake-up ends it with the
+     * read returning, so that the operation looks again. Either way the recovery carries on, announces the new
+     * connection once it is over, and fails on its own terms when it gives up. A recovery that ends while the
+     * read waits ends the wait as well, with its outcome: the read returns and the operation looks again before
+     * it reads the new connection, as after a reconnect it joined, or gets the recovery's error. A recovery
+     * another fiber already runs is joined within the same wait, as before.
+     *
+     * The recovery fiber is then the one started here, not the read's: a listener called during the recovery
+     * runs inside it, and an operation issued from there is refused a join, as for a failed write
+     * ({@see awaitOpenConnection()}).
+     *
+     * @param int $generation The {@see $connectionGeneration} the failed read ran on.
+     * @param \Throwable $readError The read's error, the cause of the recovery's own failure (#172).
+     * @param Cancellation|null $waitCancellation What the read waits with: the caller's cancellation and the
+     *        read's wake-up, whichever are given.
+     *
+     * @throws CancelledException When $waitCancellation fires first, or had fired by the time the read's error was
+     *         reported; the read tells the deadline from the wake-up.
+     * @throws ConnectionException When the recovery gives up, or closes the connection because reconnect is off;
+     *         at once, with $readError as its previous, when waiting for a reconnect is disabled.
+     */
+    private function recoverAfterFailedOperationRead(int $generation, \Throwable $readError, ?Cancellation $waitCancellation): void
+    {
+        if ($this->reconnecting !== null) {
+            $this->recoverConnection(joinCancellation: $waitCancellation, failedGeneration: $generation, cause: $readError);
+
+            return;
+        }
+
+        $recovery = async(function () use ($generation, $readError): void {
+            $this->recoverConnection(failedGeneration: $generation, cause: $readError);
+        });
+        // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
+        $recovery->ignore();
+
+        // Waiting disabled: the operation fails at once, as every operation does while a reconnect is in flight,
+        // rather than find the connection not open at its next read. A flush that read on instead met either
+        // the PONG the recovery's first attempt fails or the closed connection, depending on how long the
+        // transport's close took. Not when the operation's wait ended while the read's error was reported:
+        // what it waits for came meanwhile, in a delivery still under way, or its deadline passed, and the read
+        // tells which from the cancellation.
+        if ($this->options->reconnectEnabled && !$this->options->waitForReconnect) {
+            $waitCancellation?->throwIfRequested();
+
+            throw new ConnectionException('Connection is not open', 0, $readError);
+        }
+
+        $recovery->await($waitCancellation);
+    }
+
+    /**
      * Runs one user-initiated connect - dial + handshake with the standing failure policy (auth
      * failures fail fast; other failures hand off to recovery or the initial-connect retry loop;
      * otherwise the connection closes terminally). Serialized by {@see connect()}.
@@ -2251,9 +2315,11 @@ final class NatsConnection
      * drain(), it does not reject for them, and a throwing handler does not cost the messages behind it.
      * Nor does another subscription's full queue (SlowConsumerPolicy::Error), or an -ERR the server keeps
      * the connection open for: either is reported and the flush reads on to its PONG. A connection lost
-     * during the flush is recovered by the flush's own read, as by any read that is first to notice it, so
-     * with reconnect on the call lasts until that reconnect ends (when the server closes the connection
-     * right after such an -ERR, say).
+     * during the flush (when the server closes the connection right after such an -ERR, say) is recovered
+     * by the flush's own read, as by any read that is first to notice it; the reconnect runs on in a fiber
+     * of its own, and the flush fails as soon as its first attempt ends the lost connection's PONGs, since
+     * the one it waited for died with the socket (#178). That failure is reported, and the subscription is
+     * removed; the reconnect never re-subscribes it. The call used to last until the reconnect ended.
      *
      * When a delivery for the sid is already under way - on another fiber, or it is the handler that
      * called this, draining its own subscription - that delivery hands over the messages queued behind
@@ -2585,6 +2651,12 @@ final class NatsConnection
      * (#174). The operation then looks again: call this right after looking for the result, with no await in
      * between, since what is delivered before the call does not end the read.
      *
+     * A read with $ownSid, whose subscription still exists, that is the first to notice a lost connection starts the
+     * reconnect and waits for it only within $cancellation and that wake-up, as it waits for a reconnect another
+     * fiber runs, or with waiting disabled fails at once with "Connection is not open" (#178); a read without a
+     * wake-up - {@see readIncoming()}, a serving loop's read, one for a sid since removed - runs the reconnect itself
+     * and waits for all of it.
+     *
      * @internal For the library's own operations (JetStream, Key/Value, polling queues, services);
      *           applications read with {@see readIncoming()} or {@see processIncoming()}.
      *
@@ -2909,9 +2981,16 @@ final class NatsConnection
                     // until this read's own cancellation fires: a request whose read failed must not
                     // outlive its timeout waiting for the whole backoff schedule. Nor an operation's
                     // read its wake-up: what it waits for can come meanwhile, in a delivery still under
-                    // way when the connection dropped. A recovery this read runs itself is not cut short.
+                    // way when the connection dropped. A read with a wake-up - an operation's, or a
+                    // flush's for its PONG - waits only that long for a recovery it starts itself as well, which
+                    // then runs in a fiber of its own, and with waiting disabled fails at once (#178); a read
+                    // without one - your own, a serving loop's - runs it here, and waits for all of it.
                     try {
-                        $this->recoverConnection(joinCancellation: $waitCancellation, failedGeneration: $generation, cause: $readError);
+                        if ($wake !== null) {
+                            $this->recoverAfterFailedOperationRead($generation, $readError, $waitCancellation);
+                        } else {
+                            $this->recoverConnection(joinCancellation: $waitCancellation, failedGeneration: $generation, cause: $readError);
+                        }
                     } catch (CancelledException $cancelled) {
                         if (!self::wokenUp($wake, $cancellation)) {
                             $cancellation?->throwIfRequested();
@@ -4231,7 +4310,10 @@ final class NatsConnection
      * @param Cancellation|null $joinCancellation Bounds only a JOIN of a recovery another fiber already
      *                             runs: when it fires the joiner gets CancelledException while the
      *                             recovery carries on. A recovery this call starts runs inline in the
-     *                             calling fiber and is not bounded by it.
+     *                             calling fiber and is not bounded by it: a caller that must keep to a
+     *                             budget of its own starts the recovery in a fiber of its own instead and
+     *                             waits for that ({@see recoverAfterFailedWrite()},
+     *                             {@see recoverAfterFailedOperationRead()}).
      * @param int|null $failedGeneration The {@see $connectionGeneration} the failed read or write ran on;
      *                             a failure from a connection since replaced starts no recovery.
      * @param \Throwable|null $cause The error that ended the connection. With reconnect off it is chained to

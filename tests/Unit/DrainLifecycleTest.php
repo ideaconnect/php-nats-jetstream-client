@@ -833,11 +833,16 @@ final class DrainLifecycleTest extends TestCase
         self::assertTrue($connection->isSubscriptionActive($kept));
     }
 
-    /** The same when the flush's own read finds the connection gone and runs the reconnect itself. */
+    /**
+     * The same when the flush's own read finds the connection gone and starts the reconnect itself. The flush fails
+     * as soon as the reconnect's first attempt ends the lost connection's PONGs, and the call resolves while the
+     * reconnect runs on (#178); the subscription is gone by then, and the reconnect does not bring it back.
+     */
     public function testDrainSubscriptionIsNotReplayedWhenItsFlushLosesTheConnection(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport);
+        $recorder = new LifecycleRecorder();
+        $connection = $this->connect($transport, errorListener: $recorder->errorListener());
         $drained = $connection->subscribe('orders', static function (): void {}, 'workers')->await();
         $kept = $connection->subscribe('updates', static function (): void {})->await();
         // The connection dies once the flush's PING is out, before its PONG.
@@ -851,6 +856,9 @@ final class DrainLifecycleTest extends TestCase
 
         $connection->drainSubscription($drained)->await();
 
+        self::assertFalse($connection->isSubscriptionActive($drained));
+        self::assertSame(['Socket closed by peer (EOF)', 'Connection lost before the server answered the PING'], $recorder->errors, 'the lost connection and the flush that lost its PONG are reported');
+        $this->waitUntilOpen($connection);
         self::assertSame(1, $transport->epoch());
         self::assertSame(['SUB updates ' . $kept], $transport->controlLinesStartingWith('SUB', 1));
         self::assertNull($transport->sidFor('orders'));
@@ -1516,13 +1524,15 @@ final class DrainLifecycleTest extends TestCase
     /**
      * drainSubscription(), whose flush reads on past an -ERR the server keeps the connection open for, meets a
      * close that follows the -ERR itself: the server closing the connection after 'maximum subscriptions
-     * exceeded' when an account's subscription limit was lowered, say. With reconnect on, the flush's read runs
-     * the reconnect before the call resolves, as any read that is first to notice a dead connection does; here
-     * the server refuses new connections, so by then the reconnect has given up, said why, and closed the
-     * connection. In 2.10.0 the call ended at the -ERR and left the dead connection Open for the next
-     * operation; in 2.10.1 and 2.10.2 the -ERR itself ended the connection.
+     * exceeded' when an account's subscription limit was lowered, say. With reconnect on, the flush's read starts
+     * the reconnect, as any read that is first to notice a dead connection does, and the flush fails as soon as
+     * the reconnect's first attempt ends the lost connection's PONGs (#178): the call reports that and resolves
+     * while the reconnect runs on. Here the server refuses new connections, so the reconnect then gives up, says
+     * why, and closes the connection. In 2.10.0 the call ended at the -ERR and left the dead connection Open for
+     * the next operation; in 2.10.1 and 2.10.2 the -ERR itself ended the connection; up to 2.13.0 the call lasted
+     * until the reconnect had given up.
      */
-    public function testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseRunsTheReconnectItself(): void
+    public function testDrainSubscriptionWhoseFlushMeetsAnErrAndThenACloseStartsTheReconnectAndResolvesBeforeItGivesUp(): void
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
@@ -1550,19 +1560,24 @@ final class DrainLifecycleTest extends TestCase
         };
 
         $connection->drainSubscription($sid)->await();
+        $stateOnReturn = $connection->state();
 
         self::assertSame(
-            ["Server sent error frame: 'maximum subscriptions exceeded'", 'Socket closed by peer (EOF)', 'Reconnect attempts exhausted'],
+            ["Server sent error frame: 'maximum subscriptions exceeded'", 'Socket closed by peer (EOF)', 'Connection lost before the server answered the PING'],
             $recorder->errors,
+            'the call reported the -ERR, the lost connection and the flush that lost its PONG',
         );
+        self::assertSame(ConnectionState::Connecting, $stateOnReturn, 'the call resolved while the reconnect its read started runs on');
+        self::assertFalse($connection->isSubscriptionActive($sid));
+
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Closed);
         self::assertSame(
             [ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Closed],
             $recorder->events,
-            'the reconnect ran, and gave up, before the call resolved',
+            'the reconnect gave up on its own',
         );
-        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(['Connection refused'], $recorder->closedErrors, 'the Closed event says why');
         self::assertCount(4, $transport->connectCalls, 'the first dial and three reconnect attempts');
-        self::assertFalse($connection->isSubscriptionActive($sid));
     }
 
     /** @return iterable<string, array{string}> */

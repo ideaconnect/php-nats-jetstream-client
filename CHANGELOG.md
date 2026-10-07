@@ -15,6 +15,48 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.14.0] - 2026-10-07
+
+### Upgrade notes
+
+- One of the library's operations whose own read is the first to notice a lost connection - a `request()` or
+  `requestMany()`, a `SubscriptionQueue` poll, `fetchBatch()`, `fetchNext()` or `directGetBatch()`, a pull
+  consumer, Key/Value `keys()` or `history()`: every operation that reads for a result of its own - no longer waits
+  for the whole reconnect it starts: it waits within its own timeout, as it does for a reconnect another fiber
+  runs, and with `waitForReconnect: false` it fails at once with `Connection is not open`, the read's error as its
+  previous (#178). A `flush()`, `rtt()` or `drainSubscription()` whose own read is the first to notice fails with
+  `Connection lost before the server answered the PING` as soon as the reconnect's first attempt ends the old
+  connection's `PONG`s, or at once with `Connection is not open` when waiting is disabled, and
+  `drainSubscription()` then reports that and removes the subscription while the reconnect runs on. Code that
+  relied on such an operation returning only once the connection was back - polling in a loop and taking the next
+  successful result for the reconnect, say - now sees it time out or fail during the outage, with the reconnect
+  still under way; the connection events say when the connection is back, and with waiting enabled the next
+  operation waits for the reconnect within its own timeout, as before. A reconnect that gives up while nothing
+  waits for it any more is announced by its `Closed` event and the log: an operation that timed out before the
+  reconnect gave up does not see `Reconnect attempts exhausted`, and the exception of a `drainSubscription()` flush
+  that used to report it now reports the lost `PONG`. With `waitForReconnect: false` the reconnect such an
+  operation started advances only while something awaits on the event loop, as one the heartbeat starts always
+  did: a synchronous application that only ever issues operations failing on the spot has to keep awaiting
+  something for the connection to come back. Your own `processIncoming()` and `readIncoming()`, a serving loop's
+  read and the heartbeat still run the reconnect themselves and wait for all of it.
+
+### Fixed
+
+- `[bugfix]` An operation whose own read was the one on the socket when the connection dropped waited for the whole
+  reconnect, however long it took, before it returned (#178). `readChunk()`'s failed-read path ran the reconnect
+  inline in the operation's fiber, so neither the operation's deadline nor its wake-up (#174) could end the wait:
+  with the server down for 2 s and a 1 s deadline, `SubscriptionQueue::next()` and `request()` returned after 2 s,
+  although a delivery still under way had brought their result 50 ms into the outage, and a `fetchBatch()` or a
+  pull consumer's read did the same. On a real server, where a poll's read is often the only one on the socket, a
+  `next()` with a 1 s timeout returned only once the server was back. Such a read now starts the reconnect in a
+  fiber of its own, like a failed control write does, and waits for it within the operation's deadline and wake-up:
+  the operation returns what a delivery brings during the outage, or times out at its deadline, and the reconnect
+  carries on, announces the new connection once it is over and fails on its own terms when it gives up. With
+  `waitForReconnect: false` the operation fails at once with `Connection is not open`, the read's error as its
+  previous, as one whose control write noticed the loss does, instead of waiting for the reconnect first. A
+  reconnect another fiber already runs is still joined within the same wait, your own read still runs the reconnect
+  itself, and a listener called during the reconnect is still refused an operation that would wait on it.
+
 ## [2.13.0] - 2026-10-07
 
 ### Upgrade notes
