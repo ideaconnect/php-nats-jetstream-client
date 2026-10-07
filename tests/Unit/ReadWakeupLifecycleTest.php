@@ -11,7 +11,9 @@ use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Tests\Support\CountingBuffer;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
+use IDCT\NATS\Tests\Support\LoopRegistrations;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\WatchedTransport;
@@ -440,8 +442,24 @@ final class ReadWakeupLifecycleTest extends TestCase
 
     /**
      * Two fibers poll one queue, and one message arrives 50 ms in. One poll returns it at once; the other is woken,
-     * finds nothing, and waits on to its 2 s timeout without spinning: the socket reads and the CPU time of the whole
-     * wait are bounded.
+     * finds nothing, and waits on to its 2 s timeout without spinning: the socket reads of the whole wait are bounded,
+     * and so is how often the polls look at the queue's buffer, which is swapped for a {@see CountingBuffer}. Both
+     * polls share the buffer, so the count is theirs together: one check each as they start, and two each when the
+     * message comes - the poll that takes it finds the buffer full at both, the woken one finds it empty at both,
+     * pauses a millisecond between them, and then waits on to its timeout without looking again - six in all. A
+     * woken poll whose next wait ended at once again and again (a wake-up left fired and handed to its next read, a
+     * wait behind the application's read that returned without waiting) would look twice per pause of a millisecond,
+     * close to a thousand times or more over its wait as the loop's timer paces it, with the socket unread. Only a
+     * wait that returns to the poll is counted there, so the callbacks the event loop registers over the wait are
+     * counted as well, through {@see LoopRegistrations}: five on the current code in both data sets - the two polls'
+     * timeout timers, the woken poll's millisecond pause, and the keep-alive timer the test transport sets for each
+     * idle read of the socket, the polls' own two or the application's two - and hundreds for a wait that polled on a
+     * timer inside the connection, returning to neither poll and never reading the socket, which no look count sees:
+     * 520 to 1819 over the wait, as the driver's timers pace it, for a 1 ms poll of the read slot behind the
+     * application's read, which holds the slot for all of it (18 to 49 with no other reader, where the parked poll
+     * gets the slot once the message is in, 50 ms in), thousands for the same poll with no delay, and 491 for the
+     * woken poll's own spin above. The test used to bound the CPU time of the whole wait (under 0.5 s) instead, which
+     * depended on the environment: under Xdebug with coverage on a busy CI runner the wait's own cost reached it.
      */
     #[DataProvider('withAndWithoutAnApplicationLoop')]
     public function testTwoPollsOfOneQueueWithOneMessage(bool $loop): void
@@ -450,15 +468,21 @@ final class ReadWakeupLifecycleTest extends TestCase
         $watched = new WatchedTransport($transport);
         $client = $this->watchedClient($watched);
         $queue = $client->subscribeQueue('jobs')->await();
+        $buffer = CountingBuffer::install($queue);
         $stop = new DeferredCancellation();
         if ($loop) {
             $this->startApplicationReadLoop($client, $stop);
             $this->awaitRead($watched);
         }
         $readsBefore = $watched->reads;
-        EventLoop::delay(0.05, static fn() => $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1')));
+        $checksAtDelivery = 0;
+        EventLoop::delay(0.05, static function () use ($transport, $queue, $buffer, &$checksAtDelivery): void {
+            $checksAtDelivery = $buffer->checks;
+            $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
+        });
 
-        $cpu = self::cpuSeconds();
+        $registrations = new LoopRegistrations();
+        $registeredBefore = $registrations->soFar();
         $start = hrtime(true);
         $polls = [];
         foreach ([1, 2] as $i) {
@@ -469,19 +493,22 @@ final class ReadWakeupLifecycleTest extends TestCase
             });
         }
         $results = \Amp\Future\await($polls);
-        $cpu = self::cpuSeconds() - $cpu;
+        $registered = $registrations->soFar() - $registeredBefore;
+        $checks = $buffer->checks;
         $reads = $watched->reads - $readsBefore;
         $stop->cancel();
 
         $got = array_values(array_filter($results, static fn(array $result): bool => $result[0] === 'job-1'));
         $none = array_values(array_filter($results, static fn(array $result): bool => $result[0] === null));
-        self::report(sprintf('two polls, loop %s: %s; %d socket reads; %.3f s CPU', $loop ? 'yes' : 'no', json_encode($results), $reads, $cpu));
+        self::report(sprintf('two polls, loop %s: %s; %d socket reads; the polls checked the buffer %d times at the delivery, %d in all; the event loop registered %d callbacks over the wait', $loop ? 'yes' : 'no', json_encode($results), $reads, $checksAtDelivery, $checks, $registered));
         self::assertCount(1, $got, 'one poll got the message');
         self::assertCount(1, $none, 'the other got nothing');
         self::assertLessThan(0.5, $got[0][1], 'the message was returned at once');
         self::assertGreaterThan(1.9, $none[0][1], 'the other poll waited to its timeout');
+        self::assertGreaterThan(0, $checksAtDelivery, 'the polls checked the buffer as they started: the count sees their looks');
         self::assertLessThan(10, $reads, 'the poll that went back to waiting read the socket a bounded number of times');
-        self::assertLessThan(0.5, $cpu, 'the poll that went back to waiting did not spin');
+        self::assertLessThan(60, $checks, sprintf('the poll that went back to waiting did not spin: the two polls checked the buffer %d times in all, six when no wait ends at once', $checks));
+        self::assertLessThan(50, $registered, sprintf('nothing polled on a timer inside the connection: the event loop registered %d callbacks over the wait, where the polls\' timeout timers, the woken poll\'s millisecond pause and the keep-alive of each idle socket read make 5, and a poll of the read slot every millisecond behind the application\'s read registers hundreds', $registered));
     }
 
     /** @return iterable<string, array{string, bool}> */
@@ -732,14 +759,6 @@ final class ReadWakeupLifecycleTest extends TestCase
         EventLoop::queue(static function () use ($hops, $call): void {
             self::afterHops($hops - 1, $call);
         });
-    }
-
-    private static function cpuSeconds(): float
-    {
-        $usage = getrusage();
-
-        return ($usage['ru_utime.tv_sec'] ?? 0) + ($usage['ru_utime.tv_usec'] ?? 0) / 1e6
-            + ($usage['ru_stime.tv_sec'] ?? 0) + ($usage['ru_stime.tv_usec'] ?? 0) / 1e6;
     }
 
     /**

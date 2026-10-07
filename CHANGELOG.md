@@ -40,6 +40,35 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   error. Nothing changes without a failover (reconnect disabled, or a pool of one): the chunk is handled as before.
   Found by the review of the read wake-up (#174, 2.12.0).
 
+### Testing & CI
+
+- `[docs]` `OperationReadReconnectLifecycleTest::testAnOperationParkedOnTheReconnectItStartedDoesNotSpin` no longer
+  bounds the CPU time of the second an operation spends parked on the reconnect its read started, which depended on
+  the environment: under Xdebug with coverage on a busy CI runner the second's own cost (three refused dials with
+  their exceptions and listener calls, GC) reached the 0.15 s bound, while the same seeds passed elsewhere, and a
+  1 ms poll cost less than the bound on a fast machine. It counts how often the operation looks for its result
+  instead, which a spin would do about a thousand times in that second and a parked operation not at all: the poll's
+  buffer is swapped for a new `CountingBuffer` test double, which counts how often `next()` checks it, and the
+  request gets a `CountingCancellation` as its cancellation. A new `LoopRegistrations` test double also counts the
+  callbacks the event loop registers in that second, which catches a poll on a timer inside the connection that
+  returns to neither operation: four on the current code, hundreds for such a poll. The socket-read and dial counts
+  stay. Dev-only, no library change.
+- `[docs]` `ReadWakeupLifecycleTest::testTwoPollsOfOneQueueWithOneMessage` no longer bounds the CPU time of the 2 s
+  that two polls of one queue spend on one message, the poll the delivery wakes finding nothing and waiting on to its
+  timeout, which depended on the environment the same way: in the Infection initial run for 2.17.0, under Xdebug with
+  coverage on the shared runner, the wait's own cost reached 0.82 s against the 0.5 s bound, while the four unit jobs
+  of the same run passed it. It counts how often the two polls check the queue's buffer instead, with the same
+  `CountingBuffer` in place of the buffer the polls share: six when no wait ends at once (one check each as the polls
+  start, two each when the message comes), and two per pause of a millisecond, close to a thousand or more over the
+  wait, for a woken poll whose next wait ended at once again and again, which the socket-read count does not see when
+  the read returns before it reads. The bound is 60; the other assertions stay. A second count, of the callbacks the
+  event loop registers over the wait, read from their identifiers through a `LoopRegistrations` test double, guards
+  against a wait that polled on a timer inside the connection, returning to neither poll and never reading the socket,
+  which no buffer count sees: five on the current code in both data sets (the two polls' timeout timers, the woken
+  poll's millisecond pause and the test transport's keep-alive timer for each idle socket read), 520 to 1819 for a
+  1 ms poll of the read slot behind the application's read, which holds the slot for the whole wait, thousands for the
+  same poll with no delay. Its bound is 50. Dev-only, no library change.
+
 ## [2.17.0] - 2026-10-07
 
 ### Fixed
