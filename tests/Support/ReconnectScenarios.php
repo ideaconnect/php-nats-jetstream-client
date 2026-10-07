@@ -116,7 +116,8 @@ trait ReconnectScenarios
     /**
      * Kills the live session with dials refused and lets a background reader take the failure, so a
      * recovery owned by ANOTHER fiber is in flight - backing off between refused dials - when the test
-     * issues its operation. Returns that reader; it completes when the recovery does.
+     * issues its operation. Returns that reader; it completes when the recovery does. The reader is an
+     * operation's read without a subscription of its own ({@see loseConnection()}).
      *
      * @return Future<int>
      */
@@ -142,12 +143,21 @@ trait ReconnectScenarios
         return $this->loseConnection($connection, $transport);
     }
 
-    /** @return Future<int> */
+    /**
+     * Kills the live session and lets a background reader notice it, returning that reader (its frame count) once the
+     * connection is Connecting. The reader is an operation's read without a subscription of its own: it runs the
+     * reconnect inline and waits for all of it, like your own read, but continues no remainder before it reads and,
+     * with the default options, reports a handler's failure rather than throwing it. A test that left the rest of a
+     * subscription queued behind a handler that threw, to have a backlog when the reconnect or a drain starts, keeps
+     * it queued for them: your own read would continue it before it read (#186).
+     *
+     * @return Future<int>
+     */
     private function loseConnection(NatsConnection|NatsClient $connection, ReconnectingTransport $transport): Future
     {
         $transport->dropConnection();
 
-        $reader = async(static fn(): int => $connection->processIncoming()->await());
+        $reader = async(static fn(): int => $connection->readIncomingForOperation()->await()->frames);
         $reader->ignore();
         $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
 

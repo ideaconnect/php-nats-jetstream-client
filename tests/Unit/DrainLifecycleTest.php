@@ -18,11 +18,13 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Tests\Support\UncancellableDialTransport;
+use IDCT\NATS\Tests\Support\WatchedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
@@ -30,6 +32,7 @@ use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
+use function Amp\Future\awaitFirst;
 
 /**
  * drain() and drainSubscription() where they meet reconnects and closes: every drain ends Closed with
@@ -2283,6 +2286,89 @@ final class DrainLifecycleTest extends TestCase
         self::assertSame(['a:x', 'a:y'], $seen);
         $stop->cancel();
         $loop->await(new TimeoutCancellation(1));
+    }
+
+    /**
+     * Your read during a drain(), while the rest of a subscription whose handler threw is still being delivered in
+     * another fiber (#186): your next read X continues "s" with s2, whose handler awaits, and a drain() unsubscribes,
+     * flushes, and waits for that delivery. Your read Y, made meanwhile, leaves s3 to the delivery under way and takes
+     * the socket, a Draining connection being as good as an Open one there. Once the handler returns, X delivers s3
+     * and the drain ends Closed. Decided by the order of events: what had been delivered when Y took the socket. A
+     * read that went on from that continuation only on an Open connection would wait for a reconnect that Draining
+     * already satisfies, and continue again at once, for good: the process would spin, and this test would never end.
+     * On 2.19.0 X took the socket at once, with s2 and s3 queued.
+     */
+    public function testYourReadDuringADrainLeavesARemainderUnderWayToItsDeliveryAndReads(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $this->opened[] = $connection;
+        $connection->connect()->await();
+        $seen = [];
+        $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
+        $sid = $connection->subscribe('s', static function (NatsMessage $message) use (&$seen, $hold): void {
+            $seen[] = 's:' . $message->payload;
+            if ($message->payload === 's1') {
+                throw new \RuntimeException('handler s on s1');
+            }
+
+            if ($message->payload === 's2') {
+                $hold->holdUp();
+            }
+        })->await();
+        // One chunk: the failure on s1 leaves s2 and s3 queued.
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('s', $sid, 's1')
+            . ReconnectingTransport::msgFrame('s', $sid, 's2')
+            . ReconnectingTransport::msgFrame('s', $sid, 's3'),
+        );
+        $this->expectHandlerFailure($connection, 'handler s on s1');
+
+        // X: your next read continues s with s2, whose handler awaits, before it takes the socket.
+        /** @var DeferredFuture<null> $socketTaken */
+        $socketTaken = new DeferredFuture();
+        $watched->onRead = static function () use ($socketTaken): void {
+            if (!$socketTaken->isComplete()) {
+                $socketTaken->complete();
+            }
+        };
+        $readX = $connection->processIncoming(new TimeoutCancellation(3));
+        // However these reads end on the closed connection, that is no error of the next test.
+        $readX->ignore();
+        awaitFirst([$hold->began->getFuture(), $socketTaken->getFuture()], new TimeoutCancellation(2));
+        $watched->onRead = null;
+        self::assertTrue($hold->held, 'X continued s with s2 before it took the socket');
+
+        // The drain unsubscribes and flushes, its read taking the PONG, and then waits for the delivery under way.
+        $readsBefore = $watched->reads;
+        $drain = $connection->drain();
+        $drain->ignore();
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Draining && $watched->reads > $readsBefore && $watched->readsUnderWay === 0);
+
+        // Y: your read during the drain. What had been delivered when it took the socket.
+        $whenReading = new class {
+            /** @var list<string>|null */
+            public ?array $seen = null;
+        };
+        /** @var DeferredFuture<null> $yTookTheSocket */
+        $yTookTheSocket = new DeferredFuture();
+        $watched->onRead = static function () use ($whenReading, &$seen, $yTookTheSocket): void {
+            $whenReading->seen = $seen;
+            $yTookTheSocket->complete();
+        };
+        $readY = $connection->processIncoming(new TimeoutCancellation(3));
+        $readY->ignore();
+        $yTookTheSocket->getFuture()->await(new TimeoutCancellation(2));
+        $watched->onRead = null;
+
+        self::assertSame(['s:s1', 's:s2'], $whenReading->seen, 'Y took the socket with s3 left to the delivery under way');
+        self::assertTrue($hold->held, "s2's handler still holds X up");
+
+        $hold->end('the test');
+        $drain->await(new TimeoutCancellation(3));
+        self::assertSame(['s:s1', 's:s2', 's:s3'], $seen);
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /** @return iterable<string, array{string}> */

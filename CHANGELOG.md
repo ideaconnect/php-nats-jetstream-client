@@ -15,6 +15,47 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- Your own read, `processIncoming()` or `readIncoming()`, now first continues the subscriptions whose delivery an
+  earlier read stopped at a handler that threw, before it reads the socket (#186): their later messages are
+  delivered with nothing new on the wire, and when one of those handlers throws too, the read throws its exception
+  without reading. A `processIncoming()` that used to block on an idle socket after a handler failure now runs those
+  handlers, or throws their next failure, at once. The read then goes on as before, and its result still counts only
+  what it read from the socket. It continues what any read stopped that way, an operation's read under
+  `handlerErrorsFailOperations: true` included; the reads of the library's operations, a serving loop, the
+  heartbeat, a reconnect and a drain are unchanged.
+- A catch-and-continue loop whose connection drops now delivers that remainder, and throws its next failure, before
+  it notices the drop. Before, with reconnect off those messages were discarded when the connection closed ("parsed
+  inbound message(s) were discarded undelivered"), and with reconnect on they were delivered after the reconnect,
+  their failures reported to the error listener rather than thrown. The cancellation you pass bounds the read's
+  waits, not that delivery: a read whose cancellation has already fired still continues the remainder, then throws
+  its `CancelledException`.
+
+### Fixed
+
+- `[bugfix]` The rest of a subscription whose handler threw in your own read waited in the client's memory until the
+  server sent anything (#186). Since 2.13.0 (#177) such a read delivers the other subscriptions' messages and leaves
+  the failing subscription's later messages queued for the next pass, but your next `processIncoming()` or
+  `readIncoming()` went straight to the socket and delivered them only once a chunk arrived: on an otherwise idle
+  connection the server's next `PING`, by default two minutes away, a `disconnect()` meanwhile discarding them, and
+  the subscription's next failure reached the application just as late. Your own read now delivers that remainder
+  before it reads, in sid order, and then any that a read made in one of those handlers, or another fiber's
+  delivery, stops meanwhile, with its own rules: a handler that throws there is thrown, one failure per read, and a
+  second failing subscription is reported. Otherwise the read goes on to read as before, and its result still counts
+  what it read. Only what a handler failure stopped is continued: the later subscriptions of a delivery held up in
+  another fiber's handler still wait for that delivery, unless a handler failure had already stopped one of them,
+  which is continued whole, in order, the messages that delivery brought for it included; a subscription whose
+  delivery is under way in another fiber is left to it; and a `disconnect()` already under way when the read starts
+  still discards what is queued, while a pass already running when a `disconnect()` begins goes on to the other
+  stopped subscriptions, as any pass under way does. When a handler that runs there awaits while the connection
+  drops, the read waits for the reconnect before it touches the new socket, as a serving loop's read does. Verified
+  on nats-server 2.12 with a catch-and-continue loop and one raw write carrying `slow:s1`, `s2`, `s3` and `jobs:j1`:
+  `s2` and `s3` reached their handler 1 ms after the write, where on 2.19.0 they waited 3.0 s, until the next
+  publish.
+
 ## [2.19.0] - 2026-10-07
 
 ### Fixed
