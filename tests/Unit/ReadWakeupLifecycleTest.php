@@ -33,8 +33,10 @@ use function Amp\delay;
  *    object that the pass fires once, so the poll returns.
  *  - The handler of a SubscriptionQueue can suspend: under DropOldest its drop report calls the error listener, which
  *    may await. The wake-up fires once the pass is over, and the poll gets its message then.
- *  - A delivery held up ahead of the poll's message, in an error listener or in the write of a PONG, is not overtaken:
- *    the lower sid's handler runs first, as on the wire, and the poll returns once the delivery reaches its message.
+ *  - A dispatch held up in the write of a PONG, before the poll's message is queued, is not overtaken: the lower sid's
+ *    handler runs first, as on the wire, and the poll returns once the dispatch reaches its message. Once the poll's
+ *    message is already queued, behind a held-up error listener, the poll takes it ahead of another subscription's
+ *    message queued with it (#179): order is only ever kept within a subscription.
  *  - A second poller of the same queue, or a lifecycle event while a poll is parked, leaves the poll with nothing
  *    wrong: it looks again and waits on, or ends with the connection, and never spins.
  */
@@ -58,10 +60,11 @@ final class ReadWakeupLifecycleTest extends TestCase
 
     /**
      * The application's read is held up in a handler of a lower sid that awaits, with the poll's message queued behind
-     * it, and the queue is armed to auto-unsubscribe once that message is in. The pass that delivers the message
-     * removes the subscription and its state, delivered count included. The poll returns the message as soon as the
-     * delivery reaches it; a poll comparing delivered counts found the count back at the value it had noted, and read
-     * the socket with the message in the queue until its 3 s timeout.
+     * it, and the queue is armed to auto-unsubscribe once that message is in. The poll takes the queued message at once,
+     * without a socket read and before the handler ahead of it is let go (#179), and the delivery that hands it over
+     * removes the subscription and its state, delivered count included. A poll comparing delivered counts found the
+     * count back at the value it had noted; the wake-up is an object the pass fires once, so the own-sid delivery ends
+     * the poll cleanly even as the subscription goes.
      */
     #[DataProvider('pollsArmedToAutoUnsubscribe')]
     public function testAPollArmedToAutoUnsubscribeGetsItsMessageQueuedBehindAHandlerThatAwaits(string $poll, ?int $max, bool $earlier): void
@@ -86,19 +89,21 @@ final class ReadWakeupLifecycleTest extends TestCase
         $this->awaitRead($watched);
         $transport->pushFrame(ReconnectingTransport::msgFrame('slow', $slowSid, 's') . ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1'));
         $hold->began->getFuture()->await(new TimeoutCancellation(2));
-        $watched->onRead = $hold->endWhenARead();
 
+        $readsBefore = $watched->reads;
         $start = hrtime(true);
         $result = $poll === 'next'
             ? $queue->setTimeout(3.0)->next()?->payload
             : self::payloads($queue->setTimeout(3.0)->fetchAll(1));
         $elapsed = $this->secondsSince($start);
-        $endedBy = $hold->endedBy;
+        $heldWhenDone = $hold->held;
+        $reads = $watched->reads - $readsBefore;
         $hold->end('the end of the test');
         $stop->cancel();
 
-        self::assertSame('a read taking the socket', $endedBy, "the poll's read took the socket during the hold-up");
         self::assertSame($poll === 'next' ? 'job-1' : ['job-1'], $result);
+        self::assertTrue($heldWhenDone, 'the poll returned before the handler ahead of it was let go (#179)');
+        self::assertSame(0, $reads, 'the poll delivered its queued message without reading the socket');
         self::assertLessThan(1.0, $elapsed, sprintf('the poll took %.3f s of its 3 s timeout', $elapsed));
         self::assertSame($max === null, $client->isSubscriptionActive($queue->sid), 'the auto-unsubscribe removed the subscription');
     }
@@ -330,27 +335,19 @@ final class ReadWakeupLifecycleTest extends TestCase
         self::assertLessThan(1.0, $elapsed, sprintf('the poll took %.3f s of its 3 s timeout', $elapsed));
     }
 
-    /** @return iterable<string, array{string}> */
-    public static function dispatchesHeldUpWithoutAHandlerThatAwaits(): iterable
-    {
-        yield 'the error listener of a permissions -ERR in the chunk awaits' => ['errorListener'];
-        yield 'the PONG answering a server PING in the chunk waits for the socket' => ['pongWrite'];
-    }
-
     /**
-     * Deliveries keep the wire order across subscriptions. The chunk holds a message for "first", the lower sid, whose
-     * handler only records it, and then the poll's message, and the dispatch of the chunk waits before it delivers: in
-     * an error listener, or for the write of a PONG. The poll does not overtake that wait: "first" is delivered first,
-     * and the poll returns its message once the dispatch goes on, a second in, rather than at its 3 s timeout.
+     * Deliveries keep the wire order across subscriptions while a dispatch is held up BEFORE the poll's message is
+     * queued. The chunk holds a message for "first", the lower sid, whose handler only records it, then a server PING,
+     * then the poll's message; the dispatch answers the PING inline and waits for the write of its PONG, held up like
+     * one on a socket under backpressure, so the poll's message is not even queued yet. The poll does not overtake that
+     * wait: it finds nothing of its own to take (#179), reads the socket, and once the dispatch goes on "first" is
+     * delivered first and the poll returns its message, a second in rather than at its 3 s timeout.
      */
-    #[DataProvider('dispatchesHeldUpWithoutAHandlerThatAwaits')]
-    public function testDeliveriesKeepTheWireOrderWhileADispatchIsHeldUp(string $wait): void
+    public function testDeliveriesKeepTheWireOrderWhileADispatchIsHeldUp(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $hold = new HeldUpDelivery(fallbackSeconds: 1.0);
-        $overrides = $wait === 'errorListener' ? ['errorListener' => static fn() => $hold->holdUp()] : [];
-        $client = $this->watchedClient($watched, $overrides);
+        $client = $this->watchedClient($watched);
         $order = new class {
             /** @var list<string> */
             public array $list = [];
@@ -365,26 +362,73 @@ final class ReadWakeupLifecycleTest extends TestCase
 
         $lead = ReconnectingTransport::msgFrame('first', $firstSid, 'a');
         $job = ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1');
-        if ($wait === 'errorListener') {
-            $transport->pushFrame($lead . "-ERR 'Permissions Violation for Subscription to \"foo.bar\"'\r\n" . $job);
-            $hold->began->getFuture()->await(new TimeoutCancellation(2));
-        } else {
-            $transport->stallNextWriteContaining('PONG', 1.0);
-            $transport->pushFrame($lead . "PING\r\n" . $job);
-            $this->waitUntil(static fn(): bool => $transport->writesStalled() > 0);
-        }
+        $transport->stallNextWriteContaining('PONG', 1.0);
+        $transport->pushFrame($lead . "PING\r\n" . $job);
+        $this->waitUntil(static fn(): bool => $transport->writesStalled() > 0);
 
         $start = hrtime(true);
         $message = $queue->setTimeout(3.0)->next();
         $order->list[] = 'poll:' . ($message->payload ?? 'null');
         $elapsed = $this->secondsSince($start);
-        $hold->end('the end of the test');
         $transport->releaseStalledWrites();
         $stop->cancel();
 
         self::assertSame(['first:a', 'poll:job-1'], $order->list, 'the lower sid was delivered first, in wire order');
         self::assertGreaterThan(0.5, $elapsed, 'the poll waited for the dispatch to go on');
         self::assertLessThan(2.0, $elapsed, sprintf('the poll returned %.3f s in, its timeout being 3 s', $elapsed));
+    }
+
+    /**
+     * When the poll's message is ALREADY queued behind a held-up dispatch, the poll takes it ahead of another
+     * subscription's message queued with it (#179): the chunk holds "first" (the lower sid), a permissions -ERR whose
+     * error listener awaits, and the poll's message, so the whole chunk is queued before the listener holds the pass up
+     * - "first" and the poll's job both waiting for the pass to go on. The poll takes its own job at once, without a
+     * socket read, while "first" stays queued for the held-up pass to deliver when it resumes. Order is only ever kept
+     * within a subscription, so taking the poll's own message ahead of another subscription's reorders no handler calls
+     * between them. Before #179 the poll read the socket and returned its message only once the pass went on, "first"
+     * ahead of it.
+     */
+    public function testAnOwnSidPollTakesItsQueuedMessageAheadOfAStillQueuedLowerSid(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $hold = new HeldUpDelivery(fallbackSeconds: 1.0);
+        $client = $this->watchedClient($watched, ['errorListener' => static fn() => $hold->holdUp()]);
+        $order = new class {
+            /** @var list<string> */
+            public array $list = [];
+        };
+        $firstSid = $client->subscribe('first', static function (NatsMessage $message) use ($order): void {
+            $order->list[] = 'first:' . $message->payload;
+        })->await();
+        $queue = $client->subscribeQueue('jobs')->await();
+        $stop = new DeferredCancellation();
+        $this->startApplicationReadLoop($client, $stop);
+        $this->awaitRead($watched);
+
+        $lead = ReconnectingTransport::msgFrame('first', $firstSid, 'a');
+        $job = ReconnectingTransport::msgFrame('jobs', $queue->sid, 'job-1');
+        $transport->pushFrame($lead . "-ERR 'Permissions Violation for Subscription to \"foo.bar\"'\r\n" . $job);
+        $hold->began->getFuture()->await(new TimeoutCancellation(2));
+
+        $readsBefore = $watched->reads;
+        $start = hrtime(true);
+        $message = $queue->setTimeout(3.0)->next();
+        $order->list[] = 'poll:' . ($message->payload ?? 'null');
+        $elapsed = $this->secondsSince($start);
+        $heldWhenDone = $hold->held;
+        $reads = $watched->reads - $readsBefore;
+        $hold->end('the end of the test');
+        // The held-up pass delivers "first" one or more event-loop hops after it is let go: wait on the recorded
+        // order rather than a fixed delay.
+        $this->waitUntil(static fn(): bool => in_array('first:a', $order->list, true));
+        $stop->cancel();
+
+        self::assertSame('poll:job-1', $order->list[0], 'the poll took its own message first, ahead of the still-queued lower sid');
+        self::assertContains('first:a', $order->list, 'the lower sid is delivered when the held-up pass goes on');
+        self::assertTrue($heldWhenDone, 'the poll returned before the held-up pass went on');
+        self::assertSame(0, $reads, 'the poll delivered its queued message without reading the socket');
+        self::assertLessThan(1.0, $elapsed, sprintf('the poll returned %.3f s in, its timeout being 3 s', $elapsed));
     }
 
     /** @return iterable<string, array{bool}> */

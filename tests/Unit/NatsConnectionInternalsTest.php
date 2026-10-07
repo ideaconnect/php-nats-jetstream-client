@@ -402,7 +402,8 @@ final class NatsConnectionInternalsTest extends TestCase
     {
         $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
 
-        self::assertNull($this->invokePrivate($connection, 'drainPendingForSid', 101));
+        // Nothing queued for the sid: no delivery, so the count of messages handed to a handler is zero (#179).
+        self::assertSame(0, $this->invokePrivate($connection, 'drainPendingForSid', 101));
     }
 
     public function testIsNoRespondersStatusHandlesEmptyRawHeaderString(): void
