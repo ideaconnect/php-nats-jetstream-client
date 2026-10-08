@@ -15,6 +15,62 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- One of the library's operations whose own read brings a server's lame-duck `INFO` (a `request()` or
+  `requestMany()`, a `SubscriptionQueue` poll, a JetStream fetch or pull consumer, Key/Value `keys()` or `history()`,
+  a `flush()` or `rtt()` waiting for its `PONG`) no longer waits for the whole failover: it waits within its own
+  timeout, and with `waitForReconnect: false` fails at once with `Connection is not open` while the failover runs on,
+  unless what it waits for came in the same read (#191). Your own `processIncoming()` and `readIncoming()`, a serving
+  loop's read and the heartbeat still run the failover inline. The messages read with the `INFO`, those ahead of it
+  included, are now delivered by the operation's read, with its rules for a handler that throws or a full queue,
+  before the failover leaves the connection: unless a handler, or the error listener a report of that read goes to,
+  awaits, ahead of the failover's `Disconnected` event. What such a handler starts runs once the failover has begun,
+  since a publish and an operation each run in a fiber of their own: a publish is buffered and goes to the new server
+  once the subscriptions are replayed, and an operation waits for the failover within its timeout, or with
+  `waitForReconnect: false` fails at once with `Connection is not open`. Both used to run on the new server directly,
+  the failover having run first.
+- A `requestMany()` or a JetStream `fetchBatch()` whose read fails because the connection is going (lost or being failed
+  over with `waitForReconnect: false`, a reconnect that gave up, or reconnect off) now returns what it has received
+  instead of throwing; it throws only when it has received nothing. Code that took that exception to mean that nothing
+  was delivered now gets the partial result.
+
+### Fixed
+
+- `[bugfix]` A `requestMany()` or a JetStream `fetchBatch()` whose read fails because the connection is going returns
+  the replies or the partial batch it has received, as `requestMany()` does when the connection closes and
+  `fetchBatch()` when the heartbeats stop, rather than throw and lose them: a fetched message the server counted as
+  delivered was redelivered only after the ack wait, or never on a consumer without acks. Such a read fails with
+  `waitForReconnect: false` once the connection is lost (#178) or is being failed over from a server in lame duck mode
+  (#191), with any setting when the reconnect gives up, and with reconnect off when the connection drops, the
+  configuration of symfony-nats-messenger, whose `get()` fetches. With nothing received, or for a failure that leaves
+  the connection open (a full queue, a handler's own), they still throw. Up to 2.20.0 a lame-duck failover ran inline
+  and the collection went on once it was over, though a `fetchBatch()` whose failover gave up threw at its next read all
+  the same.
+- `[bugfix]` An operation whose own read brought a lame-duck `INFO` overran its deadline by the whole failover (#191).
+  The failover (#47) ran inline in the dispatch of the `INFO`, in the read's own fiber, and nothing bounded it: the
+  dials, the handshake, the subscription replay and any backoff between attempts. The read now starts the failover in a
+  fiber of its own and waits for it only within the operation's deadline and wake-up, as a read that meets a lost
+  connection does since 2.14.0 (#178): the operation times out at its deadline, or returns what a delivery brings
+  meanwhile, and the failover carries on, reports its failure through the error listener, as the inline failover does,
+  and announces the new connection when it is over. Only a read whose chunk holds bytes behind the `INFO` that fail to
+  parse still runs the failover inline, as it recovers the corrupt stream right after. The rest of the chunk the `INFO`
+  came in is still the leaving server's (#182), now from the moment the failover is started: its `PING` and `INFO` are
+  dropped, its `-ERR` is reported, and its `PONG` still completes the leaving connection's slot, so a `flush()` whose
+  `PONG` came behind the `INFO` succeeds, with `waitForReconnect: false` as well. Verified on nats-server 2.12 with two
+  servers, the second paused so that its dial hung until `connectTimeoutMs` (1 s), and the first put into lame duck mode
+  with `SIGUSR2`: a `request()` with a 300 ms timeout whose read brought the `INFO` returned after 3.29 s, once the
+  failover had reached the second server; it now times out after 0.30 s with the failover under way, and the second
+  server's connection is announced 3.17 s after the `LameDuck` event, as before.
+- `[bugfix]` A lame-duck failover no longer fails over a connection that a reconnect opened while a `DiscoveredServers`
+  or `LameDuck` listener of the `INFO` was suspended (#191). It took the connection that was current once the listeners
+  had returned: a `LameDuck` listener that awaited a `flush()` on a connection that had just died let the flush's failed
+  write reconnect, and the failover then failed the new connection over as well, a second reconnect for nothing. It now
+  fails over only the connection the `INFO` came on, whether it runs inline (your own read, a serving loop's, the
+  heartbeat's) or in a fiber of its own (an operation's read).
+
 ## [2.20.0] - 2026-10-08
 
 ### Upgrade notes

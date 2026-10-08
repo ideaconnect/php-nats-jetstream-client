@@ -39,7 +39,8 @@ use function Amp\async;
  * own and waits for it only within the operation's own wait, as it waits for a reconnect another fiber runs, and the
  * reconnect carries on without it; with waiting disabled the operation fails at once, as one whose write noticed the
  * loss does. Your own processIncoming() still runs the reconnect itself and waits for all of it, and the heartbeat's
- * read still does the same.
+ * read still does the same. A requestMany() or fetchBatch() whose read fails that way, or because the reconnect gave
+ * up or reconnect is off, returns what it has received rather than lose it to the read's error.
  *
  * Over the scripted server in tests/Support/ReconnectingTransport.php, seen through tests/Support/WatchedTransport.php,
  * which tells the test when the operation's read is on the socket, with deliveries held up by
@@ -664,6 +665,107 @@ final class OperationReadReconnectTest extends TestCase
         self::assertSame(ConnectionState::Closed, $client->state());
         self::assertCount(4, $transport->connectCalls, 'the first dial and three reconnect attempts');
         self::assertLessThan(2.0, $elapsed, sprintf('%s failed after %.3f s, as soon as the reconnect gave up', $operation, $elapsed));
+    }
+
+    /** @return iterable<string, array{string, string, list<string>}> */
+    public static function collectionsWhoseReadFailsWithTheConnectionGoing(): iterable
+    {
+        foreach (['waiting disabled', 'the reconnect gives up', 'reconnect off'] as $failure) {
+            yield 'requestMany(max 3), ' . $failure . ', two replies collected' => ['requestMany', $failure, ['r-1', 'r-2']];
+            yield 'requestMany(max 3), ' . $failure . ', nothing collected' => ['requestMany', $failure, []];
+            yield 'JetStreamContext::fetchBatch(3), ' . $failure . ', two messages received' => ['fetchBatch', $failure, ['m-1', 'm-2']];
+            yield 'JetStreamContext::fetchBatch(3), ' . $failure . ', nothing received' => ['fetchBatch', $failure, []];
+        }
+    }
+
+    /**
+     * A requestMany() for three replies, or a fetchBatch() of three, its deadline 30 s away, has received two, each in
+     * a read of its own, when the connection drops under its next read: with waiting for a reconnect disabled that read
+     * fails at once with "Connection is not open"; with dials refused and three attempts it waits for the reconnect,
+     * which gives up ("Reconnect attempts exhausted"); with reconnect off the connection closes ("Reconnect is
+     * disabled": the configuration of symfony-nats-messenger, whose get() fetches). The collection returns the two
+     * then, well before its deadline, as requestMany() does when the connection closes and fetchBatch() when the
+     * heartbeats stop, with the connection still Connecting, or Closed; with nothing received it fails with the read's
+     * error. It used to throw that error with the two received as well, which were lost: a fetched message the server
+     * counted as delivered came again only after the ack wait. The nothing-received data sets are guards.
+     *
+     * @param list<string> $received
+     */
+    #[DataProvider('collectionsWhoseReadFailsWithTheConnectionGoing')]
+    public function testACollectionWhoseReadFailsWithTheConnectionGoingReturnsWhatItReceived(string $operation, string $failure, array $received): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = new NatsClient(match ($failure) {
+            'waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null),
+            'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, null, 5, 20, null),
+            default => new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 2_000, reconnectEnabled: false, pingIntervalSeconds: 0),
+        }, $watched);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        $inbox = new class {
+            /** Where the operation receives what it waits for: its reply subject, or its pull's inbox, and that sid. */
+            public ?string $subject = null;
+            public int $sid = 0;
+        };
+        $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $inbox): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if ($subject === 'svc.warm') {
+                return $transport->replyFrame($replyTo, 'ok');
+            }
+
+            // What the operation receives the test sends below, a read at a time.
+            $inbox->subject = $replyTo;
+            $inbox->sid = (int) $transport->sidFor($replyTo);
+
+            return [];
+        };
+        // Sets the reply inbox up first: the collection's reads are then the only ones on the socket.
+        $client->request('svc.warm', 'x', 1_000)->await();
+
+        $result = $operation === 'requestMany'
+            ? $client->requestMany('svc.many', 'y', null, 3, 30_000)->map(self::payloads(...))
+            : $client->jetStream()->fetchBatch('S', 'C', 3, 30_000)->map(self::payloads(...));
+        $this->waitUntil(static fn(): bool => $inbox->subject !== null && $watched->readsUnderWay === 1);
+        foreach ($received as $payload) {
+            $reads = $watched->reads;
+            $transport->pushFrame($operation === 'requestMany'
+                ? ReconnectingTransport::msgFrame((string) $inbox->subject, $inbox->sid, $payload)
+                : ReconnectingTransport::msgFrame('evt.s', $inbox->sid, $payload, self::ACK_SUBJECT));
+            // The collection took it, and its next read is on the socket.
+            $this->waitUntil(static fn(): bool => $watched->reads > $reads && $watched->readsUnderWay === 1);
+        }
+        $transport->refuseDials();
+        $transport->dropConnection();
+        [$payloads, $elapsed, $error] = $this->settle($result, hrtime(true));
+        $stateOnReturn = $client->state();
+
+        [$readsError, $state] = match ($failure) {
+            'waiting disabled' => ['Connection is not open', ConnectionState::Connecting],
+            'the reconnect gives up' => ['Reconnect attempts exhausted', ConnectionState::Closed],
+            default => ['Reconnect is disabled', ConnectionState::Closed],
+        };
+        self::assertSame($state, $stateOnReturn, $failure === 'waiting disabled' ? 'the reconnect the read started goes on' : 'the connection is gone');
+        // Far from both: a collection that went on reading instead looked until its deadline, 30 s away.
+        self::assertLessThan(5.0, $elapsed, sprintf('%s returned after %.3f s, its deadline 30 s away', $operation, $elapsed));
+        if ($received !== []) {
+            self::assertNull($error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? ''));
+            self::assertSame($received, $payloads);
+
+            return;
+        }
+
+        self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? 'nothing'));
+        self::assertSame($readsError, $error->getMessage());
+        if ($failure === 'the reconnect gives up') {
+            self::assertNotNull($error->getPrevious(), 'with its cause');
+        } else {
+            self::assertInstanceOf(TransportClosedException::class, $error->getPrevious(), 'the read\'s error is its cause');
+            self::assertSame('Socket closed by peer (EOF)', $error->getPrevious()->getMessage());
+        }
     }
 
     /**

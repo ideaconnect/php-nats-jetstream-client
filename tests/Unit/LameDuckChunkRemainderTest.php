@@ -26,18 +26,22 @@ use PHPUnit\Framework\TestCase;
 use function Amp\async;
 
 /**
- * The rest of the chunk a lame-duck INFO came in (#182). The INFO's dispatch fails the connection over inline (#47):
- * the dispatching fiber comes back from it with the connection on the second server, or ended when none could be
- * reached, and the chunk's remaining frames are the first server's. They used to be handled as if nothing had
- * happened, on the connection that replaced the one they were read on: a PING answered with a PONG on the second
- * connection, a stale INFO overwriting the second server's info, a second lame-duck INFO starting a second failover, a
- * PONG confirming the replayed reply inbox before the second server had answered anything, a late reply on that inbox
- * confirming it the same way, an -ERR dropping that inbox or firing a replayed subscription's rejection handler and
- * failing the read although the failover had succeeded. The dispatch now handles the remainder for the connection it
- * was read on: its messages are delivered, without a late reply counting as the new server's confirmation of the
- * replayed inbox, its PING, PONG and INFO are dropped, and its -ERR is reported through the error listener and not
- * applied. The same holds when the connection ended instead: the failover reached no server, or the LameDuck listener
- * closed the connection itself.
+ * The rest of the chunk a lame-duck INFO came in (#182). The INFO's dispatch fails the connection over (#47), inline
+ * for your own read, which most tests here read with: the dispatching fiber comes back from it with the connection on
+ * the second server, or ended when none could be reached, and the chunk's remaining frames are the first server's.
+ * Those frames used to be handled as if nothing had happened, on the connection that replaced the one they were read
+ * on: a PING answered with a PONG on the second connection, a stale INFO overwriting the second server's info, a
+ * second lame-duck INFO starting a second failover, a PONG confirming the replayed reply inbox before the second
+ * server had answered anything, a late reply on that inbox confirming it the same way, an -ERR dropping that inbox or
+ * firing a replayed subscription's rejection handler and failing the read although the failover had succeeded. The
+ * dispatch now handles the remainder for the connection it was read on: its messages are delivered, without a late
+ * reply counting as the new server's confirmation of the replayed inbox, its PING, PONG and INFO are dropped, and its
+ * -ERR is reported through the error listener and not applied. The same holds when the connection ended instead: the
+ * failover reached no server, or the LameDuck listener closed the connection itself. The read of one of the library's
+ * operations, a request's or a pull consumer's here, starts the failover in a fiber of its own instead (#191, see
+ * OperationReadLameDuckFailoverTest): the remaining frames are the leaving server's from that moment, a PONG among
+ * them still answering the leaving connection's PING until the failover replaces it, with the same outcome here once
+ * the failover is over.
  *
  * Over the scripted server in `tests/Support/ReconnectingTransport.php`, whose every dial opens a new session
  * (epoch 0, then 1 after the failover), with the lame-duck INFO naming the second server in `connect_urls`, so that
@@ -275,10 +279,11 @@ final class LameDuckChunkRemainderTest extends TestCase
 
     /**
      * [INFO ldm | -ERR 'Permissions Violation for Subscription to "<pull inbox>"'] read by the read of a pull consumer
-     * run in flight: the engine does not fail from the -ERR of the server the connection left - it re-issues its pull
-     * on the second server, and the -ERR is reported - and fails only from the second server's own -ERR when that one
-     * rejects the replayed SUB, with the clear permissions error. The stale -ERR used to fire the replayed inbox's
-     * rejection handler, and the run failed before the second server had answered anything.
+     * run in flight, which starts the failover in a fiber of its own (#191), the -ERR the leaving server's from that
+     * moment: the engine does not fail from it, but re-issues its pull on the second server, the -ERR reported, and
+     * fails only from the second server's own -ERR when that one rejects the replayed SUB, with the clear permissions
+     * error. The stale -ERR used to fire the replayed inbox's rejection handler, and the run failed before the second
+     * server had answered anything.
      */
     public function testAStalePermissionsErrBehindTheLameDuckInfoDoesNotFailARunningPullConsumer(): void
     {
@@ -453,9 +458,11 @@ final class LameDuckChunkRemainderTest extends TestCase
     }
 
     /**
-     * The same [INFO ldm | PING] chunk read by a request's own read: no PONG on the second connection. The request,
-     * whose reply never comes on either server, times out on its own; the connection is on the second server. The
-     * request's read used to answer the PING there.
+     * The same [INFO ldm | PING] chunk read by a request's own read, which starts the failover in a fiber of its own
+     * (#191), the PING the leaving server's from that moment: no PONG on either connection. The request, whose reply
+     * never comes on either server, times out on its own, the connection on the second server by then (it times out
+     * while the failover still dials in OperationReadLameDuckFailoverTest). The request's read used to answer the PING
+     * on the second connection.
      */
     public function testAPingBehindTheLameDuckInfoReadByARequestIsNotAnsweredOnTheNewConnection(): void
     {

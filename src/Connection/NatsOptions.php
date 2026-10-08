@@ -114,14 +114,17 @@ final class NatsOptions
       *        a synchronous application drive the reconnect: the reconnect only advances while something
       *        waits on the event loop, so a caller that only ever issued operations failing on the spot
       *        would starve it forever. An operation whose own read or control write is the first to notice
-      *        a lost connection starts the reconnect and waits for it the same way, within its own timeout
-      *        (#178); your own processIncoming()/readIncoming(), a serving loop's read and the heartbeat run
-      *        the reconnect themselves and wait for all of it. Set `false` to fail fast instead (the behavior
-      *        before this option existed): an operation whose own read or write noticed the loss then fails
-      *        at once with "Connection is not open" as well, and the reconnect it started advances only while
-      *        something awaits on the event loop; drain() closes the connection and throws rather than
-      *        leaving the reconnect to reopen a connection being shut down, and drainSubscription() delivers
-      *        what already arrived and removes the subscription at once.
+      *        a lost connection, or whose read brings a lame-duck INFO that fails the connection over,
+      *        starts the reconnect and waits for it the same way, within its own timeout (#178, #191); your
+      *        own processIncoming()/readIncoming(), a serving loop's read and the heartbeat run the reconnect
+      *        themselves and wait for all of it. Set `false` to fail fast instead (the behavior before this
+      *        option existed): an operation whose own read or write noticed the loss, or whose read brought
+      *        the lame-duck INFO, then fails at once with "Connection is not open" as well, unless what it
+      *        waits for has come by then, and a requestMany() or a JetStream fetchBatch() returns what it
+      *        has received instead; the reconnect it started advances only while something awaits on the
+      *        event loop; drain() closes the connection and throws rather than leaving the reconnect to
+      *        reopen a connection being shut down, and drainSubscription() delivers what already arrived
+      *        and removes the subscription at once.
       * @param bool $slowConsumerErrorsFailOperations Under {@see SlowConsumerPolicy::Error}: whether a full
       *        subscription queue fails whichever operation's read ran into it. Operations read the socket
       *        themselves while they wait for a result of their own - request()/requestMany(), flush(),
