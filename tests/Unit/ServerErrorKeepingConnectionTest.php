@@ -456,6 +456,59 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     }
 
     /**
+     * Your own next read continues that remainder itself, before it reads (#186), and its result still says what it
+     * read: the socket has nothing more, so no frames and no bytes consumed, although it delivered a's second message.
+     * A loop that pauses on such a result has nothing left to deliver. The read used to leave a's message queued until
+     * a read received anything.
+     */
+    public function testYourOwnNextReadDeliversTheRemainderAndSaysItReadNothing(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $seen = [];
+        $connection = $this->connectionWithAFailingHandler($recorder, $seen);
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a', $e->getMessage());
+        }
+
+        $read = $connection->readIncoming()->await();
+
+        self::assertSame(['a:x', 'b:z', 'a:y'], $seen, "a's remainder is delivered by your next read");
+        self::assertSame(0, $read->frames, 'no frame was read');
+        self::assertFalse($read->consumedBytes, 'nothing was read');
+        self::assertSame([], $recorder->errors);
+    }
+
+    /**
+     * An operation's read does not continue that remainder (#186): it reports the other subscriptions' handler
+     * failures, and its own subscription has a take of its own (#179). An operation's read that finds the socket empty
+     * leaves a's second message queued, and your next read delivers it.
+     */
+    public function testAnOperationsReadLeavesTheRemainderToYourNextRead(): void
+    {
+        $recorder = new LifecycleRecorder();
+        $seen = [];
+        $connection = $this->connectionWithAFailingHandler($recorder, $seen);
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a', $e->getMessage());
+        }
+
+        $operationRead = $connection->readIncomingForOperation()->await();
+
+        self::assertFalse($operationRead->consumedBytes);
+        self::assertSame(['a:x', 'b:z'], $seen, "the operation's read left a's remainder queued");
+
+        self::assertSame(0, $connection->processIncoming()->await());
+        self::assertSame(['a:x', 'b:z', 'a:y'], $seen, 'your next read delivered it');
+        self::assertSame([], $recorder->errors);
+    }
+
+    /**
      * A serving loop's read that has waited for another fiber's read, whose delivery is held up in a handler that
      * awaits, delivers what that read has queued and not reached before it returns, instead of leaving it to its own
      * next read, which a loop that is stopping never makes.

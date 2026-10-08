@@ -716,8 +716,10 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         }
         $transport->handshakeTrailer = ReconnectingTransport::INFO;
 
+        // An operation's read notices the drop and leaves f2 queued for the handshake: your own read would continue
+        // f2 before it read (#186).
         $transport->dropConnection();
-        $client->processIncoming()->await();
+        $client->readIncomingForOperation()->await();
 
         self::assertSame(1, $client->statistics()->reconnects);
         self::assertCount(2, $transport->connectCalls, 'the first attempt succeeded');
@@ -746,8 +748,9 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         }
         $transport->handshakeTrailer = "-ERR 'Unknown Protocol Operation'\r\n";
 
+        // An operation's read notices the drop and leaves f2 queued for the handshakes, as above (#186).
         $transport->dropConnection();
-        $client->processIncoming()->await();
+        $client->readIncomingForOperation()->await();
 
         self::assertCount(3, $transport->connectCalls, 'the first attempt failed on the -ERR, the second succeeded');
         self::assertSame(['handler failed on f2'], $recorder->errorsContaining('handler failed'));

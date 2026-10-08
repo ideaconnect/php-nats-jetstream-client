@@ -23,12 +23,14 @@ use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\UncancellableDialTransport;
+use IDCT\NATS\Tests\Support\WatchedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
+use function Amp\Future\awaitFirst;
 
 /**
  * Operations issued while a reconnect is in flight wait for it within their own single budget instead
@@ -709,6 +711,83 @@ final class WaitForReconnectTest extends TestCase
         self::assertSame(['y', 'z'], $seen);
         $hold->end('the end of the test');
         self::assertSame(2, $heldUp->await(), "the application's read ends once its handler returns");
+    }
+
+    /**
+     * Your own read continues the rest of a subscription whose handler threw in an earlier read before it reads
+     * (#186). When a handler it runs there awaits while the connection drops and another fiber's read reconnects, it
+     * waits for that reconnect before it reads, like any reader (#148): reading at once would take the PONG of the
+     * reconnect's handshake, and with one attempt allowed the connection would close. Decided by the order of events:
+     * the handler returns while the reconnect's CONNECT write is held, and the write is let go once it has returned.
+     */
+    public function testYourReadContinuingARemainderLeavesTheHandshakeToTheRecovery(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $recorder = new LifecycleRecorder();
+        $connection = new NatsConnection(
+            $this->options(true, 2_000, 1, 0, 2, $recorder->connectionListener(), 1, 1, $recorder->errorListener()),
+            $watched,
+        );
+        $this->opened[] = $connection;
+        $connection->connect()->await();
+        $seen = [];
+        $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
+        $sid = $connection->subscribe('orders', static function (NatsMessage $message) use (&$seen, $hold): void {
+            $seen[] = $message->payload;
+            if ($message->payload === 'o1') {
+                throw new \RuntimeException('handler failed on o1');
+            }
+
+            if ($message->payload === 'o2') {
+                $hold->holdUp();
+            }
+        })->await();
+        // One chunk: the failure on o1 leaves o2 queued.
+        $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'o1') . ReconnectingTransport::msgFrame('orders', $sid, 'o2'));
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler failed on o1', $e->getMessage());
+        }
+
+        // Your next read continues with o2, whose handler awaits, before it takes the socket.
+        /** @var DeferredFuture<null> $socketTaken */
+        $socketTaken = new DeferredFuture();
+        $watched->onRead = static function () use ($socketTaken): void {
+            if (!$socketTaken->isComplete()) {
+                $socketTaken->complete();
+            }
+        };
+        $next = $connection->processIncoming();
+        // Should an assertion below fail first, tearDown() fails this read: that is no error of the next test.
+        $next->ignore();
+        awaitFirst([$hold->began->getFuture(), $socketTaken->getFuture()], new TimeoutCancellation(2));
+        self::assertTrue($hold->held, 'your next read continued with o2 before it took the socket');
+        $watched->onRead = null;
+
+        // Meanwhile the connection drops, and another fiber's read reconnects at once, its CONNECT write held.
+        $transport->stallNextWriteContaining('CONNECT', 10.0);
+        $transport->dropConnection();
+        $reader = async(static fn(): int => $connection->processIncoming()->await());
+        $this->waitUntil(static fn(): bool => $transport->writesStalled() === 1);
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+
+        // o2's handler returns during the handshake: your read then waits for the reconnect.
+        $hold->end('the test, during the handshake');
+        $hold->returned->getFuture()->await(new TimeoutCancellation(2));
+        $transport->releaseStalledWrites();
+
+        self::assertSame(0, $reader->await(new TimeoutCancellation(2)), 'the read that met the drop ran the reconnect');
+        self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected], $recorder->events);
+        self::assertCount(2, $transport->connectCalls, 'the first reconnect attempt succeeded');
+        self::assertSame(['Socket closed by peer (EOF)'], $recorder->errors);
+
+        // Your read reads the new connection.
+        $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'o3'));
+        self::assertSame(1, $next->await(new TimeoutCancellation(2)));
+        self::assertSame(['o1', 'o2', 'o3'], $seen);
     }
 
     /**

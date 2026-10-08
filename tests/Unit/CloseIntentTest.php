@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Unit;
 
 use Amp\ByteStream\ClosedException;
+use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
@@ -20,6 +21,7 @@ use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Tests\Support\UncancellableDialTransport;
+use IDCT\NATS\Tests\Support\WatchedTransport;
 use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -28,6 +30,7 @@ use Revolt\EventLoop;
 
 use function Amp\async;
 use function Amp\delay;
+use function Amp\Future\awaitFirst;
 
 /**
  * A close wins over what is still in flight on the connection: a connect() racing it, a reconnect
@@ -1111,6 +1114,140 @@ final class CloseIntentTest extends TestCase
 
         self::assertSame(ConnectionState::Closed, $connection->state());
         self::assertSame([], $seen, 'discarded by disconnect()');
+    }
+
+    /**
+     * Your own read while a disconnect() is closing the connection leaves the rest of a subscription whose handler
+     * threw in an earlier read to the close, which discards it (#134), as a serving loop's read leaves what it has not
+     * reached: the read continues such a remainder before it reads only while no close is under way (#186). Here the
+     * close takes a while, a TLS or WebSocket one, and the read starts as it begins. A guard: it passes on the code
+     * before #186 as well, whose read did not continue the remainder at all, and fails when the read continues it
+     * whatever the close.
+     */
+    public function testYourReadDuringADisconnectLeavesTheRemainderOfAFailingSubscriptionToTheClose(): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport);
+        $seen = [];
+        $sid = $connection->subscribe('orders', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = $message->payload;
+            if ($message->payload === 'o1') {
+                throw new \RuntimeException('handler failed on o1');
+            }
+        })->await();
+        // One chunk: the failure on o1 leaves o2 queued.
+        $transport->pushFrame(ReconnectingTransport::msgFrame('orders', $sid, 'o1') . ReconnectingTransport::msgFrame('orders', $sid, 'o2'));
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler failed on o1', $e->getMessage());
+        }
+
+        $holder = new class {
+            /** @var Future<int>|null */
+            public ?Future $read = null;
+        };
+        $transport->closeDelay = 0.2;
+        $transport->beforeClose = static function () use ($transport, $connection, $holder): void {
+            $transport->beforeClose = null;
+            $holder->read = $connection->processIncoming(new TimeoutCancellation(2));
+        };
+
+        $connection->disconnect()->await(new TimeoutCancellation(3));
+        self::assertInstanceOf(Future::class, $holder->read);
+        try {
+            $holder->read->await(new TimeoutCancellation(3));
+        } catch (\Throwable) {
+            // The close ended its read of the socket.
+        }
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(['o1'], $seen, 'o2 was discarded by disconnect()');
+    }
+
+    /**
+     * A pass your read makes before it reads goes on to the other subscriptions a handler failure stopped once a
+     * disconnect() has begun (#186): one read stops "a" at x1 and "b" at y1, with x2 and y2 queued; your next read
+     * continues a with x2, whose handler awaits, and a disconnect() begins meanwhile. The handler returns as the close
+     * begins, and the pass goes on to b and delivers y2 during the close, after disconnect() was called, as any pass
+     * under way does. Only a read that starts its pass during the close leaves the remainder to it, as the test above
+     * pins. Decided by the order of events: the transport's close waits until a's handler has returned. A pass that
+     * stopped at the close between two subscriptions would leave y2 to it; on 2.19.0 your read continued nothing: it
+     * took the socket at once.
+     */
+    public function testAPassUnderWayWhenADisconnectBeginsGoesOnToTheOtherStoppedSubscriptions(): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $recorder = new LifecycleRecorder();
+        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $recorder->errorListener()), $watched);
+        $this->opened[] = $connection;
+        $connection->connect()->await();
+        $seen = [];
+        $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
+        $sidA = $connection->subscribe('a', static function (NatsMessage $message) use (&$seen, $hold): void {
+            $seen[] = 'a:' . $message->payload;
+            if ($message->payload === 'x1') {
+                throw new \RuntimeException('handler a on x1');
+            }
+
+            $hold->holdUp();
+        })->await();
+        $sidB = $connection->subscribe('b', static function (NatsMessage $message) use (&$seen): void {
+            $seen[] = 'b:' . $message->payload;
+            if ($message->payload === 'y1') {
+                throw new \RuntimeException('handler b on y1');
+            }
+        })->await();
+        // One chunk: a stops at x1, and b at y1, whose failure is reported.
+        $transport->pushFrame(
+            ReconnectingTransport::msgFrame('a', $sidA, 'x1')
+            . ReconnectingTransport::msgFrame('a', $sidA, 'x2')
+            . ReconnectingTransport::msgFrame('b', $sidB, 'y1')
+            . ReconnectingTransport::msgFrame('b', $sidB, 'y2'),
+        );
+        try {
+            $connection->processIncoming()->await();
+            self::fail('expected the handler failure');
+        } catch (\RuntimeException $e) {
+            self::assertSame('handler a on x1', $e->getMessage());
+        }
+
+        self::assertSame(['handler b on y1'], $recorder->errors);
+
+        // Your next read continues a with x2, whose handler awaits, before it takes the socket.
+        /** @var DeferredFuture<null> $socketTaken */
+        $socketTaken = new DeferredFuture();
+        $watched->onRead = static function () use ($socketTaken): void {
+            if (!$socketTaken->isComplete()) {
+                $socketTaken->complete();
+            }
+        };
+        $read = $connection->processIncoming(new TimeoutCancellation(3));
+        // However it ends on the closed connection, that is no error of the next test.
+        $read->ignore();
+        awaitFirst([$hold->began->getFuture(), $socketTaken->getFuture()], new TimeoutCancellation(2));
+        $watched->onRead = null;
+        self::assertTrue($hold->held, 'your read continued a with x2 before it took the socket');
+
+        // A disconnect() begins, and a's handler returns as the transport's close begins, which waits for it.
+        $closeBegan = new class {
+            /** @var list<string>|null */
+            public ?array $seen = null;
+        };
+        $transport->beforeClose = static function () use ($transport, $hold, $closeBegan, &$seen): void {
+            $transport->beforeClose = null;
+            $closeBegan->seen = $seen;
+            $hold->end('the close');
+            // A guard against a hang only: the handler returns at once.
+            $hold->returned->getFuture()->await(new TimeoutCancellation(2));
+        };
+        $connection->disconnect()->await(new TimeoutCancellation(3));
+
+        self::assertSame(['a:x1', 'b:y1', 'a:x2'], $closeBegan->seen, 'y2 was still queued when the close began');
+        self::assertSame(['a:x1', 'b:y1', 'a:x2', 'b:y2'], $seen, 'the pass went on to b during the close');
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     /** A connection that retries a failed first dial (retryOnFailedInitialConnect, reconnect disabled). */

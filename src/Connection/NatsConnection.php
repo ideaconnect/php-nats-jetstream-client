@@ -138,6 +138,18 @@ final class NatsConnection
      */
     private array $dispatchingSids = [];
     /**
+     * Sids whose delivery a pass stopped at a handler failure it held to throw ({@see drainPendingForSid()}, #177),
+     * the rest of their queue left for the next pass: your own next read continues them before it reads
+     * ({@see deliverStoppedSubscriptions()}, #186). A subset of {@see $pendingDirty}, cleared where that one is: a sid
+     * leaves the set when its queue empties, or with the subscription. A sid is marked when a pass stops it, not when
+     * that pass ends: a read in another fiber can continue it while the read that stopped it is still held up in
+     * another subscription's handler that awaits, and throw its next failure before that read throws the first. The
+     * order of each subscription's deliveries is unchanged.
+     *
+     * @var array<int, true>
+     */
+    private array $stoppedByAFailure = [];
+    /**
      * Muxed request inbox base subject for the current connection epoch (e.g. "_INBOX.<24hex>"), null
      * until the first request establishes it. One long-lived wildcard subscription "<base>.*" serves
      * EVERY request()/requestMany() reply instead of a fresh inbox + SUB/UNSUB per request (#118).
@@ -1322,6 +1334,7 @@ final class NatsConnection
         $this->subscriptionMeta = [];
         $this->pendingMessages = [];
         $this->pendingDirty = [];
+        $this->stoppedByAFailure = [];
         $this->receivedCounts = [];
         $this->deliveredCounts = [];
         $this->autoUnsubMax = [];
@@ -2784,6 +2797,30 @@ final class NatsConnection
      * fails while another fiber already runs the recovery likewise waits for it only until
      * $cancellation fires.
      *
+     * A handler that throws in this read is thrown once the read has delivered the other subscriptions'
+     * messages, and its own subscription's delivery stops at the failing message, the rest of it left queued
+     * (#177). Before it reads, or waits for another fiber's read, the read continues every subscription whose
+     * delivery an earlier read stopped like that, in sid order, so that their later messages are delivered with
+     * nothing new on the wire (#186), and then any that a read in one of the handlers it runs, or another fiber's
+     * delivery, stops meanwhile. It does so with its own rules: a handler that throws there is thrown once that
+     * pass is over, and the read ends without reading; a second subscription that fails in the same pass is
+     * reported. Otherwise the read goes on as it would have, waiting on an idle socket as any read does, and its
+     * result counts only what it took off the wire, not what it continued: one that continued such a subscription
+     * and then waited for another fiber's read returns no frames and no bytes consumed. The cancellation bounds
+     * the read's waits, not this delivery: a read whose cancellation has already fired still continues the
+     * remainder, then throws CancelledException. The later messages of a failing subscription used to wait for a
+     * read that received anything, on an otherwise idle connection the server's next PING.
+     *
+     * Not continued: a subscription whose delivery is under way further up some fiber's stack, which delivers the
+     * rest itself, and what a disconnect() already under way when the read starts is to discard
+     * ({@see leftoversBelongToAClose()}); a pass already running when a disconnect() begins goes on to the other
+     * stopped subscriptions, as any pass under way does. Nor the later subscriptions of a delivery held up in
+     * another fiber's handler that awaits, unless a handler failure had already stopped one of them, which is then
+     * continued whole, in order, the messages the held-up delivery brought for it included; the others wait for
+     * that delivery, which goes on once the handler returns. A read already waiting on the socket, or for another
+     * fiber's read, is not woken when another fiber's read stops a subscription meanwhile: that remainder waits for
+     * your next read, or for any read that receives something.
+     *
      * A frame that ends the connection - a fatal -ERR, which the server sends right before it closes the
      * socket, or a PONG the socket would not take - recovers it before its error reaches the caller: with
      * reconnect off the connection is then Closed, and with reconnect on the read waits for the reconnect
@@ -2802,7 +2839,7 @@ final class NatsConnection
      */
     public function readIncoming(?Cancellation $cancellation = null): Future
     {
-        return $this->readChunk($cancellation, \Fiber::getCurrent(), reportOverflows: false);
+        return $this->readChunk($cancellation, \Fiber::getCurrent(), reportOverflows: false, continueStoppedSubscriptions: true);
     }
 
     /**
@@ -2989,13 +3026,27 @@ final class NatsConnection
      *        drainSubscription(), which read on to their PONG.
      * @param bool $deliverLeftovers Deliver what an earlier or a concurrent read has queued and not reached,
      *        before reading and after waiting for another fiber's read: for a serving loop's read
-     *        ({@see readIncomingForOperation()}), since nothing else would deliver it until the server sent
-     *        more - unless it is a close's to handle ({@see leftoversBelongToAClose()}). A delivery held up in
-     *        another fiber's handler that awaits leaves the later sids queued until that handler returns, and a
-     *        handler that threw leaves the rest of its own subscription queued ({@see deliverPending()}). Not
-     *        for a flush: a handler it ran there could suspend while another fiber took the flush's PONG and
-     *        started its next read, which the flush would then wait for until its deadline. A drain delivers
-     *        that backlog itself.
+     *        ({@see readIncomingForOperation()}), since nothing else would deliver all of it until the server
+     *        sent more - unless it is a close's to handle ({@see leftoversBelongToAClose()}). A delivery held up
+     *        in another fiber's handler that awaits leaves the later sids queued until that handler returns, and
+     *        a handler that threw leaves the rest of its own subscription queued ({@see deliverPending()}), which
+     *        your own next read continues as well ($continueStoppedSubscriptions). Not for a flush: a handler it
+     *        ran there could suspend while another fiber took the flush's PONG and started its next read, which
+     *        the flush would then wait for until its deadline. A drain delivers that backlog itself.
+     * @param bool $continueStoppedSubscriptions Continue, before reading and before the read-slot decision, the
+     *        subscriptions whose delivery an earlier pass stopped at a handler failure it held to throw
+     *        ({@see deliverStoppedSubscriptions()}, #186): for your own read ({@see readIncoming()}), which throws
+     *        such failures one read at a time, so that what each one leaves queued does not wait for a read that
+     *        receives anything. Only those: the later sids of a delivery held up in another fiber's handler that
+     *        awaits stay queued for that delivery, as they do for every read but a serving loop's, unless a
+     *        handler failure had already stopped one of them, which is continued whole, the messages that delivery
+     *        brought for it included. With the read's own rules, so that a handler that throws there ends the read
+     *        without reading; otherwise the read goes on as it would have, and its result counts only what it read.
+     *        Not what a disconnect() already under way when the read starts is to discard
+     *        ({@see leftoversBelongToAClose()}): a pass already running when one begins goes on. Not for an
+     *        operation's read, which reports the other subscriptions' failures and takes its own subscription's
+     *        queue ($ownSid): it leaves the remainders to your next read, or to whichever read receives anything
+     *        first.
      * @param DeferredFuture<null>|null $pongSlot The pong slot this read is for: a flush's, or that of the PING behind
      *        the mux SUB, which a request waits for ({@see awaitMuxConfirmation()}). When it is complete by the time
      *        the read would take the read slot, or wait for another fiber's read, the read returns without reading.
@@ -3026,6 +3077,7 @@ final class NatsConnection
         bool $deliverLeftovers = false,
         ?DeferredFuture $pongSlot = null,
         ?Cancellation $wake = null,
+        bool $continueStoppedSubscriptions = false,
     ): Future {
         if ($wake === null && $pongSlot !== null && !$pongSlot->isComplete()) {
             // A slot still pending is the read's wake-up. One already complete is not: that read returns at the slot
@@ -3035,7 +3087,7 @@ final class NatsConnection
             $wake = $this->wakeOnPong($pongSlot);
         }
 
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake): IncomingChunkResult {
+        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake, $continueStoppedSubscriptions): IncomingChunkResult {
             // What the read waits with: the caller's cancellation, and the operation's wake-up. Every wait below
             // subscribes to it before it suspends, and the checks before each wait run with no suspension between
             // them and the wait, so a wake-up that fires at any point either ends the wait or is seen by a check.
@@ -3076,15 +3128,36 @@ final class NatsConnection
 
             // A serving loop's read first delivers what an earlier or a concurrent read has queued and not reached:
             // the later sids of a delivery that another fiber's handler holds up, awaiting, or the rest of a
-            // subscription whose handler threw in the application's own read (#177). A read that finds nothing
-            // new delivers nothing, so that would otherwise wait for the server to send more. Done before
-            // the check below, so that a handler that suspends cannot leave two fibers reading at once. Such a
-            // handler can outlast the connection, too: a recovery started meanwhile is waited for, as above,
-            // before the socket is read, or this read would take the replies to the recovery's handshake. What a
-            // disconnect() under way is to discard is left to it, as the delivery after a reconnect leaves it, and
-            // that is checked before every pass: a handler that suspends can let a close begin.
+            // subscription whose handler threw in the application's own read (#177), which the application's next
+            // read also continues (below). A read that finds nothing new delivers nothing, so that would otherwise
+            // wait for the server to send more. Done before the check below, so that a handler that suspends cannot
+            // leave two fibers reading at once. Such a handler can outlast the connection, too: a recovery started
+            // meanwhile is waited for, as above, before the socket is read, or this read would take the replies to
+            // the recovery's handshake. What a disconnect() under way is to discard is left to it, as the delivery
+            // after a reconnect leaves it, and that is checked before every pass: a handler that suspends can let a
+            // close begin.
             while ($deliverLeftovers && $this->pendingDirty !== [] && !$this->leftoversBelongToAClose()) {
                 $this->deliverPending($reportOverflows, $ownSid, $reportHandlerFailures);
+                if ($this->state === ConnectionState::Open || $this->state === ConnectionState::Draining) {
+                    break;
+                }
+
+                $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
+            }
+
+            // Your own read first continues the subscriptions whose delivery an earlier pass stopped at a handler
+            // failure it held to throw (#186): the rest of each is queued, in order, and would otherwise wait for a
+            // read that receives anything, on an otherwise idle connection the server's next PING. Only those: the
+            // later sids of a delivery held up in another fiber's handler stay queued for that delivery, which goes on
+            // once the handler returns, unless a handler failure had already stopped one of them, which is continued
+            // whole. With this read's own rules, so that a handler that throws there ends the read without reading;
+            // otherwise the read goes on below, as it would have, and its result counts what it read. With the guards
+            // of the leftovers above: a handler that suspends cannot leave two fibers reading at once, a recovery
+            // started meanwhile is waited for before the socket is read, and what a disconnect() already under way is
+            // to discard is left to it. A pass already running when a disconnect() begins goes on to the other stopped
+            // subscriptions, as the one above does.
+            while ($continueStoppedSubscriptions && $this->stoppedByAFailure !== [] && !$this->leftoversBelongToAClose()) {
+                $this->deliverStoppedSubscriptions($reportOverflows);
                 if ($this->state === ConnectionState::Open || $this->state === ConnectionState::Draining) {
                     break;
                 }
@@ -3358,9 +3431,12 @@ final class NatsConnection
      * loop's read's to deliver ({@see readChunk()}): close-intent is set and the connection is not Draining. A disconnect() under way
      * discards it - delivered, it reached handlers after disconnect() had been called - and a drain() without a
      * connection delivers it itself. A drain() that is Draining takes the backlog over and lets reads deliver as
-     * they go, as its flush's reads do. Only the delivery of leftovers asks this: a read that receives anything
-     * during the close delivers the whole queue with what it received, as any read does ({@see deliverPending()}
-     * does not look at close-intent).
+     * they go, as its flush's reads do. Only the deliveries a read makes before it reads ask this - a serving loop's
+     * leftovers, an operation's take of its own subscription ({@see deliverQueuedForOwnSid()}), and your own read's
+     * continuation of the subscriptions a handler failure stopped ({@see deliverStoppedSubscriptions()}): a read
+     * that receives anything during the close delivers the whole queue with what it received, as any read does
+     * ({@see deliverPending()} does not look at close-intent). They ask it before each pass, not within one: a pass
+     * under way when the close begins, in a handler that awaits, goes on to the end.
      */
     private function leftoversBelongToAClose(): bool
     {
@@ -5985,8 +6061,9 @@ final class NatsConnection
      * SubscriptionQueue's overflow always was before that option existed: code that swallows an
      * operation's failure must not make it vanish. A handler that fails otherwise does not end the delivery
      * either (#177): its subscription's delivery stops at the failing message, the rest of that subscription
-     * left queued for the next pass, and the other subscriptions' messages are still delivered, in sid order,
-     * so that an operation waiting for one of them gets it now rather than with the server's next bytes.
+     * left queued for the next pass, which your own next read makes before it reads
+     * ({@see deliverStoppedSubscriptions()}, #186), and the other subscriptions' messages are still delivered, in
+     * sid order, so that an operation waiting for one of them gets it now rather than with the server's next bytes.
      * The first such failure is held and thrown once the pass is over, ahead of any held overflow, which
      * are then all reported; a second subscription that fails in the same pass is stopped the same way and
      * its failure is reported, since there is one exception to throw. With $reportHandlerFailures (a drain,
@@ -6046,11 +6123,61 @@ final class NatsConnection
     }
 
     /**
-     * Throws what a delivery pass held, once the pass is over ({@see deliverPending()}, {@see deliverQueuedForOwnSid()}).
-     * The first handler failure held by the pass is thrown; the others are reported, as the frame failures behind the
-     * one dispatchFrames() rethrows are (#128). One that ended the pass outright wins. Without a failure the first held
-     * overflow is thrown and the rest are reported; with NatsOptions::$slowConsumerErrorsFailOperations the thrown one
-     * is reported as well, as a SubscriptionQueue's overflow always was before that option existed.
+     * Continues, ahead of your own read ({@see readChunk()}, #186), the subscriptions whose delivery an earlier pass
+     * stopped at a handler failure it held to throw ({@see $stoppedByAFailure}): the rest of each was left queued, in
+     * order, for the next pass, which otherwise only a read that receives anything, or a serving loop's read, makes.
+     * In sid order, whatever order they stopped in, and with the rules {@see deliverPending()} has for your own read:
+     * a handler that throws stops its subscription again, the first such failure is thrown once the pass is over
+     * and any other is reported, and a SubscriptionQueue's overflow is held and thrown, or reported, as
+     * $reportOverflows says. The pass then goes over the subscriptions stopped while it ran, by a nested read in a
+     * handler it ran that the handler caught, or by another fiber's delivery while one of its handlers awaited: the
+     * read would otherwise go to the socket with their rest queued and nothing else to continue it. Each
+     * subscription at most once per pass, so that the rest of one whose handler throws again here waits for the
+     * next read, which throws its next failure: one failure per read.
+     *
+     * Only these subscriptions: the later sids of a delivery held up in another fiber's handler that awaits stay
+     * queued for that delivery, unless a handler failure had already stopped one of them, which is then continued
+     * whole, in order, the messages the held-up delivery brought for it included. {@see drainPendingForSid()} keeps
+     * its guards: a subscription whose delivery is under way further up some fiber's stack is left to it, still
+     * marked, and one that is gone, or whose queue has emptied, loses its mark. A disconnect() that begins while a
+     * handler the pass runs awaits does not end the pass: it goes on to the other stopped subscriptions, as any pass
+     * under way does. Only a read that would start its pass during the close leaves them to it
+     * ({@see leftoversBelongToAClose()}).
+     */
+    private function deliverStoppedSubscriptions(bool $reportOverflows): void
+    {
+        $visited = [];
+        $held = [];
+        $heldFailures = [];
+        $failure = null;
+        try {
+            // The marked subscriptions, then again those stopped while the pass ran - by a nested read in a handler it
+            // ran, which the handler caught, or by another fiber's delivery while one of its handlers awaited - each
+            // once: the read would otherwise go to the socket with their rest queued and nothing else to continue it.
+            while (($stopped = array_diff_key($this->stoppedByAFailure, $visited)) !== []) {
+                $sids = array_keys($stopped);
+                // The set is in the order the subscriptions were first marked, a sid marked again keeping its place,
+                // and two reads can stop them in either order: sorted, like the delivery of a chunk.
+                sort($sids);
+                foreach ($sids as $sid) {
+                    $visited[$sid] = true;
+                    $this->drainPendingForSid($sid, $held, $heldFailures, $reportOverflows);
+                }
+            }
+        } catch (\Throwable $e) {
+            $failure = $e;
+        }
+
+        $this->throwWhatThePassHeld($failure, $heldFailures, $held);
+    }
+
+    /**
+     * Throws what a delivery pass held, once the pass is over ({@see deliverPending()},
+     * {@see deliverQueuedForOwnSid()}, {@see deliverStoppedSubscriptions()}). The first handler failure held by the
+     * pass is thrown; the others are reported, as the frame failures behind the one dispatchFrames() rethrows are
+     * (#128). One that ended the pass outright wins. Without a failure the first held overflow is thrown and the rest
+     * are reported; with NatsOptions::$slowConsumerErrorsFailOperations the thrown one is reported as well, as a
+     * SubscriptionQueue's overflow always was before that option existed.
      *
      * @param \Throwable|null $failure What ended the pass outright, if anything did.
      * @param list<\Throwable> $heldFailures The handler failures the pass held ({@see drainPendingForSid()}).
@@ -6836,9 +6963,11 @@ final class NatsConnection
      * @param list<\Throwable>|null $heldFailures When an array, anything else the handler throws that is not
      *        reported (see $reportHandlerFailures) does not end the delivery either (#177): it is held here, to
      *        be thrown once the pass is over, and this subscription's delivery stops at the failing message for
-     *        this pass, the rest of it left queued, in order, and the sid dirty, so that the next pass continues
-     *        it. The other subscriptions' messages queued behind it are then still delivered. When null such a
-     *        failure ends the delivery and propagates.
+     *        this pass, the rest of it left queued, in order, and the sid dirty and marked as stopped
+     *        ({@see $stoppedByAFailure}), so that the next pass continues it: your own next read makes one before
+     *        it reads (#186). The other subscriptions' messages queued behind it are then still delivered. When
+     *        null such a failure ends the delivery and propagates, and the sid is not marked: that caller,
+     *        drainSubscription(), reports it and delivers the rest itself.
      * @param bool $reportHandlerFailures Report anything else the handler throws at once and go on, unless
      *        $sid is $ownSid: the handler of an operation's own subscription that fails still fails the
      *        operation.
@@ -6862,9 +6991,9 @@ final class NatsConnection
         }
 
         if (!isset($this->subscriptions[$sid])) {
-            // The subscription is gone; its backlog is undeliverable. Drop it (and its dirty-set entry)
-            // instead of retaining state that drainAllPending() would re-scan.
-            unset($this->pendingMessages[$sid], $this->pendingDirty[$sid]);
+            // The subscription is gone; its backlog is undeliverable. Drop it (and its dirty-set entry and
+            // stopped mark) instead of retaining state that drainAllPending() would re-scan.
+            unset($this->pendingMessages[$sid], $this->pendingDirty[$sid], $this->stoppedByAFailure[$sid]);
 
             return 0;
         }
@@ -6873,8 +7002,9 @@ final class NatsConnection
             // Nothing buffered. The queue persists empty until the subscription is dropped (#139) - the
             // previous unset-on-empty meant one SplQueue alloc/free per delivered message in the
             // promptly-drained common case. Clear any dirty-set entry so the invariant (dirty IFF
-            // non-empty) holds even when a reentrant drain emptied this sid earlier in the same pass.
-            unset($this->pendingDirty[$sid]);
+            // non-empty) holds even when a reentrant drain emptied this sid earlier in the same pass, and
+            // the stopped mark with it: nothing is left to continue (#186).
+            unset($this->pendingDirty[$sid], $this->stoppedByAFailure[$sid]);
 
             return 0;
         }
@@ -6950,8 +7080,10 @@ final class NatsConnection
                         $this->emitErrorSafely($overflow);
                     } elseif ($heldFailures !== null) {
                         // Held like any other failure of the handler, below: this subscription's delivery
-                        // stops here for this pass, and the other subscriptions' messages are still delivered.
+                        // stops here for this pass, marked for your next read, and the other subscriptions'
+                        // messages are still delivered.
                         $heldFailures[] = $overflow;
+                        $this->stoppedByAFailure[$sid] = true;
 
                         break;
                     } else {
@@ -6965,7 +7097,11 @@ final class NatsConnection
                         // subscriptions' messages (#177). This subscription's delivery stops at the failing
                         // message: the rest of it stays queued, in order, and the finally below keeps the sid
                         // dirty, so the next pass continues it, and throws again if the next handler throws.
+                        // Marked, so that your own next read makes that pass before it reads (#186), rather
+                        // than once a read receives anything; the finally below clears the mark when nothing
+                        // is left.
                         $heldFailures[] = $handlerFailure;
+                        $this->stoppedByAFailure[$sid] = true;
 
                         break;
                     } else {
@@ -7012,11 +7148,12 @@ final class NatsConnection
 
             // Keep the dirty set = sids with a non-empty queue: once this sid's queue has fully drained
             // (or the subscription was dropped by an auto-unsub cap / completeAutoUnsub above), remove it
-            // so drainAllPending() no longer scans it. A handler that threw mid-drain leaves this
-            // subscription's later messages queued with the subscription still alive - only its own: the
-            // pass goes on to the other sids (#177) - and the sid stays dirty, re-drained next pass (#162).
+            // so drainAllPending() no longer scans it, and the stopped mark with it (#186). A handler that
+            // threw mid-drain leaves this subscription's later messages queued with the subscription still
+            // alive - only its own: the pass goes on to the other sids (#177) - and the sid stays dirty,
+            // re-drained next pass (#162), and marked as stopped until nothing is left.
             if (!isset($this->pendingMessages[$sid]) || $this->pendingMessages[$sid]->isEmpty()) {
-                unset($this->pendingDirty[$sid]);
+                unset($this->pendingDirty[$sid], $this->stoppedByAFailure[$sid]);
             }
         }
 
@@ -7062,6 +7199,8 @@ final class NatsConnection
         unset($this->guardedSids[$sid]);
         unset($this->unconfirmedSids[$sid]);
         unset($this->removeAfterDelivery[$sid]);
+        // Nor a stopped mark (#186): its queue went with it, and your next read has nothing to continue.
+        unset($this->stoppedByAFailure[$sid]);
         // Nothing more will be delivered to it: an operation's read still waiting for a delivery looks again.
         $this->wakeReadsWaitingFor($sid);
     }
