@@ -323,6 +323,17 @@ final class PullConsumerIterator
      * configured iteration count is reached, a terminal error occurs, or {@see stop()}/{@see drain()}
      * is signalled (#120).
      *
+     * A run that fails first runs the handler for what its pulls have received (#197): when its read fails because the
+     * connection is going (lost with waitForReconnect off, a reconnect that gave up, reconnect off, a fatal -ERR), when
+     * a pull's write fails, when the server rejects the run's reply inbox, or when the read fails for a reason the
+     * options make its own (handlerErrorsFailOperations, slowConsumerErrorsFailOperations). Those messages go to the
+     * handler in the order they arrived, unless {@see stop()} was called, or the application closed the connection (a
+     * disconnect() or a drain() of the client, which discards them), and the future then fails with that error,
+     * unchanged. A handler that throws during that delivery ends it, and its exception goes to the connection's error
+     * listener and logger, since the run's own failure is the one thrown; on a closed connection that includes a
+     * handler whose ack failed. A handler that throws at any other time ends the run at once with its own exception,
+     * the other messages left undelivered.
+     *
      * Start the next run only once the previous run's future has resolved: the runs of one iterator
      * share the stop/drain flags, so a handle() while a run is still active clears a stop() or drain()
      * that run has not seen yet, and its wake-ups replace that run's. The active run goes on, as before

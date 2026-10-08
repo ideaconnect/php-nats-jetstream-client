@@ -2184,6 +2184,19 @@ final class NatsConnection
     }
 
     /**
+     * Whether the application has closed the connection, or is closing it: disconnect() or drain() was called since the
+     * last connect(). A pull consumer run that ends with a failure then leaves what its pulls received undelivered, as
+     * a stop() does ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #197), since a disconnect()
+     * discards what the connection has received and not delivered.
+     *
+     * @internal For the pull consumer engine (#197); not part of the supported API.
+     */
+    public function isCloseRequested(): bool
+    {
+        return $this->closing;
+    }
+
+    /**
      * Registers a subscription callback and sends a SUB command.
      *
      * While a reconnect is in flight it first waits for it, within the request timeout
