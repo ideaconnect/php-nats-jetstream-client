@@ -287,6 +287,56 @@ final class SlowConsumerErrorPolicyTest extends TestCase
     }
 
     /** @return iterable<string, array{string}> */
+    public static function collections(): iterable
+    {
+        yield 'requestMany(max 3)' => ['requestMany'];
+        yield 'JetStream fetchBatch(3)' => ['fetchBatch'];
+    }
+
+    /**
+     * Guard: with slowConsumerErrorsFailOperations, a requestMany() for three replies or a fetchBatch() of three that
+     * has received one, in a read of its own, still fails with another subscription's overflow that its next read runs
+     * into, the connection open. What such a collection has received is returned instead of its read's failure only
+     * when the connection is going: lost, failed over, or closed ({@see
+     * OperationReadReconnectTest::testACollectionWhoseReadFailsWithTheConnectionGoingReturnsWhatItReceived()}).
+     */
+    #[DataProvider('collections')]
+    public function testACollectionThatHasReceivedPartOfItsResultStillFailsOnAnotherSubscriptionsOverflowWhenConfiguredTo(string $operation): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $client = $this->errorPolicyClient($transport, $recorder, failOperations: true);
+        [$overflow, $sid] = $this->overflow('subscription queue', $client, $transport);
+        $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $overflow): array {
+            $inboxSid = $replyTo === null ? null : $transport->sidFor($replyTo);
+            if ($replyTo === null || $inboxSid === null) {
+                return [];
+            }
+
+            // A read for the first of the three, then one for the overflow.
+            return [
+                $subject === 'svc'
+                    ? ReconnectingTransport::msgFrame($replyTo, $inboxSid, 'r-1')
+                    : ReconnectingTransport::msgFrame('evt.s', $inboxSid, 'm-1', '$JS.ACK.ORDERS.worker.1.1.1.0.0'),
+                $overflow,
+            ];
+        };
+
+        try {
+            if ($operation === 'requestMany') {
+                $client->requestMany('svc', 'ping', maxResponses: 3, totalTimeoutMs: 30_000)->await(new TimeoutCancellation(5));
+            } else {
+                $client->jetStream()->fetchBatch('ORDERS', 'worker', 3, 30_000)->await(new TimeoutCancellation(5));
+            }
+            self::fail('expected the overflow');
+        } catch (SlowConsumerException $e) {
+            self::assertSame($sid, $e->sid);
+        }
+
+        self::assertSame(ConnectionState::Open, $client->state(), 'the overflow left the connection open');
+    }
+
+    /** @return iterable<string, array{string}> */
     public static function failuresTakingPrecedence(): iterable
     {
         yield 'a fatal -ERR' => ["-ERR 'Unknown Protocol Operation'\r\n"];

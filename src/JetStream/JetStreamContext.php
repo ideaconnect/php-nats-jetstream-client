@@ -2531,6 +2531,18 @@ final class JetStreamContext
                     } catch (CancelledException) {
                         // This wait segment ended (overall deadline or a heartbeat check came due);
                         // loop around to re-evaluate the deadlines against fresh activity.
+                    } catch (ConnectionException $e) {
+                        // The read failed with the connection going: lost, or failed over from a server in lame duck
+                        // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended
+                        // by a reconnect that gave up or by a fatal -ERR. A partial batch is still returned, as above:
+                        // those messages are real, and the server counted them as delivered. A failure on an open
+                        // connection still fails the fetch: a full queue, a handler's own, or a fatal -ERR whose
+                        // reconnect has reopened it.
+                        if ($messages === [] || $this->client->state() === ConnectionState::Open) {
+                            throw $e;
+                        }
+
+                        return $messages;
                     }
                 }
             } finally {
