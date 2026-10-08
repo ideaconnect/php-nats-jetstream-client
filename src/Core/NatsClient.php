@@ -61,7 +61,10 @@ final class NatsClient
      *
      * Locally queued, undelivered messages are discarded without being delivered - nats.go
      * Close() parity (#134). Use {@see drain()} for the lossless path: it delivers the buffered
-     * backlog before closing.
+     * backlog before closing. Neither close reaches what a JetStream pull consumer run's pulls hold:
+     * a run that this or drain() ends hands its handler none of it (#197). Drain the iterator
+     * ({@see \IDCT\NATS\JetStream\Consumers\PullConsumerIterator::drain()}) and await its handle()
+     * before you close the connection.
      *
      * @return Future<void>
      */
@@ -262,6 +265,17 @@ final class NatsClient
     public function isSubscriptionActive(int $sid): bool
     {
         return $this->connection->isSubscriptionActive($sid);
+    }
+
+    /**
+     * Whether the application has closed the connection, or is closing it: disconnect() or drain() was called since the
+     * last connect() ({@see NatsConnection::isCloseRequested()}).
+     *
+     * @internal For the pull consumer engine (#197); not part of the supported API.
+     */
+    public function isCloseRequested(): bool
+    {
+        return $this->connection->isCloseRequested();
     }
 
     /**

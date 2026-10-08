@@ -29,7 +29,11 @@ final class PullInFlight
     /** Count of data messages received on this pull; reaching {@see $batch} retires it as full. */
     public int $received = 0;
 
-    /** Whether the pull is complete: a full batch was received, or a terminal status frame arrived. */
+    /**
+     * Whether the pull is complete: a full batch was received, or a terminal status frame arrived. Also set when the
+     * run hands the buffer over right before it ends with a failure (#197), so that the router attributes nothing more
+     * to the pull while the handler runs.
+     */
     public bool $done = false;
 
     /** Terminal status code (>=400) captured raw from a status frame, or null when none arrived. */

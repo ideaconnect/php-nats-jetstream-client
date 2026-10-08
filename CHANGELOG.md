@@ -15,6 +15,61 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- A JetStream pull consumer run, `PullConsumerIterator::handle()`, that ends with an error now runs the handler for the
+  messages its pulls had received before it throws (#197): when its read fails because the connection is going (lost
+  with `waitForReconnect: false`, a reconnect that gave up, reconnect off, a fatal `-ERR` whether or not the reconnect
+  reopened the connection), when a pull's write fails, when the server rejects its reply inbox, or when its read fails
+  for a reason `handlerErrorsFailOperations` or `slowConsumerErrorsFailOperations` makes the read's own. `handle()`
+  still throws the same error, once the handler has run. On a closed connection the handler's ack fails; a handler that
+  throws during that delivery, as one that lets its failed ack out does, ends it, and its exception goes to the error
+  listener and the logger instead of out of `handle()`. A `stop()` still leaves those messages unhandled, and so does
+  closing the connection yourself, with `disconnect()` or the client's `drain()`, which discards them as before: drain
+  the iterator and await `handle()` before you close the connection. A handler that throws at any other time still ends
+  the run at once with its own exception.
+
+### Fixed
+
+- `[bugfix]` A pull consumer run that ended with a failure of its own read or of a pull's write dropped the messages its
+  pulls in flight had received (#197). The engine behind `PullConsumerIterator::handle()` hands a pull's messages to the
+  handler only when it retires the pull (its batch full, a status from the server, or its deadline), so a pull holds
+  messages the server counted as delivered and the handler has not seen, with `setBatching(10)` on a stream that
+  trickles most of the time. A run whose read failed with the connection going, which it does with
+  `waitForReconnect: false` once the connection is lost (#178) or failed over from a server in lame duck mode (#191),
+  when the reconnect gives up, with reconnect off and on a fatal `-ERR`, ended with that error and dropped them, finite
+  and infinite runs alike, and so did a run whose pull's write failed while an earlier pull held messages
+  (depth above 1), whose reply inbox the server rejected, or whose read failed for a reason
+  `handlerErrorsFailOperations` or `slowConsumerErrorsFailOperations` makes its own: the server redelivered those
+  messages only after `ack_wait`, and never under `ack_policy: none` or `max_deliver: 1`. Such a run now hands the
+  handler what its pulls received, in issue order, with `stop()` checked before each message as when it retires a pull,
+  and then throws that error unchanged, as `fetchBatch()` returns its partial batch since 2.21.0. A run the application
+  ends by closing the connection, with `disconnect()` or the client's `drain()`, still hands nothing over: the close
+  discards those messages, as `disconnect()` discards what the connection received and has not delivered, rather than
+  run the handler after the close has returned, with every ack failing, and a close made during that delivery ends it as
+  a `stop()` does. That covers only the hand-over before the run fails: a pull the run retires normally is still handed
+  over whole, as before, also when the handler or another fiber closes the connection meanwhile, since the connection's
+  `drain()` lets acks out while it is Draining. A handler that throws during that delivery ends it and is reported to
+  the error listener and the logger, the run's own failure being the one thrown, and a message read while the handler
+  runs goes to a pull still to be handed over, when one is left open, rather than being dropped with the buffer being
+  handed over; with none left it is dropped, unacked, and comes again only after `ack_wait`, or never under
+  `ack_policy: none` or `max_deliver: 1`. Measured on nats-server 2.12 with reconnect off: a run of batch 3 and depth 1
+  whose pull had received the stream's two messages, the client's TCP connection then cut through a proxy while the
+  server stayed up. On a consumer with `ack_policy: none` the handler never saw them, and the server had them as
+  delivered and acknowledged (`ack_floor` 2, nothing pending): they were gone. With explicit acks they came back only as
+  redeliveries after `ack_wait` (`num_delivered` 2). The handler now gets both before `handle()` throws
+  `Reconnect is disabled`. With explicit acks its acks fail on the closed connection and the server redelivers both
+  after `ack_wait`: a handler that catches the failed ack gets both, and one that lets it out, as a bare
+  `$js->ack($msg)->await()` does, gets the first, the failure going to the error listener. A `disconnect()` or `drain()`
+  of the connection while the pull held them handed nothing over, in 2.21.0 and now alike, the messages then lost or
+  redelivered as above. A graceful server shutdown was not affected: the server answers the waiting pull with
+  `409 Server Shutdown` before it closes the connection, which retires the pull. Over the unit suite's scripted server
+  the same holds with waiting disabled, a reconnect that gave up, a lame-duck failover with waiting disabled, and a
+  fatal `-ERR` whose reconnect reopened the connection. An infinite run that goes on through a reconnect still discards
+  what its pulls held at the reconnect (#187).
+
 ## [2.21.0] - 2026-10-08
 
 ### Upgrade notes

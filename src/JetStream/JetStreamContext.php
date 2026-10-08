@@ -2600,6 +2600,24 @@ final class JetStreamContext
      * iterator replaced fires without its flag; left out of the waits like any fired one, it leaves this run
      * waiting to its deadlines as before #181, with no spin (see {@see pullWaitCancellation()}).
      *
+     * A run that ends with a failure of its own waits or writes first hands the handler what its pulls have received
+     * (#197): the pump read failing with anything but the CancelledException that ends a wait (the connection lost with
+     * waiting for a reconnect disabled, a reconnect that gave up, reconnect off, a fatal -ERR whether or not the
+     * reconnect reopened the connection, an overflow or another subscription's handler under
+     * slowConsumerErrorsFailOperations or handlerErrorsFailOperations), a pull's write failing, or the server rejecting
+     * the run's inbox. The server counted those messages as delivered, and lost with the run they came again only after
+     * the ack wait, or never on a consumer without acks or with max_deliver 1; fetchBatch() returns its partial batch
+     * for the same reason. The pulls in flight are handed over in issue order through the retire phase's delivery,
+     * stop() checked before each message, though unlike the retire phase it captures no group pin from them; the
+     * failure is then rethrown unchanged, so that the caller still learns why the run ended, and a handler that throws
+     * during that delivery ends it and is reported through the error listener and the logger
+     * ({@see deliverReceivedBeforeFailing()}). A close the application makes, a disconnect() or a drain() of the
+     * connection, before or during that delivery, ends it as a stop() does: the close discards what the pulls hold, as
+     * a disconnect() discards what the connection has received and not delivered, rather than run the handler after the
+     * close returned, with every ack failing; a pull the run retires normally is still handed over whole, as before,
+     * also when the connection is closed meanwhile. An exception of the handler or of onError anywhere else still ends
+     * the run at once, the other pulls' buffers left undelivered and unacked, as a stop() leaves them.
+     *
      * @internal Engine entry point for {@see PullConsumerIterator}; not part of the supported public API.
      *
      * @param callable(NatsMessage, JetStreamContext):void $handler
@@ -2687,9 +2705,11 @@ final class JetStreamContext
                     return;
                 }
 
-                // No open pull owns this delivery (every requested batch already filled): a straggler.
-                // Drop it - it stays unacked and is redelivered on a later pull, matching fetchBatch
-                // discarding messages received past the requested batch.
+                // No open pull owns this delivery (every requested batch already filled, or the run is handing
+                // its pulls over before it fails, #197): a straggler.
+                // Drop it - it stays unacked, for the server to redeliver on a later pull after the ack wait (on a
+                // consumer with acks and deliveries left), matching fetchBatch discarding messages received past
+                // the requested batch.
             };
 
             // A guarded subscribe (#175): the SUB lives in subscriptionMeta and resubscribeAll() replays it on
@@ -2762,9 +2782,16 @@ final class JetStreamContext
                     // the error loudly through handle()'s future (mirroring request()'s #167 fail-fast) instead
                     // of polling forever: a configuration error for a permissions violation, and the connection's
                     // subscription limit when that is the cause (#175), where the inbox may have been rejected -
-                    // the -ERR names no subject - and the run has released it.
+                    // the -ERR names no subject - and the run has released it. What the pulls in flight received
+                    // before the rejection goes to the handler first, as before any failure of the run (#197): the
+                    // pulls of a run whose replayed inbox the new server rejected, or whose subscribe permission a
+                    // server's configuration reload withdrew, can hold messages the server counted as delivered,
+                    // and the connection, which a rejection leaves open, still takes the handler's acks.
                     if ($inboxRejection !== null) {
-                        throw $this->pullInboxRejectedException($base, $inboxRejection);
+                        $rejected = $this->pullInboxRejectedException($base, $inboxRejection);
+                        $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $handler, $ctl);
+
+                        throw $rejected;
                     }
 
                     // FIX2 (infinite only): a reconnect lost every server-side in-flight pull. Drop them
@@ -2821,16 +2848,8 @@ final class JetStreamContext
                         // Drain the buffer to the handler FIRST (so a deadline/terminal retire of a
                         // partially received pull does not drop already-received messages; mirrors
                         // fetchBatch returning the partial batch). stop() breaks; drain() does NOT.
-                        $delivered = 0;
-                        foreach ($pull->buffer as $bufferedMsg) {
-                            if ($ctl->isStopRequested()) {
-                                break;
-                            }
-                            $handler($bufferedMsg, $this);
-                            ++$delivered;
-                            ++$totalProcessed;
-                        }
-                        $pull->buffer = [];
+                        $delivered = $this->deliverPullBuffer($pull, $handler, $ctl);
+                        $totalProcessed += $delivered;
 
                         if ($delivered > 0) {
                             // A delivery ends the idle streak and clears any latched drain (#153, FIX1).
@@ -3003,11 +3022,25 @@ final class JetStreamContext
                         }
 
                         $requestPayload = $this->buildPullRequest($cfg->batch, $cfg->expiresMs, $fields);
-                        $this->client->publish(
-                            $subject,
-                            json_encode($requestPayload, JSON_THROW_ON_ERROR),
-                            $prefix . $token,
-                        )->await();
+                        try {
+                            $this->client->publish(
+                                $subject,
+                                json_encode($requestPayload, JSON_THROW_ON_ERROR),
+                                $prefix . $token,
+                            )->await();
+                        } catch (\Throwable $failure) {
+                            // The pull's write failed: the socket was dead and the reconnect the write ran gave up, or
+                            // reconnect is off, or the connection was closed already, or the request was refused before
+                            // it was written (longer than a max_payload an INFO lowered), whatever the throwable. The
+                            // pulls issued before it can hold what the server sent them, with depth above 1 while a
+                            // later pull refills the pipeline: the handler gets that first, unless the application
+                            // closed the connection (a disconnect() under a held-up write fails it with the transport's
+                            // own error), and the run then ends with the write's error, as for the pump read below
+                            // (#197).
+                            $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $handler, $ctl);
+
+                            throw $failure;
+                        }
                     }
 
                     if ($inflight === []) {
@@ -3079,6 +3112,19 @@ final class JetStreamContext
                         // This wait segment ended (the earliest deadline or heartbeat check came due, or
                         // a stop()/drain() woke the engine): loop to re-evaluate stop()/drain() and the
                         // deadlines against any freshly buffered frames.
+                    } catch (\Throwable $failure) {
+                        // The read failed, and the run ends with its error: the connection lost with waiting for a
+                        // reconnect disabled (#178, #191), a reconnect that gave up, reconnect off, a fatal -ERR
+                        // whether or not the reconnect reopened the connection, what the options make the read's own
+                        // failure (an overflow, another subscription's handler), or a disconnect() or drain() of the
+                        // application's. The pulls in flight hold what the server sent them and the handler has not
+                        // seen: it gets that first, in issue order, unless the application closed the connection,
+                        // which discards it, and the read's error is then rethrown, so that the caller still learns
+                        // why the run ended (#197). fetchBatch() returns its partial batch for the same reason when
+                        // its read fails with the connection going.
+                        $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $handler, $ctl);
+
+                        throw $failure;
                     }
                 }
 
@@ -3088,6 +3134,79 @@ final class JetStreamContext
                 $this->client->unsubscribe($sid)->await();
             }
         });
+    }
+
+    /**
+     * Hands the messages $pull has buffered to the run's handler, in the order they arrived, and empties the buffer:
+     * how {@see consumePipelined()} delivers a pull it retires, and each pull in flight before a run ends with a
+     * failure of its own ({@see deliverReceivedBeforeFailing()}, #197). stop() is checked before each message, so a
+     * stop() made before or during the delivery, by the handler or from another fiber, leaves the rest undelivered and
+     * unacked. With $endAtAClose, for that failure delivery, a close the application asked for (a disconnect() or a
+     * drain() of the connection) ends it the same way. The retire phase does not pass it: a pull it retires is handed
+     * over whole, as before, also when the handler or another fiber closes the connection meanwhile, since the
+     * connection's drain() lets acks out while it is Draining. The iterator's drain() is not checked, since it lets
+     * what was received complete. The router must not be able to add to the buffer meanwhile, since the handler can
+     * suspend and the router runs in whichever fiber reads then: the retire phase takes the pull out of the run's
+     * in-flight set first, and deliverReceivedBeforeFailing() marks it done. A handler that throws ends the delivery,
+     * its exception thrown.
+     *
+     * @param callable(NatsMessage, JetStreamContext):void $handler
+     * @return int How many messages the handler got.
+     */
+    private function deliverPullBuffer(PullInFlight $pull, callable $handler, PullPipelineControl $ctl, bool $endAtAClose = false): int
+    {
+        $delivered = 0;
+        foreach ($pull->buffer as $bufferedMsg) {
+            if ($ctl->isStopRequested() || ($endAtAClose && $this->client->isCloseRequested())) {
+                break;
+            }
+            $handler($bufferedMsg, $this);
+            ++$delivered;
+        }
+        $pull->buffer = [];
+
+        return $delivered;
+    }
+
+    /**
+     * What a {@see consumePipelined()} run does right before it ends with a failure of its own waits or writes (#197):
+     * its pump read failing, a pull's write failing, or the server rejecting its inbox. The pulls in flight hold
+     * messages the server counted as delivered and the handler has not seen yet; lost with the run, they came again
+     * only after the ack wait, or never on a consumer without acks or with max_deliver 1. Each pull's buffer is handed
+     * to the handler, in issue order, through the retire phase's delivery ({@see deliverPullBuffer()}, with its stop()
+     * check before each message), though no group pin is captured from it as the retire phase does, and the caller
+     * then throws its failure unchanged. Each pull is marked done right before its buffer goes out: a message read
+     * while the handler suspends, by the handler's own read or another fiber's, is then attributed to a pull still to
+     * come, where it counts against that pull's batch, or dropped as a straggler once no pull is left open, instead of
+     * being added to the buffer being delivered, which is emptied after. A straggler stays unacked: the server
+     * redelivers it after the ack wait, and on a consumer without acks or with max_deliver 1 it is lost, as the whole
+     * run's buffers were before. A close the application asked for, a disconnect() or a drain() of the connection,
+     * made before the delivery or during it, ends it as stop() does: the close discards what the connection received
+     * and has not delivered (nats.go Close() parity), the handler would run after the close had returned, and its acks
+     * could not go out any more. Only this hand-over ends at a close: a pull the run retires normally is still handed
+     * over whole, as before ({@see deliverPullBuffer()}).
+     *
+     * A handler that throws ends the delivery, the rest left undelivered and unacked as when a handler throws in the
+     * retire phase, and its exception is reported through the error listener and the logger: the run's failure came
+     * first and is the one thrown, as the connection throws the first of two failures and reports the second (#128,
+     * #158). An exception the handler or onError throws anywhere else is not handled here: it ends the run at once, as
+     * it always did.
+     *
+     * @param array<string, PullInFlight> $inflight The run's pulls in flight, keyed by token.
+     * @param list<string> $issueOrder Their tokens, oldest first.
+     * @param callable(NatsMessage, JetStreamContext):void $handler
+     */
+    private function deliverReceivedBeforeFailing(array $inflight, array $issueOrder, callable $handler, PullPipelineControl $ctl): void
+    {
+        try {
+            foreach ($issueOrder as $token) {
+                $pull = $inflight[$token];
+                $pull->done = true;
+                $this->deliverPullBuffer($pull, $handler, $ctl, endAtAClose: true);
+            }
+        } catch (\Throwable $handlerFailure) {
+            $this->emitClientError($handlerFailure);
+        }
     }
 
     /**
@@ -3377,7 +3496,9 @@ final class JetStreamContext
      * subscription dispatch loop. Routing through NatsClient::emitError() (the connection's
      * listener+logger path) means an application configured with a logger but no listener still
      * gets a log line for a terminally stopped consumer - previously these conditions bypassed the
-     * logger entirely and were invisible without an errorListener.
+     * logger entirely and were invisible without an errorListener. Also the pull consumer's handler failing while a run
+     * hands over what its pulls received before it fails ({@see deliverReceivedBeforeFailing()}, #197): reported, so
+     * that the run's own failure, which came first, is the one thrown.
      */
     private function emitClientError(\Throwable $error): void
     {
