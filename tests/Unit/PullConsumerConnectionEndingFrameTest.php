@@ -15,6 +15,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
+use IDCT\NATS\Tests\Support\DrainFlushWatcher;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
@@ -36,7 +37,7 @@ use function Amp\async;
  * end of the run: it handed over what its pulls held (#197) and handle() threw, the connection Open on the new socket,
  * where after an EOF the run pulled again on the new connection. The run now goes on: the frame's error goes to the
  * error listener and the logger, what the pulls held goes to the handler as a delivery of the run, counted in its
- * total, a stop() and a close of the application's ending it as they end the hand-over before a failure (#197) and a
+ * total, a stop() and a close that discards ending it as they end the hand-over before a failure (#197, #207) and a
  * group pin captured from it as in the retire phase, and the run pulls on the new connection; while a reconnect slower
  * than the read's wait is still under way, it goes round as after an EOF whose reconnect outlasts that wait, the pulls
  * still open kept in flight. A finite run, waiting disabled, reconnect off, a reconnect that gives up while the read
@@ -50,7 +51,9 @@ use function Amp\async;
  * ends. The order of events decides every outcome, except where a test needs a pull's deadline to pass while a
  * reconnect is held, which it stages with a 100 ms expiry (and, for two deadlines, a half-second margin between them);
  * the other time bounds only keep a broken run from hanging the suite. Each test fails on 2.22.0, where handle() threw
- * the frame's error, except the EOF control data sets and the declared guards, which pass on both.
+ * the frame's error, except the EOF control data sets and the declared guards, which pass on both. A drain() of the
+ * client still Draining lets the hand-over deliver what the pulls held, the run issuing no pull while it drains (#207):
+ * the two tests of that fail on 2.23.0 as well, where any close ended the hand-over.
  */
 final class PullConsumerConnectionEndingFrameTest extends TestCase
 {
@@ -658,21 +661,24 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
     }
 
     /**
-     * Guard, passes on both: a close of the application's under way when the frame's error reaches the engine ends the
-     * run with that error, as it did in 2.22.0. The pull holds m-1 when a fatal -ERR ends the connection, the reconnect's
-     * dial is held, so the engine's read waits for it, and the application drains the connection, which waits for the
-     * reconnect too. Once the dial is let through, the drain takes the reopened connection over, and the engine's read
-     * then throws the -ERR's error with the connection Draining: the run hands nothing over, since the close discards
-     * what the pull held (#197), reports nothing, and handle() throws that error.
+     * A close of the application's under way when the frame's error reaches the engine still ends the run with that
+     * error, as it did in 2.22.0, and a drain() of the client still Draining then lets the hand-over before the run
+     * fails deliver what the pull held, as it delivers what the connection holds (#207). The pull holds m-1 when a
+     * fatal -ERR ends the connection, the reconnect's dial is held, so the engine's read waits for it, and the
+     * application drains the connection, which waits for the reconnect too. Once the dial is let through, the drain
+     * takes the reopened connection over, and the engine's read then throws the -ERR's error with the connection
+     * Draining: the run does not go on, the handler gets m-1 while the connection is Draining, the engine reports
+     * nothing, and handle() throws that error. On 2.23.0 the hand-over ended at any close, a drain() still Draining
+     * included, and the handler got nothing.
      */
-    public function testAConnectionDrainUnderWayWhenTheFramesErrorReachesTheEngineEndsTheRun(): void
+    public function testAConnectionDrainUnderWayWhenTheFramesErrorReachesTheEngineEndsTheRunAfterTheHandOver(): void
     {
         [$transport, $watched, $client, $recorder] = $this->client();
         $server = $this->pullServer($transport, self::answerOnTheNewConnection(true, 'm-2'));
         $handled = self::payloadLog();
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
-            ->handle(static function (NatsMessage $message) use ($handled): void {
-                $handled[] = $message->payload;
+            ->handle(static function (NatsMessage $message) use ($handled, $client): void {
+                $handled[] = $message->payload . ' (' . $client->state()->name . ')';
             });
         $this->waitUntil(static fn(): bool => $server->sid !== null && $watched->readsUnderWay === 1);
         $this->sendEachInAReadOfItsOwn($transport, $watched, $server, ['m-1']);
@@ -690,10 +696,72 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
         self::assertNull($processed, 'the run fails');
         self::assertInstanceOf(ConnectionException::class, $error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame(self::STALE_CONNECTION_ERROR, $error->getMessage());
-        self::assertSame([], $handled->getArrayCopy(), 'the close discards what the pull held');
+        self::assertSame(['m-1 (Draining)'], $handled->getArrayCopy(), 'a drain still Draining hands over what the pull held');
         self::assertSame([0], $server->epochs, 'no pull on the new connection');
         self::assertSame(ConnectionState::Closed, $client->state());
         self::assertSame([], $recorder->errorsContaining('Stale Connection'));
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function clientDrainsDuringTheHandOver(): iterable
+    {
+        yield 'the drain asks for the rest while the handler holds m-1' => [true];
+        yield 'the drain still flushing when the hand-over ends' => [false];
+    }
+
+    /**
+     * A drain() of the client during that hand-over lets it go on while the connection is Draining, and the run then
+     * ends with its count, with no pull written onto the inbox the drain has unsubscribed (#207). The pull holds m-1
+     * and m-2 when a fatal -ERR ends the connection, the reconnect reopening it at once, and the handler holds m-1 on a
+     * gate while the application drains the client. In the first data set the drain's flush is answered, and the drain,
+     * which reads its own PONG with the engine in the handler, asks the run for the rest and waits for it; in the
+     * second the server does not answer the drain's PING until the run has ended, so that the drain is still flushing
+     * when the hand-over ends. Either way the test opens the gate once the drain has got that far: the handler gets m-2
+     * while the connection is Draining, the run writes no pull, handle() returns 2, and drain() resolves, the engine
+     * having reported the -ERR's error once. On 2.23.0 the hand-over ended at the drain's close intent, m-2
+     * undelivered, and the run then wrote its next pull, after the drain's UNSUB of its inbox where the drain was still
+     * flushing, and failed with "Connection is not open" once the drain had closed the connection.
+     */
+    #[DataProvider('clientDrainsDuringTheHandOver')]
+    public function testAClientDrainDuringTheHandOverLetsItFinishAndTheRunWritesNoPullAfter(bool $flushAnswered): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport, self::answerOnTheNewConnection(true, 'm-3'));
+        $flush = new DrainFlushWatcher($transport, $watched, $client);
+        /** @var DeferredFuture<null> $gate */
+        $gate = new DeferredFuture();
+        $handled = self::payloadLog();
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(static function (NatsMessage $message) use ($handled, $client, $gate): void {
+                $handled[] = $message->payload . ' (' . $client->state()->name . ')';
+                if ($message->payload === 'm-1') {
+                    $gate->getFuture()->await();
+                }
+            });
+        $this->waitUntil(static fn(): bool => $server->sid !== null && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server, ['m-1', 'm-2']);
+        $transport->pushFrame(self::STALE_CONNECTION);
+        // The reconnect reopens the connection at once, and the hand-over holds m-1 in the handler.
+        $this->waitUntil(static fn(): bool => $handled->getArrayCopy() === ['m-1 (Open)']);
+
+        $transport->answerPings = $flushAnswered;
+        $drain = $client->drain();
+        $this->waitUntil(static fn(): bool => $flushAnswered ? $flush->flushDone() || $drain->isComplete() : $flush->pingWritten());
+        $gate->complete();
+        [$processed, $error] = self::settle($run);
+        if (!$flushAnswered) {
+            $transport->pushFrame("PONG\r\n");
+        }
+        $drain->await(new TimeoutCancellation(5));
+
+        self::assertSame(['m-1 (Open)', 'm-2 (Draining)'], $handled->getArrayCopy());
+        self::assertTrue($flush->unsubscribed((int) $server->sid));
+        self::assertSame([], $flush->pullsAfterTheUnsubscribeOf((int) $server->sid, self::PULL_SUBJECT), 'no pull after the drain\'s UNSUB of the inbox');
+        self::assertSame([0], $server->epochs, 'no pull on the new connection');
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(2, $processed);
+        self::assertSame([self::STALE_CONNECTION_ERROR], $recorder->errors);
+        self::assertSame(ConnectionState::Closed, $client->state());
     }
 
     /**

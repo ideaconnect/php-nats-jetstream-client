@@ -7,6 +7,7 @@ namespace IDCT\NATS\Core;
 use Amp\Cancellation;
 use Amp\Future;
 use IDCT\NATS\Connection\ConnectionStats;
+use IDCT\NATS\Connection\DrainParticipant;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
@@ -61,10 +62,14 @@ final class NatsClient
      *
      * Locally queued, undelivered messages are discarded without being delivered - nats.go
      * Close() parity (#134). Use {@see drain()} for the lossless path: it delivers the buffered
-     * backlog before closing. Neither close reaches what a JetStream pull consumer run's pulls hold:
-     * a run that this or drain() ends hands its handler none of it (#197). Drain the iterator
-     * ({@see \IDCT\NATS\JetStream\Consumers\PullConsumerIterator::drain()}) and await its handle()
-     * before you close the connection.
+     * backlog before closing. What a JetStream pull consumer run's pulls hold is discarded the same
+     * way, wherever the run is (#207): a run this ends hands its handler none of it, and a run handing
+     * a pull over, in its handler for one of the pull's messages say, stops before the next message,
+     * the rest left unacked for the server to deliver again after the ack wait (lost on a consumer
+     * without acks). The run's handle() then fails, with "Connection is not open" or the error of the
+     * read or write that met the close, except where the client's drain() had already asked the run
+     * for its hand-over, or where a finite run has no pull left to issue: it then resolves with its
+     * count.
      *
      * @return Future<void>
      */
@@ -81,6 +86,23 @@ final class NatsClient
      * if the budget runs out first it still closes. When it cannot wait it closes the connection and
      * throws. Every drain ends with one {@see \IDCT\NATS\Connection\Enum\ConnectionEvent::Closed}
      * event, and connect() is refused until it is over.
+     *
+     * A JetStream pull consumer run's pulls are drained too (#207): once the drain's flush is done, each
+     * run hands its handler what its pulls hold, in order, while the connection is Draining, so that the
+     * acks the handler publishes (ack(), nak(), term(), inProgress()) still go out, and the drain waits
+     * for that, the handler included, within the same budget. The connection refuses requests while it
+     * is Draining, so a request the handler makes then, an ackSync(), a JetStream publish or a Key/Value
+     * write, fails with "Connection is not open". The run then ends, and its handle() resolves with its
+     * count, as after the iterator's
+     * {@see \IDCT\NATS\JetStream\Consumers\PullConsumerIterator::drain()}. When the budget runs out
+     * first, the drain closes the connection, and what the run still holds is discarded from the "drain
+     * deadline exceeded" report on, which counts it, as a disconnect() discards it. A drain without a
+     * connection to drain (its budget ran out before the reconnect it waited for was done, or that
+     * reconnect gave up) asks no run: the run's read fails, and what it holds is discarded. Do not await
+     * it from code the run calls (its handler, its onError, the error listener while the run reports to
+     * it): the drain waits for the very run that waits for it, to the end of its budget, as it does from
+     * a subscription's handler that awaits it. Stop or drain the iterator there and drain the client
+     * once handle() has resolved, or call this from another fiber, or without awaiting it.
      *
      * @return Future<void>
      */
@@ -269,13 +291,51 @@ final class NatsClient
 
     /**
      * Whether the application has closed the connection, or is closing it: disconnect() or drain() was called since the
-     * last connect() ({@see NatsConnection::isCloseRequested()}).
+     * last connect() ({@see NatsConnection::isCloseRequested()}). The pull consumer engine asks it whether an infinite
+     * run goes on past a frame that ended the connection (#210); whether what a run holds is discarded is
+     * {@see isDiscardingUndelivered()}'s to say (#207).
      *
-     * @internal For the pull consumer engine (#197); not part of the supported API.
+     * @internal For the pull consumer engine (#197, #210); not part of the supported API.
      */
     public function isCloseRequested(): bool
     {
         return $this->connection->isCloseRequested();
+    }
+
+    /**
+     * Whether what the connection has received and not handed to a handler is a close's to discard: a disconnect()
+     * under way or done, or a drain() whose budget has run out (from its deadline report on) or that has none to
+     * drain, but not a drain() within its budget, which delivers it
+     * ({@see NatsConnection::isDiscardingUndelivered()}). The pull consumer engine asks it before each message it
+     * hands to the handler, wherever the run is (#207).
+     *
+     * @internal For the pull consumer engine (#207); not part of the supported API.
+     */
+    public function isDiscardingUndelivered(): bool
+    {
+        return $this->connection->isDiscardingUndelivered();
+    }
+
+    /**
+     * Registers what a drain() of this client waits for besides the connection's own backlog, and returns the id
+     * {@see removeDrainParticipant()} takes ({@see NatsConnection::addDrainParticipant()}): a pull consumer run, whose
+     * pulls a drain() asks it to hand over once its flush is done (#207).
+     *
+     * @internal For the pull consumer engine (#207); not part of the supported API.
+     */
+    public function addDrainParticipant(DrainParticipant $participant): int
+    {
+        return $this->connection->addDrainParticipant($participant);
+    }
+
+    /**
+     * Removes a participant {@see addDrainParticipant()} registered ({@see NatsConnection::removeDrainParticipant()}).
+     *
+     * @internal For the pull consumer engine (#207); not part of the supported API.
+     */
+    public function removeDrainParticipant(int $id): void
+    {
+        $this->connection->removeDrainParticipant($id);
     }
 
     /**

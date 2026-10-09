@@ -26,15 +26,23 @@ final class PullInFlight
      */
     public array $buffer = [];
 
+    /**
+     * How many of {@see $buffer}'s messages a delivery to the handler has handed over so far: the delivery's place in
+     * the buffer while the handler runs, so that what the handler has not got yet is known ({@see undelivered()}),
+     * for the drain's deadline report (#207). Back to 0 when the delivery empties the buffer.
+     */
+    public int $handedOver = 0;
+
     /** Count of data messages received on this pull; reaching {@see $batch} retires it as full. */
     public int $received = 0;
 
     /**
      * Whether the pull is complete: a full batch was received, or a terminal status frame arrived. Also set when the
-     * run hands the buffer over right before it ends with a failure (#197), or when an infinite run hands it over after
-     * a frame ended the connection (#210), so that the router attributes nothing more to the pull while the handler
-     * runs. That infinite run clears it again on a pull still open that it keeps in flight, emptied, while the
-     * reconnect is still under way, as the pulls in flight after an EOF stay open.
+     * run hands the buffer over right before it ends with a failure (#197), when an infinite run hands it over after a
+     * frame ended the connection (#210), or when the client's drain() asks the run for its hand-over (#207), so that
+     * the router attributes nothing more to the pull while the handler runs. The infinite run clears it again on a pull
+     * still open that it keeps in flight, emptied, while the reconnect is still under way, as the pulls in flight after
+     * an EOF stay open.
      */
     public bool $done = false;
 
@@ -54,4 +62,10 @@ final class PullInFlight
         public readonly int $batch,
         public readonly int $deadlineNs,
     ) {}
+
+    /** The messages of {@see $buffer} the handler has not got yet (#207). */
+    public function undelivered(): int
+    {
+        return count($this->buffer) - $this->handedOver;
+    }
 }

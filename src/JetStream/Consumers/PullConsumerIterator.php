@@ -328,12 +328,33 @@ final class PullConsumerIterator
      * PONG the socket would not take that the run does not go on past, see below), when a pull's write fails, when the
      * server rejects the run's reply inbox, or when the read fails for a reason the options make its own
      * (handlerErrorsFailOperations, slowConsumerErrorsFailOperations). Those messages go to the handler in the order
-     * they arrived, unless {@see stop()} was called, or the application closed the connection (a disconnect() or a
-     * drain() of the client, which discards them), and the future then fails with that error, unchanged. A handler that
-     * throws during that delivery ends it, and its exception goes to the connection's error listener and logger, since
-     * the run's own failure is the one thrown; on a closed connection that includes a handler whose ack failed. A
-     * handler that throws at any other time ends the run at once with its own exception, the other messages left
-     * undelivered.
+     * they arrived, unless {@see stop()} was called, or the application closed the connection in a way that discards
+     * them (see below), and the future then fails with that error, unchanged. A handler that throws during that
+     * delivery ends it, and its exception goes to the connection's error listener and logger, since the run's own
+     * failure is the one thrown; on a closed connection that includes a handler whose ack failed. A handler that throws
+     * at any other time ends the run at once with its own exception, the other messages left undelivered.
+     *
+     * The client's drain() hands over what the run's pulls hold, and its disconnect() discards it, wherever the run is
+     * (#207), as they do with what the connection itself has received. Once the drain's flush is done, the run hands
+     * every pull in flight to the handler in order while the connection is Draining, so that the acks the handler
+     * publishes still go out (a request, such as ackSync(), fails there with "Connection is not open", the connection
+     * refusing requests while it is Draining), and the future then resolves with the count, as after {@see drain()};
+     * the client's drain() waits for that, the handler included, within its budget, and when the budget runs out first
+     * it closes the connection, the rest left undelivered from its "drain deadline exceeded" report on, which names it,
+     * and the future still resolves with what was handed over, or fails with the error of a pull's write that the close
+     * cut short. A handler, onError or error listener that awaits the client's drain() while the run calls it holds
+     * that drain for its whole budget, since the drain waits for this run, as it waits for a subscription's handler
+     * that awaits it: stop() or drain() the iterator there, and drain the client once the future has resolved, or from
+     * another fiber. A handler that throws during the hand-over ends the run with its own exception, and a stop()
+     * leaves the rest undelivered. While the client's drain() is under way the run issues no new pull, and with none
+     * left in flight it ends with its count. A disconnect(), from the handler or from another fiber, ends whatever
+     * delivery is under way, the retire of a full pull included, before the next message: the rest stays unacked, for
+     * the server to deliver again after the ack wait (lost on a consumer without acks), and the future fails, as it
+     * does when the connection is closed under the run, with "Connection is not open" or the error of the read or write
+     * that met the close; it resolves with the count where the client's drain() had already asked the run for its
+     * hand-over, or where a finite run has no pull left to issue. A drain() that finds no connection to drain (its
+     * budget ran out before the reconnect it waited for was done, or that reconnect gave up) discards the same way, the
+     * future failing with "Connection is not open" or the reconnect's own error.
      *
      * An infinite run with reconnect on and waitForReconnect enabled goes on after a fatal -ERR ('Stale Connection',
      * 'User Authentication Expired') or a PONG the socket would not take, once the reconnect has reopened the
