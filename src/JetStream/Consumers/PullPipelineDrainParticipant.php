@@ -37,7 +37,7 @@ final class PullPipelineDrainParticipant implements DrainParticipant
 
     /**
      * @param \Closure(): int $held Counts the messages the run's pulls hold that the handler has not got yet, the pull
-     *        the retire phase is handing over included.
+     *        the retire phase is handing over included, and those its overflow holds (#187), each once.
      */
     public function __construct(private readonly \Closure $held)
     {
@@ -58,7 +58,9 @@ final class PullPipelineDrainParticipant implements DrainParticipant
         return $this->handOver->getFuture();
     }
 
-    /** What the run's pulls hold that the handler has not got yet, for the drain's deadline report. */
+    /**
+     * What the run's pulls, and its overflow, hold that the handler has not got yet, for the drain's deadline report.
+     */
     public function undelivered(): int
     {
         return ($this->held)();

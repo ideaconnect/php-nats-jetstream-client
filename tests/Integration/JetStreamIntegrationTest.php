@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Integration;
 
 use Amp\CancelledException;
+use Amp\DeferredFuture;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -2332,6 +2333,104 @@ final class JetStreamIntegrationTest extends TestCase
             }
         } finally {
             $client->disconnect()->await();
+        }
+    }
+
+    /**
+     * An infinite pull consumer run hands its handler what a request the server kept across a reconnect brings
+     * (#187). The worker's run (batch 1, depth 1, a 10 s expiry, a consumer with ack_policy none) waits on its pull
+     * when its socket is severed, the server staying up: the server keeps that request, and once the reconnect has
+     * subscribed the run's inbox again it holds two of the run's requests, the old one and the pull the run issued
+     * on the new connection, where the run counts one. m-1 then goes to the old request, and the run's pull takes it;
+     * the handler holds m-1 until the worker has received m-2, which the server gives the run's own request, so that
+     * no pull of the run is open when m-2 arrives. The handler gets both, in order, and the consumer counts both as
+     * delivered, nothing pending. The run used to drop m-2 as a straggler: delivered and, without acks, done for the
+     * consumer, but never handled.
+     */
+    public function testAPullConsumerHandlesWhatARequestTheServerKeptAcrossAReconnectBrings(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITKEPT' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $js = $admin->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, 'worker', $subject, ['ack_policy' => 'none'])->await();
+        [$client, $transport] = $this->connectRecoverableClient();
+        /** @var DeferredFuture<null> $gate */
+        $gate = new DeferredFuture();
+        /** @var \ArrayObject<int, string> $handled */
+        $handled = new \ArrayObject();
+        $iterator = $client->jetStream()->pullConsumer($stream, 'worker')->setBatching(1)->setDepth(1)->setExpiresMs(10_000);
+        $run = $iterator->handle(static function (NatsMessage $message) use ($handled, $gate): void {
+            $handled[] = $message->payload;
+            if ($message->payload === 'm-1') {
+                $gate->getFuture()->await();
+            }
+        });
+
+        try {
+            $this->waitForWaitingPulls($admin, $stream, 1);
+            $transport->sever();
+            $this->waitFor(static fn(): bool => $client->statistics()->reconnects === 1, 'the reconnect');
+            // The request the run issued before the reconnect, and the one it issued after it.
+            $this->waitForWaitingPulls($admin, $stream, 2);
+
+            $received = $client->statistics()->inMsgs;
+            $js->publish($subject, 'm-1')->await();
+            $this->waitFor(static fn(): bool => $handled->count() === 1, 'the handler holding m-1');
+            $js->publish($subject, 'm-2')->await();
+            // The worker reads m-2 while its handler holds m-1: none of the run's pulls is open.
+            $this->waitFor(static function () use ($client, $received): bool {
+                $client->processIncoming(new TimeoutCancellation(0.1))->await();
+
+                return $client->statistics()->inMsgs >= $received + 2;
+            }, 'the worker receiving m-2');
+            $gate->complete();
+            $this->waitFor(static fn(): bool => $handled->count() === 2, 'the handler getting m-2');
+            $iterator->stop();
+            $processed = $run->await(new TimeoutCancellation(5));
+            $info = $js->getConsumer($stream, 'worker')->await()->raw;
+
+            self::assertSame(['m-1', 'm-2'], $handled->getArrayCopy());
+            self::assertSame(2, $processed);
+            self::assertSame(1, $client->statistics()->reconnects);
+            self::assertIsArray($info['delivered'] ?? null);
+            self::assertSame(2, $info['delivered']['consumer_seq'] ?? null);
+            self::assertSame(0, $info['num_pending'] ?? null);
+        } finally {
+            if (!$gate->isComplete()) {
+                $gate->complete();
+            }
+            $iterator->stop();
+            $client->disconnect()->await();
+            $run->ignore();
+            $js->deleteStream($stream)->await();
+            $admin->disconnect()->await();
+        }
+    }
+
+    /** Waits until the pull consumer "worker" of $stream holds $count waiting pull requests, as its info reports. */
+    private function waitForWaitingPulls(NatsClient $admin, string $stream, int $count): void
+    {
+        $this->waitFor(
+            static fn(): bool => ($admin->jetStream()->getConsumer($stream, 'worker')->await()->raw['num_waiting'] ?? 0) === $count,
+            sprintf('%d waiting pull request(s)', $count),
+        );
+    }
+
+    /** Waits until $condition holds, failing after five seconds (monotonic) with what it waited for. */
+    private function waitFor(\Closure $condition, string $what): void
+    {
+        $deadline = $this->monotonic() + 5.0;
+        while (!$condition()) {
+            if ($this->monotonic() > $deadline) {
+                self::fail('Waited 5 s for ' . $what);
+            }
+
+            delay(0.01);
         }
     }
 }

@@ -298,10 +298,10 @@ final class PullConsumerIterator
 
     /**
      * Signals a running {@see handle()} loop to drain: it finishes processing the in-flight batch
-     * (so no fetched message is dropped) and then stops without issuing another pull. From another
-     * fiber the call wakes the engine once, so it stops issuing pulls at once and, with nothing in flight,
-     * returns at once; the in-flight pulls still complete or reach their deadline first, as from inside
-     * the handler (#181). Mirrors nats.go `ConsumeContext.Drain()`.
+     * (so no fetched message is dropped, across a reconnect too, #187) and then stops without issuing
+     * another pull. From another fiber the call wakes the engine once, so it stops issuing pulls at once
+     * and, with nothing in flight, returns at once; the in-flight pulls still complete or reach their
+     * deadline first, as from inside the handler (#181). Mirrors nats.go `ConsumeContext.Drain()`.
      */
     public function drain(): void
     {
@@ -365,6 +365,19 @@ final class PullConsumerIterator
      * disabled, whose connection the application is closing, or whose reconnect gave up while the read that met the
      * frame still waited for it; a reconnect that gives up later ends the run with its own error ("Reconnect attempts
      * exhausted"), as after a lost connection.
+     *
+     * An infinite run hands the handler every message it receives, across a reconnect too (#187). Once the connection
+     * has reconnected, the run ends its pulls in flight and pulls again at once, the server holding some of them or
+     * not: what they received reaches the handler first, in order, and a status one of them got on the old connection
+     * neither ends the run nor drops a group's pin. A server that outlived the connection still serves the requests the
+     * run issued before the reconnect, and a pull written during the outage goes out on the new connection: what such a
+     * request brings goes to the run's newer pulls, and what none of them has room for is held for the handler, in
+     * arrival order, behind what the pulls hold, counted in the future's result, the run issuing no pull until it has
+     * handed it over. So across a reconnect the handler can get more messages than the batch times the depth. A
+     * terminal status also hands over what the pulls behind the one it ended hold, before the future resolves. stop()
+     * and a close that discards leave such messages undelivered, as they leave any; the run used to drop them, for the
+     * server to deliver again after the ack wait, or never on a consumer without acks or with max_deliver 1. A finite
+     * run keeps its exact count, and drops what its last pull has no room for, as fetchBatch() does.
      *
      * Start the next run only once the previous run's future has resolved: the runs of one iterator
      * share the stop/drain flags, so a handle() while a run is still active clears a stop() or drain()
