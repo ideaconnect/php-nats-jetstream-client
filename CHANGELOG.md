@@ -15,6 +15,25 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.24.1] - 2026-10-09
+
+### Upgrade notes
+
+- A request whose PUB/HPUB write discovers a lost connection now honors its existing timeout,
+  caller cancellation and `waitForReconnect: false` while the connection recovers (#215).
+  `requestMany()` throws `TimeoutException` when its budget expires before the send completes;
+  after a successful send, its collection timeout still returns the replies collected, possibly none.
+  A transport write already in progress can finish after cancellation or timeout; neither guarantees
+  that the server did not act on the request.
+
+### Fixed
+
+- [bugfix] Keep `request()`, `requestWithHeaders()` and `requestMany()` PUB/HPUB writes and their
+  single recover-and-retry within the request's original budget, including inline socket backpressure.
+  Recovery continues independently after the request ends; expired requests are neither buffered
+  nor retried later. Each attempt rechecks the budget, connection state and shared reply inbox before
+  writing, so an inbox rejected or dropped during recovery cannot receive a retry (#215).
+
 ## [2.24.0] - 2026-10-09
 
 ### Upgrade notes

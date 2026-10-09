@@ -932,15 +932,15 @@ final class NatsConnection
     }
 
     /**
-     * Recovers a connection whose socket failed the write of a control frame - a SUB, or the PING of
-     * flush() or rtt() - and waits for it the way an operation waits for a recovery already in flight
+     * Recovers a connection whose socket failed a bounded write - a request's PUB/HPUB, a SUB, or the
+     * PING of flush() or rtt() - and waits for it the way an operation waits for a recovery already in flight
      * ({@see awaitOpenConnection()}): within the caller's own budget, and not at all when waiting is
      * disabled. A recovery that outlasts the budget carries on without the caller. A reconnect that the
      * recovery's Reconnected listener leaves in flight is waited for within the same budget.
      *
      * Such a write used to leave the connection Open on the dead socket, its raw error reaching the caller,
      * and every operation that wrote a control frame failed the same way until the heartbeat noticed. A
-     * publish recovers inline and sends again; these hand the recovery to its own fiber, as the heartbeat
+     * plain publish recovers inline and sends again; these hand the recovery to its own fiber, as the heartbeat
      * does, so that a caller with a budget keeps to it. It joins a recovery another fiber already runs, and
      * starts none for a connection since replaced ({@see recoverConnection()}). With reconnect off it closes
      * the connection for good, and the caller gets its "Reconnect is disabled".
@@ -2006,6 +2006,10 @@ final class NatsConnection
      * use a JetStream publish-with-ack rather than treating this success as proof the bytes were
      * transmitted.
      *
+     * A publish issued on an Open connection writes directly. If that write fails, it runs one
+     * recovery inline and retries afterward, including with waitForReconnect=false. publish() has
+     * no timeout or caller cancellation; requests use their own bounded write path.
+     *
      * The one exception to "resolves immediately" is sustained publish pressure during the reconnect
      * flush: once the buffer has been drained {@see self::RECONNECT_FLUSH_MAX_PASSES} times it is sealed
      * so recovery can reach Open in a bounded number of passes (#165). A publish that arrives after the
@@ -2019,10 +2023,7 @@ final class NatsConnection
     public function publish(string $subject, string $payload, ?string $replyTo = null): Future
     {
         return async(function () use ($subject, $payload, $replyTo): void {
-            $this->validatePublishSubjects($subject, $replyTo);
-            $this->enforceMaxPayload(strlen($payload));
-
-            $frame = $this->codec->encodePublish($subject, $payload, $replyTo);
+            $frame = $this->encodePublishFrame($subject, $payload, null, $replyTo);
 
             $this->writePublishFrame($frame);
             $this->recordOutbound($payload);
@@ -2032,6 +2033,7 @@ final class NatsConnection
     /**
      * Publishes payload bytes with NATS headers to the given subject. A header value may be a single
      * string or a list of strings for multi-value (multimap) headers (ADR-4).
+     * Delivery and recovery follow the same rules as {@see publish()}.
      *
      * @param array<string,string|list<string>> $headers
      * @return Future<void>
@@ -2043,23 +2045,38 @@ final class NatsConnection
         ?string $replyTo = null,
     ): Future {
         return async(function () use ($subject, $payload, $headers, $replyTo): void {
-            $this->validatePublishSubjects($subject, $replyTo);
-            // A server that does not advertise the `headers` capability treats HPUB as an unknown
-            // protocol operation and closes the connection; fail client-side instead (nats.go
-            // ErrHeadersNotSupported parity, #132).
-            if ($this->serverInfo?->headersSupported === false) {
-                throw new ConnectionException('Server does not advertise headers support; cannot publish with headers (HPUB)');
-            }
-            // Build (and CR/LF-validate) the header wire block once, then reuse it for sizing and for
-            // each write attempt, instead of re-running toWireBlock() per call.
-            $headerBlock = NatsHeaders::toWireBlock($headers);
-            $this->enforceMaxPayload(strlen($headerBlock) + strlen($payload));
-
-            $frame = $this->codec->encodeHeaderPublishBlock($subject, $payload, $headerBlock, $replyTo);
+            $frame = $this->encodePublishFrame($subject, $payload, $headers, $replyTo);
 
             $this->writePublishFrame($frame);
             $this->recordOutbound($payload);
         });
+    }
+
+    /**
+     * Validates and encodes one PUB/HPUB for both ordinary publishes and bounded request writes.
+     * The frame is built once and reused for a retry.
+     *
+     * @param array<string,string|list<string>>|null $headers Null selects PUB; even an empty array selects HPUB.
+     */
+    private function encodePublishFrame(string $subject, string $payload, ?array $headers, ?string $replyTo): string
+    {
+        $this->validatePublishSubjects($subject, $replyTo);
+        if ($headers === null) {
+            $this->enforceMaxPayload(strlen($payload));
+
+            return $this->codec->encodePublish($subject, $payload, $replyTo);
+        }
+
+        // Without the advertised capability, HPUB closes the server connection (#132).
+        if ($this->serverInfo?->headersSupported === false) {
+            throw new ConnectionException('Server does not advertise headers support; cannot publish with headers (HPUB)');
+        }
+
+        // Build and CR/LF-validate once, for both sizing and encoding.
+        $headerBlock = NatsHeaders::toWireBlock($headers);
+        $this->enforceMaxPayload(strlen($headerBlock) + strlen($payload));
+
+        return $this->codec->encodeHeaderPublishBlock($subject, $payload, $headerBlock, $replyTo);
     }
 
     /**
@@ -2149,7 +2166,7 @@ final class NatsConnection
     /**
      * Validates a publish subject (cached) and its optional reply subject. The reply is validated
      * uncached: a publish replyTo is typically a per-request unique inbox, so caching it would only
-     * churn the memo (see validateSubjectCached()). Shared by publish() and publishWithHeaders().
+     * churn the memo (see validateSubjectCached()). Shared by ordinary publishes and requests.
      */
     private function validatePublishSubjects(string $subject, ?string $replyTo): void
     {
@@ -4431,11 +4448,86 @@ final class NatsConnection
     }
 
     /**
+     * Sends a request within its existing budget, with at most one recover-and-retry (#215).
+     * Requests never enter the ordinary publish reconnect buffer: they wait for Open, then recheck
+     * their deadline and reply inbox immediately before each transport write.
+     *
+     * A transport may suspend inline before write() returns its Future. Each attempt therefore runs
+     * in its own fiber, and the request bounds its wait for that fiber. An already-started write is
+     * uncancellable and may finish after expiry; no new write starts after expiry. A late failure can
+     * still repair the connection independently, but cannot retry the abandoned request.
+     *
+     * @param array<string,string>|null $headers
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     */
+    private function publishRequestWithin(
+        string $subject,
+        string $payload,
+        ?array $headers,
+        string $replyTo,
+        Cancellation $budget,
+        ?Cancellation $cancellation,
+        ?\Fiber $caller,
+        int $closes,
+        int $muxGeneration,
+    ): void {
+        $frame = $this->encodePublishFrame($subject, $payload, $headers, $replyTo);
+
+        try {
+            for ($attempt = 0; ; $attempt++) {
+                $budget->throwIfRequested();
+                $write = async(function () use ($frame, $payload, $budget, $caller, $closes, $muxGeneration): ?array {
+                    $budget->throwIfRequested();
+                    $this->awaitOpenConnection($budget, $caller);
+                    // The scheduled writer may start after its waiter expired, or after a recovery
+                    // dropped/rejected the mux. Never send on that expired or unusable request.
+                    $budget->throwIfRequested();
+                    $this->throwUnlessMuxInstalled($closes, $muxGeneration);
+                    $generation = $this->connectionGeneration;
+
+                    try {
+                        $this->transport->write($frame)->await();
+                    } catch (\Throwable $writeError) {
+                        if ($budget->isRequested()) {
+                            // The request may already have left. Repair only the failed generation;
+                            // this continuation owns no retry and cannot damage a newer connection.
+                            async(function () use ($generation, $writeError): void {
+                                $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
+                            })->ignore();
+                        }
+
+                        return [$generation, $writeError];
+                    }
+
+                    $this->recordOutbound($payload);
+
+                    return null;
+                });
+                $write->ignore();
+                $failure = $write->await($budget);
+                if ($failure === null) {
+                    return;
+                }
+
+                [$generation, $writeError] = $failure;
+                if ($attempt === 1) {
+                    throw $writeError;
+                }
+
+                $this->recoverAfterFailedWrite($generation, $writeError, $budget, $caller);
+            }
+        } catch (CancelledException) {
+            throw $this->requestNotSentFailure($subject, $cancellation, 'the request to be sent');
+        }
+    }
+
+    /**
      * Executes request/reply flow using plain publish or header publish variants.
      *
      * One budget covers the whole request: the wait for an in-flight reconnect
      * ({@see NatsOptions::$waitForReconnect}), the mux inbox set-up, the publish and the wait for the
-     * reply all draw on the deadline started here, so a request never outlives its timeout.
+     * reply all draw on the deadline started here. The publish wait includes inline transport
+     * backpressure and recovery from its own failed write; no retry starts after the budget expires.
      *
      * @param array<string,string>|null $headers
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called request()/requestWithHeaders().
@@ -4493,11 +4585,7 @@ final class NatsConnection
         }, $replyArrived);
 
         try {
-            if ($headers === null) {
-                $this->publish($subject, $payload, $replyTo)->await();
-            } else {
-                $this->publishWithHeaders($subject, $payload, $headers, $replyTo)->await();
-            }
+            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $caller, $closes, $muxGeneration);
 
             while (true) {
                 // Completion is checked BEFORE the deadline so a reply delivered in the same tick the
@@ -4711,11 +4799,7 @@ final class NatsConnection
         }, $replyWake);
 
         try {
-            if ($headers === null) {
-                $this->publish($subject, $payload, $replyTo)->await();
-            } else {
-                $this->publishWithHeaders($subject, $payload, $headers, $replyTo)->await();
-            }
+            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $caller, $closes, $muxGeneration);
 
             while (true) {
                 // The connection closed for good while replies were awaited (see requestInternal()): what was

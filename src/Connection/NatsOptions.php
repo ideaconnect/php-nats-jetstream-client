@@ -113,9 +113,12 @@ final class NatsOptions
       *        publish buffered during the reconnect yields one event-loop tick. The wait is also what lets
       *        a synchronous application drive the reconnect: the reconnect only advances while something
       *        waits on the event loop, so a caller that only ever issued operations failing on the spot
-      *        would starve it forever. An operation whose own read or control write is the first to notice
-      *        a lost connection, or whose read brings a lame-duck INFO that fails the connection over,
-      *        starts the reconnect and waits for it the same way, within its own timeout (#178, #191); your
+      *        would starve it forever. An operation whose own read, control write or request PUB/HPUB
+      *        write is the first to notice a lost connection, or whose read brings a lame-duck INFO
+      *        that fails the connection over,
+      *        starts the reconnect and waits for it the same way, within its own timeout (#178, #191, #215).
+      *        Requests never enter the reconnect publish buffer; a retry checks the same budget and
+      *        reply inbox, and a transport write already in progress may finish after the request ends. Your
       *        own processIncoming()/readIncoming(), a serving loop's read and the heartbeat run the reconnect
       *        themselves and wait for all of it. Set `false` to fail fast instead (the behavior before this
       *        option existed): an operation whose own read or write noticed the loss, or whose read brought

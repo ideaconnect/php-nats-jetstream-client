@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3045 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 3101 unit tests, 149 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -268,6 +268,24 @@ A control frame - a SUB, an UNSUB, the PING of flush() or rtt() - whose write fi
 - `testFlushWhosePingWriteFindsTheSocketDeadGivesUpAtItsBudget` - With dials refused, flush() throws `Flush timed out waiting for the connection to be re-established` within its budget, the reconnect still running.
 - `testUnsubscribeWhoseUnsubWriteFindsTheSocketDeadDoesNotThrow` - unsubscribe() returns; the next publish reconnects, and the subscription is not replayed.
 - `testAutoUnsubscribeWhoseWriteFindsTheSocketDeadIsArmedOnTheNewConnection` - unsubscribe($sid, 3) returns; after the next publish reconnects, `UNSUB <sid> 3` is on the new connection.
+
+### tests/Unit/FailedRequestWriteTest.php
+
+Request PUB/HPUB failure coverage for `request()`, `requestWithHeaders()` and `requestMany()` (#215). Held recovery dials prove requests end independently of recovery; inline-wedged writes mirror real socket backpressure.
+
+- `testTimeoutEndsTheRequestBeforeRecoveryAndDoesNotResendItLater` - All four request variants time out before the held recovery finishes, leave no mux waiters, and send nothing after recovery.
+- `testCancellationEndsTheRequestBeforeRecoveryAndDoesNotResendItLater` - Caller cancellation ends each request during recovery and prevents a late retry.
+- `testWaitingDisabledFailsBeforeRecoveryWithoutBufferingTheRequest` - With `waitForReconnect: false`, a failed request write reports `Connection is not open` with the write error as its previous, while recovery continues without buffering the request.
+- `testRecoveryWithinBudgetReplaysTheInboxAndRetriesTheRequestOnce` - Recovery restores the inbox, retries once and delivers the reply; outbound message and payload counters record the successful send once.
+- `testReconnectDisabledClosesTheConnectionInsteadOfRetrying` - With reconnect disabled, a failed request write reports `Reconnect is disabled`, closes the connection and leaves no mux waiters.
+- `testCancellationInTheReconnectedListenerPreventsTheRetry` - Cancellation during the Reconnected listener prevents sending on the restored connection.
+- `testCancellationBeforeTheScheduledRetryRunsPreventsTheWrite` - Cancellation queued between recovery completion and the scheduled writer prevents the retry, proving the writer itself checks the budget.
+- `testAnInvalidatedReplayedInboxPreventsTheRetry` - Permission rejection or a subscription-limit drop of the inbox replay fails the request before its retry is sent.
+- `testASecondFailedWriteDoesNotRetryTheRequestAgain` - A failed retry surfaces its transport error without another recovery or request attempt.
+- `testInlineWriteBackpressureIsBoundedByTheRequestTimeout` - Inline socket backpressure cannot park a request past its timeout; teardown releases the abandoned write without a retry.
+- `testInlineWriteBackpressureIsBoundedByCallerCancellation` - Caller cancellation ends a request parked inside transport write() before the test guard expires.
+- `testAnAbandonedWriteThatLaterFailsRepairsTheConnectionWithoutResending` - A write failure surfacing after request timeout still repairs the connection, with no late request frame.
+- `testCollectionTimeoutAfterASuccessfulRetryReturnsTheCollectedReplies` - After a successful PUB/HPUB retry, requestMany() collection expiry returns either its reply or an empty collection.
 
 ### tests/Unit/FeatureSupportTest.php
 - `testRequiredVersion` - Asserts the version registry returns the minimum NATS version for known fields (filter_subjects->2.10, allow_msg_ttl->2.11, allow_atomic->2.12) and null for unknown fields.
