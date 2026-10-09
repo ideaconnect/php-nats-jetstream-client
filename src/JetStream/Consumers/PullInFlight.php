@@ -31,8 +31,10 @@ final class PullInFlight
 
     /**
      * Whether the pull is complete: a full batch was received, or a terminal status frame arrived. Also set when the
-     * run hands the buffer over right before it ends with a failure (#197), so that the router attributes nothing more
-     * to the pull while the handler runs.
+     * run hands the buffer over right before it ends with a failure (#197), or when an infinite run hands it over after
+     * a frame ended the connection (#210), so that the router attributes nothing more to the pull while the handler
+     * runs. That infinite run clears it again on a pull still open that it keeps in flight, emptied, while the
+     * reconnect is still under way, as the pulls in flight after an EOF stay open.
      */
     public bool $done = false;
 

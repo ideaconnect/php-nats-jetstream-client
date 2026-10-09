@@ -15,6 +15,54 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.23.0] - 2026-10-09
+
+### Upgrade notes
+
+- An infinite JetStream pull consumer run, `PullConsumerIterator::handle()` without `setIterations()`, with reconnect on
+  and `waitForReconnect` enabled (the defaults), now goes on after a fatal `-ERR` (`Stale Connection`,
+  `User Authentication Expired`, ...) or a server `PING` whose `PONG` the socket would not take, once the reconnect has
+  reopened the connection, as it goes on after a lost connection (#210). The frame's error goes to the error listener
+  and the logger, and `handle()` no longer throws it: a worker that restarted its consumer when `handle()` failed with
+  `Server sent error frame: 'Stale Connection'` finds the run still going. What the pulls held when the connection ended
+  reaches the handler as part of the run and counts in the result of `handle()`, and a handler that throws there ends
+  the run with its own exception, where 2.22.0 reported it and threw the frame's error. A finite run still ends with the
+  frame's error, and so does an infinite one with reconnect off or `waitForReconnect: false`, whose connection the
+  application is closing, or whose reconnect gave up, or whose new server refused the credentials, while the read that
+  met the frame was still waiting for it. A reconnect that gives up only after that read stopped waiting, as one against
+  a server that stays down does with the default options (ten attempts whose backoffs alone add up to about 43 s, where
+  that read waits at most the run's expiry plus one second), ends the run as after a lost connection: the frame's error
+  goes to the error listener first, and `handle()` then throws `Reconnect attempts exhausted`.
+
+### Fixed
+
+- `[bugfix]` An infinite pull consumer run ended on a fatal `-ERR` or a `PONG` the socket would not take even when the
+  reconnect had reopened the connection, where it goes on after an EOF (#210). The pump read that met such a frame
+  recovered the connection and threw the frame's error once the reconnect was done (#171), and the engine took that as
+  the end of the run: it handed over what its pulls held (#197) and `handle()` failed with
+  `Server sent error frame: 'Stale Connection'` while the connection was Open on the new socket, so a worker stopped
+  consuming until something started it again. A server sends `Stale Connection` to a client that left its `PING`s
+  unanswered for a few intervals (a handler that blocks the event loop with synchronous work, a paused process), and
+  `User Authentication Expired` when a user JWT expires, which `jwtProvider` renews on every reconnect, so every expiry
+  ended such a consumer. Such a run now goes on, as after a lost connection: the frame's error goes to the error
+  listener and the logger, since nothing else says why the server closed the connection; what the pulls held goes to the
+  handler in issue order as a delivery of the run, counted in its total, with `stop()` and a close of the application's
+  ending it and a pinned group's pin captured from it; and the run pulls again on the new connection, once the reconnect
+  is done, or, when the read's own wait ended first, once its next read has waited for the reconnect. A finite run,
+  reconnect off, `waitForReconnect: false`, a reconnect that gave up while the read was still waiting for it and a close
+  of the application's still end the run with the frame's error, and so does any failure that leaves the connection
+  open; a reconnect that gives up later ends the run as after an EOF, with `Reconnect attempts exhausted`. Measured on
+  nats-server 2.12 with `ping_interval: "1s"` and `ping_max: 1`: an infinite run of batch 1 and depth 1 whose handler
+  blocked the process for 3.5 s on m-1 (`usleep()`), the client's own heartbeat off. The server logged
+  `Stale Client Connection - Closing`; in 2.22.0, `handle()` threw `Server sent error frame: 'Stale Connection'` right
+  after the `Reconnected` event, 3.5 s into the run, with `ack_policy` explicit and none alike, and m-2 and m-3,
+  published once the client had reconnected, were never consumed (`num_pending` 2). The run now reports that error to
+  the error listener, gets m-2 and m-3 on the new connection, and `handle()` returns 3 when the handler stops it on m-3
+  (`num_pending` 0, `num_ack_pending` 0 with explicit acks). With the process blocked by a timer while the run's pull
+  (batch 3) held m-1, 2.22.0 handed m-1 over before it threw; the run now hands it over as part of the run and goes on
+  to m-2 and m-3. A handler that acks m-1 only after blocking still loses that ack to the closed socket, as before: the
+  server redelivers m-1 after `ack_wait`.
+
 ## [2.22.0] - 2026-10-08
 
 ### Upgrade notes
