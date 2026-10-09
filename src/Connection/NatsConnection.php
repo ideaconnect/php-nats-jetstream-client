@@ -297,6 +297,10 @@ final class NatsConnection
      * @var list<int>
      */
     private array $guardedSidsToRelease = [];
+    /** @var array<int, int> Generation of a budgeted SUB write still in progress. */
+    private array $subscriptionWrites = [];
+    /** @var array<int, array{generation: int, future: Future<null>}> */
+    private array $subscriptionReleases = [];
     private int $outstandingPings = 0;
     private ?string $pingTimerId = null;
     /**
@@ -2433,7 +2437,12 @@ final class NatsConnection
         ?\Closure $registered = null,
         string $before = '',
         string $after = '',
+        ?Cancellation $budget = null,
     ): int {
+        if ($budget !== null) {
+            return $this->subscribeWithin($subject, $handler, $queue, $caller, $registered, $before, $after, $budget);
+        }
+
         if ($this->state !== ConnectionState::Open) {
             try {
                 $this->awaitOpenConnection(new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $caller);
@@ -2467,7 +2476,7 @@ final class NatsConnection
             try {
                 $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $caller);
             } catch (CancelledException) {
-                $this->dropSubscriptionState($sid);
+                $this->releaseTemporarySubscription($sid);
 
                 throw new TimeoutException(sprintf('Subscribe to "%s" timed out waiting for the connection to be re-established', $subject));
             } catch (\Throwable $recoveryError) {
@@ -2485,6 +2494,90 @@ final class NatsConnection
         }
 
         return $sid;
+    }
+
+    /**
+     * Budgeted guarded SUB, including inline transport backpressure. Recovery replays its registration;
+     * this writer never retries SUB itself. Abandoned registrations cannot be replayed or resurrected.
+     *
+     * @param callable(NatsMessage):void $handler
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @param (\Closure(int):void)|null $registered
+     */
+    private function subscribeWithin(
+        string $subject,
+        callable $handler,
+        ?string $queue,
+        ?\Fiber $caller,
+        ?\Closure $registered,
+        string $before,
+        string $after,
+        Cancellation $budget,
+    ): int {
+        $this->validateSubject($subject, allowWildcards: true);
+        if ($queue !== null) {
+            $this->validateQueueGroup($queue);
+        }
+        $sid = $this->nextSid++;
+        $closes = $this->terminalCloses;
+        $bytes = $before . $this->codec->encodeSubscribe($subject, $sid, $queue) . $after;
+
+        try {
+            $budget->throwIfRequested();
+            $write = async(function () use ($subject, $handler, $queue, $caller, $registered, $budget, $sid, $closes, $bytes): ?array {
+                $budget->throwIfRequested();
+                $this->awaitOpenConnection($budget, $caller);
+                $budget->throwIfRequested();
+                if ($this->terminalCloses !== $closes) {
+                    throw new ConnectionException('Connection was closed while the reply inbox was being set up');
+                }
+
+                $this->subscriptions[$sid] = $handler;
+                $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
+                $this->pendingMessages[$sid] = new SplQueue();
+                $registered?->__invoke($sid);
+                $generation = $this->connectionGeneration;
+                $this->subscriptionWrites[$sid] = $generation;
+                try {
+                    $this->transport->write($bytes)->await();
+                } catch (\Throwable $error) {
+                    if ($budget->isRequested()) {
+                        async(fn() => $this->recoverConnection(failedGeneration: $generation, cause: $error))->ignore();
+                    }
+
+                    return [$generation, $error];
+                } finally {
+                    unset($this->subscriptionWrites[$sid]);
+                }
+
+                if (!$this->isSubscriptionActive($sid)) {
+                    // The caller abandoned a pending SUB. Its UNSUB must follow that SUB, on that session.
+                    $this->sendSubscriptionRelease($sid, $generation);
+                }
+
+                return null;
+            });
+            $write->ignore();
+            $failure = $write->await($budget);
+            if ($failure !== null) {
+                [$generation, $error] = $failure;
+                $this->recoverAfterFailedWrite($generation, $error, $budget, $caller);
+            }
+            $budget->throwIfRequested();
+            if (!isset($this->subscriptionMeta[$sid])) {
+                throw new ConnectionException(sprintf('Subscribe to "%s" failed: the connection was closed', $subject));
+            }
+
+            return $sid;
+        } catch (CancelledException $error) {
+            $this->releaseTemporarySubscription($sid);
+
+            throw new TimeoutException(sprintf('Subscribe to "%s" timed out within the operation budget', $subject), 0, $error);
+        } catch (\Throwable $error) {
+            $this->releaseTemporarySubscription($sid);
+
+            throw $error;
+        }
     }
 
     /**
@@ -2509,7 +2602,8 @@ final class NatsConnection
      * registration is recorded before the SUB is written, so whichever fiber reads the server's answer finds it.
      *
      * The subscribe part behaves as {@see subscribe()}: it waits for a reconnect in flight, within the request
-     * timeout, and a failed write leaves the registration for the reconnect to replay. When the new server rejects
+     * timeout unless an operation budget is supplied. That budget also bounds SUB write backpressure. A failed
+     * write leaves the registration for the reconnect to replay. When the new server rejects
      * that replay, the replay's drain drops the registration, $onRejected called, and this reports the rejection,
      * with a ConnectionException naming the subject and the limit, where {@see subscribeInternal()} sees a closed
      * connection - as {@see ensureMuxInbox()} reports a dropped reply inbox; the replay writes the UNSUB
@@ -2524,11 +2618,11 @@ final class NatsConnection
      *        dispatch of the -ERR.
      * @return Future<int>
      */
-    public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected): Future
+    public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected, ?Cancellation $budget = null): Future
     {
         $caller = \Fiber::getCurrent();
 
-        return async(function () use ($subject, $handler, $onRejected, $caller): int {
+        return async(function () use ($subject, $handler, $onRejected, $caller, $budget): int {
             // Recorded here as well, so that a rejection read while this fiber waits in its subscribe - by the
             // drain of the reconnect a failed write started - is told from a connection that closed.
             /** @var string|null $rejection */
@@ -2552,6 +2646,7 @@ final class NatsConnection
                         $this->unconfirmedSids[$sid] = $this->enqueuePongSlot();
                     },
                     after: $this->codec->encodePing(),
+                    budget: $budget,
                 );
             } catch (ConnectionException $e) {
                 throw $this->guardedSubscribeFailure($subject, $rejection, $e);
@@ -2707,6 +2802,70 @@ final class NatsConnection
             // Dropped even when the write failed, so that recovery does not subscribe the sid again (#116).
             $this->dropSubscriptionState($sid);
         });
+    }
+
+    /**
+     * @internal Releases a temporary inbox locally, and bounds only the wait for its wire cleanup.
+     * @return Future<void>
+     */
+    public function releaseSubscriptionWithin(int $sid, Cancellation $budget): Future
+    {
+        return async(function () use ($sid, $budget): void {
+            $release = $this->releaseTemporarySubscription($sid);
+            if ($release !== null) {
+                try {
+                    $release->await($budget);
+                } catch (CancelledException) {
+                    // Cleanup continues without delaying or masking the operation's result.
+                }
+            }
+        });
+    }
+
+    /** @return Future<null>|null */
+    private function releaseTemporarySubscription(int $sid): ?Future
+    {
+        $held = isset($this->subscriptionMeta[$sid]);
+        $owed = $this->takeOwedRelease($sid);
+        $this->dropSubscriptionState($sid);
+        if ((!$held && !$owed) || $this->state !== ConnectionState::Open) {
+            // A reconnect's finishReplayWindow releases anything already replayed while Connecting.
+            return null;
+        }
+        if (($this->subscriptionWrites[$sid] ?? null) === $this->connectionGeneration) {
+            // The writer releases the SID after its pending SUB completes, preserving wire order.
+            return null;
+        }
+
+        return $this->sendSubscriptionRelease($sid, $this->connectionGeneration);
+    }
+
+    /** @return Future<null> */
+    private function sendSubscriptionRelease(int $sid, int $generation): Future
+    {
+        $existing = $this->subscriptionReleases[$sid] ?? null;
+        if ($existing !== null && $existing['generation'] === $generation) {
+            return $existing['future'];
+        }
+        $write = async(function () use ($sid, $generation): null {
+            try {
+                if ($this->connectionGeneration === $generation && $this->state === ConnectionState::Open) {
+                    $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
+                }
+            } catch (\Throwable) {
+                // A failed UNSUB on a dead socket has no remaining server subscription to release.
+            } finally {
+                if (($this->subscriptionReleases[$sid]['generation'] ?? null) === $generation) {
+                    unset($this->subscriptionReleases[$sid]);
+                }
+            }
+
+            return null;
+        });
+        $write->ignore();
+        $this->subscriptionReleases[$sid] = ['generation' => $generation, 'future' => $write];
+
+        return $write;
     }
 
     /**
@@ -4472,52 +4631,101 @@ final class NatsConnection
         int $muxGeneration,
     ): void {
         $frame = $this->encodePublishFrame($subject, $payload, $headers, $replyTo);
-
         try {
-            for ($attempt = 0; ; $attempt++) {
-                $budget->throwIfRequested();
-                $write = async(function () use ($frame, $payload, $budget, $caller, $closes, $muxGeneration): ?array {
-                    $budget->throwIfRequested();
-                    $this->awaitOpenConnection($budget, $caller);
-                    // The scheduled writer may start after its waiter expired, or after a recovery
-                    // dropped/rejected the mux. Never send on that expired or unusable request.
-                    $budget->throwIfRequested();
-                    $this->throwUnlessMuxInstalled($closes, $muxGeneration);
-                    $generation = $this->connectionGeneration;
-
-                    try {
-                        $this->transport->write($frame)->await();
-                    } catch (\Throwable $writeError) {
-                        if ($budget->isRequested()) {
-                            // The request may already have left. Repair only the failed generation;
-                            // this continuation owns no retry and cannot damage a newer connection.
-                            async(function () use ($generation, $writeError): void {
-                                $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
-                            })->ignore();
-                        }
-
-                        return [$generation, $writeError];
-                    }
-
-                    $this->recordOutbound($payload);
-
-                    return null;
-                });
-                $write->ignore();
-                $failure = $write->await($budget);
-                if ($failure === null) {
-                    return;
-                }
-
-                [$generation, $writeError] = $failure;
-                if ($attempt === 1) {
-                    throw $writeError;
-                }
-
-                $this->recoverAfterFailedWrite($generation, $writeError, $budget, $caller);
-            }
+            $this->publishFrameWithin(
+                static fn(): array => [$frame, $payload],
+                $budget,
+                $caller,
+                fn() => $this->throwUnlessMuxInstalled($closes, $muxGeneration),
+            );
         } catch (CancelledException) {
             throw $this->requestNotSentFailure($subject, $cancellation, 'the request to be sent');
+        }
+    }
+
+    /**
+     * @internal Publishes a batch request without reconnect buffering. The callbacks must not suspend.
+     * @param \Closure():?string $payload Null means replies already establish that no further send is needed.
+     * @param \Closure():void $beforeWrite Checks the operation's recorded inbox rejection before every attempt.
+     * @return Future<void>
+     */
+    public function publishWithin(string $subject, \Closure $payload, string $replyTo, int $replySid, Cancellation $budget, \Closure $beforeWrite): Future
+    {
+        $caller = \Fiber::getCurrent();
+
+        return async(function () use ($subject, $payload, $replyTo, $replySid, $budget, $beforeWrite, $caller): void {
+            try {
+                $this->publishFrameWithin(
+                    function () use ($subject, $payload, $replyTo): ?array {
+                        $body = $payload();
+
+                        return $body === null ? null : [$this->encodePublishFrame($subject, $body, null, $replyTo), $body];
+                    },
+                    $budget,
+                    $caller,
+                    function () use ($replySid, $beforeWrite): void {
+                        $beforeWrite();
+                        if (!isset($this->subscriptionMeta[$replySid])) {
+                            throw new ConnectionException('Connection was closed while the reply inbox was being set up');
+                        }
+                    },
+                );
+            } catch (CancelledException $error) {
+                throw new TimeoutException('Batch request timed out before publication completed', 0, $error);
+            }
+        });
+    }
+
+    /**
+     * @param \Closure():?array{string,string} $makeFrame
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @param \Closure():void $guard
+     */
+    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, ?\Fiber $caller, \Closure $guard): void
+    {
+        for ($attempt = 0; ; $attempt++) {
+            $budget->throwIfRequested();
+            $write = async(function () use ($makeFrame, $budget, $caller, $guard): ?array {
+                $budget->throwIfRequested();
+                $this->awaitOpenConnection($budget, $caller);
+                $budget->throwIfRequested();
+                $guard();
+                $encoded = $makeFrame();
+                if ($encoded === null) {
+                    return null;
+                }
+                [$frame, $payload] = $encoded;
+                $budget->throwIfRequested();
+                $generation = $this->connectionGeneration;
+
+                try {
+                    $this->transport->write($frame)->await();
+                } catch (\Throwable $writeError) {
+                    if ($budget->isRequested()) {
+                        async(function () use ($generation, $writeError): void {
+                            $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
+                        })->ignore();
+                    }
+
+                    return [$generation, $writeError];
+                }
+
+                $this->recordOutbound($payload);
+
+                return null;
+            });
+            $write->ignore();
+            $failure = $write->await($budget);
+            if ($failure === null) {
+                return;
+            }
+
+            [$generation, $writeError] = $failure;
+            if ($attempt === 1) {
+                throw $writeError;
+            }
+
+            $this->recoverAfterFailedWrite($generation, $writeError, $budget, $caller);
         }
     }
 

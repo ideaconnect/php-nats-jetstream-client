@@ -2314,4 +2314,24 @@ final class JetStreamIntegrationTest extends TestCase
             $admin->disconnect()->await();
         }
     }
+
+    public function testJetStreamFetchDuringALongerOutageEndsWithItsOwnEmptyResult(): void
+    {
+        $this->requireIntegrationEnabled();
+        [$client, $transport] = $this->connectRecoverableClient();
+
+        try {
+            $this->takeServerDownFor($client, $transport);
+            try {
+                $client->jetStream()->fetchBatch('UNSENT', 'UNSENT', 1, 100)->await(new TimeoutCancellation(2));
+                self::fail('expected the fetch deadline to end before reconnect becomes available');
+            } catch (JetStreamException $error) {
+                self::assertSame(408, $error->getCode());
+                self::assertSame('No messages received within timeout', $error->getMessage());
+                self::assertSame(ConnectionState::Connecting, $client->state());
+            }
+        } finally {
+            $client->disconnect()->await();
+        }
+    }
 }
