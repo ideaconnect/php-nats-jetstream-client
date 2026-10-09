@@ -352,6 +352,70 @@ final class PullConsumerClientDrainTest extends TestCase
         self::assertSame(ConnectionState::Closed, $client->state());
     }
 
+    /** @return iterable<string, array{array<string, list<string>>, int, int}> */
+    public static function pullsHoldingMessagesWhenTheBudgetRunsOut(): iterable
+    {
+        yield 'two runs on one connection, each holding the rest of its pull' => [['C' => ['c-1', 'c-2'], 'D' => ['d-1', 'd-2']], 1, 2];
+        yield 'one run of depth 2, holding the rest of one pull and all of the next' => [['C' => ['c-1', 'c-2', 'c-3', 'c-4']], 2, 3];
+    }
+
+    /**
+     * The drain's report names the sum of what every run still holds when its budget runs out, and of what every pull
+     * of a run holds: a budget of half a second (requestTimeoutMs 500), batch 2, the server answering the first pull of
+     * each run with all its messages in one chunk, so that the first pull is full and the retire phase hands it over,
+     * and each handler holding its first message on a gate that the test opens once drain() has resolved. In the first
+     * data set two runs on one connection, of consumers C and D, hold the rest of their pulls, c-2 and d-2: the drain
+     * asks both, waits for both to the end of its budget, and its report names 2. In the second, a run of depth 2 holds
+     * c-2 in the pull being retired and c-3 and c-4 in the second pull, still in flight behind it: the report names 3.
+     * Nothing the report named reaches a handler, and each handle() returns 1, what was handed over. Counting only the
+     * last run the drain asked, the report named 1 in the first data set, and counting only the last pull of the run,
+     * 2 in the second. On 2.23.0 the drain asked no run and resolved without waiting, reporting nothing: each handler
+     * then got the rest on the Closed connection, and handle() threw "Connection is not open".
+     *
+     * @param array<string, list<string>> $answers What the server answers the first pull of each consumer's run with.
+     */
+    #[DataProvider('pullsHoldingMessagesWhenTheBudgetRunsOut')]
+    public function testTheDrainsReportAddsUpWhatEveryRunAndEveryPullStillHolds(array $answers, int $depth, int $notDelivered): void
+    {
+        [$transport, , $client, $recorder] = $this->client(requestTimeoutMs: 500);
+        $this->pullServer($transport, static fn(string $consumer, string $replyTo, int $sid, int $pull): array => $pull === 1 ? [self::messages($sid, $consumer, ...$answers[$consumer])] : []);
+        /** @var DeferredFuture<null> $gate */
+        $gate = new DeferredFuture();
+        $logs = [];
+        $runs = [];
+        foreach ($answers as $consumer => $payloads) {
+            $log = self::log();
+            $first = $payloads[0];
+            $logs[$consumer] = $log;
+            $runs[$consumer] = $client->jetStream()->pullConsumer('S', $consumer)->setBatching(2)->setDepth($depth)->setExpiresMs(30_000)
+                ->handle(static function (NatsMessage $message) use ($log, $client, $gate, $first): void {
+                    $log[] = 'handler ' . $message->payload . ' (' . $client->state()->name . ')';
+                    if ($message->payload === $first) {
+                        $gate->getFuture()->await(new TimeoutCancellation(5));
+                    }
+                });
+        }
+        $holding = array_map(static fn(array $payloads): array => ['handler ' . $payloads[0] . ' (Open)'], $answers);
+        $logged = static fn(): array => array_map(static fn(\ArrayObject $log): array => $log->getArrayCopy(), $logs);
+        $this->waitUntil(static fn(): bool => $logged() === $holding);
+
+        $client->drain()->await(new TimeoutCancellation(5));
+        $gate->complete();
+        $outcomes = array_map(self::settle(...), $runs);
+
+        self::assertSame(
+            [sprintf('drain deadline exceeded: %d buffered message(s) were not delivered before close', $notDelivered)],
+            $recorder->errorsContaining('drain deadline exceeded'),
+            'the report names what every run, and every pull of a run, still held',
+        );
+        self::assertSame($holding, $logged(), 'nothing the report named reached a handler');
+        foreach ($outcomes as $consumer => [$processed, $error]) {
+            self::assertNull($error, sprintf('%s\'s handle() threw %s', $consumer, self::describe($error)));
+            self::assertSame(1, $processed, sprintf('%s\'s handle() returns what was handed over', $consumer));
+        }
+        self::assertSame(ConnectionState::Closed, $client->state());
+    }
+
     /**
      * A drain whose budget runs out discards what the run still holds from then on, also while it closes the transport
      * (#207): a close that takes a while (the scripted server's closeDelay, as a TLS or WebSocket close does), a budget
