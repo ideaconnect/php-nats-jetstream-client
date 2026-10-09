@@ -15,6 +15,82 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.24.0] - 2026-10-09
+
+### Upgrade notes
+
+- A JetStream pull consumer run, `PullConsumerIterator::handle()`, now follows the connection's own rule when the
+  application closes the connection (#207): the client's `drain()` hands over what the run's pulls hold, and
+  `disconnect()` discards it, wherever the run is. Once its flush is done, `drain()` asks each run to hand every pull in
+  flight to the handler, in order, while the connection is Draining, so that the handler's acks still go out, and waits
+  for that, the handler included, within its budget (`requestTimeoutMs`); the run then ends and `handle()` resolves with
+  its count, as after the iterator's `drain()`, where it used to fail with `Connection is not open`, the handler having
+  got none of those messages. A `drain()` can therefore take as long as such a handler, up to its budget, before it
+  closes the connection; when the budget runs out first, the rest is discarded and counted in its
+  `drain deadline exceeded` report, and `handle()` still resolves with what was handed over, unless the run was writing
+  a pull as the drain closed the connection, which fails it with that write's error. Only the acks the handler publishes
+  go out during that hand-over (`ack()`, `nak()`, `term()`, `inProgress()`): the connection refuses requests while it is
+  Draining, so `ackSync()`, a JetStream publish or a Key/Value write fails there at once with `Connection is not open`;
+  a handler that may run during a drain acks with `ack()`. A handler, an `onError` or an `errorListener` that awaits the
+  client's `drain()` while the run calls it holds that drain for its whole budget, as a core subscription's handler that
+  awaits it does, since the drain waits for the very run that waits for it, and the rest of the pull is then discarded:
+  stop or drain the iterator there and drain the client once `handle()` has resolved, or call the client's `drain()`
+  from another fiber or without awaiting it. While the client drains, a run issues no new pull. A `disconnect()`, from
+  the handler or from another fiber, now also ends the hand-over of a pull the run retires, before the next message,
+  where the rest of the pull used to reach the handler after the close had returned, every ack failing: on a consumer
+  with acks that rest is delivered again after `ack_wait` and processed once, rather than twice, and on a consumer
+  without acks (`ack_policy: none`) or with `max_deliver: 1` it is lost, as the hand-over before a run fails loses it
+  since 2.22.0. `handle()` still fails after a `disconnect()`, with `Connection is not open` or the error of the read or
+  write that met the close, except where the client's `drain()` had already asked the run for its hand-over, or where a
+  finite run has no pull left to issue: it then resolves with its count. A worker that drains the iterator and awaits
+  `handle()` before it closes the connection sees no change.
+
+### Changed
+
+- `[bugfix]` `disconnect()` discards what a pull consumer run's pulls hold also while the run hands over a pull it
+  retires (#207), as it discards it in the hand-over before a run fails since 2.22.0 and as it discards what the
+  connection itself has received and not delivered (nats.go `Close()` parity): the handler gets no message after the
+  close, whether the handler or another fiber called `disconnect()`, and the rest of the pull stays unacked. The retire
+  phase used to hand a full pull over whole, the handler running on the Closed connection after `disconnect()` had
+  returned, every ack failing, so that with explicit acks those messages were processed and then delivered again. Every
+  delivery of a run now checks the same signal before each message, the connection's own
+  (`NatsConnection::isDiscardingUndelivered()`, `@internal`): a `disconnect()` under way or done, or a `drain()` once
+  its budget has run out (from its `drain deadline exceeded` report on, also while it closes the connection), discards;
+  a `drain()` within its budget hands over. A pull whose messages the close discards still counts as one that brought
+  messages, so that the run goes on to meet the close and `handle()` fails as before, rather than end as if the stream
+  were exhausted. Measured on nats-server 2.12.15 with `ack_wait` 3 s and a run of batch 2 and depth 1 whose pull holds
+  m-1 and m-2, the handler awaiting `disconnect()` on m-1: in 2.23.0 m-2 reached the handler on the Closed connection,
+  its ack failing, and with explicit acks the server delivered it again after `ack_wait` (`num_delivered` 2); with
+  `ack_policy: none` it was processed after `disconnect()` had returned. Now m-2 is not handed over: with explicit acks
+  it is delivered again after `ack_wait`, once, and with `ack_policy: none` it is lost (`ack_floor` 2).
+
+### Fixed
+
+- `[bugfix]` The client's `drain()` dropped what a pull consumer run's pulls held, and did not wait for a handler that
+  was handing a pull over (#207). The engine behind `PullConsumerIterator::handle()` hands a pull's messages to the
+  handler only when the pull completes (its batch full, a status from the server, or its deadline), and the drain
+  delivered only the connection's own queues: it unsubscribed the run's inbox, read until the `PONG` of its flush and
+  closed the connection under the run, whose read then failed and handed nothing over, since the drain had set the close
+  intent (#197), and `handle()` threw `Connection is not open`. A worker that drained its client on `SIGTERM`, without
+  draining the iterator first, so lost those messages on a consumer without acks and got them again after `ack_wait`
+  otherwise; a pull that a message filled during the drain's flush was handed over while the drain closed the
+  connection, the later messages reaching the handler on the Closed connection with their acks failing; and a run that
+  went on while the drain flushed wrote its next pull onto the inbox the drain had unsubscribed. The run is now a drain
+  participant (`DrainParticipant`, `@internal`), registered once its inbox is subscribed: once its flush is done, the
+  drain asks each run to hand every pull in flight over, in issue order, while the connection is Draining, the request
+  waking a run that waits in its pump read or its idle backoff, and waits for those hand-overs within its single budget,
+  the `drain deadline exceeded` report counting what a run still holds when the budget runs out, which the run then
+  discards, also while the drain closes the connection, rather than hand it over. The run then ends with its count, and
+  it issues no pull while the connection is Draining. A drain without a connection to drain, or whose flush a
+  `disconnect()` cut short, asks no run, whose read then fails and discards what it holds, as before; a drain that first
+  waited for a reconnect still gets what the pulls held before the connection dropped. Measured on nats-server 2.12.15
+  with `ack_wait` 3 s, the stream holding m-1 and m-2, and the client's `drain()` called 1 s into an infinite run of
+  batch 3 and depth 1: in 2.23.0 the handler got nothing and `handle()` threw `Connection is not open`; with
+  `ack_policy: none` the consumer then had both as delivered and acknowledged (`ack_floor` 2), the messages gone, and
+  with explicit acks both came again after `ack_wait` (`num_delivered` 2). The handler now gets m-1 and m-2 while the
+  connection is Draining, `drain()` returns once that is done, and `handle()` returns 2; with explicit acks both acks
+  reach the server (`ack_floor` 2, `num_ack_pending` 0) and nothing comes again.
+
 ## [2.23.0] - 2026-10-09
 
 ### Upgrade notes

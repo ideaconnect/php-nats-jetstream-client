@@ -411,6 +411,27 @@ final class NatsConnection
      */
     private bool $drainInProgress = false;
     /**
+     * What a {@see drain()} waits for besides the connection's own backlog ({@see DrainParticipant}), by the id
+     * {@see addDrainParticipant()} gave each: the JetStream pull consumer runs, each from the moment its inbox is
+     * subscribed to the end of the run (#207). A drain asks each of them once its flush is done and waits for their
+     * hand-overs within its budget. Not part of the per-connection state a close releases: a participant removes
+     * itself.
+     *
+     * @var array<int, DrainParticipant>
+     */
+    private array $drainParticipants = [];
+    /** The id {@see addDrainParticipant()} gave last. */
+    private int $lastDrainParticipantId = 0;
+    /**
+     * Whether the {@see drain()} under way still hands over what the connection's participants hold
+     * ({@see isDiscardingUndelivered()}, #207): set as the drain enters Draining, and cleared once its delivery phase is
+     * over (every hand-over done, or its budget run out, before its deadline report) and by a disconnect() that
+     * interrupts it. The state alone cannot say it: the drain's teardown and a disconnect() both await the transport's
+     * close with the state still Draining, and a handler that went on meanwhile got what the drain had just reported as
+     * discarded, or what the disconnect() was discarding.
+     */
+    private bool $drainDelivers = false;
+    /**
      * Whether the current close has been announced with a Closed event, or is about to be: by the
      * disconnect() that set it, or by the connect or reconnect that gave up on the connection
      * ({@see markClosedForGood()}). Both set it before their awaited transport close, so whatever closes
@@ -1235,7 +1256,9 @@ final class NatsConnection
      *
      * Locally queued, undelivered messages (already parsed and counted in `inMsgs`, awaiting
      * dispatch) are discarded without being delivered - nats.go Close() parity (#134). Use
-     * {@see drain()} for the lossless path: it delivers the buffered backlog before closing.
+     * {@see drain()} for the lossless path: it delivers the buffered backlog before closing. What a
+     * JetStream pull consumer run's pulls hold is discarded the same way, wherever the run is
+     * ({@see isDiscardingUndelivered()}, #207).
      *
      * @return Future<void>
      */
@@ -1254,6 +1277,9 @@ final class NatsConnection
             // Signal close-intent BEFORE closing the socket so an in-flight reconnect/heartbeat read
             // cannot race to re-open the connection after the user asked to close it (#84).
             $this->setCloseIntent();
+            // A drain() this interrupts hands nothing more over, also while the close below is awaited with the
+            // state still Draining (#207).
+            $this->drainDelivers = false;
             $stopped = $this->stoppedDials();
             // This disconnect announces the close below: a drain() it interrupts must not announce it
             // again when it ends, even if it ends first.
@@ -1526,6 +1552,20 @@ final class NatsConnection
      * queue (SlowConsumerPolicy::Error), a handler that throws, or an -ERR the server keeps the connection
      * open for, that the drain's flush runs into, is reported and does not end the flush.
      *
+     * What a JetStream pull consumer run's pulls hold is delivered too (#207): the run is a drain participant
+     * ({@see DrainParticipant}), and once the flush is done, while the connection is Draining, the drain asks it to
+     * hand its pulls over to its handler and waits for that within the same budget, as it waits for its own backlog,
+     * the handler's acks going out meanwhile, though not its requests, which the connection refuses while it is
+     * Draining; the run then ends, and its handle() resolves with its count. A run used to lose them: they had left
+     * the connection's queues long before, and the drain closed the connection under them. A drain whose budget runs
+     * out first closes the connection all the same, and what the run still holds is discarded from the "drain deadline
+     * exceeded" report on, which counts it, as a disconnect() discards it, also while the transport's close is under
+     * way ({@see $drainDelivers}). A drain without a connection (the budget ran out before the reconnect it waited for
+     * was done, or that reconnect gave up) asks no run: nothing was flushed, and a run whose read then fails discards
+     * what it holds; nor does a drain whose flush a disconnect() cut short. A drain awaited from code the run calls
+     * (its handler, its onError, the error listener while the run reports to it) waits for the very run that waits for
+     * it, to the end of its budget, as one awaited from a subscription's handler waits for that handler.
+     *
      * @return Future<void>
      */
     public function drain(): Future
@@ -1584,6 +1624,7 @@ final class NatsConnection
 
         if ($connected) {
             $this->state = ConnectionState::Draining;
+            $this->drainDelivers = true;
         }
         // Close-intent: a recovery triggered mid-drain must not re-open the connection (#84) - and one
         // still in flight when the budget ran out stops now, its backoff cut short.
@@ -1598,6 +1639,17 @@ final class NatsConnection
             $this->unsubscribeAndFlushForDrain($drainDeadline);
         }
 
+        // The drain's participants hold messages the connection handed them long before, which their handlers have not
+        // got yet: the JetStream pull consumer runs, whose pulls are handed over only when they complete (#207). Once
+        // the flush is done the server has stopped delivering to them and the drain has read what it sent before the
+        // UNSUBs, so each is asked to hand over what it holds now, while the connection is Draining and the handlers'
+        // acks still go out, and the loop below waits for those hand-overs as it waits for the backlog. They used to be
+        // left out: the drain closed the connection under them, and a run whose read then failed discarded them. Not
+        // without a connection: nothing was flushed, and such a run discards what it holds, as a disconnect() does. Nor
+        // once a disconnect() has interrupted the flush: the connection is closed, and a run asked then returned a
+        // count, having discarded what it held, where a disconnect() fails it with "Connection is not open".
+        $handOvers = $this->drainDelivers ? $this->askDrainParticipants() : [];
+
         // Deliver the remaining buffered backlog before closing. A handler may await mid-delivery
         // (suspending on ANOTHER fiber, its sid guarded by dispatchingSids with messages still queued)
         // or publish an ack/reply (which now reaches the wire during Draining, #150). Wait - bounded by
@@ -1605,12 +1657,13 @@ final class NatsConnection
         // in-flight dispatch to finish before releasing state, so a suspended dispatch loop cannot
         // resume into a cleared registry and silently drop its remainder on the lossless path (#149).
         // Each delivery pass is contained so a handler exception is surfaced rather than stranding the
-        // connection in Draining - drain() always reaches Closed (#150).
+        // connection in Draining - drain() always reaches Closed (#150). The participants' hand-overs are
+        // waited for within the same deadline (#207).
         while (true) {
             // A handler that throws, or a full SubscriptionQueue, is reported without cutting the pass short.
             $this->deliverReportingFailures();
 
-            if (!$this->hasUndeliveredDrainBacklog()) {
+            if (!$this->hasUndeliveredDrainBacklog() && !self::anyHandOverPending($handOvers)) {
                 break;
             }
 
@@ -1619,8 +1672,11 @@ final class NatsConnection
                 // releaseRuntimeState() below clears the registry, and the resumed dispatch loop then
                 // breaks on the missing subscription and discards the remainder. Make that discard
                 // LOUD, never silent (#149 acceptance: either delivered or an error naming the count;
-                // mirrors the #123/#134 observable-drop principle).
-                $undelivered = $this->countUndeliveredDrainBacklog();
+                // mirrors the #123/#134 observable-drop principle). What a participant still holds is
+                // discarded the same way from here, before the report counts it, so that a handler that
+                // goes on while the report is made or the close below is awaited gets none of it (#207).
+                $this->drainDelivers = false;
+                $undelivered = $this->countUndeliveredDrainBacklog() + self::countHeldByParticipants($handOvers);
                 if ($undelivered > 0) {
                     $this->emitErrorSafely(new ConnectionException(
                         'drain deadline exceeded: ' . $undelivered
@@ -1635,6 +1691,8 @@ final class NatsConnection
             // without this the loop would spin while that fiber is never scheduled.
             delay(0.001);
         }
+        // The delivery phases are over: from here the close discards what a participant still holds (#207).
+        $this->drainDelivers = false;
 
         // The drain budget ends with the delivery phases above; writePublishFrame()'s Draining branch
         // falls back to its fixed per-publish bound once cleared.
@@ -1847,6 +1905,58 @@ final class NatsConnection
         }
 
         return $count;
+    }
+
+    /**
+     * Asks each drain participant registered now to hand over what it holds ({@see DrainParticipant::handOver()}),
+     * for a {@see drain()} whose flush is done (#207). Asking does not suspend: a participant only records the request
+     * and wakes what waits on its behalf.
+     *
+     * @return list<array{DrainParticipant, Future<null>}> Each participant asked, with the future of its hand-over.
+     */
+    private function askDrainParticipants(): array
+    {
+        $handOvers = [];
+        foreach ($this->drainParticipants as $participant) {
+            $handOvers[] = [$participant, $participant->handOver()];
+        }
+
+        return $handOvers;
+    }
+
+    /**
+     * Whether a hand-over {@see askDrainParticipants()} asked for is still under way (#207).
+     *
+     * @param list<array{DrainParticipant, Future<null>}> $handOvers
+     */
+    private static function anyHandOverPending(array $handOvers): bool
+    {
+        foreach ($handOvers as [, $handOver]) {
+            if (!$handOver->isComplete()) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * What the participants whose hand-over is still under way hold and have not handed to a handler: for the "drain
+     * deadline exceeded" report, which names it with the backlog the deadline leaves (#207). A hand-over that is over
+     * holds nothing the drain could still deliver.
+     *
+     * @param list<array{DrainParticipant, Future<null>}> $handOvers
+     */
+    private static function countHeldByParticipants(array $handOvers): int
+    {
+        $held = 0;
+        foreach ($handOvers as [$participant, $handOver]) {
+            if (!$handOver->isComplete()) {
+                $held += $participant->undelivered();
+            }
+        }
+
+        return $held;
     }
 
     /**
@@ -2208,15 +2318,68 @@ final class NatsConnection
 
     /**
      * Whether the application has closed the connection, or is closing it: disconnect() or drain() was called since the
-     * last connect(). A pull consumer run that ends with a failure then leaves what its pulls received undelivered, as
-     * a stop() does ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #197), since a disconnect()
-     * discards what the connection has received and not delivered.
+     * last connect(). The pull consumer engine asks it to tell whether an infinite run goes on past a frame that ended
+     * the connection ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #210): any close, a drain()
+     * still Draining included, ends the run instead. Whether what the run holds is then handed over or discarded is not
+     * this answer's to say but {@see isDiscardingUndelivered()}'s (#207): a drain() in its delivery phase hands it over.
      *
-     * @internal For the pull consumer engine (#197); not part of the supported API.
+     * @internal For the pull consumer engine (#197, #210); not part of the supported API.
      */
     public function isCloseRequested(): bool
     {
         return $this->closing;
+    }
+
+    /**
+     * Whether a close of the application's owns what the connection has received and not handed to a handler, so that
+     * deliveries leave it alone: the application closed the connection, or is closing it, other than by a drain() still
+     * in its delivery phase. A disconnect() discards it (nats.go Close() parity), and so does a drain() with what it
+     * cannot deliver itself: from its deadline report on, once its budget has run out, or all of it when it found no
+     * connection to drain. A drain() in its delivery phase, the connection Draining, lets deliveries go on, and the
+     * handlers' acks out. The pull consumer engine asks it before each message it hands to the handler, wherever the
+     * run is, so that what a run's pulls hold follows the rule of the connection's own queues
+     * ({@see leftoversBelongToAClose()}, #207): the retire phase, the hand-over before a run fails (#197), the hand-over
+     * of an infinite run going on past a frame that ended the connection (#210) and the hand-over a drain() asks for
+     * ({@see DrainParticipant}). A disconnect() under way or done, from the handler or from another fiber, then leaves
+     * the rest undelivered and unacked, rather than run the handler after it has returned with every ack failing.
+     *
+     * The state alone cannot tell a drain() in its delivery phase ({@see $drainDelivers}): the drain's teardown, from
+     * its deadline report on, and a disconnect() that interrupts a drain both await the transport's close with the state
+     * still Draining, and a handler that went on meanwhile got what the drain had just reported as discarded, or what
+     * the disconnect() was discarding.
+     *
+     * @internal For the pull consumer engine (#207); not part of the supported API.
+     */
+    public function isDiscardingUndelivered(): bool
+    {
+        return $this->closing && !($this->state === ConnectionState::Draining && $this->drainDelivers);
+    }
+
+    /**
+     * Registers what a {@see drain()} waits for besides the connection's own backlog ({@see DrainParticipant}) and
+     * returns the id {@see removeDrainParticipant()} takes. The pull consumer engine registers each run once its inbox
+     * is subscribed (#207): a drain that has flushed asks it to hand over what its pulls hold, and waits for that.
+     *
+     * @internal For the pull consumer engine (#207); not part of the supported API.
+     */
+    public function addDrainParticipant(DrainParticipant $participant): int
+    {
+        $id = ++$this->lastDrainParticipantId;
+        $this->drainParticipants[$id] = $participant;
+
+        return $id;
+    }
+
+    /**
+     * Removes a participant {@see addDrainParticipant()} registered: a drain that has not asked it yet will not. A
+     * drain that has already asked it waits for the future it was given, which the participant completes as it goes, so
+     * a drain never waits for a participant that has gone (#207). An id no longer registered is ignored.
+     *
+     * @internal For the pull consumer engine (#207); not part of the supported API.
+     */
+    public function removeDrainParticipant(int $id): void
+    {
+        unset($this->drainParticipants[$id]);
     }
 
     /**

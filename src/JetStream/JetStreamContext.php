@@ -23,6 +23,7 @@ use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
 use IDCT\NATS\JetStream\Consumers\PullInFlight;
 use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
 use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
+use IDCT\NATS\JetStream\Consumers\PullPipelineDrainParticipant;
 use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
 use IDCT\NATS\JetStream\Models\AccountInfo;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
@@ -2611,12 +2612,45 @@ final class JetStreamContext
      * stop() checked before each message, though unlike the retire phase it captures no group pin from them; the
      * failure is then rethrown unchanged, so that the caller still learns why the run ended, and a handler that throws
      * during that delivery ends it and is reported through the error listener and the logger
-     * ({@see deliverReceivedBeforeFailing()}). A close the application makes, a disconnect() or a drain() of the
-     * connection, before or during that delivery, ends it as a stop() does: the close discards what the pulls hold, as
-     * a disconnect() discards what the connection has received and not delivered, rather than run the handler after the
-     * close returned, with every ack failing; a pull the run retires normally is still handed over whole, as before,
-     * also when the connection is closed meanwhile. An exception of the handler or of onError anywhere else still ends
-     * the run at once, the other pulls' buffers left undelivered and unacked, as a stop() leaves them.
+     * ({@see deliverReceivedBeforeFailing()}). A close that discards what the connection has received and not
+     * delivered, a disconnect() or a drain() of the connection once its budget has run out, made before or during that
+     * delivery, ends it as a stop() does, rather than run the handler after the close returned, with every ack failing,
+     * as it ends every delivery of the run (#207, below); a drain() still within its budget lets it go on, the
+     * handler's acks going out. An exception of the handler or of onError anywhere else still ends the run at once, the
+     * other pulls' buffers left undelivered and unacked, as a stop() leaves them.
+     *
+     * The client's drain() hands over what the pulls hold, and a disconnect() discards it, wherever the run is (#207),
+     * as they do for the connection's own queues. Every delivery to the handler checks before each message, as it
+     * checks stop(), whether a close discards what the connection has not delivered ({@see deliverPullBuffer()}): a
+     * disconnect(), from the handler or from another fiber, leaves the rest of the pull being handed over undelivered
+     * and unacked, for the server to deliver again after the ack wait, or never on a consumer without acks, as the
+     * hand-over before a failure has since #197; the retire phase used to hand a full pull over whole, the handler
+     * running after the close had returned, every ack failing. A pull a close left with messages undelivered is still
+     * retired as one that brought messages, not as an empty retire, so that the run goes on to meet the close rather
+     * than end as if the stream were exhausted, or end on the status that closed a pull after its messages, reported to
+     * onError. A drain() within its budget hands it over. The run is a drain participant
+     * ({@see PullPipelineDrainParticipant}), registered once its inbox is subscribed and removed as it ends: once the
+     * drain's flush is done, the server has stopped delivering to the run's inbox and the drain has read what the
+     * server sent before the inbox's UNSUB, and the drain asks the run to hand over. The request fires a wake-up that
+     * the pump read and the idle backoff wait with while it has not fired, and it is checked at the top of the loop,
+     * right before the idle backoff and the issue phase, and right before the pump read, since it can come while the
+     * handler runs and its wake-up has then fired already. At the top of the loop the run hands every pull in flight
+     * over, in issue order, each marked done right before its buffer goes out, stop() and the discard checked before
+     * each message and no group pin captured, counts what it handed over in its total, and returns that count, as after
+     * the iterator's drain(), while the drain waits for it within its budget. A drain whose budget runs out first
+     * discards the rest from its deadline report on, which counts it, also while it closes the connection, the state
+     * still Draining until that close is over ({@see \IDCT\NATS\Core\NatsClient::isDiscardingUndelivered()}); a handler
+     * that throws ends the run with its own exception, as anywhere else, and a stop() leaves the rest undelivered. The
+     * drain's future completes as the run ends, however it ends, so that a drain never waits for a run that has gone. A
+     * pull written after the drain's UNSUB of the inbox is wasted (nats-server drops a pull request whose reply subject
+     * has no interest), so the issue phase issues nothing while the connection is Draining, and a run with nothing left
+     * in flight then ends with its count before the drain asks. A drain without a connection (its budget ran out before
+     * the reconnect it waited for was done, or that reconnect gave up) asks nothing: the run's read fails, and the
+     * close discards what the pulls hold. Nor does a drain whose flush a disconnect() cut short: the run fails as after
+     * any disconnect(). A drain that waited for a reconnect first gets what the pulls held before the connection
+     * dropped, since the reset at the top of the loop that drops the pulls a reconnect lost (#187) is skipped while the
+     * connection is Draining, the acks being valid on the new connection. The client's drain() used to lose it: it
+     * closed the connection under the run, whose read then failed and handed nothing over.
      *
      * An infinite run goes on after a frame that ended the connection, as it goes on after a lost connection (#210): a
      * fatal -ERR ('Stale Connection' for a client that left the server's PINGs unanswered, 'User Authentication
@@ -2626,26 +2660,26 @@ final class JetStreamContext
      * wait and then threw the frame's error (#171), and the run used to end with it although the connection was open
      * again. The error now goes to the error listener and the logger, since nothing else says why the server closed the
      * connection. What the pulls in flight hold goes to the handler as a delivery of the run: in issue order, counted
-     * in its total, stop() checked before each message and a close of the application's ending it, as above, and a
-     * group pin captured from it as in the retire phase; a handler that throws there ends the run with its own
-     * exception. The pulls then leave the run, which counts them as lost with the old connection, as after an EOF
-     * (#120), and it pulls again on the new connection once the reconnect is done. The server may still hold one of
-     * them: nats-server serves a waiting pull on the new connection when the reconnect subscribes the run's inbox again
-     * before it next checks the pull (#212), and the router gives what that pull receives to the run's open pulls, in
-     * issue order, and drops what none of them has room for. A status read in the same chunk as the frame (a terminal
-     * 409 Consumer Deleted, say) leaves with the pulls and never reaches onError, where one read before an EOF is
-     * classified first: the run goes on, and on a deleted consumer then meets the no-responders path (a 503, routine,
-     * reported to onError once). A finite run, reconnect off, waiting disabled, a reconnect that gave up while the read
-     * still waited for it and a close of the application's still end the run with the frame's error, as above. When the
-     * read's own wait ended before the reconnect did, the run goes round as after an EOF whose reconnect outlasted that
-     * wait: the pulls still open stay in flight, emptied, until their deadline or the reset at the top of the loop, so
-     * that the issue phase replaces only the pulls that ended, as after that EOF, rather than a whole generation; a
-     * pull it issues meanwhile goes into the reconnect buffer and out on the new connection, where that reset drops it
-     * from the run while the server still serves it, which is #187's to fix along with that reset. Such a run also ends
-     * as after that EOF: with the reconnect's own error ('Reconnect attempts exhausted', say) when the reconnect gives
-     * up, and with 'Connection is not open' when buffering is disabled (reconnectBufferSize 0), which refuses the write
-     * of a pull it issues meanwhile. A run the iterator's drain() ends does not go round: with nothing left in flight
-     * once the hand-over is done, it returns at once.
+     * in its total, stop() checked before each message and a close that discards ending it, as above, and a group pin
+     * captured from it as in the retire phase; a handler that throws there ends the run with its own exception. The
+     * pulls then leave the run, which counts them as lost with the old connection, as after an EOF (#120), and it pulls
+     * again on the new connection once the reconnect is done. The server may still hold one of them: nats-server serves
+     * a waiting pull on the new connection when the reconnect subscribes the run's inbox again before it next checks
+     * the pull (#212), and the router gives what that pull receives to the run's open pulls, in issue order, and drops
+     * what none of them has room for. A status read in the same chunk as the frame (a terminal 409 Consumer Deleted,
+     * say) leaves with the pulls and never reaches onError, where one read before an EOF is classified first: the run
+     * goes on, and on a deleted consumer then meets the no-responders path (a 503, routine, reported to onError once).
+     * A finite run, reconnect off, waiting disabled, a reconnect that gave up while the read still waited for it and a
+     * close of the application's still end the run with the frame's error, as above. When the read's own wait ended
+     * before the reconnect did, the run goes round as after an EOF whose reconnect outlasted that wait: the pulls still
+     * open stay in flight, emptied, until their deadline or the reset at the top of the loop, so that the issue phase
+     * replaces only the pulls that ended, as after that EOF, rather than a whole generation; a pull it issues meanwhile
+     * goes into the reconnect buffer and out on the new connection, where that reset drops it from the run while the
+     * server still serves it, which is #187's to fix along with that reset. Such a run also ends as after that EOF:
+     * with the reconnect's own error ('Reconnect attempts exhausted', say) when the reconnect gives up, and with
+     * 'Connection is not open' when buffering is disabled (reconnectBufferSize 0), which refuses the write of a pull it
+     * issues meanwhile. A run the iterator's drain() ends does not go round: with nothing left in flight once the
+     * hand-over is done, it returns at once.
      *
      * @internal Engine entry point for {@see PullConsumerIterator}; not part of the supported public API.
      *
@@ -2800,10 +2834,48 @@ final class JetStreamContext
             // FIX2 reconnect epoch: replayed interest restores the SUB, we only re-issue lost pulls.
             $reconnectEpoch = $this->client->statistics()->reconnects;
 
+            // The pull the retire phase is handing over: it has left $inflight by then, so that the router adds nothing
+            // to it, and the drain's deadline report counts what it still holds from here (#207).
+            /** @var PullInFlight|null $retiring */
+            $retiring = null;
+            // The run's part in a drain() of the client (#207): registered now that the inbox is subscribed, and
+            // removed in the finally below, before the inbox's UNSUB, so that a drain asks only a run that can still
+            // hand over. What it counts for the drain's deadline report is what the handler has not got yet:
+            // deliverPullBuffer() counts each message of a pull as handed over as it hands it over.
+            $drainParticipant = new PullPipelineDrainParticipant(static function () use (&$inflight, &$retiring): int {
+                $held = $retiring === null ? 0 : $retiring->undelivered();
+                foreach ($inflight as $heldPull) {
+                    $held += $heldPull->undelivered();
+                }
+
+                return $held;
+            });
+            $drainParticipantId = $this->client->addDrainParticipant($drainParticipant);
+
             try {
                 while (true) {
                     // stop(): abandon the whole in-flight generation immediately, issue nothing more.
                     if ($ctl->isStopRequested()) {
+                        break;
+                    }
+
+                    // The client's drain() asked for what the pulls hold (#207): its flush is done, so the server has
+                    // stopped delivering to the inbox and the drain has read what the server sent before the inbox's
+                    // UNSUB, and every pull is as complete as it will get. Each goes to the handler now, in issue
+                    // order, while the connection is Draining and the handler's acks still go out, and the run ends
+                    // with its count, as after the iterator's drain(); the drain waits for this within its budget, and
+                    // the finally below completes what it waits for. As in deliverReceivedBeforeFailing(), each pull is
+                    // marked done right before its buffer goes out, so that a message read while the handler suspends
+                    // goes to a pull still to come, and stop(), or a close that discards (the drain's budget ran out,
+                    // or a disconnect() came), ends the delivery; a handler that throws ends the run with its own
+                    // exception, as anywhere else. No group pin is captured: the run ends.
+                    if ($drainParticipant->isHandOverRequested()) {
+                        foreach ($issueOrder as $token) {
+                            $pull = $inflight[$token];
+                            $pull->done = true;
+                            $totalProcessed += $this->deliverPullBuffer($pull, $handler, $ctl);
+                        }
+
                         break;
                     }
 
@@ -2826,8 +2898,12 @@ final class JetStreamContext
                     // FIX2 (infinite only): a reconnect lost every server-side in-flight pull. Drop them
                     // WITHOUT onError/terminal (their unacked messages are redelivered), reset the idle
                     // state, and let the issue phase re-pull fresh. Finite mode keeps today's
-                    // stop-on-reconnect: its silent pull simply deadline-retires as an empty below.
-                    if (!$finite) {
+                    // stop-on-reconnect: its silent pull simply deadline-retires as an empty below. Not while
+                    // the client drains (#207): the drain waited for that reconnect and asks the run for what its
+                    // pulls hold, whose acks are valid on the new connection, and the run issues nothing more.
+                    // Dropped here, it was lost to that hand-over whenever the engine came round before the drain
+                    // asked, as over any real round trip of the drain's flush (#187).
+                    if (!$finite && $this->client->state() !== ConnectionState::Draining) {
                         $epoch = $this->client->statistics()->reconnects;
                         if ($epoch !== $reconnectEpoch) {
                             $reconnectEpoch = $epoch;
@@ -2872,11 +2948,23 @@ final class JetStreamContext
 
                         // Drain the buffer to the handler FIRST (so a deadline/terminal retire of a
                         // partially received pull does not drop already-received messages; mirrors
-                        // fetchBatch returning the partial batch). stop() breaks; drain() does NOT.
+                        // fetchBatch returning the partial batch). stop() breaks, and so does a close that discards
+                        // (a disconnect(), or the client's drain() once its budget has run out, #207); drain() does
+                        // NOT, nor does the client's drain() while it still delivers.
+                        $retiring = $pull;
+                        // What the pull brought, counted before the delivery, which empties the buffer at its end.
+                        $buffered = count($pull->buffer);
                         $delivered = $this->deliverPullBuffer($pull, $handler, $ctl);
                         $totalProcessed += $delivered;
 
-                        if ($delivered > 0) {
+                        // A pull that brought messages is not an empty retire, also when stop() or a close that
+                        // discards left some or all of them undelivered (#207): the retire is classified by what the
+                        // pull held, not by what the handler got, as before #207, when only a stop() made during the
+                        // delivery could cut it, and only after its first message. Classified by what the handler got,
+                        // a full pull that a disconnect() emptied ended a finite run as if the stream were exhausted,
+                        // handle() resolving instead of failing, and a status that ended a later pull after its
+                        // messages reached onError, ending the run as a terminal status does.
+                        if ($buffered > 0) {
                             // A delivery ends the idle streak and clears any latched drain (#153, FIX1).
                             $consecutiveEmptyPulls = 0;
                             $emptyRetireStreak = 0;
@@ -2890,7 +2978,7 @@ final class JetStreamContext
                             continue;
                         }
 
-                        // Empty retire (0 delivered): classify the outcome.
+                        // Empty retire (the pull brought no message): classify the outcome.
                         $code = $pull->terminalCode;
                         $description = $pull->terminalDescription;
 
@@ -2988,21 +3076,31 @@ final class JetStreamContext
 
                     // #153/FIX1 BACKOFF at a generation boundary: the whole generation came back empty
                     // (any delivery would have cleared idleDraining), so pace before relaunching. Skipped
-                    // under drain() (which is exiting, not relaunching).
-                    if (!$finite && !$ctl->isDrainRequested() && $inflight === [] && $idleDraining) {
+                    // under drain() (which is exiting, not relaunching), and once the client's drain() has
+                    // asked for the hand-over (#207): an onError that awaits in the retire phase can let it ask,
+                    // its wake-up then fired already, and the run ends below with nothing in flight.
+                    if (
+                        !$finite
+                        && !$ctl->isDrainRequested()
+                        && !$drainParticipant->isHandOverRequested()
+                        && $inflight === []
+                        && $idleDraining
+                    ) {
                         if ($backoffWarranted) {
                             ++$consecutiveEmptyPulls;
                             // The wait holds the run's wake-ups (neither flag is set here, checked just above,
                             // so neither has fired unless a later handle() replaced it): a stop() or drain()
                             // from another fiber ends the backoff at once instead of at its end, and the loop
-                            // top then sees the flag (#181).
+                            // top then sees the flag (#181), and so does the client's drain() asking for the
+                            // hand-over (#207).
                             try {
                                 delay(
                                     PullConsumerIterator::idleBackoffMs($consecutiveEmptyPulls) / 1000,
-                                    cancellation: self::pullWaitCancellation($ctl, null),
+                                    cancellation: self::pullWaitCancellation($ctl, null, $drainParticipant->wakeUp()),
                                 );
                             } catch (CancelledException) {
-                                // Woken: stop() breaks at the loop top, drain() exits there with nothing in flight.
+                                // Woken: stop() breaks at the loop top, drain() exits there with nothing in flight, and
+                                // so does the client's drain() asking for the hand-over (#207).
                             }
                         }
                         $idleDraining = false;
@@ -3017,13 +3115,21 @@ final class JetStreamContext
                     // gate stops mid-generation refills; drain() and the finite budget also gate it, and so
                     // does stop(): the breaks above caught one latched before this phase, the check per pull
                     // catches one latched while the previous pull's write was awaited, so the rest of the
-                    // generation is not written for a run about to end (#181).
+                    // generation is not written for a run about to end (#181). Nothing is issued once the
+                    // client's drain() has asked for the hand-over, which it can do while the handler runs in the
+                    // retire phase, nor while the connection is Draining at all (#207): the drain has unsubscribed
+                    // the inbox, or is about to, and nats-server drops a pull request whose reply subject has no
+                    // interest, so a pull written then would bring nothing. A run with nothing left in flight then
+                    // ends below with its count, before the drain asks; the drain's flush still reads what the
+                    // server sent to the pulls in flight before the UNSUB, for the hand-over.
                     $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered, $everPinned);
                     while (
                         count($inflight) < $effectiveDepth
                         && !$idleDraining
                         && !$ctl->isStopRequested()
                         && !$ctl->isDrainRequested()
+                        && !$drainParticipant->isHandOverRequested()
+                        && $this->client->state() !== ConnectionState::Draining
                         && ($cfg->iterations === null || $issued < $cfg->iterations)
                     ) {
                         $token = dechex($tokenSeq++);
@@ -3070,8 +3176,9 @@ final class JetStreamContext
 
                     if ($inflight === []) {
                         // Finite: the iteration budget is spent (or it terminated). Infinite: only reached
-                        // under stop()/drain() with nothing left in flight (steady state always refills).
-                        // Nothing to pump either way -> the run is done.
+                        // under stop()/drain() with nothing left in flight (steady state always refills), or
+                        // while the client's drain() is under way (#207). Nothing to pump either way -> the run
+                        // is done.
                         break;
                     }
 
@@ -3090,6 +3197,14 @@ final class JetStreamContext
                     // already, so the read below could not be ended by it: back to the top, which breaks
                     // (#181). A drain() latched there needs nothing: the pulls in flight are still pumped.
                     if ($ctl->isStopRequested()) {
+                        continue;
+                    }
+
+                    // The client's drain() asked for the hand-over while the handler ran in the retire phase, or while
+                    // the issue phase awaited its writes: its wake-up has fired already, so the read below could not be
+                    // ended by it, and would wait to the earliest pull's deadline, holding the drain to its budget.
+                    // Back to the top, which hands the pulls over (#207).
+                    if ($drainParticipant->isHandOverRequested()) {
                         continue;
                     }
 
@@ -3121,10 +3236,12 @@ final class JetStreamContext
                     // The wait ends at the deadline computed above, or when a wake-up that had not fired yet
                     // fires: stop() then breaks at the loop top; drain() stops issuing there and goes on
                     // pumping the pulls in flight, their reads from then on without its fired wake-up, so a
-                    // latched drain never ends a wait at once (#181).
+                    // latched drain never ends a wait at once (#181); the client's drain() asking for the
+                    // hand-over has it made at the loop top (#207).
                     $waitCancellation = self::pullWaitCancellation(
                         $ctl,
                         new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9),
+                        $drainParticipant->wakeUp(),
                     );
                     try {
                         $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
@@ -3145,10 +3262,11 @@ final class JetStreamContext
                             // reconnect off, waiting disabled, a reconnect that gave up within the read's wait), what
                             // the options make the read's own failure (an overflow, another subscription's handler), or
                             // a disconnect() or drain() of the application's. The pulls in flight hold what the server
-                            // sent them and the handler has not seen: it gets that first, in issue order, unless the
-                            // application closed the connection, which discards it, and the read's error is then
-                            // rethrown, so that the caller still learns why the run ended (#197). fetchBatch() returns
-                            // its partial batch for the same reason when its read fails with the connection going.
+                            // sent them and the handler has not seen: it gets that first, in issue order, unless a
+                            // close discards it (a disconnect(), or a drain() whose budget has run out; one within its
+                            // budget lets it go to the handler, #207), and the read's error is then rethrown, so that
+                            // the caller still learns why the run ended (#197). fetchBatch() returns its partial batch
+                            // for the same reason when its read fails with the connection going.
                             $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $handler, $ctl);
 
                             throw $failure;
@@ -3162,15 +3280,16 @@ final class JetStreamContext
                         // delivery of the run: the server counted it as delivered, and the reset at the top of the loop
                         // would drop it (#187). As in deliverReceivedBeforeFailing(), each pull is marked done right
                         // before its buffer goes out, so that a message read while the handler suspends goes to a pull
-                        // still to come, and a stop() or a close of the application's ends that delivery: the run then
-                        // ends at the top of the loop, as a stopped run, or where its next pull meets the close. That
-                        // pull's write fails on a closed connection; on one that a drain() of the client still drains
-                        // it goes out, onto the inbox the drain has unsubscribed (#207), and the run's next read ends
-                        // once the drain has closed the connection. As in the retire phase, a pin is captured from the
-                        // first message, since a pin belongs to the consumer, not the connection, the messages count
-                        // towards the run's total, a delivery resets the idle state, and a handler that throws ends the
-                        // run with its own exception. The pulls are counted as lost with the old connection, as after
-                        // an EOF (#120), though a server can still serve one whose inbox the reconnect subscribed again
+                        // still to come, and a stop() or a close that discards (a disconnect(), or a drain() whose
+                        // budget has run out) ends that delivery: the run then ends at the top of the loop, as a
+                        // stopped run, or where its next pull's write fails on the closed connection. A drain() of the
+                        // client within its budget lets it go on (#207): the run then hands the rest over at the top of
+                        // the loop once the drain asks for it, or ends there with its count, issuing no pull onto the
+                        // inbox the drain has unsubscribed. As in the retire phase, a pin is captured from the first
+                        // message, since a pin belongs to the consumer, not the connection, the messages count towards
+                        // the run's total, a delivery resets the idle state, and a handler that throws ends the run
+                        // with its own exception. The pulls are counted as lost with the old connection, as after an
+                        // EOF (#120), though a server can still serve one whose inbox the reconnect subscribed again
                         // (#212): with the reconnect done they leave the run, and the top of the loop pulls again on
                         // the new connection. When the read's own wait ended first, the run goes round as after an EOF
                         // whose reconnect outlasted that wait (below), and its next read waits for the reconnect.
@@ -3182,7 +3301,7 @@ final class JetStreamContext
                             if ($this->capturePin($lostPull, $cfg, $ctl)) {
                                 $everPinned = true;
                             }
-                            $handedOver += $this->deliverPullBuffer($lostPull, $handler, $ctl, endAtAClose: true);
+                            $handedOver += $this->deliverPullBuffer($lostPull, $handler, $ctl);
                         }
                         $totalProcessed += $handedOver;
                         if ($handedOver > 0) {
@@ -3208,7 +3327,7 @@ final class JetStreamContext
                             // while the server still serves it (#187). A full pull, and one a status ended, leave the
                             // run. A run the iterator's drain() ends, which then returns at the top of the loop with
                             // nothing left in flight, and one whose connection the application is closing, which ends
-                            // where it meets the close, keep none of them (below).
+                            // at the top of the loop or where it meets the close, keep none of them (below).
                             $stillOpen = [];
                             foreach ($issueOrder as $token) {
                                 $lostPull = $inflight[$token];
@@ -3229,6 +3348,11 @@ final class JetStreamContext
 
                 return $totalProcessed;
             } finally {
+                // However the run ends, a drain() no longer asks it, and one that has asked stops waiting for it: the
+                // hand-over is over, or the run's end left the rest undelivered (#207). Before the inbox's UNSUB, which
+                // can suspend.
+                $this->client->removeDrainParticipant($drainParticipantId);
+                $drainParticipant->handedOver();
                 // Plain unsubscribe: release the pull inbox once, on every exit path.
                 $this->client->unsubscribe($sid)->await();
             }
@@ -3238,32 +3362,43 @@ final class JetStreamContext
     /**
      * Hands the messages $pull has buffered to the run's handler, in the order they arrived, and empties the buffer:
      * how {@see consumePipelined()} delivers a pull it retires, each pull in flight before a run ends with a failure of
-     * its own ({@see deliverReceivedBeforeFailing()}, #197), and each pull a frame that ended the connection took with
-     * it when an infinite run goes on past that frame (#210). stop() is checked before each message, so a stop() made
-     * before or during the delivery, by the handler or from another fiber, leaves the rest undelivered and unacked.
-     * With $endAtAClose, for those two hand-overs of pulls the run has lost, a close the application asked for (a
-     * disconnect() or a drain() of the connection) ends it the same way. The retire phase does not pass it: a pull it
-     * retires is handed over whole, as before, also when the handler or another fiber closes the connection meanwhile,
-     * since the connection's drain() lets acks out while it is Draining. The iterator's drain() is not checked, since
-     * it lets what was received complete. The router must not be able to add to the buffer meanwhile, since the
-     * handler can suspend and the router runs in whichever fiber reads then: the retire phase takes the pull out of the
-     * run's in-flight set first, and the two hand-overs mark it done. A handler that throws ends the delivery, its
-     * exception thrown.
+     * its own ({@see deliverReceivedBeforeFailing()}, #197), each pull a frame that ended the connection took with it
+     * when an infinite run goes on past that frame (#210), and each pull in flight when the client's drain() asks the
+     * run for its hand-over (#207). Two things end the delivery, checked before each message, the rest left undelivered
+     * and unacked: a stop() made before or during it, by the handler or from another fiber, and a close that discards
+     * what the connection has received and not delivered
+     * ({@see \IDCT\NATS\Core\NatsClient::isDiscardingUndelivered()}): a disconnect() under way or done, or a drain() of
+     * the connection whose budget has run out, from its deadline report on, rather than run the handler after the close
+     * has returned with every ack failing. A drain() within its budget does not end it, and the handler's acks go out.
+     * The retire phase used to hand a pull over whole whatever the close (#207); it classifies the pull by what it held
+     * before this delivery, not by what this returns, since these checks can leave a pull that brought messages with
+     * none handed over. The iterator's drain() is not checked, since it lets what was received complete. Each message
+     * is counted as handed over as it goes to the handler ({@see PullInFlight::$handedOver}), so that what the handler
+     * has not got yet is known while it runs, which the drain's deadline report counts
+     * ({@see PullPipelineDrainParticipant::undelivered()}). The router must not be able to add to the buffer meanwhile,
+     * since the handler can suspend and the router runs in whichever fiber reads then: the retire phase takes the pull
+     * out of the run's in-flight set first, and the hand-overs mark it done. A handler that throws ends the delivery,
+     * its exception thrown.
      *
      * @param callable(NatsMessage, JetStreamContext):void $handler
      * @return int How many messages the handler got.
      */
-    private function deliverPullBuffer(PullInFlight $pull, callable $handler, PullPipelineControl $ctl, bool $endAtAClose = false): int
+    private function deliverPullBuffer(PullInFlight $pull, callable $handler, PullPipelineControl $ctl): int
     {
         $delivered = 0;
         foreach ($pull->buffer as $bufferedMsg) {
-            if ($ctl->isStopRequested() || ($endAtAClose && $this->client->isCloseRequested())) {
+            if ($ctl->isStopRequested() || $this->client->isDiscardingUndelivered()) {
                 break;
             }
+            // Counted as handed over as it goes to the handler, so that what the handler has not got yet is known
+            // while it runs, for the drain's deadline report (#207): a cursor, since taking each message out of the
+            // buffer with array_shift() renumbered the rest and made a delivery quadratic in the batch size.
+            ++$pull->handedOver;
             $handler($bufferedMsg, $this);
             ++$delivered;
         }
         $pull->buffer = [];
+        $pull->handedOver = 0;
 
         return $delivered;
     }
@@ -3273,18 +3408,19 @@ final class JetStreamContext
      * its pump read failing, a pull's write failing, or the server rejecting its inbox. The pulls in flight hold
      * messages the server counted as delivered and the handler has not seen yet; lost with the run, they came again
      * only after the ack wait, or never on a consumer without acks or with max_deliver 1. Each pull's buffer is handed
-     * to the handler, in issue order, through the retire phase's delivery ({@see deliverPullBuffer()}, with its stop()
-     * check before each message), though no group pin is captured from it as the retire phase does, and the caller
-     * then throws its failure unchanged. Each pull is marked done right before its buffer goes out: a message read
-     * while the handler suspends, by the handler's own read or another fiber's, is then attributed to a pull still to
-     * come, where it counts against that pull's batch, or dropped as a straggler once no pull is left open, instead of
-     * being added to the buffer being delivered, which is emptied after. A straggler stays unacked: the server
-     * redelivers it after the ack wait, and on a consumer without acks or with max_deliver 1 it is lost, as the whole
-     * run's buffers were before. A close the application asked for, a disconnect() or a drain() of the connection,
-     * made before the delivery or during it, ends it as stop() does: the close discards what the connection received
-     * and has not delivered (nats.go Close() parity), the handler would run after the close had returned, and its acks
-     * could not go out any more. Only this hand-over ends at a close: a pull the run retires normally is still handed
-     * over whole, as before ({@see deliverPullBuffer()}).
+     * to the handler, in issue order, through the retire phase's delivery ({@see deliverPullBuffer()}, with its checks
+     * of stop() and of a close before each message), though no group pin is captured from it as the retire phase does,
+     * and the caller then throws its failure unchanged. Each pull is marked done right before its buffer goes out: a
+     * message read while the handler suspends, by the handler's own read or another fiber's, is then attributed to a
+     * pull still to come, where it counts against that pull's batch, or dropped as a straggler once no pull is left
+     * open, instead of being added to the buffer being delivered, which is emptied after. A straggler stays unacked:
+     * the server redelivers it after the ack wait, and on a consumer without acks or with max_deliver 1 it is lost, as
+     * the whole run's buffers were before. A close that discards what the connection received and has not delivered
+     * (nats.go Close() parity), a disconnect() or a drain() of the connection once its budget has run out, made before
+     * the delivery or during it, ends it as stop() does: the handler would run after the close had returned, and its
+     * acks could not go out any more. A drain() within its budget does not: it hands over what the connection holds,
+     * and the handler's acks go out (#207). Every delivery of the run follows that rule, the retire phase included
+     * ({@see deliverPullBuffer()}).
      *
      * A handler that throws ends the delivery, the rest left undelivered and unacked as when a handler throws in the
      * retire phase, and its exception is reported through the error listener and the logger: the run's failure came
@@ -3302,7 +3438,7 @@ final class JetStreamContext
             foreach ($issueOrder as $token) {
                 $pull = $inflight[$token];
                 $pull->done = true;
-                $this->deliverPullBuffer($pull, $handler, $ctl, endAtAClose: true);
+                $this->deliverPullBuffer($pull, $handler, $ctl);
             }
         } catch (\Throwable $handlerFailure) {
             $this->emitClientError($handlerFailure);
@@ -3362,20 +3498,25 @@ final class JetStreamContext
     /**
      * What a wait of {@see consumePipelined()} waits with (#181): $deadline, when the wait has one (the pump
      * read's earliest pull deadline or heartbeat miss; the idle backoff has none), plus each of the run's
-     * two wake-ups, stop()'s and drain()'s, while it has not fired yet. A fired wake-up is left out whatever
+     * three wake-ups, stop()'s and drain()'s of the iterator and the client's drain() asking for the run's
+     * hand-over ($clientDrain, #207), while it has not fired yet. A fired wake-up is left out whatever
      * fired it: composed, it would end this wait and every later one at once, a spin of reads in queued
      * callbacks that runs ahead of every timer and socket read in the process. One fired by its own stop()
-     * or drain() has its flag set, and the flag is seen at the top of the loop. One fired with its flag
-     * unset was replaced by a later handle() on the same iterator, which Amp fires as it is destructed: this
-     * run then waits as it did before #181, to its deadlines, until the shared flags end it. The wake-ups
-     * are read in the engine's fiber right before the wait starts, with no suspension in between, so a
-     * stop() or drain() from another fiber either fired before this check or fires a wake-up this wait holds.
-     * With one part, or none, the composite forwards that part or never fires.
+     * or drain() has its flag set, and the flag is seen at the top of the loop, as is the client's drain()
+     * request, which its wake-up never fires without. One of the iterator's fired with its flag unset was
+     * replaced by a later handle() on the same iterator, which Amp fires as it is destructed: this run then
+     * waits as it did before #181, to its deadlines, until the shared flags end it. The wake-ups are read in
+     * the engine's fiber right before the wait starts, with no suspension in between, so a stop() or drain()
+     * from another fiber either fired before this check or fires a wake-up this wait holds. With one part,
+     * or none, the composite forwards that part or never fires.
      */
-    private static function pullWaitCancellation(PullPipelineControl $ctl, ?Cancellation $deadline): Cancellation
-    {
+    private static function pullWaitCancellation(
+        PullPipelineControl $ctl,
+        ?Cancellation $deadline,
+        Cancellation $clientDrain,
+    ): Cancellation {
         $parts = $deadline === null ? [] : [$deadline];
-        foreach ([$ctl->stopInterruption(), $ctl->drainInterruption()] as $wakeUp) {
+        foreach ([$ctl->stopInterruption(), $ctl->drainInterruption(), $clientDrain] as $wakeUp) {
             if (!$wakeUp->isRequested()) {
                 $parts[] = $wakeUp;
             }
