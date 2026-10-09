@@ -2536,7 +2536,8 @@ final class JetStreamContext
                                 }
                                 $request = $payload;
                                 $request['expires'] = $expiresNs;
-                                if ($idleHeartbeatNs !== null && 2 * $idleHeartbeatNs > $expiresNs) {
+                                // An omitted heartbeat stays omitted if this shortened send needs a retry.
+                                if ($idleHeartbeatNs === null || 2 * $idleHeartbeatNs > $expiresNs) {
                                     unset($request['idle_heartbeat']);
                                     $idleHeartbeatNs = null;
                                 }

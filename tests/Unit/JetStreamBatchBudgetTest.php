@@ -196,7 +196,15 @@ final class JetStreamBatchBudgetTest extends TestCase
         self::assertLessThan(1_000_000_000, $bodies[0]['expires']);
     }
 
-    public function testAnOmittedWireHeartbeatAlsoDisablesTheLocalMissTimer(): void
+    /** @return iterable<string,array{bool}> */
+    public static function omittedHeartbeats(): iterable
+    {
+        yield 'delayed send' => [false];
+        yield 'failed shortened send is retried' => [true];
+    }
+
+    #[DataProvider('omittedHeartbeats')]
+    public function testAnOmittedWireHeartbeatAlsoDisablesTheLocalMissTimer(bool $retry): void
     {
         $transport = new ReconnectingTransport();
         self::answer($transport);
@@ -212,6 +220,9 @@ final class JetStreamBatchBudgetTest extends TestCase
         $transport->dropConnection();
         async(static fn() => $client->processIncoming()->await())->ignore();
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Connecting);
+        if ($retry) {
+            $transport->failNextWriteContaining('PUB $JS.API.');
+        }
         $gate = EventLoop::delay(1.73, $transport->releaseDial(...));
         try {
             $messages = $client->jetStream()->fetchBatch('S', 'C', 1, 1000, ['idle_heartbeat' => 100_000_000])->await(new TimeoutCancellation(2.5));

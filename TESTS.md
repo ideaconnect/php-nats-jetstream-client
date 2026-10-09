@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3140 unit tests, 150 integration tests, 48 Behat scenarios.
+Indicative totals: 3141 unit tests, 150 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -635,7 +635,7 @@ A handler that throws in the application's own read, processIncoming() or readIn
 - `testInlineWriteBackpressureCannotHoldTheOperationPastItsBudget` - A transport that suspends inside SUB, PUB or UNSUB cannot overrun fetch or Direct Get; local inbox state is released.
 - `testAnExpiryLongerThanTheGlobalRequestTimeoutCanWaitForRecovery` - A longer fetch waits beyond the global subscribe timeout and gets its reply.
 - `testTheWireExpiryFitsTheRemainingBudgetWithoutTheOldCutoff` - Delayed setup and failed-PUB retry recompute a positive expiry on both sides of the previous one-second discontinuity.
-- `testAnOmittedWireHeartbeatAlsoDisablesTheLocalMissTimer` - Replies in transit survive shortening that removes the requested heartbeat.
+- `testAnOmittedWireHeartbeatAlsoDisablesTheLocalMissTimer` - Replies in transit survive shortening that removes the requested heartbeat; a failed shortened send cannot restore it on retry.
 - `testLateSubCompletionIsReleasedInOrderAndLeavesPongCorrelationIntact` - A late SUB receives its UNSUB afterward, and a subsequent flush consumes the correct PONG.
 - `testTimeoutDuringAReconnectedListenerReleasesTheReplayedInbox` - Timeout while a reconnect listener is held releases the replayed subscription on the new session.
 - `testAnInboxRejectedDuringPubRecoveryCannotReceiveTheRetry` - Permissions and subscription-limit rejection prevent retries for fetch and Direct Get.
