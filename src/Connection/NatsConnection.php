@@ -3511,7 +3511,7 @@ final class NatsConnection
 
                 // An operation's read that waited for a reconnect returns without reading, whether or not the
                 // reconnect delivered anything to it: the operation may have to act on the new connection first, as
-                // the pull engine re-issues the pulls the old server forgot, and would otherwise read the new socket
+                // the pull engine ends its pulls in flight and pulls again, and would otherwise read the new socket
                 // until the server's next bytes or its deadline before it looked.
                 if ($wake !== null) {
                     return new IncomingChunkResult(0, false);

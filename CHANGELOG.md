@@ -15,6 +15,46 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.24.3] - 2026-10-10
+
+### Upgrade notes
+
+- An infinite `PullConsumerIterator::handle()` run (no `setIterations()`) now hands its handler every message the
+  server sends it, also more than its pulls in flight asked for (#187). After a reconnect the server can hold more of
+  the run's pull requests than the run counts: a server that outlived the connection serves the requests the run
+  issued before the reconnect once the reconnect has subscribed the run's inbox again, and a pull written during the
+  outage goes out from the reconnect buffer afterwards. Those messages used to be dropped; they now reach the handler
+  in arrival order, behind what the run's pulls hold, and count in the result of `handle()`, so that across a
+  reconnect a handler can get more messages than `setBatching()` times `setDepth()`. The run issues no new pull while
+  it holds such messages. A terminal pull status (`409 Consumer Deleted`, say) now also hands over what the pulls
+  behind the one it ended hold before `handle()` resolves, where those messages used to be left unacked. `stop()`,
+  `disconnect()` and a `drain()` whose budget runs out still leave the rest undelivered, and a finite run keeps its
+  exact count and still drops a message past its last pull's batch.
+
+### Fixed
+
+- [bugfix] An infinite pull consumer run dropped messages it had received when the connection reconnected (#187).
+  The engine behind `PullConsumerIterator::handle()` ends its pulls in flight once the connection's reconnect count
+  moves, so that it pulls again on the new connection at once (#120), and it dropped them with what they held: a
+  message the reconnect's own delivery gave a pull while a lower subscription's handler held the engine's read up,
+  and the answer to a pull the engine had issued on the new connection before it saw a reconnect that the handler's
+  own `ack()` ran. It also dropped as a straggler every message none of its pulls in flight had room for, which a
+  server that outlived the connection sends for the requests the run issued before the reconnect, or wrote from the
+  reconnect buffer during it. The handler never got such a message; the server delivered it again only after
+  `ack_wait`, or never on a consumer with `ack_policy: none` or `max_deliver: 1`. Measured on nats-server 2.12.15 with
+  the worker's socket closed while the server stayed up, an infinite run of batch 1 and depth 1 on a consumer with
+  `ack_policy: none`: after the reconnect the consumer held two waiting requests, the worker received m-1 and m-2, and
+  the handler got only m-1, the consumer's `ack_floor` at 2. The run now ends its pulls instead of dropping them: what
+  they received goes to the handler in issue order before any pull goes out, a pull that received nothing leaves
+  without its status being classified, and what no pull has room for is held for the handler in arrival order, behind
+  the pulls, wherever the run goes on or ends (the iterator's and the client's `drain()`, a failure, a terminal
+  status, a frame that ended the connection), and counted in the drain's deadline report. The run checks the
+  reconnect count again after every wait, the handler's included, so that a status the old connection brought a pull
+  still to be retired neither ends the run through `onError` nor drops a group's pin, and a pull issued after a
+  reconnect the handler ran is not ended with the old ones; it never does while the client's `drain()` is under way,
+  which still gets what the pulls held. The iterator's `drain()` across a reconnect now delivers what the pulls in
+  flight had received. Found by the review of #178 (2.14.0), and of #210 (2.23.0).
+
 ## [2.24.2] - 2026-10-09
 
 ### Upgrade notes

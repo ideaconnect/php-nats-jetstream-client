@@ -371,11 +371,15 @@ final class JetStreamContext_8MutationTest extends TestCase
         self::assertSame(5, $pubsAtFirstDelivery);
     }
 
-    // kills LogicalNot @ 2259 (if (!$finite)  ->  if ($finite))
-    // A mid-run reconnect (infinite mode) must clear the in-flight pull and re-issue fresh: a reply that
-    // arrives on the pre-reconnect token is then dropped. If the guard flips to $finite, infinite mode
-    // skips the reset and the stale in-flight pull survives, so that pre-reconnect reply IS delivered.
-    public function testInfiniteModeDropsInflightPullsOnReconnect(): void
+    // #187: a mid-run reconnect (infinite mode) ends the in-flight pull and re-issues fresh, handing what
+    // the ended pull holds to the handler instead of dropping it. The SUB replay brings two frames for the
+    // pre-reconnect pull (token "0"): a data message on its ORIGINAL subject, which the router gives that
+    // pull, and a non-status frame on the pull's reply token, which the router ignores as an unexpected
+    // control frame whatever the pull's state (it is no data message: a server sends data on the original
+    // subject). The data message is delivered once, the token frame never; the post-reconnect pull's
+    // terminal 409 then ends the run with 1. The engine used to drop the pull with its message at the
+    // reconnect reset, returning 0.
+    public function testInfiniteModeHandsOverWhatTheInflightPullHeldWhenAReconnectEndsIt(): void
     {
         $transport = new FakeTransport($this->infoPong());
         $options = new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0);
@@ -397,10 +401,13 @@ final class JetStreamContext_8MutationTest extends TestCase
                 $pullSid = (int) (explode(' ', $head)[2] ?? 1);
                 ++$subSeen;
                 if ($subSeen === 2) {
-                    // The SUB replay during reconnect: a reply for the pre-reconnect pull (token "0")
-                    // now arrives. Real code has cleared inflight["0"], so its router drops it; the
-                    // mutant kept it and delivers it.
-                    return [sprintf("MSG %s.0 %d %d\r\n%s\r\n", $base, $pullSid, 8, 'survivor')];
+                    // The SUB replay during reconnect: the server, which outlived the connection, serves the
+                    // pre-reconnect pull (token "0") on its original subject, and a stray frame arrives on that
+                    // pull's reply token.
+                    return [
+                        sprintf("MSG evt.s %d \$JS.ACK.S.C.1.1.1.0.0 %d\r\n%s\r\n", $pullSid, 4, 'kept'),
+                        sprintf("MSG %s.0 %d %d\r\n%s\r\n", $base, $pullSid, 8, 'survivor'),
+                    ];
                 }
 
                 return [];
@@ -421,10 +428,11 @@ final class JetStreamContext_8MutationTest extends TestCase
                 ];
             }
 
-            // Any post-reconnect pull (token "1") gets a terminal 409 so the run stops promptly.
+            // Any post-reconnect pull gets a terminal 409 on its own reply token so the run stops promptly.
+            $replyTo = explode(' ', $head)[2] ?? '';
             $hdr = "NATS/1.0 409 Consumer Deleted\r\n\r\n";
 
-            return [sprintf("HMSG %s.1 %d %d %d\r\n%s\r\n", $base, $pullSid, strlen($hdr), strlen($hdr), $hdr)];
+            return [sprintf("HMSG %s %d %d %d\r\n%s\r\n", $replyTo, $pullSid, strlen($hdr), strlen($hdr), $hdr)];
         };
 
         $js = $this->context($transport, $options);
@@ -441,7 +449,7 @@ final class JetStreamContext_8MutationTest extends TestCase
         // Guard: the reconnect actually happened (initial connect + one reconnect), so the assertion
         // below is exercising the epoch-change branch rather than passing vacuously.
         self::assertGreaterThanOrEqual(2, count($transport->connectCalls));
-        self::assertSame([], $received, 'a reply on the pre-reconnect token must not be delivered after an infinite-mode reconnect');
-        self::assertSame(0, $processed);
+        self::assertSame(['kept'], $received, 'the message the ended pull held is delivered; the frame on its token is not');
+        self::assertSame(1, $processed);
     }
 }

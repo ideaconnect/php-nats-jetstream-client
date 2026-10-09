@@ -896,10 +896,13 @@ final class PullConsumerClientDrainTest extends TestCase
      * connection over, and the server answers the PING of its flush 200 ms later, as over a slow round trip, so that
      * the engine, its read woken by the reconnect, comes round the top of its loop well before the drain asks it. The
      * handler gets m-1 and m-2 while the connection is Draining, both acks go out (an ack subject is valid on any
-     * connection), handle() returns 2, and no pull follows the drain's UNSUB of the inbox. Without the check of the
-     * Draining state the reset at the top of the loop, which drops the pulls a reconnect lost (#187), ran first: the
-     * hand-over found nothing, handle() returned 0, and the drain reported nothing. On 2.23.0 the drain asked no run,
-     * and the handler got nothing.
+     * connection), handle() returns 2, and no pull follows the drain's UNSUB of the inbox. The run leaves its pulls
+     * alone while the connection is Draining, so that the handler gets m-1 only once the drain's flush is done, in
+     * the hand-over the drain asks for, and what the server sent the pull before the UNSUB would still reach it. A run
+     * that ended its pulls at the reconnect while Draining, as it does outside a drain (#187), handed them over before
+     * that flush was done, and then ended with nothing in flight; the reset at the top of the loop used to drop them
+     * there, and without the check of the Draining state the hand-over found nothing, handle() returned 0, and the
+     * drain reported nothing. On 2.23.0 the drain asked no run, and the handler got nothing.
      */
     public function testADrainThatWaitedForAReconnectStillGetsWhatThePullsHeld(): void
     {
@@ -907,8 +910,13 @@ final class PullConsumerClientDrainTest extends TestCase
         $flush = new DrainFlushWatcher($transport, $watched, $client);
         $server = $this->pullServer($transport);
         $log = self::log();
+        $acking = self::ackingHandler($log, $client);
+        $flushDoneAtTheHandOver = null;
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
-            ->handle(self::ackingHandler($log, $client));
+            ->handle(static function (NatsMessage $message, JetStreamContext $js) use ($acking, $flush, &$flushDoneAtTheHandOver): void {
+                $flushDoneAtTheHandOver ??= $flush->flushDone();
+                $acking($message, $js);
+            });
         $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
         $sid = $server->sids['C'];
         $this->sendEachInAReadOfItsOwn($transport, $watched, $sid, 'C', ['m-1', 'm-2']);
@@ -924,6 +932,7 @@ final class PullConsumerClientDrainTest extends TestCase
         [$processed, $error] = self::settle($run);
 
         self::assertSame(['handler m-1 (Draining)', 'ack of m-1 sent', 'handler m-2 (Draining)', 'ack of m-2 sent'], $log->getArrayCopy(), 'what the pulls held before the reconnect is handed over');
+        self::assertTrue($flushDoneAtTheHandOver, 'the run kept its pull until the drain asked for it, once its flush was done');
         self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame(2, $processed);
         self::assertSame(2, self::acksOnTheWire($transport));

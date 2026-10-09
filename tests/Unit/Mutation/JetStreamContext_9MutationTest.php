@@ -154,36 +154,73 @@ final class JetStreamContext_9MutationTest extends TestCase
     }
 
     /**
-     * A terminal error retires the whole in-flight generation: once it fires onError and breaks, no
-     * further already-buffered pull in the generation is delivered. Here the head pull (pull#0) turns
-     * out terminal while the tail pull (pull#1) already holds a message; that message must be abandoned
-     * (processed stays 0), which the break at the terminal-retire guarantees.
+     * A terminal error ends the run, but what the generation's tail already holds goes to the handler
+     * first (#187): here the head pull (pull#0) turns out terminal while the tail pull (pull#1) already
+     * holds a message. onError fires once for the head, the tail's 'x' is handed over and counted, and
+     * the run then ends normally. The run used to abandon it (processed 0): the server counted it as
+     * delivered, so it came again only after the ack wait, or never on a consumer without acks.
      *
      * The head's 409 is packed BEFORE the tail's data in one chunk, so the router sees the head done
      * first and then attributes the token-less data frame to the (still open) tail - reproducing "head
      * terminal, tail buffered" without relying on out-of-order completion (impossible under FIFO).
      */
-    public function testTerminalErrorAbandonsAlreadyBufferedTailOfGeneration(): void
+    public function testTerminalErrorHandsTheAlreadyBufferedTailOfGenerationOver(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $this->packedGenerationResponder($transport, 'S', 'C', static fn (string $head, string $tail, int $sid): array => [
+        $this->packedGenerationResponder($transport, 'S', 'C', static fn(string $head, string $tail, int $sid): array => [
             self::statusFrame($head, $sid, 409, 'Consumer Deleted') . self::msgFrame($tail, $sid, 'x'),
         ]);
         $js = $this->context($transport);
 
         $received = [];
+        $errors = [];
         $processed = $js->pullConsumer('S', 'C')
             ->setBatching(1)
             ->setDepth(2)
             ->setExpiresMs(200)
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e->getMessage();
+            })
             ->handle(function (NatsMessage $m) use (&$received): void {
                 $received[] = $m->payload;
             })->await();
 
-        // kills Break_->Continue_ @ 2367: a mutant that continues past the terminal head would go on to
-        // deliver the tail pull's buffered 'x' instead of abandoning it.
+        self::assertSame(1, $processed);
+        self::assertSame(['x'], $received);
+        self::assertCount(1, $errors);
+        self::assertStringContainsString('409: Consumer Deleted', $errors[0]);
+    }
+
+    /**
+     * A terminal error ends the retire pass at once: a status the generation's tail got behind it is not
+     * classified, so onError fires once. Both pulls of the generation come back with a terminal 409
+     * Consumer Deleted, packed into one chunk, and the run ends with nothing processed and one onError.
+     *
+     * kills Break_->Continue_ at the terminal retire: a mutant that continues past the terminal head goes
+     * on to retire the tail and classify its 409 as a second terminal error, firing onError twice (the
+     * tail's buffered messages, which the run now hands over as it ends, would otherwise reach the
+     * handler either way, #187).
+     */
+    public function testTerminalErrorEndsTheRetirePassBeforeTheTailsStatusIsClassified(): void
+    {
+        $transport = new FakeTransport($this->infoAndPong());
+        $this->packedGenerationResponder($transport, 'S', 'C', static fn(string $head, string $tail, int $sid): array => [
+            self::statusFrame($head, $sid, 409, 'Consumer Deleted') . self::statusFrame($tail, $sid, 409, 'Consumer Deleted'),
+        ]);
+        $js = $this->context($transport);
+
+        $errors = [];
+        $processed = $js->pullConsumer('S', 'C')
+            ->setBatching(1)
+            ->setDepth(2)
+            ->setExpiresMs(200)
+            ->setOnError(static function (\Throwable $e) use (&$errors): void {
+                $errors[] = $e->getMessage();
+            })
+            ->handle(static function (): void {})->await();
+
         self::assertSame(0, $processed);
-        self::assertSame([], $received);
+        self::assertCount(1, $errors, 'onError fires once, for the head');
     }
 
     /**
