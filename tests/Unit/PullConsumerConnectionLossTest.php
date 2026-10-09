@@ -30,8 +30,9 @@ use PHPUnit\Framework\TestCase;
  * writes (#197). The pipelined engine behind PullConsumerIterator::handle() buffers each message into the oldest pull
  * in flight and hands a pull's buffer to the handler only when it retires the pull: once its batch is full, a terminal
  * status came, or its deadline passed. A run whose read failed with the connection going (waiting for a reconnect
- * disabled, a lame-duck failover with waiting disabled, a reconnect that gave up, reconnect off, a fatal -ERR whether
- * or not the reconnect reopened the connection), or for a reason the options make the read's own
+ * disabled, a lame-duck failover with waiting disabled, a reconnect that gave up, reconnect off, a fatal -ERR, which
+ * ends a finite run whether or not the reconnect reopened the connection, and an infinite one only when the run cannot
+ * go on past it, #210, see PullConsumerConnectionEndingFrameTest), or for a reason the options make the read's own
  * (handlerErrorsFailOperations, slowConsumerErrorsFailOperations), whose pull's write failed, or whose inbox the server
  * rejected, used to end with that error and drop what its pulls held: messages the server counted as delivered, which
  * came again only after the ack wait, or never on a consumer without acks. The run now hands them to the handler
@@ -70,7 +71,10 @@ final class PullConsumerConnectionLossTest extends TestCase
     public static function failures(): iterable
     {
         foreach (['waiting disabled', 'the reconnect gives up', 'reconnect off', 'fatal -ERR', 'lame duck, waiting disabled'] as $failure) {
-            yield 'an infinite run, ' . $failure => [$failure, false];
+            // An infinite run goes on past a fatal -ERR whose reconnect reopens the connection, as past a lost connection
+            // (#210, PullConsumerConnectionEndingFrameTest): it ends at one where it cannot go on, here with reconnect off.
+            $infinite = $failure === 'fatal -ERR' ? 'fatal -ERR, reconnect off' : $failure;
+            yield 'an infinite run, ' . $infinite => [$infinite, false];
             yield 'a finite run, ' . $failure => [$failure, true];
         }
     }
@@ -80,11 +84,12 @@ final class PullConsumerConnectionLossTest extends TestCase
      * read of its own: they sit in the pull's buffer, the batch not full, and the handler has seen neither. Then the
      * connection goes under the engine's next read: it drops with waiting for a reconnect disabled ("Connection is not
      * open", the reconnect going on in the background) or with dials refused and three attempts ("Reconnect attempts
-     * exhausted"), or with reconnect off ("Reconnect is disabled"), or the server sends a fatal -ERR and the reconnect
-     * reopens the connection ("Server sent error frame: 'Stale Connection'"), or the server sends a lame-duck INFO with
-     * waiting disabled and the failover's dial held ("Connection is not open", the failover under way, #191). The
-     * handler gets m-1 and m-2, in order, and handle() then throws the read's error, the run having pulled once. It used
-     * to throw the same error with the handler never having seen them.
+     * exhausted"), or with reconnect off ("Reconnect is disabled"), or the server sends a fatal -ERR ("Server sent error
+     * frame: 'Stale Connection'"), the reconnect reopening the connection under the finite run and reconnect off under
+     * the infinite one, which goes on past it otherwise (#210), or the server sends a lame-duck INFO with waiting
+     * disabled and the failover's dial held ("Connection is not open", the failover under way, #191). The handler gets
+     * m-1 and m-2, in order, and handle() then throws the read's error, the run having pulled once. It used to throw the
+     * same error with the handler never having seen them.
      */
     #[DataProvider('failures')]
     public function testARunWhoseReadFailsWithTheConnectionGoingHandsTheHandlerWhatItsPullReceivedFirst(string $failure, bool $finite): void
@@ -117,14 +122,15 @@ final class PullConsumerConnectionLossTest extends TestCase
 
     /**
      * Two pulls hold messages when the run fails: depth 2 and batch 2, both pulls on the wire, and the server's next
-     * chunk brings m-1 and m-2, which fill the first pull, m-3, which goes into the second, and a fatal -ERR. The
-     * engine's read buffers the three and fails with the -ERR once the reconnect has reopened the connection, before
+     * chunk brings m-1 and m-2, which fill the first pull, m-3, which goes into the second, and a fatal -ERR. With
+     * reconnect off, the engine's read buffers the three and fails with the -ERR once the connection is closed, before
      * the engine could retire the first pull. The handler gets m-1, m-2 and m-3, in issue order, then handle() throws
-     * the -ERR's error. It used to get nothing.
+     * the -ERR's error. It used to get nothing. (With the reconnect reopening the connection, the infinite run goes on
+     * past the -ERR instead, #210.)
      */
     public function testWhatTwoPullsReceivedReachesTheHandlerInIssueOrder(): void
     {
-        [$transport, $watched, $client] = $this->client('fatal -ERR');
+        [$transport, $watched, $client] = $this->client('fatal -ERR, reconnect off');
         $server = $this->pullServer($transport);
         $handled = self::payloadLog();
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(2)->setDepth(2)->setExpiresMs(30_000)
@@ -139,7 +145,7 @@ final class PullConsumerConnectionLossTest extends TestCase
         self::assertInstanceOf(ConnectionException::class, $error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame("Server sent error frame: 'Stale Connection'", $error->getMessage());
         self::assertSame(['m-1', 'm-2', 'm-3'], $handled->getArrayCopy(), 'both pulls\' messages, in issue order');
-        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame(ConnectionState::Closed, $client->state());
         self::assertSame([0, 0], $server->epochs);
     }
 
@@ -276,16 +282,16 @@ final class PullConsumerConnectionLossTest extends TestCase
 
     /**
      * A handler that throws during that delivery ends it: the two pulls hold m-1 and m-2, and m-3, when the read fails
-     * with a fatal -ERR (as in testWhatTwoPullsReceivedReachesTheHandlerInIssueOrder()), and the handler throws on m-2.
-     * m-3 is not handed over, as the rest of a batch is not when a handler throws in the retire phase; the error
-     * listener gets the handler's exception, and handle() throws the read's error, the run's failure, which came
-     * first. The handler used to get nothing, and the listener nothing either.
+     * with a fatal -ERR, reconnect off (as in testWhatTwoPullsReceivedReachesTheHandlerInIssueOrder()), and the handler
+     * throws on m-2. m-3 is not handed over, as the rest of a batch is not when a handler throws in the retire phase;
+     * the error listener gets the handler's exception, and handle() throws the read's error, the run's failure, which
+     * came first. The handler used to get nothing, and the listener nothing either.
      */
     public function testAHandlerThatThrowsDuringThatDeliveryEndsItAndIsReported(): void
     {
         /** @var \ArrayObject<int, \Throwable> $reported */
         $reported = new \ArrayObject();
-        [$transport, $watched, $client] = $this->client('fatal -ERR', static function (\Throwable $error) use ($reported): void {
+        [$transport, $watched, $client] = $this->client('fatal -ERR, reconnect off', static function (\Throwable $error) use ($reported): void {
             $reported[] = $error;
         });
         $server = $this->pullServer($transport);
@@ -427,13 +433,15 @@ final class PullConsumerConnectionLossTest extends TestCase
 
     /**
      * A disconnect() made during that delivery ends it, as a stop() does: the two pulls hold m-1 and m-2, and m-3, when
-     * the read fails with a fatal -ERR, the reconnect having reopened the connection, and the handler closes the
-     * connection on m-1. Neither m-2, in the same pull, nor m-3, in the next, reaches the handler, which would
+     * the read fails with a fatal -ERR, reconnect off, and the handler calls disconnect() on m-1, which marks the close
+     * as the application's. Neither m-2, in the same pull, nor m-3, in the next, reaches the handler, which would
      * otherwise run on after the close, and handle() still throws the read's error. The handler used to get nothing.
+     * (The same close ends the hand-over of an infinite run that goes on past the -ERR once the reconnect reopened the
+     * connection, #210: see PullConsumerConnectionEndingFrameTest.)
      */
     public function testADisconnectDuringThatDeliveryEndsIt(): void
     {
-        [$transport, $watched, $client] = $this->client('fatal -ERR');
+        [$transport, $watched, $client] = $this->client('fatal -ERR, reconnect off');
         $server = $this->pullServer($transport);
         $handled = self::payloadLog();
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(2)->setDepth(2)->setExpiresMs(30_000)
@@ -551,22 +559,26 @@ final class PullConsumerConnectionLossTest extends TestCase
     /**
      * A message read while the handler runs during that delivery is handed over too, after what was received before
      * it: depth 2 and batch 3, the first pull holds m-1 and m-2 and the second none when the read fails with a fatal
-     * -ERR, the reconnect having reopened the connection and replayed the inbox. On m-1 the server sends m-3 and the
-     * handler reads it itself: the first pull, being handed over, takes nothing more, so m-3 goes into the second pull
-     * and reaches the handler after m-2. Added to the buffer being handed over, it would have been dropped with it. The
-     * handler used to get nothing.
+     * -ERR, waiting for the reconnect disabled, so that the read fails at once while the reconnect reopens the
+     * connection in the background and replays the inbox. On m-1 the handler waits for that, the server sends m-3 on the
+     * new connection, and the handler reads it itself: the first pull, being handed over, takes nothing more, so m-3
+     * goes into the second pull and reaches the handler after m-2. Added to the buffer being handed over, it would have
+     * been dropped with it. The handler used to get nothing. (With waiting enabled the infinite run goes on past the
+     * -ERR instead, #210, and PullConsumerConnectionEndingFrameTest checks the same rule for that hand-over.)
      */
     public function testAMessageReadWhileTheHandlerRunsGoesToAPullStillToBeHandedOver(): void
     {
-        [$transport, $watched, $client] = $this->client('fatal -ERR');
+        [$transport, $watched, $client] = $this->client('fatal -ERR, waiting disabled');
         $server = $this->pullServer($transport);
         $handled = self::payloadLog();
         $framesRead = [];
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(2)->setExpiresMs(30_000)
-            ->handle(static function (NatsMessage $message) use ($handled, $transport, $server, $client, &$framesRead): void {
+            ->handle(function (NatsMessage $message) use ($handled, $transport, $server, $client, &$framesRead): void {
                 $handled[] = $message->payload;
                 if ($message->payload === 'm-1') {
-                    // The new connection's server answers the first pull further: the handler's own read takes it.
+                    // Once the reconnect has reopened the connection, its server answers the first pull further: the
+                    // handler's own read takes it.
+                    $this->waitUntilOpen($client);
                     $transport->pushFrame(self::messages((int) $server->sid, 'm-3'));
                     $framesRead[] = $client->processIncoming(new TimeoutCancellation(2))->await();
                 }
@@ -681,13 +693,13 @@ final class PullConsumerConnectionLossTest extends TestCase
 
     /**
      * A stop() from the handler during that delivery leaves the rest undelivered, as in the retire phase: the two
-     * pulls hold m-1 and m-2, and m-3, when the read fails with a fatal -ERR, and the handler stops the run on m-1.
-     * Neither m-2, in the same pull, nor m-3, in the next, is handed over, and handle() still throws the read's error.
-     * The handler used to get nothing.
+     * pulls hold m-1 and m-2, and m-3, when the read fails with a fatal -ERR, reconnect off, and the handler stops the
+     * run on m-1. Neither m-2, in the same pull, nor m-3, in the next, is handed over, and handle() still throws the
+     * read's error. The handler used to get nothing.
      */
     public function testAStopFromTheHandlerDuringThatDeliveryLeavesTheRestUndelivered(): void
     {
-        [$transport, $watched, $client] = $this->client('fatal -ERR');
+        [$transport, $watched, $client] = $this->client('fatal -ERR, reconnect off');
         $server = $this->pullServer($transport);
         $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(2)->setDepth(2)->setExpiresMs(30_000);
         $handled = self::payloadLog();
@@ -738,8 +750,9 @@ final class PullConsumerConnectionLossTest extends TestCase
 
     /**
      * A connected client over a watched ReconnectingTransport, closed in tearDown, with no heartbeat, so only the
-     * engine and the test read: waiting for a reconnect disabled, also for the lame duck; three reconnect attempts;
-     * reconnect off; or, for 'reconnect on' and 'fatal -ERR', the defaults of these tests: reconnect on, with waiting for
+     * engine and the test read: waiting for a reconnect disabled, also for the lame duck and for a fatal -ERR whose
+     * reconnect runs in the background; three reconnect attempts; reconnect off, also for a fatal -ERR that ends an
+     * infinite run; or, for 'reconnect on' and 'fatal -ERR', the defaults of these tests: reconnect on, with waiting for
      * it enabled and a thousand attempts.
      *
      * @param (\Closure(\Throwable): void)|null $errorListener
@@ -751,9 +764,9 @@ final class PullConsumerConnectionLossTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $client = new NatsClient(match ($failure) {
-            'waiting disabled', 'lame duck, waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, $connectionListener, 5, 20, $errorListener),
+            'waiting disabled', 'lame duck, waiting disabled', 'fatal -ERR, waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, $connectionListener, 5, 20, $errorListener),
             'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, $connectionListener, 5, 20, $errorListener),
-            'reconnect off' => new NatsOptions(
+            'reconnect off', 'fatal -ERR, reconnect off' => new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 2_000,
                 reconnectEnabled: false,
@@ -847,7 +860,7 @@ final class PullConsumerConnectionLossTest extends TestCase
      */
     private static function endTheConnection(ReconnectingTransport $transport, string $failure): void
     {
-        if ($failure === 'fatal -ERR') {
+        if ($failure === 'fatal -ERR' || $failure === 'fatal -ERR, reconnect off') {
             $transport->pushFrame(self::STALE_CONNECTION);
 
             return;
@@ -877,6 +890,7 @@ final class PullConsumerConnectionLossTest extends TestCase
             'waiting disabled', 'lame duck, waiting disabled' => ['Connection is not open', ConnectionState::Connecting],
             'the reconnect gives up' => ['Reconnect attempts exhausted', ConnectionState::Closed],
             'reconnect off' => ['Reconnect is disabled', ConnectionState::Closed],
+            'fatal -ERR, reconnect off' => ["Server sent error frame: 'Stale Connection'", ConnectionState::Closed],
             default => ["Server sent error frame: 'Stale Connection'", ConnectionState::Open],
         };
     }

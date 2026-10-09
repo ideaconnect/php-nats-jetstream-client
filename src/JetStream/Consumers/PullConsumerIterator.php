@@ -324,15 +324,26 @@ final class PullConsumerIterator
      * is signalled (#120).
      *
      * A run that fails first runs the handler for what its pulls have received (#197): when its read fails because the
-     * connection is going (lost with waitForReconnect off, a reconnect that gave up, reconnect off, a fatal -ERR), when
-     * a pull's write fails, when the server rejects the run's reply inbox, or when the read fails for a reason the
-     * options make its own (handlerErrorsFailOperations, slowConsumerErrorsFailOperations). Those messages go to the
-     * handler in the order they arrived, unless {@see stop()} was called, or the application closed the connection (a
-     * disconnect() or a drain() of the client, which discards them), and the future then fails with that error,
-     * unchanged. A handler that throws during that delivery ends it, and its exception goes to the connection's error
-     * listener and logger, since the run's own failure is the one thrown; on a closed connection that includes a
-     * handler whose ack failed. A handler that throws at any other time ends the run at once with its own exception,
-     * the other messages left undelivered.
+     * connection is going (lost with waitForReconnect off, a reconnect that gave up, reconnect off, a fatal -ERR or a
+     * PONG the socket would not take that the run does not go on past, see below), when a pull's write fails, when the
+     * server rejects the run's reply inbox, or when the read fails for a reason the options make its own
+     * (handlerErrorsFailOperations, slowConsumerErrorsFailOperations). Those messages go to the handler in the order
+     * they arrived, unless {@see stop()} was called, or the application closed the connection (a disconnect() or a
+     * drain() of the client, which discards them), and the future then fails with that error, unchanged. A handler that
+     * throws during that delivery ends it, and its exception goes to the connection's error listener and logger, since
+     * the run's own failure is the one thrown; on a closed connection that includes a handler whose ack failed. A
+     * handler that throws at any other time ends the run at once with its own exception, the other messages left
+     * undelivered.
+     *
+     * An infinite run with reconnect on and waitForReconnect enabled goes on after a fatal -ERR ('Stale Connection',
+     * 'User Authentication Expired') or a PONG the socket would not take, once the reconnect has reopened the
+     * connection, as it goes on after a lost connection (#210): the frame's error goes to the error listener and the
+     * logger instead of failing the future, the handler gets what the pulls held as part of the run (counted in its
+     * total, a handler that throws there ending the run with its own exception), and the run pulls again on the new
+     * connection. A finite run still fails with that error, and so does an infinite one with reconnect off or waiting
+     * disabled, whose connection the application is closing, or whose reconnect gave up while the read that met the
+     * frame still waited for it; a reconnect that gives up later ends the run with its own error ("Reconnect attempts
+     * exhausted"), as after a lost connection.
      *
      * Start the next run only once the previous run's future has resolved: the runs of one iterator
      * share the stop/drain flags, so a handle() while a run is still active clears a stop() or drain()

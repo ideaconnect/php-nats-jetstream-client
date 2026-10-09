@@ -973,6 +973,29 @@ final class NatsConnection
     }
 
     /**
+     * Whether $failure, which a read of this connection threw, is the failure of a frame that ended the connection
+     * ({@see frameFailureEndsConnection()}): a fatal -ERR, such as 'Stale Connection' or 'User Authentication
+     * Expired', which the server sends right before it closes the connection, or, outside a drain, a PONG the socket
+     * would not take. The read that met such a frame recovered the connection before it threw (#171), within its own
+     * wait when waiting for a reconnect is enabled: by the time the caller sees the failure, the connection can be
+     * open again on a new socket, still reconnecting, or closed for good, and the failure says only why the old one
+     * ended. Every other failure answers false: an -ERR the server keeps the connection open for, a full
+     * subscription queue, a handler's exception, and what a read throws when the socket itself went (the connection
+     * reports the socket's own error as it starts the reconnect).
+     *
+     * The one classifier of such a failure: the library's operations that outlive a connection ask it, through
+     * NatsClient, to tell a failure that ended the connection from one that ended only their read. The pull
+     * consumer engine does, whose infinite run goes on after such a failure as it goes on after a lost connection
+     * ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #210).
+     *
+     * @internal Low-level mechanism for the library's own operations; not general API.
+     */
+    public function endedTheConnection(\Throwable $failure): bool
+    {
+        return $this->frameFailureEndsConnection($failure);
+    }
+
+    /**
      * Recovers a connection that a frame said was finished ({@see frameFailureEndsConnection()}), so that the
      * read that met the frame is the only operation to fail (#171). Left Open, the connection had the next
      * operation write into the socket the server had closed, where it failed as well, or with reconnect on

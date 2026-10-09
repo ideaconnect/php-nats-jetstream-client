@@ -279,6 +279,19 @@ final class NatsClient
     }
 
     /**
+     * Whether a failure that a read of this client threw came from a frame that ended the connection: a fatal -ERR,
+     * or a PONG the socket would not take, as the connection classifies it ({@see NatsConnection::endedTheConnection()}).
+     * The read recovered the connection before it threw (#171), so the failure says why the old connection ended, not
+     * that the connection is gone.
+     *
+     * @internal For the pull consumer engine (#210); not part of the supported API.
+     */
+    public function endedTheConnection(\Throwable $failure): bool
+    {
+        return $this->connection->endedTheConnection($failure);
+    }
+
+    /**
      * Removes a subscription by SID.
      *
      * With $maxMessages, arms auto-unsubscribe: delivery continues until that many TOTAL messages
