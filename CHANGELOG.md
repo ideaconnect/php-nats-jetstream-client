@@ -15,6 +15,31 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.24.2] - 2026-10-09
+
+### Upgrade notes
+
+- Batch fetch setup now draws on `expiresMs + 1000` ms, including inbox SUB, failed-write
+  recovery, PUB and collection. An empty fetch whose own budget expires reports the usual
+  `JetStreamException('No messages received within timeout', 408)` instead of a global subscribe
+  timeout. A longer fetch may wait past `requestTimeoutMs`. Direct Get includes setup in its
+  initial no-progress interval and renews that interval when replies arrive, even during a pending
+  PUB; the multi-subject helper keeps a separate interval for each chunk (#188).
+- A delayed pull is shortened to fit the remaining local budget with a 100 ms response margin.
+  If its requested heartbeat no longer fits half that expiry, that attempt omits the heartbeat
+  and its local heartbeat-miss check. Already-started transport writes remain uncancellable.
+
+### Fixed
+
+- [bugfix] Bound `fetchBatch()`, `fetchNext()`, `directGetBatch()` and `directGetLastForSubjects()`
+  setup and failed PUB recovery by their own budgets, including inline write backpressure.
+  Batch requests do not enter the reconnect buffer; a retry checks its inbox and remaining budget.
+  Completed replies wake a pending publication, and late failed writes recover without resending (#188).
+- [bugfix] Release timed-out or rejected batch inboxes locally before waiting for wire cleanup.
+  An abandoned SUB that completes late is followed by UNSUB on its own connection; cleanup of a
+  replayed inbox during a slow Reconnected listener also releases the server subscription. An
+  UNSUB stalled by backpressure cannot hold the batch result beyond its budget (#188).
+
 ## [2.24.1] - 2026-10-09
 
 ### Upgrade notes

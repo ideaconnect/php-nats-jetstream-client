@@ -7,6 +7,7 @@ namespace IDCT\NATS\JetStream;
 use Amp\Cancellation;
 use Amp\CancelledException;
 use Amp\CompositeCancellation;
+use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -17,6 +18,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
@@ -41,6 +43,9 @@ use function Amp\delay;
  */
 final class JetStreamContext
 {
+    /** Time reserved for a shortened pull's terminal response before the local deadline. */
+    private const PULL_RESPONSE_MARGIN_NS = 100_000_000;
+
     /** Idle window (ns) after which the server reaps an ephemeral push consumer with no interest. */
     private const EPHEMERAL_INACTIVE_THRESHOLD_NS = 300_000_000_000; // 5 minutes
 
@@ -436,7 +441,7 @@ final class JetStreamContext
                 $raw = $response['streams'] ?? null;
                 $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
-                return array_map(static fn (array $stream): StreamInfo => StreamInfo::fromArray($stream), $arrays);
+                return array_map(static fn(array $stream): StreamInfo => StreamInfo::fromArray($stream), $arrays);
             });
         });
     }
@@ -455,7 +460,7 @@ final class JetStreamContext
                 $raw = $response['consumers'] ?? null;
                 $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
-                return array_map(static fn (array $consumer): ConsumerInfo => ConsumerInfo::fromArray($consumer), $arrays);
+                return array_map(static fn(array $consumer): ConsumerInfo => ConsumerInfo::fromArray($consumer), $arrays);
             });
         });
     }
@@ -804,7 +809,9 @@ final class JetStreamContext
      * Issues a batched / multi Direct Get request (ADR-31) and collects the multi-response stream into
      * a list of messages. The server streams one reply per matched message to a private inbox,
      * terminated by an end-of-batch marker (a 204 status, or a final message carrying
-     * `Nats-Num-Pending: 0`). The wait is bounded by `$expiresMs` so a silent server cannot hang it.
+     * `Nats-Num-Pending: 0`). A no-progress interval of `$expiresMs + 1000` ms starts before inbox
+     * setup and covers reconnect and SUB/PUB backpressure. Each reply renews it, including replies
+     * dispatched by another reader while publication is pending; an incomplete batch stalls with an error.
      *
      * Requires NATS server 2.11+ and a stream created with `allow_direct`.
      *
@@ -828,6 +835,10 @@ final class JetStreamContext
             $subject = JetStreamApi::STREAM_DIRECT_GET_PREFIX . $stream;
             $inbox = Inbox::generate('_INBOX.JS.DGET');
 
+            $budget = new BatchReadBudget($expiresMs + 1000, rolling: true);
+            $finished = new DeferredCancellation();
+            $sendBudget = new CompositeCancellation($budget->cancellation(), $finished->getCancellation());
+
             $messages = [];
             $done = false;
             /** @var array{code:int,description:string}|null $error */
@@ -839,13 +850,15 @@ final class JetStreamContext
             // Guarded (#175): a 'maximum subscriptions exceeded' -ERR read before the server is known to hold the
             // inbox - by this fiber's read or any other's, the heartbeat's say - records the rejection here and
             // ends the read below, so that the call fails at once instead of waiting out its stall interval.
-            $onReply = static function (NatsMessage $msg) use (&$messages, &$done, &$error): void {
+            $onReply = static function (NatsMessage $msg) use (&$messages, &$done, &$error, $budget, $finished): void {
+                $budget->touch();
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
                 $status = (int) ($headers['Status'] ?? 0);
 
                 // End-of-batch marker (204), with no payload - the stream is complete.
                 if ($status === 204) {
                     $done = true;
+                    $finished->cancel();
 
                     return;
                 }
@@ -856,6 +869,7 @@ final class JetStreamContext
                         'description' => trim((string) ($headers['Description'] ?? '')),
                     ];
                     $done = true;
+                    $finished->cancel();
 
                     return;
                 }
@@ -872,97 +886,106 @@ final class JetStreamContext
                 // a separate 204; treat that as completion too.
                 if (($headers['Nats-Num-Pending'] ?? null) === '0') {
                     $done = true;
+                    $finished->cancel();
                 }
             };
-            $onRejected = static function (string $serverError) use (&$inboxRejection): void {
+            $onRejected = static function (string $serverError) use (&$inboxRejection, $finished): void {
                 $inboxRejection ??= $serverError;
+                $finished->cancel();
             };
 
             try {
-                $sid = $this->client->subscribeGuarded($inbox, $onReply, $onRejected)->await();
-            } catch (ConnectionException $e) {
-                // The SUB write failed, and the new server rejected the reconnect's replay of the SUB: the replay
-                // recorded the rejection, and the subscribe reports it. Said in this call's terms.
-                $this->throwIfInboxRejected($operation, $inbox, $inboxRejection, $e);
+                try {
+                    $sid = $this->client->subscribeGuarded($inbox, $onReply, $onRejected, $budget->cancellation())->await();
+                } catch (TimeoutException $e) {
+                    $this->throwIfInboxRejected($operation, $inbox, $inboxRejection, $e);
 
-                throw $e;
-            }
-            // Slow-consumer exemption (#118/#120 twin): a batch reply burst can exceed the per-sub
-            // pending cap within ONE read chunk (readIncoming enqueues every frame of a chunk before
-            // draining), and a dropped Direct Get reply is never redelivered - the 204 end-of-batch
-            // marker still arrives, so the call would return a TRUNCATED result presented as complete.
-            // Memory stays bounded by the requested batch size.
-            $this->client->markSubscriptionUnbounded($sid);
+                    throw $this->directGetStall($stream, $expiresMs, count($messages), $e);
+                } catch (ConnectionException $e) {
+                    // The SUB write failed, and the new server rejected the reconnect's replay of the SUB: the replay
+                    // recorded the rejection, and the subscribe reports it. Said in this call's terms.
+                    $this->throwIfInboxRejected($operation, $inbox, $inboxRejection, $e);
 
-            try {
-                // Rejected while this fiber waited for the SUB write: no request is sent on a dead inbox.
-                $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
+                    throw $e;
+                }
+                // Slow-consumer exemption (#118/#120 twin): a batch reply burst can exceed the per-sub
+                // pending cap within ONE read chunk (readIncoming enqueues every frame of a chunk before
+                // draining), and a dropped Direct Get reply is never redelivered - the 204 end-of-batch
+                // marker still arrives, so the call would return a TRUNCATED result presented as complete.
+                // Memory stays bounded by the requested batch size.
+                $this->client->markSubscriptionUnbounded($sid);
 
-                $this->client->publish($subject, $json, $inbox)->await();
-
-                // Progress-based bound: reset the stall clock on each batch frame, so a healthy-but-slow
-                // batch that keeps making progress is never failed - only a server that makes NO
-                // progress for the whole interval throws (mirrors #153's missed-heartbeat approach).
-                // Each wait's cancellation cancels the underlying socket read so a silent server cannot
-                // hang the batch indefinitely.
-                $progressIntervalNs = ($expiresMs + 1000) * 1_000_000;
-                $lastActivityNs = hrtime(true);
-                $seen = count($messages);
-
-                while (!$done) {
-                    // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
+                try {
+                    // Rejected while this fiber waited for the SUB write: no request is sent on a dead inbox.
                     $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
 
-                    $nowNs = hrtime(true);
-                    if ($nowNs - $lastActivityNs >= $progressIntervalNs) {
-                        // No batch frame arrived for the whole progress interval (no 204 EOB, no
-                        // Nats-Num-Pending:0, no error frame - those all set $done and exit the loop
-                        // normally). Returning the collected prefix would silently truncate the result
-                        // as if complete; a stalled server surfaces as an incomplete-result error (#121).
-                        throw new JetStreamException(sprintf(
-                            'Direct Get batch for stream "%s" stalled: no progress for %d ms '
-                                . '(received %d message(s), no end-of-batch marker)',
-                            $stream,
-                            intdiv($progressIntervalNs, 1_000_000),
-                            count($messages),
-                        ));
+                    try {
+                        $this->client->publishWithin(
+                            $subject,
+                            static function () use (&$done, &$messages, $json): ?string {
+                                return $done || $messages !== [] ? null : $json;
+                            },
+                            $inbox,
+                            $sid,
+                            $sendBudget,
+                            function () use ($operation, $inbox, &$inboxRejection): void {
+                                $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
+                            },
+                        )->await();
+                    } catch (TimeoutException $e) {
+                        $this->throwIfInboxRejected($operation, $inbox, $inboxRejection, $e);
+                        if (!$done) {
+                            throw $this->directGetStall($stream, $expiresMs, count($messages), $e);
+                        }
                     }
 
-                    $waitCancellation = new TimeoutCancellation(($progressIntervalNs - ($nowNs - $lastActivityNs)) / 1e9);
-                    try {
-                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
-                        // The read ends when the inbox is dropped, with the rejection recorded: fail now, not after
-                        // the idle pause (#175).
+                    // Progress-based bound: reset the stall clock on each batch frame, so a healthy-but-slow
+                    // batch that keeps making progress is never failed - only a server that makes NO
+                    // progress for the whole interval throws (mirrors #153's missed-heartbeat approach).
+                    // Each wait's cancellation cancels the underlying socket read so a silent server cannot
+                    // hang the batch indefinitely.
+
+                    while (!$done) {
+                        // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
                         $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
 
-                        if (!$read->consumedBytes) {
-                            // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
-                            // completed no frame yet (a chunked batch payload) loops immediately so the
-                            // rest of the payload already buffered is drained without an idle sleep (#119).
-                            delay(0.001, cancellation: $waitCancellation);
+                        if ($budget->remainingNs() === 0 || $budget->cancellation()->isRequested()) {
+                            throw $this->directGetStall($stream, $expiresMs, count($messages));
                         }
-                    } catch (CancelledException) {
-                        // This wait segment ended; loop around to re-evaluate the stall deadline.
-                    }
 
-                    if (count($messages) > $seen) {
-                        // A batch frame landed: progress. Rebase the stall clock from now.
-                        $seen = count($messages);
-                        $lastActivityNs = hrtime(true);
+                        $waitCancellation = $budget->cancellation();
+                        try {
+                            $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
+                            // The read ends when the inbox is dropped, with the rejection recorded: fail now, not after
+                            // the idle pause (#175).
+                            $this->throwIfInboxRejected($operation, $inbox, $inboxRejection);
+
+                            if (!$read->consumedBytes) {
+                                // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
+                                // completed no frame yet (a chunked batch payload) loops immediately so the
+                                // rest of the payload already buffered is drained without an idle sleep (#119).
+                                delay(0.001, cancellation: $waitCancellation);
+                            }
+                        } catch (CancelledException) {
+                            // This wait segment ended; loop around to re-evaluate the stall deadline.
+                        }
+
                     }
+                } finally {
+                    $this->client->releaseSubscriptionWithin($sid, $budget->cancellation())->await();
                 }
+
+                if ($error !== null) {
+                    throw new JetStreamException(
+                        $error['description'] !== '' ? $error['description'] : 'JetStream direct get batch error',
+                        $error['code'],
+                    );
+                }
+
+                return $messages;
             } finally {
-                $this->client->unsubscribe($sid)->await();
+                $budget->stop();
             }
-
-            if ($error !== null) {
-                throw new JetStreamException(
-                    $error['description'] !== '' ? $error['description'] : 'JetStream direct get batch error',
-                    $error['code'],
-                );
-            }
-
-            return $messages;
         });
     }
 
@@ -2348,6 +2371,7 @@ final class JetStreamContext
 
     /**
      * Fetches the next message for a pull consumer.
+     * Uses the same setup-through-collection budget as {@see fetchBatch()}.
      *
      * @param array<string,mixed> $pull Optional pull-request fields (see {@see fetchBatch()}).
      * @return Future<NatsMessage>
@@ -2366,6 +2390,11 @@ final class JetStreamContext
 
     /**
      * Fetches a batch of messages for a pull consumer.
+     *
+     * One `$expiresMs + 1000` ms budget covers inbox setup, reconnect, publication, collection and
+     * cleanup. A delayed send shortens the wire expiry to leave 100 ms for its response; an idle
+     * heartbeat that no longer fits is omitted, together with its local heartbeat-miss check.
+     * An empty result at this deadline throws the usual JetStreamException with code 408.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
@@ -2413,6 +2442,10 @@ final class JetStreamContext
             $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
             $json = json_encode($payload, JSON_THROW_ON_ERROR);
 
+            $budget = new BatchReadBudget($expiresMs + 1000);
+            $finished = new DeferredCancellation();
+            $sendBudget = new CompositeCancellation($budget->cancellation(), $finished->getCancellation());
+
             $inbox = Inbox::generate('_INBOX.JS.FETCH');
             $messages = [];
             /** @var array{code: int, description: string}|null $terminalStatus */
@@ -2431,7 +2464,7 @@ final class JetStreamContext
             // inbox - by this fiber's read or any other's, the heartbeat's say - records the rejection here and
             // ends the read below, so that the fetch fails at once, loudly, instead of waiting out its deadline
             // and reporting an empty pull (a 408).
-            $onReply = static function (NatsMessage $msg) use (&$messages, &$terminalStatus, &$lastActivityNs): void {
+            $onReply = static function (NatsMessage $msg) use (&$messages, &$terminalStatus, &$lastActivityNs, $finished, $batch): void {
                 $lastActivityNs = hrtime(true);
 
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
@@ -2446,129 +2479,182 @@ final class JetStreamContext
                         'code' => $status,
                         'description' => trim((string) ($headers['Description'] ?? '')),
                     ];
+                    $finished->cancel();
 
                     return;
                 }
 
                 $messages[] = $msg;
+                if (count($messages) >= $batch) {
+                    $finished->cancel();
+                }
             };
-            $onRejected = static function (string $serverError) use (&$inboxRejection): void {
+            $onRejected = static function (string $serverError) use (&$inboxRejection, $finished): void {
                 $inboxRejection ??= $serverError;
+                $finished->cancel();
             };
 
             try {
-                $sid = $this->client->subscribeGuarded($inbox, $onReply, $onRejected)->await();
-            } catch (ConnectionException $e) {
-                // The SUB write failed, and the new server rejected the reconnect's replay of the SUB: the replay
-                // recorded the rejection, and the subscribe reports it. Said in the fetch's terms.
-                $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection, $e);
+                try {
+                    $sid = $this->client->subscribeGuarded($inbox, $onReply, $onRejected, $budget->cancellation())->await();
+                } catch (TimeoutException $e) {
+                    $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection, $e);
 
-                throw $e;
-            }
-            // Slow-consumer exemption (#118/#120 twin): one default 128 KiB read chunk can carry well
-            // over the 1024-frame per-sub cap in small-payload pull deliveries, and readIncoming
-            // enqueues every frame of a chunk before draining - without the exemption the head of the
-            // batch is DropOldest-discarded silently. The server counted those as delivered: on an
-            // explicit-ack consumer they redeliver late (skewed order, inflated num_delivered); with
-            // max_deliver=1 they are lost permanently. Memory stays bounded by the requested batch.
-            $this->client->markSubscriptionUnbounded($sid);
+                    throw new JetStreamException('No messages received within timeout', 408, $e);
+                } catch (ConnectionException $e) {
+                    // The SUB write failed, and the new server rejected the reconnect's replay of the SUB: the replay
+                    // recorded the rejection, and the subscribe reports it. Said in the fetch's terms.
+                    $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection, $e);
 
-            try {
-                // Rejected while this fiber waited for the SUB write: no pull is sent for a dead inbox, whose
-                // deliveries nobody would take.
-                $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+                    throw $e;
+                }
+                // Slow-consumer exemption (#118/#120 twin): one default 128 KiB read chunk can carry well
+                // over the 1024-frame per-sub cap in small-payload pull deliveries, and readIncoming
+                // enqueues every frame of a chunk before draining - without the exemption the head of the
+                // batch is DropOldest-discarded silently. The server counted those as delivered: on an
+                // explicit-ack consumer they redeliver late (skewed order, inflated num_delivered); with
+                // max_deliver=1 they are lost permanently. Memory stays bounded by the requested batch.
+                $this->client->markSubscriptionUnbounded($sid);
 
-                $this->client->publish($subject, $json, $inbox)->await();
-
-                // Bound the pull by the server expiry (plus slack), and - when heartbeats were
-                // requested - by the heartbeat-miss deadline (2 silent intervals, nats.go
-                // ErrNoHeartbeat parity). Each wait's cancellation cancels the underlying socket
-                // read so a silent server cannot hang the fetch indefinitely.
-                $deadlineNs = hrtime(true) + ($expiresMs + 1000) * 1_000_000;
-                $lastActivityNs = hrtime(true);
-
-                while (count($messages) < $batch && $terminalStatus === null) {
-                    // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
+                try {
+                    // Rejected while this fiber waited for the SUB write: no pull is sent for a dead inbox, whose
+                    // deliveries nobody would take.
                     $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
 
-                    $nowNs = hrtime(true);
-                    if ($nowNs >= $deadlineNs) {
-                        break;
-                    }
-
-                    $waitUntilNs = $deadlineNs;
-                    if ($idleHeartbeatNs !== null) {
-                        $missAtNs = $lastActivityNs + 2 * $idleHeartbeatNs;
-                        if ($nowNs >= $missAtNs) {
-                            // Two heartbeat intervals of silence: the server (or route) is gone.
-                            // A partial batch is still returned - those messages are real - but an
-                            // empty fetch fails fast instead of sitting out the full deadline.
-                            if ($messages !== []) {
-                                break;
-                            }
-
-                            throw new JetStreamException(sprintf(
-                                'JetStream pull fetch missed idle heartbeats: no message or heartbeat received for %d ms (2 x idle_heartbeat)',
-                                intdiv(2 * $idleHeartbeatNs, 1_000_000),
-                            ));
-                        }
-
-                        $waitUntilNs = min($waitUntilNs, $missAtNs);
-                    }
-
-                    $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
                     try {
-                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
-                        // The read ends when the inbox is dropped, with the rejection recorded: fail now, not after
-                        // the idle pause (#175).
-                        $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+                        $this->client->publishWithin(
+                            $subject,
+                            function () use ($payload, $json, $budget, &$messages, &$terminalStatus, &$idleHeartbeatNs, &$lastActivityNs): ?string {
+                                if ($messages !== [] || $terminalStatus !== null) {
+                                    return null;
+                                }
+                                // Keep the ordinary pull unchanged while it fits; otherwise use the same
+                                // margin on every attempt, with no discontinuous extra second of grace.
+                                $expiresNs = min((int) $payload['expires'], $budget->remainingNs() - self::PULL_RESPONSE_MARGIN_NS);
+                                if ($expiresNs <= 0) {
+                                    throw new TimeoutException('Pull lifetime exhausted before sending');
+                                }
+                                $request = $payload;
+                                $request['expires'] = $expiresNs;
+                                // An omitted heartbeat stays omitted if this shortened send needs a retry.
+                                if ($idleHeartbeatNs === null || 2 * $idleHeartbeatNs > $expiresNs) {
+                                    unset($request['idle_heartbeat']);
+                                    $idleHeartbeatNs = null;
+                                }
+                                $lastActivityNs = hrtime(true);
 
-                        if (!$read->consumedBytes) {
-                            // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
-                            // completed no frame yet (a chunked batch payload) loops immediately so the
-                            // rest of the payload already buffered is drained without an idle sleep (#119).
-                            delay(0.001, cancellation: $waitCancellation);
+                                return $request === $payload ? $json : json_encode($request, JSON_THROW_ON_ERROR);
+                            },
+                            $inbox,
+                            $sid,
+                            $sendBudget,
+                            function () use ($inbox, &$inboxRejection): void {
+                                $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+                            },
+                        )->await();
+                    } catch (TimeoutException $e) {
+                        $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection, $e);
+                        if ($messages === [] && $terminalStatus === null) {
+                            throw new JetStreamException('No messages received within timeout', 408, $e);
                         }
-                    } catch (CancelledException) {
-                        // This wait segment ended (overall deadline or a heartbeat check came due);
-                        // loop around to re-evaluate the deadlines against fresh activity.
                     } catch (ConnectionException $e) {
-                        // The read failed with the connection going: lost, or failed over from a server in lame duck
-                        // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended
-                        // by a reconnect that gave up or by a fatal -ERR. A partial batch is still returned, as above:
-                        // those messages are real, and the server counted them as delivered. A failure on an open
-                        // connection still fails the fetch: a full queue, a handler's own, or a fatal -ERR whose
-                        // reconnect has reopened it.
                         if ($messages === [] || $this->client->state() === ConnectionState::Open) {
                             throw $e;
                         }
 
                         return $messages;
                     }
+
+                    // Bound the pull by the server expiry (plus slack), and - when heartbeats were
+                    // requested - by the heartbeat-miss deadline (2 silent intervals, nats.go
+                    // ErrNoHeartbeat parity). Each wait's cancellation cancels the underlying socket
+                    // read so a silent server cannot hang the fetch indefinitely.
+
+                    while (count($messages) < $batch && $terminalStatus === null) {
+                        // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
+                        $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+
+                        $nowNs = hrtime(true);
+                        if ($budget->remainingNs() === 0 || $budget->cancellation()->isRequested()) {
+                            break;
+                        }
+
+                        $waitUntilNs = $nowNs + $budget->remainingNs();
+                        if ($idleHeartbeatNs !== null) {
+                            $missAtNs = $lastActivityNs + 2 * $idleHeartbeatNs;
+                            if ($nowNs >= $missAtNs) {
+                                // Two heartbeat intervals of silence: the server (or route) is gone.
+                                // A partial batch is still returned - those messages are real - but an
+                                // empty fetch fails fast instead of sitting out the full deadline.
+                                if ($messages !== []) {
+                                    break;
+                                }
+
+                                throw new JetStreamException(sprintf(
+                                    'JetStream pull fetch missed idle heartbeats: no message or heartbeat received for %d ms (2 x idle_heartbeat)',
+                                    intdiv(2 * $idleHeartbeatNs, 1_000_000),
+                                ));
+                            }
+
+                            $waitUntilNs = min($waitUntilNs, $missAtNs);
+                        }
+
+                        $waitCancellation = new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9);
+                        try {
+                            $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
+                            // The read ends when the inbox is dropped, with the rejection recorded: fail now, not after
+                            // the idle pause (#175).
+                            $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
+
+                            if (!$read->consumedBytes) {
+                                // Only a genuinely idle read yields 1 ms; a read that consumed bytes but
+                                // completed no frame yet (a chunked batch payload) loops immediately so the
+                                // rest of the payload already buffered is drained without an idle sleep (#119).
+                                delay(0.001, cancellation: $waitCancellation);
+                            }
+                        } catch (CancelledException) {
+                            // This wait segment ended (overall deadline or a heartbeat check came due);
+                            // loop around to re-evaluate the deadlines against fresh activity.
+                        } catch (ConnectionException $e) {
+                            // The read failed with the connection going: lost, or failed over from a server in lame duck
+                            // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended
+                            // by a reconnect that gave up or by a fatal -ERR. A partial batch is still returned, as above:
+                            // those messages are real, and the server counted them as delivered. A failure on an open
+                            // connection still fails the fetch: a full queue, a handler's own, or a fatal -ERR whose
+                            // reconnect has reopened it.
+                            if ($messages === [] || $this->client->state() === ConnectionState::Open) {
+                                throw $e;
+                            }
+
+                            return $messages;
+                        }
+                    }
+                } finally {
+                    $this->client->releaseSubscriptionWithin($sid, $budget->cancellation())->await();
                 }
+
+                if ($messages === []) {
+                    if ($terminalStatus !== null) {
+                        throw new JetStreamException(
+                            $this->formatPullTerminalStatusMessage($terminalStatus['code'], $terminalStatus['description']),
+                            $terminalStatus['code'],
+                        );
+                    }
+
+                    throw new JetStreamException('No messages received within timeout', 408);
+                }
+
+                // A terminal status arrived AFTER >=1 message: the partial batch is returned (nats.go
+                // parity), but surface the status so a caller can observe a non-routine mid-batch
+                // termination (e.g. the consumer was deleted) instead of only learning on the next pull.
+                if ($terminalStatus !== null && $onTerminalStatus !== null) {
+                    $onTerminalStatus($terminalStatus['code'], $terminalStatus['description']);
+                }
+
+                return $messages;
             } finally {
-                $this->client->unsubscribe($sid)->await();
+                $budget->stop();
             }
-
-            if ($messages === []) {
-                if ($terminalStatus !== null) {
-                    throw new JetStreamException(
-                        $this->formatPullTerminalStatusMessage($terminalStatus['code'], $terminalStatus['description']),
-                        $terminalStatus['code'],
-                    );
-                }
-
-                throw new JetStreamException('No messages received within timeout', 408);
-            }
-
-            // A terminal status arrived AFTER >=1 message: the partial batch is returned (nats.go
-            // parity), but surface the status so a caller can observe a non-routine mid-batch
-            // termination (e.g. the consumer was deleted) instead of only learning on the next pull.
-            if ($terminalStatus !== null && $onTerminalStatus !== null) {
-                $onTerminalStatus($terminalStatus['code'], $terminalStatus['description']);
-            }
-
-            return $messages;
         });
     }
 
@@ -4059,6 +4145,17 @@ final class JetStreamContext
      * Supported optional pull-request fields (ADR-13/ADR-42) accepted by fetchBatch()/fetchNext().
      */
     private const PULL_REQUEST_FIELDS = ['group', 'id', 'min_pending', 'min_ack_pending', 'priority', 'max_bytes', 'no_wait', 'idle_heartbeat'];
+
+    private function directGetStall(string $stream, int $expiresMs, int $received, ?\Throwable $previous = null): JetStreamException
+    {
+        return new JetStreamException(sprintf(
+            'Direct Get batch for stream "%s" stalled: no progress for %d ms '
+                . '(received %d message(s), no end-of-batch marker)',
+            $stream,
+            $expiresMs + 1000,
+            $received,
+        ), 0, $previous);
+    }
 
     /**
      * Builds a pull-consumer CONSUMER.MSG.NEXT request body, merging supported ADR-13/ADR-42 pull

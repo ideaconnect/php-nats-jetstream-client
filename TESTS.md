@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3101 unit tests, 149 integration tests, 48 Behat scenarios.
+Indicative totals: 3141 unit tests, 150 integration tests, 48 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -627,6 +627,19 @@ A handler that throws in the application's own read, processIncoming() or readIn
 - `testRecreateTriggeredDuringStopTeardownDoesNotRecreate` - a recreate trigger that fires while stopOrderedConsumer() is still mid-teardown observes the stop latch and does nothing: no delete of the already-stopped instance, no fresh inbox, no CONSUMER.CREATE.
 - `testDeferralKeepsAdoptionWhenCandidateDeliveredSoSurvivorReplayIsNotDuplicated` - the deferral rewind is skipped when the episode already delivered: an adopted candidate that replayed a message keeps its adopted state, so the surviving old consumer's post-reconnect frame for an already-seen stream sequence is name-filtered rather than re-delivered as a duplicate, while the never-installed fresh inbox is still released.
 - `testDefunctTickDuringParkedRecreateCreatePreventsInstall` - onDefunct latches the stopped flag FIRST, so a plain unsubscribe whose defunct tick runs while a recreate is parked in its CONSUMER.CREATE await makes the resumed recreate tear the fresh instance down (unsubscribe the rotated inbox, best-effort delete the created consumer) instead of installing it, leaving no watchdog re-armed and no zombie consumer delivering.
+
+### tests/Unit/JetStreamBatchBudgetTest.php
+
+- `testSetupEndsWithinItsOwnBudgetAndCannotSendAfterRecovery` - All four batch entry points; an existing reconnect or failed SUB/PUB ends at the original budget, drops its inbox, and sends nothing when recovery resumes.
+- `testFailedWritesRespectWaitingDisabledAndReconnectDisabled` - Failed SUB/PUB honors both connection policy flags, without a late publish.
+- `testInlineWriteBackpressureCannotHoldTheOperationPastItsBudget` - A transport that suspends inside SUB, PUB or UNSUB cannot overrun fetch or Direct Get; local inbox state is released.
+- `testAnExpiryLongerThanTheGlobalRequestTimeoutCanWaitForRecovery` - A longer fetch waits beyond the global subscribe timeout and gets its reply.
+- `testTheWireExpiryFitsTheRemainingBudgetWithoutTheOldCutoff` - Delayed setup and failed-PUB retry recompute a positive expiry on both sides of the previous one-second discontinuity.
+- `testAnOmittedWireHeartbeatAlsoDisablesTheLocalMissTimer` - Replies in transit survive shortening that removes the requested heartbeat; a failed shortened send cannot restore it on retry.
+- `testLateSubCompletionIsReleasedInOrderAndLeavesPongCorrelationIntact` - A late SUB receives its UNSUB afterward, and a subsequent flush consumes the correct PONG.
+- `testTimeoutDuringAReconnectedListenerReleasesTheReplayedInbox` - Timeout while a reconnect listener is held releases the replayed subscription on the new session.
+- `testAnInboxRejectedDuringPubRecoveryCannotReceiveTheRetry` - Permissions and subscription-limit rejection prevent retries for fetch and Direct Get.
+- `testDirectGetProgressRenewsAPendingPubAndNeverRetriesAfterCompletion` - Concurrent replies renew the budget beyond its initial interval; an end marker settles pending publication, true silence stalls, and a late write failure repairs without resending.
 
 ### tests/Unit/JetStreamInboxRejectionTest.php
 The JetStream reply inboxes at the connection's subscription limit (#175): the pull fetch's ("_INBOX.JS.FETCH.<nuid>"), the pull pipeline's ("_INBOX.JS.PULL.<nuid>.*") and the batched Direct Get's ("_INBOX.JS.DGET.<nuid>") get the shared reply inbox's rule (`NatsConnection::subscribeGuarded()`): a PING behind the SUB, whose PONG confirms the inbox, as a delivery on it does; a 'maximum subscriptions exceeded' -ERR read before that, by whichever fiber, drops the inbox, writes its UNSUB and fails the operation at once with an error naming the inbox and the limit, where the operation used to wait out its deadline and report a routine empty result when another fiber's read took the -ERR. Over `tests/Support/SubscriptionLimitServer.php` (which enforces the limit and answers in wire order) with an application processIncoming() loop as the other reader, and over `tests/Support/ReconnectingTransport.php` with the heartbeat as the other reader and the SUB write held up. The order of events decides; the 1 s bounds sit far from the milliseconds expected and from the 3 s deadline (2 s expiry plus 1 s) of the broken behaviour.
@@ -3101,6 +3114,7 @@ drain() and drainSubscription() against a live NATS server.
 - `testJetStreamBatchedDirectGet` - On an allow_direct stream with 3 subjects, asserts directGetLastForSubjects returns 3 messages and directGetBatch over a sequence range returns all 3 with the expected payloads.
 - `testJetStreamPublishDuringReconnectWaitsForTheAckAgainstALiveServer` - Severs the client's live socket and refuses its dials for 300 ms, so the heartbeat starts the recovery, then asserts a JetStream publish waits for the reconnect and returns the stream's PubAck (seq 1) after exactly one reconnect.
 - `testJetStreamFetchDuringReconnectWaitsForItAgainstALiveServer` - The same outage; asserts a fetchBatch() issued during it waits for the reconnect and returns the stored message.
+- `testJetStreamFetchDuringALongerOutageEndsWithItsOwnEmptyResult` - A held outage over the real socket transport ends the fetch with its own 408 while still Connecting.
 
 ### tests/Integration/MultiConsumerIntegrationTest.php
 - `testTwoDurableConsumersOnSameStreamEachReceiveAllMessages` - two independent durable consumers on one stream each receive the full message set in order (fan-out independence; one consumer acking does not consume the other's copy).

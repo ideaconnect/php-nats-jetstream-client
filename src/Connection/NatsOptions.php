@@ -118,7 +118,9 @@ final class NatsOptions
       *        that fails the connection over,
       *        starts the reconnect and waits for it the same way, within its own timeout (#178, #191, #215).
       *        Requests never enter the reconnect publish buffer; a retry checks the same budget and
-      *        reply inbox, and a transport write already in progress may finish after the request ends. Your
+      *        reply inbox, and a transport write already in progress may finish after the request ends.
+      *        Batch fetch setup uses its expiry plus a second; Direct Get renews that interval on replies,
+      *        including during PUB backpressure. Their failed writes obey this flag too (#188). Your
       *        own processIncoming()/readIncoming(), a serving loop's read and the heartbeat run the reconnect
       *        themselves and wait for all of it. Set `false` to fail fast instead (the behavior before this
       *        option existed): an operation whose own read or write noticed the loss, or whose read brought

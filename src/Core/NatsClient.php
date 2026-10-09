@@ -122,6 +122,26 @@ final class NatsClient
     }
 
     /**
+     * @internal Budgeted batch publication; callbacks must not suspend.
+     * @param \Closure():?string $payload
+     * @param \Closure():void $beforeWrite
+     * @return Future<void>
+     */
+    public function publishWithin(string $subject, \Closure $payload, string $replyTo, int $replySid, Cancellation $budget, \Closure $beforeWrite): Future
+    {
+        return $this->connection->publishWithin($subject, $payload, $replyTo, $replySid, $budget, $beforeWrite);
+    }
+
+    /**
+     * @internal Releases a temporary inbox without allowing its cleanup to overrun the operation.
+     * @return Future<void>
+     */
+    public function releaseSubscriptionWithin(int $sid, Cancellation $budget): Future
+    {
+        return $this->connection->releaseSubscriptionWithin($sid, $budget);
+    }
+
+    /**
      * Publishes a payload with NATS headers to a subject. A header value may be a single string or a
      * list of strings for multi-value (multimap) headers (ADR-4).
      *
@@ -176,6 +196,7 @@ final class NatsClient
      * unconfirmed at once are all treated as rejected by such an -ERR. A SUB whose write failed is replayed by the
      * reconnect; when the new server rejects the replay, the subscribe itself fails with a ConnectionException
      * naming the subject and the limit, $onRejected called first. See {@see NatsConnection::subscribeGuarded()}.
+     * An optional operation budget covers reconnect and SUB write backpressure instead of the global timeout.
      *
      * @internal Low-level mechanism for the JetStream reply inboxes; not part of the supported API.
      *
@@ -183,9 +204,9 @@ final class NatsClient
      * @param \Closure(string): void $onRejected Must not suspend: it runs inside the dispatch of the -ERR.
      * @return Future<int>
      */
-    public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected): Future
+    public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected, ?Cancellation $budget = null): Future
     {
-        return $this->connection->subscribeGuarded($subject, $handler, $onRejected);
+        return $this->connection->subscribeGuarded($subject, $handler, $onRejected, $budget);
     }
 
     /**
