@@ -15,6 +15,43 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- A pull consumer run that ends with a failure of its own now releases its inbox before it hands what its pulls hold to
+  the handler (#212): `handle()` throws its failure up to one round trip later (at most `requestTimeoutMs`), and the
+  handler no longer gets messages the server delivers during that hand-over: they stay in the stream for the next pull.
+  An error listener may now get a `TimeoutException` ("Releasing the pull consumer inbox ...") as a warning when the
+  server does not answer the release's `PING` in time.
+
+### Fixed
+
+- [bugfix] A pull consumer run that ended with a failure of its own kept its pulls alive on the server while it handed
+  their messages to the handler, and dropped what they received meanwhile (#212). Since 2.22.0 such a run (its pump
+  read failing, a pull's write failing, or the server rejecting its inbox) hands its buffers over first (#197), and it
+  released its inbox only in its finally, after that hand-over. The server knows nothing of the failure: for as long as
+  the hand-over lasted it went on serving the run's pulls, each waiting for the rest of its batch, with what was
+  published meanwhile, and the run dropped it unacked, read after the run's UNSUB, or as a straggler once no pull was
+  left open; a reconnect completed during the hand-over even subscribed the run's inbox again. On a consumer with
+  `ack_policy: none` or `max_deliver: 1` that message was lost, otherwise it came again after `ack_wait`. Measured on
+  nats-server 2.12 with `ack_policy: none`: a message published while the handler held the first of two buffered
+  messages left the consumer at `delivered 3` and was never handled. The run now closes its inbox to new deliveries
+  before the hand-over, through a new connection-owned operation, `NatsClient::retirePullInbox()` (`@internal`): on an
+  open connection it writes `UNSUB` and a `PING` in one write and reads what the server sent before the `UNSUB` into the
+  pulls (and an infinite run's overflow) until that PING's PONG, waiting for the PONG itself rather than for the read,
+  within one `requestTimeoutMs` budget on a referenced timer; while the client's `drain()` is under way the drain's own
+  `UNSUB` and flush stand in for it, the run waiting for the drain to ask for its hand-over; while a reconnect is under
+  way, or on a closed connection, the inbox only leaves the replay. It then routes what the inbox's queue holds into the
+  pulls, unless a `stop()` or a close that discards came, and removes the inbox's local state, so nothing more reaches
+  the run; a guarded inbox already treated as rejected gets its owed `UNSUB` within the same budget. The server stops
+  serving the run's pulls, and what is published during the hand-over stays in the stream for the next pull. The
+  release costs the failing run one round trip; one that runs out of its budget (an unanswered `PING`, a stalled
+  write) or whose read fails is reported to the error listener as a warning, never in place of the run's own failure,
+  and a `stop()` ends it at once. The normal retire path, the infinite run that goes on past a frame that ended the
+  connection (#210), and finite batch and iteration limits are unchanged. The fence is best effort: a `UNSUB` whose
+  write timed out can still leave interest on the server until it lands. Found by the review of #197 (2.22.0).
+
 ## [2.25.1] - 2026-10-10
 
 ### Upgrade notes

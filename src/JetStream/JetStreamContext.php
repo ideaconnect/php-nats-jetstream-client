@@ -2729,7 +2729,12 @@ final class JetStreamContext
      * that delivery, ends it as a stop() does, rather than run the handler after the close returned, with every ack
      * failing, as it ends every delivery of the run (#207, below); a drain() still within its budget lets it go on, the
      * handler's acks going out. An exception of the handler or of onError anywhere else still ends the run at once, the
-     * other pulls' buffers left undelivered and unacked, as a stop() leaves them.
+     * other pulls' buffers left undelivered and unacked, as a stop() leaves them. Before that hand-over the run closes its
+     * inbox to new deliveries (#212, {@see \IDCT\NATS\Core\NatsClient::retirePullInbox()}): UNSUB and a PING in one write
+     * on an open connection, what the server sent before the UNSUB routed into the pulls until that PING's PONG, within
+     * one request-timeout budget, and the inbox's local state removed, so that the server stops serving the run's pulls
+     * and what is published during the hand-over stays in the stream for the next pull. The server used to serve them
+     * until the run's finally released the inbox, after the hand-over, and what it delivered meanwhile was dropped.
      *
      * The client's drain() hands over what the pulls hold, and a disconnect() discards it, wherever the run is (#207),
      * as they do for the connection's own queues. Every delivery to the handler checks before each message, as it
@@ -3076,7 +3081,7 @@ final class JetStreamContext
                     $rejection = $inboxRejection->error();
                     if ($rejection !== null) {
                         $rejected = $this->pullInboxRejectedException($base, $rejection);
-                        $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $overflow, $handler, $ctl);
+                        $this->deliverReceivedBeforeFailing($sid, $drainParticipant, $inflight, $issueOrder, $overflow, $handler, $ctl);
 
                         throw $rejected;
                     }
@@ -3441,7 +3446,7 @@ final class JetStreamContext
                             // pull refills the pipeline: the handler gets that first, unless the application closed the
                             // connection (a disconnect() under a held-up write fails it with the transport's own error),
                             // and the run then ends with the write's error, as for the pump read below (#197).
-                            $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $overflow, $handler, $ctl);
+                            $this->deliverReceivedBeforeFailing($sid, $drainParticipant, $inflight, $issueOrder, $overflow, $handler, $ctl);
 
                             throw $failure;
                         }
@@ -3565,7 +3570,7 @@ final class JetStreamContext
                             // the caller still learns why the run ended (#197). fetchBatch() returns its partial batch
                             // for the same reason when its read fails with the connection going. The overflow goes
                             // after the pulls, its messages being newer (#187).
-                            $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $overflow, $handler, $ctl);
+                            $this->deliverReceivedBeforeFailing($sid, $drainParticipant, $inflight, $issueOrder, $overflow, $handler, $ctl);
 
                             throw $failure;
                         }
@@ -3655,7 +3660,8 @@ final class JetStreamContext
                 // can suspend.
                 $this->client->removeDrainParticipant($drainParticipantId);
                 $drainParticipant->handedOver();
-                // Plain unsubscribe: release the pull inbox once, on every exit path.
+                // Plain unsubscribe: release the pull inbox once, on every exit path. A run that failed released it
+                // before its hand-over (#212, deliverReceivedBeforeFailing()), and this then writes nothing.
                 $this->client->unsubscribe($sid)->await();
             }
         });
@@ -3715,7 +3721,8 @@ final class JetStreamContext
      * buffer goes out: a message read while the handler suspends, by the handler's own read or another fiber's, is then
      * attributed to a pull still to come, where it counts against that pull's batch, or to the overflow once no pull is
      * left open (a finite run, which has none, drops it as a straggler), instead of being added to the buffer being
-     * delivered. Every delivery goes through {@see deliverPullBuffer()}, with its checks of stop() and of a close
+     * delivered; before a failure nothing more is read for the run by then, its inbox released first (#212). Every
+     * delivery goes through {@see deliverPullBuffer()}, with its checks of stop() and of a close
      * before each message; no group pin is captured, since the run ends. For the hand-over the client's drain() asks
      * for (#207), the end of a run on a terminal status (#187), and the hand-over before a run fails ({@see
      * deliverReceivedBeforeFailing()}, #197). A handler that throws ends the delivery, its exception thrown.
@@ -3744,15 +3751,26 @@ final class JetStreamContext
      * lost with the run, they came again only after the ack wait, or never on a consumer without acks or with
      * max_deliver 1. They go to the handler as the run's other hand-overs give them ({@see deliverWhatTheRunHolds()}):
      * each pull in issue order, then the overflow, with the checks of stop() and of a close before each message, though
-     * no group pin is captured from them as the retire phase does, and the caller then throws its failure unchanged. A
-     * message read while the handler suspends goes to a pull still to come, or to the overflow, and is handed over with
-     * the rest; a finite run, which has no overflow, drops it as a straggler once no pull is left open, unacked: the
-     * server redelivers it after the ack wait, and on a consumer without acks or with max_deliver 1 it is lost, as the
-     * whole run's buffers were before. A close that discards what the connection received and has not delivered
-     * (nats.go Close() parity), a disconnect() or a drain() of the connection once its budget has run out, made before
-     * the delivery or during it, ends it as stop() does: the handler would run after the close had returned, and its
-     * acks could not go out any more. A drain() within its budget does not: it hands over what the connection holds,
-     * and the handler's acks go out (#207). Every delivery of the run follows that rule, the retire phase included
+     * no group pin is captured from them as the retire phase does, and the caller then throws its failure unchanged.
+     *
+     * The run's inbox is closed to new deliveries first (#212), through
+     * {@see \IDCT\NATS\Core\NatsClient::retirePullInbox()}: on an open connection UNSUB and a PING go out in one write,
+     * and what the server sent the inbox before it had the UNSUB is read and routed into the pulls (or an infinite run's
+     * overflow) until that PING's PONG, within one request-timeout budget; while a drain() of the client is under way
+     * the drain's own UNSUB and flush stand in for that, the run waiting for the drain to ask for its hand-over; while
+     * a reconnect is under way, or on a closed connection, the inbox only leaves the replay. Then the inbox's local
+     * state goes, what its queue held routed into the pulls first, unless a stop() or a close that discards came. The
+     * server then stops serving the run's pulls: what is published during the hand-over stays in the stream for the next
+     * pull, neither delivered nor counted, where the server used to deliver it to the failed run's pulls for as long as
+     * the hand-over lasted, and the run dropped it unacked, read after the run's UNSUB or as a straggler. A cleanup that
+     * fails or runs out of its budget is reported, never thrown: the run's own failure is the one the caller throws. A
+     * message the server sent after the release, or one the fence could not collect in time, is not delivered: it stays
+     * unacked, for the server to deliver again after the ack wait, or never on a consumer without acks or with
+     * max_deliver 1. A close that discards what the connection received and has not delivered (nats.go Close()
+     * parity), a disconnect() or a drain() of the connection once its budget has run out, made before the delivery or
+     * during it, ends it as stop() does: the handler would run after the close had returned, and its acks could not go
+     * out any more. A drain() within its budget does not: it hands over what the connection holds, and the handler's
+     * acks go out (#207). Every delivery of the run follows that rule, the retire phase included
      * ({@see deliverPullBuffer()}).
      *
      * A handler that throws ends the delivery, the rest left undelivered and unacked as when a handler throws in the
@@ -3765,8 +3783,22 @@ final class JetStreamContext
      * @param list<string> $issueOrder Their tokens, oldest first.
      * @param callable(NatsMessage, JetStreamContext):void $handler
      */
-    private function deliverReceivedBeforeFailing(array $inflight, array $issueOrder, PullOverflow $overflow, callable $handler, PullPipelineControl $ctl): void
-    {
+    private function deliverReceivedBeforeFailing(
+        int $sid,
+        PullPipelineDrainParticipant $drainParticipant,
+        array $inflight,
+        array $issueOrder,
+        PullOverflow $overflow,
+        callable $handler,
+        PullPipelineControl $ctl,
+    ): void {
+        try {
+            $this->client->retirePullInbox($sid, $ctl->stopInterruption(), $drainParticipant->wakeUp())->await();
+        } catch (\Throwable $cleanupFailure) {
+            // Reported, never thrown: the run's own failure is the one its caller throws.
+            $this->emitClientError($cleanupFailure);
+        }
+
         try {
             $this->deliverWhatTheRunHolds($inflight, $issueOrder, $overflow, $handler, $ctl);
         } catch (\Throwable $handlerFailure) {

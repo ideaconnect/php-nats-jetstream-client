@@ -41,8 +41,9 @@ use PHPUnit\Framework\TestCase;
  * stop() still leaves them undelivered, whether it came before the failure or from the handler during that delivery,
  * and so does a close that discards them, a disconnect() or a drain() of the connection that has closed it; the
  * iterator's drain() changes nothing; a handler that throws during that delivery, one whose ack failed on a closed
- * connection say, ends it and is reported to the error listener, the run's own failure being the one thrown; a message
- * read while the handler runs goes to a pull still to be handed over, when one is left open; and a handler that throws
+ * connection say, ends it and is reported to the error listener, the run's own failure being the one thrown; the run
+ * closes its inbox to new deliveries before that delivery, so a reconnect completed meanwhile does not subscribe it
+ * again (#212, see PullConsumerFailedRunInboxReleaseTest); and a handler that throws
  * in the normal retire phase still ends the run at once, as it always did. Since #207 the close rule covers every
  * delivery of the run, as it covers what the connection itself has received: a disconnect() also ends the hand-over of
  * a pull the run retires, and the client's drain() hands over what the pulls hold instead of closing the connection
@@ -702,30 +703,32 @@ final class PullConsumerConnectionLossTest extends TestCase
     }
 
     /**
-     * A message read while the handler runs during that delivery is handed over too, after what was received before
-     * it: depth 2 and batch 3, the first pull holds m-1 and m-2 and the second none when the read fails with a fatal
-     * -ERR, waiting for the reconnect disabled, so that the read fails at once while the reconnect reopens the
-     * connection in the background and replays the inbox. On m-1 the handler waits for that, the server sends m-3 on the
-     * new connection, and the handler reads it itself: the first pull, being handed over, takes nothing more, so m-3
-     * goes into the second pull and reaches the handler after m-2. Added to the buffer being handed over, it would have
-     * been dropped with it. The handler used to get nothing. (With waiting enabled the infinite run goes on past the
-     * -ERR instead, #210, and PullConsumerConnectionEndingFrameTest checks the same rule for that hand-over.)
+     * A run that fails while a reconnect is under way takes its inbox out of the reconnect's replay before it hands its
+     * pulls over (#212): the reconnect, completed while the handler works through the hand-over, does not subscribe the
+     * failed run's inbox again on the new connection, so the server, which serves a waiting pull only where its inbox
+     * has interest, gives the run's old pulls nothing more. Depth 2 and batch 3, the first pull holding m-1 and m-2 and
+     * the second none when the read fails with a fatal -ERR, waiting for the reconnect disabled, so that the read fails
+     * at once while the reconnect reopens the connection in the background. On m-1 the handler waits for that: the new
+     * connection holds no subscription for the run's inbox, the handler gets m-1 and m-2, and handle() throws the frame's
+     * error. The replay used to subscribe it again, and the server could serve the run's pulls there, what it sent going
+     * to a run that was ending (this test's predecessor pinned that a message read during the hand-over went into the
+     * second pull; the run now stops receiving before the hand-over instead, see PullConsumerFailedRunInboxReleaseTest).
+     * (With waiting enabled the infinite run goes on past the -ERR instead, #210, and keeps its inbox.)
      */
-    public function testAMessageReadWhileTheHandlerRunsGoesToAPullStillToBeHandedOver(): void
+    public function testAReconnectCompletedDuringTheHandOverDoesNotSubscribeTheFailedRunsInboxAgain(): void
     {
         [$transport, $watched, $client] = $this->client('fatal -ERR, waiting disabled');
         $server = $this->pullServer($transport);
         $handled = self::payloadLog();
-        $framesRead = [];
+        /** @var list<?int> $interest */
+        $interest = [];
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(2)->setExpiresMs(30_000)
-            ->handle(function (NatsMessage $message) use ($handled, $transport, $server, $client, &$framesRead): void {
+            ->handle(function (NatsMessage $message) use ($handled, $transport, $server, $client, &$interest): void {
                 $handled[] = $message->payload;
                 if ($message->payload === 'm-1') {
-                    // Once the reconnect has reopened the connection, its server answers the first pull further: the
-                    // handler's own read takes it.
+                    // Once the reconnect has reopened the connection: does it hold a subscription for the run's pulls?
                     $this->waitUntilOpen($client);
-                    $transport->pushFrame(self::messages((int) $server->sid, 'm-3'));
-                    $framesRead[] = $client->processIncoming(new TimeoutCancellation(2))->await();
+                    $interest[] = $transport->sidFor($server->base . '.0');
                 }
             });
         $this->waitUntil(static fn(): bool => count($server->epochs) === 2 && $watched->readsUnderWay === 1);
@@ -736,9 +739,17 @@ final class PullConsumerConnectionLossTest extends TestCase
 
         self::assertInstanceOf(ConnectionException::class, $error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame("Server sent error frame: 'Stale Connection'", $error->getMessage());
-        self::assertSame([1], $framesRead, 'the handler\'s read took m-3');
-        self::assertSame(1, $transport->epoch(), 'm-3 came on the new connection');
-        self::assertSame(['m-1', 'm-2', 'm-3'], $handled->getArrayCopy(), 'm-3 went into the second pull, still to be handed over');
+        self::assertSame(1, $transport->epoch(), 'the reconnect reopened the connection during the hand-over');
+        self::assertSame([null], $interest, 'the new connection holds no subscription for the failed run\'s inbox');
+        self::assertSame(
+            [],
+            array_values(array_filter(
+                $transport->controlLinesStartingWith('SUB ', 1),
+                static fn(string $line): bool => str_contains($line, (string) $server->base),
+            )),
+            'the reconnect did not replay the inbox',
+        );
+        self::assertSame(['m-1', 'm-2'], $handled->getArrayCopy());
     }
 
     /**
