@@ -12,15 +12,25 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
 
 final class SubscriptionQueueMutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private function makeConnectedClient(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client;

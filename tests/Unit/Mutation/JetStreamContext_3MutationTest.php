@@ -11,6 +11,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Mutation-killing tests for src/JetStream/JetStreamContext.php (chunk 3).
@@ -22,6 +23,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     private function jsOk(string $json): string
@@ -31,7 +41,7 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
 
     private function connected(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return $client;
@@ -525,16 +535,16 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
         $this->orderedConsumerServer(
             $transport,
             onCreate: [
-                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
-                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+                static fn(string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn(string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
             ],
             onDelete: [
-                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn(string $rt): array => [self::muxMsg($rt, $deleteReply)],
             ],
             deliverEpochs: [
                 // First delivery is already out of order: consumer seq 5 (expected 1) -> immediate
                 // recreate. lastStreamSeq is still 0, so opt_start_seq must be 0 + 1 = 1.
-                static fn (int $sid): array => ["MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.5.9.5.0.0 4\r\nbad5\r\n"],
+                static fn(int $sid): array => ["MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.5.9.5.0.0 4\r\nbad5\r\n"],
                 // The rotated (second) epoch delivers nothing: server-side replay is exercised in the
                 // integration suite, not against FakeTransport.
             ],
@@ -588,7 +598,7 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
         $this->orderedConsumerServer(
             $transport,
             onCreate: [
-                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn(string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
                 static function (string $rt) use ($createReply, &$rotatedSid): array {
                     return [
                         self::muxMsg($rt, $createReply('ORD2')),
@@ -599,10 +609,10 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
                 },
             ],
             onDelete: [
-                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn(string $rt): array => [self::muxMsg($rt, $deleteReply)],
             ],
             deliverEpochs: [
-                static fn (int $sid): array => [
+                static fn(int $sid): array => [
                     // In-order msg1 (consumer seq 1) -> delivered, expected next 2.
                     "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
                     // Gap (consumer seq 3) -> recreate to ORD2; expected resets to 1.
@@ -661,14 +671,14 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
         $this->orderedConsumerServer(
             $transport,
             onCreate: [
-                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
-                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
+                static fn(string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn(string $rt): array => [self::muxMsg($rt, $createReply('ORD2'))],
             ],
             onDelete: [
-                static fn (string $rt): array => [self::muxMsg($rt, $deleteReply)],
+                static fn(string $rt): array => [self::muxMsg($rt, $deleteReply)],
             ],
             deliverEpochs: [
-                static fn (int $sid): array => [
+                static fn(int $sid): array => [
                     "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
                     sprintf("HMSG deliver.ord $sid %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb),
                 ],
@@ -716,11 +726,11 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
         $this->orderedConsumerServer(
             $transport,
             onCreate: [
-                static fn (string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
+                static fn(string $rt): array => [self::muxMsg($rt, $createReply('ORD1'))],
             ],
             onDelete: [],
             deliverEpochs: [
-                static fn (int $sid): array => [
+                static fn(int $sid): array => [
                     "MSG deliver.ord $sid \$JS.ACK.EVENTS.ORD1.1.1.1.0.0 4\r\nmsg1\r\n",
                     sprintf("HMSG deliver.ord $sid %d %d\r\n%s\r\n", strlen($hb), strlen($hb), $hb),
                 ],

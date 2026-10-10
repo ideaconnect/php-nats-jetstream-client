@@ -978,7 +978,7 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         int $reconnectMaxDelayMs = 20,
         int $maxReconnectAttempts = 1_000,
     ): NatsClient {
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             $this->options(
                 true,
                 2_000,
@@ -991,7 +991,7 @@ final class OperationReadReconnectLifecycleTest extends TestCase
                 $errorListener ?? $recorder->errorListener(),
             ),
             $watched,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
 

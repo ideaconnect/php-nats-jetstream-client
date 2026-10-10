@@ -11,6 +11,7 @@ use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
 use IDCT\NATS\JetStream\Models\StreamInfo;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -31,6 +32,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class JetStreamContext_13MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -43,7 +53,7 @@ final class JetStreamContext_13MutationTest extends TestCase
     private function connect(array $muxFrames): array
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
         $this->muxReplies($transport, $muxFrames);
 

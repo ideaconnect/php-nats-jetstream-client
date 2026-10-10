@@ -658,7 +658,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         $holder = new class {
             public ?NatsClient $client = null;
         };
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 pingIntervalSeconds: 0,
@@ -671,7 +671,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
         $holder->client = $client;
@@ -918,7 +918,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                 };
             $transport = new ReconnectingTransport();
             $recorder = new LifecycleRecorder();
-            $client = new NatsClient(
+            $client = $this->own(new NatsClient(
                 new NatsOptions(
                     connectTimeoutMs: 500,
                     pingIntervalSeconds: 0,
@@ -928,7 +928,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                     logger: $logger,
                 ),
                 $transport,
-            );
+            ));
             $this->opened[] = $client;
             $client->connect()->await();
             [$overflow, $sid] = $this->overflow('polling buffer', $client, $transport);
@@ -962,10 +962,10 @@ final class SlowConsumerErrorPolicyTest extends TestCase
     public function testKeyValueListingIsNotCutShortByThePendingBound(string $listing, SlowConsumerPolicy $policy): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(connectTimeoutMs: 500, pingIntervalSeconds: 0, maxPendingMessagesPerSubscription: 2, slowConsumerPolicy: $policy),
             $transport,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
         $consumer = $listing === 'keys' ? 'KEYS' : 'HIST';
@@ -1242,7 +1242,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
     public function testSubscriptionQueueStillFailsWhenItsOwnPollingBufferOverflows(): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 pingIntervalSeconds: 0,
@@ -1250,7 +1250,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
         $holder = new class {
@@ -1313,7 +1313,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
         bool $reconnect = true,
         bool $handlerFailuresFailOperations = false,
     ): NatsClient {
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: $requestTimeoutMs,
@@ -1326,7 +1326,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                 handlerErrorsFailOperations: $handlerFailuresFailOperations,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
 
@@ -1404,7 +1404,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
     /** A connection whose subscriptions hold at most three messages, under SlowConsumerPolicy::Error. */
     private function errorPolicyConnection(ReconnectingTransport $transport, LifecycleRecorder $recorder, bool $failOperations = false): NatsConnection
     {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 2_000,
@@ -1421,7 +1421,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
                 slowConsumerErrorsFailOperations: $failOperations,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
 

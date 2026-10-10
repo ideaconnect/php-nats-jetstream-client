@@ -12,6 +12,7 @@ use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\SubscriptionLimitServer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -33,6 +34,8 @@ use function Amp\delay;
  */
 final class MuxInboxSetUpBudgetTest extends TestCase
 {
+    use OwnsTestResources;
+
     private const LIMIT_ERROR = "Server sent error frame: 'maximum subscriptions exceeded'";
 
     /** @var list<NatsConnection> */
@@ -40,6 +43,9 @@ final class MuxInboxSetUpBudgetTest extends TestCase
 
     protected function tearDown(): void
     {
+        // #183: what the test registered is closed and checked first.
+        $this->releaseOwnedResources();
+
         foreach ($this->opened as $connection) {
             try {
                 $connection->disconnect()->await(new TimeoutCancellation(1));
@@ -188,7 +194,7 @@ final class MuxInboxSetUpBudgetTest extends TestCase
 
     private function connect(SubscriptionLimitServer $server): NatsConnection
     {
-        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0), $server);
+        $connection = $this->own(new NatsConnection(new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0), $server));
         $this->opened[] = $connection;
         $connection->connect()->await();
 

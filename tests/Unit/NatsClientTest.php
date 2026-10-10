@@ -11,10 +11,20 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Services\Service;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 final class NatsClientTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /**
      * Verifies facade delegates connect/publish behavior to connection runtime.
      */
@@ -25,10 +35,10 @@ final class NatsClientTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             options: new NatsOptions(servers: ['nats://127.0.0.1:4222'], name: 'client-test'),
             transport: $transport,
-        );
+        ));
 
         $client->connect()->await();
         $client->publish('orders.created', '{"id":1}')->await();
@@ -51,7 +61,7 @@ final class NatsClientTest extends TestCase
             "MSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $message = null;
@@ -88,7 +98,7 @@ final class NatsClientTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
         };
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $reply = $client->request('svc.echo', '{"x":1}', 50)->await();
@@ -106,7 +116,7 @@ final class NatsClientTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $deferredCancellation = new DeferredCancellation();
@@ -141,7 +151,7 @@ final class NatsClientTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 %d\r\n%s\r\n", $replyTo, strlen($replyPayload), $replyPayload)];
         };
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->publishWithHeaders('orders.created', '{"id":1}', ['X-Test' => '1'])->await();
@@ -164,7 +174,7 @@ final class NatsClientTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         self::assertSame(['nats://10.0.0.2:4222', 'nats://10.0.0.3:4222'], $client->discoveredServers());
@@ -181,7 +191,7 @@ final class NatsClientTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $clientA = new NatsClient(new NatsOptions(), $transportA);
+        $clientA = $this->own(new NatsClient(new NatsOptions(), $transportA));
         $clientA->connect()->await();
         $service = $clientA->service('orders', '1.0.0', 'Order API', ['team' => 'core']);
         self::assertInstanceOf(Service::class, $service);
@@ -193,7 +203,7 @@ final class NatsClientTest extends TestCase
         self::assertTrue($transportA->closed);
 
         $transportB = new FakeTransport();
-        $clientB = new NatsClient(new NatsOptions(), $transportB);
+        $clientB = $this->own(new NatsClient(new NatsOptions(), $transportB));
         $clientB->disconnect()->await();
         self::assertTrue($transportB->closed);
     }
@@ -208,7 +218,7 @@ final class NatsClientTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
         $delivered = [];
         $sid = $client->subscribe('events', static function (NatsMessage $message) use (&$delivered): void {

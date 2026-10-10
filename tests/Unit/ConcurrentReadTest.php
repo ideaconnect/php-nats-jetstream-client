@@ -260,7 +260,7 @@ final class ConcurrentReadTest extends TestCase
     public function testFetchAllTakesWhatAnotherReadDeliveredDuringItsPauseBeforeReadingOn(SlowConsumerPolicy $policy): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0, maxPendingMessagesPerSubscription: 2, slowConsumerPolicy: $policy), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0, maxPendingMessagesPerSubscription: 2, slowConsumerPolicy: $policy), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $queue = $client->subscribeQueue('jobs')->await();

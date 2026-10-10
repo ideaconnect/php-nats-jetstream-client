@@ -346,7 +346,7 @@ final class ReadWakeupTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0.05, 1, null, 5, 20, null), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0.05, 1, null, 5, 20, null), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         $hold = new HeldUpDelivery(fallbackSeconds: 3.0);
@@ -412,7 +412,7 @@ final class ReadWakeupTest extends TestCase
                 delay(0);
             }
         };
-        $client = new NatsClient($this->options(true, 2_000, 3, 0, 2, $listener, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 3, 0, 2, $listener, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $queue = $client->subscribeQueue('jobs')->await();
@@ -484,7 +484,7 @@ final class ReadWakeupTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $connection = new NatsConnection($this->options(true, 5_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $connection = $this->own(new NatsConnection($this->options(true, 5_000, 1_000, 0, 2, null, 5, 20, null), $watched));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->responder = static fn(string $subject, ?string $replyTo): array => $replyTo === null ? [] : $transport->replyFrame($replyTo, 'ok');
@@ -1000,7 +1000,7 @@ final class ReadWakeupTest extends TestCase
         $this->teardowns[] = $server->close(...);
         $options = new NatsOptions(servers: [$server->url()], connectTimeoutMs: 2_000, pingIntervalSeconds: 0);
         $watched = new WatchedTransport(new AmpSocketTransport($options));
-        $client = new NatsClient($options, $watched);
+        $client = $this->own(new NatsClient($options, $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 
@@ -1028,7 +1028,7 @@ final class ReadWakeupTest extends TestCase
 
     private function connectWatched(WatchedTransport $watched): NatsClient
     {
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

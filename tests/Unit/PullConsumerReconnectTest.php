@@ -572,7 +572,7 @@ final class PullConsumerReconnectTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             reconnectEnabled: true,
@@ -583,7 +583,7 @@ final class PullConsumerReconnectTest extends TestCase
             pingIntervalSeconds: 0,
             connectionListener: $recorder->connectionListener(),
             errorListener: $recorder->errorListener(),
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

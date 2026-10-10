@@ -186,6 +186,7 @@ Choose the narrowest useful test first, then broaden only as needed.
 - Keep test names descriptive and behavior-oriented.
 - If exception wording changes intentionally, update the tests in the same change.
 - Prefer Behat for end-to-end documented workflows and PHPUnit for low-level protocol edges and exhaustive negative cases.
+- A unit test owns what it starts on the event loop (#183): register each client or connection with `$this->own(...)` (`tests/Support/OwnsTestResources.php`, or `ReconnectScenarios`, which uses it) right after constructing it, and call `releaseOwnedResources()` from `tearDown()`. The shutdown closes everything, joins the closes and fails the test when something is still running. Register what only the test can end through `$this->resources()`: a background operation with its own cancellation (`ownOperation()`), a fixture gate such as a held dial or a stalled write (`onRelease()`), a listener that would reconnect on Closed or an injected close failure (`onStop()`). Do not cancel every loop callback in `setUp()`/`tearDown()`: that hides what a test leaves running. A class whose tests arm heartbeat watchdogs makes the scope in `setUp()` and calls `releaseOwnedResourcesAndTheirWatchdogs()`.
 
 ### Editing boundaries
 

@@ -11,6 +11,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 use Psr\Log\AbstractLogger;
 use Psr\Log\LoggerInterface;
@@ -25,6 +26,15 @@ use Psr\Log\LoggerInterface;
  */
 final class NatsConnection_7MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -60,7 +70,7 @@ final class NatsConnection_7MutationTest extends TestCase
     {
         $logger = $this->recordingLogger();
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, logger: $logger), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, logger: $logger), $transport));
 
         $connection->connect()->await();
 
@@ -89,7 +99,7 @@ final class NatsConnection_7MutationTest extends TestCase
     {
         $logger = $this->recordingLogger();
         $transport = new FakeTransport([self::INFO, "-ERR Authorization Violation\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, logger: $logger), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, logger: $logger), $transport));
 
         try {
             $connection->connect()->await();
@@ -133,7 +143,7 @@ final class NatsConnection_7MutationTest extends TestCase
             "PONG\r\n",
             "-ERR 'Permissions Violation for Subscription to foo'\r\n",
         ]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, logger: $logger), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, logger: $logger), $transport));
         $connection->connect()->await();
 
         $connection->processIncoming()->await();
@@ -172,12 +182,12 @@ final class NatsConnection_7MutationTest extends TestCase
             'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, connectionListener: static function (ConnectionEvent $e) use (&$events): void {
                 $events[] = $e;
             }),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->processIncoming()->await(); // first async INFO
@@ -199,13 +209,13 @@ final class NatsConnection_7MutationTest extends TestCase
         $ldm = 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true}' . "\r\n";
         $transport = new FakeTransport([self::INFO, "PONG\r\n", $ldm, $ldm]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             // reconnectEnabled:false isolates the latch from the lame-duck auto-failover (#47).
             new NatsOptions(reconnectEnabled: false, connectionListener: static function (ConnectionEvent $e) use (&$events): void {
                 $events[] = $e;
             }),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->processIncoming()->await(); // first ldm INFO
@@ -235,10 +245,10 @@ final class NatsConnection_7MutationTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(servers: ['nats://127.0.0.1:4222'], reconnectEnabled: true, reconnectDelayMs: 1, reconnectJitterMs: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->processIncoming()->await(); // lame-duck INFO
@@ -257,7 +267,7 @@ final class NatsConnection_7MutationTest extends TestCase
     public function testWildcardTokenStillValidatesLaterTokens(): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         // First token '*' is a valid standalone wildcard; second token 'bad*' has an embedded wildcard.
@@ -282,7 +292,7 @@ final class NatsConnection_7MutationTest extends TestCase
             "MSG updates 1 5\r\nfirst\r\n",  // first delivery: handler throws
             "MSG updates 1 6\r\nsecond\r\n", // second delivery: must still reach the handler
         ]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         $delivered = [];

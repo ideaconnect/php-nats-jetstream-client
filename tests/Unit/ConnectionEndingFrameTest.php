@@ -212,7 +212,7 @@ final class ConnectionEndingFrameTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
@@ -222,7 +222,7 @@ final class ConnectionEndingFrameTest extends TestCase
                 errorListener: $recorder->errorListener(),
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->pushFrame(self::STALE);
@@ -261,7 +261,7 @@ final class ConnectionEndingFrameTest extends TestCase
     public function testFullSubscriptionQueueDoesNotEndTheConnection(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
@@ -270,7 +270,7 @@ final class ConnectionEndingFrameTest extends TestCase
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $sid = $connection->subscribe('updates', static function (): void {})->await();
@@ -324,7 +324,7 @@ final class ConnectionEndingFrameTest extends TestCase
 
     private function connectWithReconnectOff(ReconnectingTransport $transport, LifecycleRecorder $recorder): NatsConnection
     {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
@@ -332,7 +332,7 @@ final class ConnectionEndingFrameTest extends TestCase
                 connectionListener: $recorder->connectionListener(),
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
 

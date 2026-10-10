@@ -126,7 +126,7 @@ final class JetStreamBatchBudgetTest extends TestCase
     public function testInlineWriteBackpressureCannotHoldTheOperationPastItsBudget(string $operation, int $successfulWrites): void
     {
         $transport = new WedgedWriteTransport([ReconnectingTransport::INFO, "PONG\r\n"], $successfulWrites);
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $pending = self::issue($client, $operation);
@@ -389,7 +389,7 @@ final class JetStreamBatchBudgetTest extends TestCase
 
     private function client(ReconnectingTransport $transport, bool $wait = true, bool $reconnect = true, int $requestTimeoutMs = 2000, ?\Closure $listener = null): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 5000,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: $reconnect,
@@ -400,7 +400,7 @@ final class JetStreamBatchBudgetTest extends TestCase
             maxReconnectAttempts: 1000,
             pingIntervalSeconds: 0,
             connectionListener: $listener,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 

@@ -263,7 +263,7 @@ final class RequestsDuringDrainTest extends TestCase
     public function testOnlyRequestsAreTakenWhileTheDrainDelivers(): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $transport->responder = self::echo($transport);
@@ -370,7 +370,7 @@ final class RequestsDuringDrainTest extends TestCase
     public function testARequestsWriteWedgedDuringTheDrainDoesNotHoldItPastItsBudget(bool $inboxBeforeTheDrain): void
     {
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $backlog = [];
@@ -401,7 +401,7 @@ final class RequestsDuringDrainTest extends TestCase
     public function testTheReplyInboxsReleaseWedgedAtTheEndOfTheDrainDoesNotHoldItPastItsBudget(): void
     {
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $backlog = [];
@@ -428,7 +428,7 @@ final class RequestsDuringDrainTest extends TestCase
     {
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"]);
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0, errorListener: $recorder->errorListener()), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0, errorListener: $recorder->errorListener()), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $backlog = [];
@@ -458,7 +458,7 @@ final class RequestsDuringDrainTest extends TestCase
         $events = $recorder->connectionListener();
         $reconnect = null;
         $connection = null;
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 300,
             reconnectEnabled: false,
@@ -469,7 +469,7 @@ final class RequestsDuringDrainTest extends TestCase
                     $reconnect = $connection->connect();
                 }
             },
-        ), $server);
+        ), $server));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $server->stallNextWriteContaining('SUB _INBOX.', 30.0, completesAfterClose: true);

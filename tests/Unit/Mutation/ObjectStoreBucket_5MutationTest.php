@@ -7,6 +7,7 @@ namespace IDCT\NATS\Tests\Unit\Mutation;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -21,6 +22,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class ObjectStoreBucket_5MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /** URL-safe base64 (with padding), matching the Object Store meta-subject encoding. */
@@ -37,7 +47,7 @@ final class ObjectStoreBucket_5MutationTest extends TestCase
     private function connectedClient(FakeTransport $transport): NatsClient
     {
         // A small request timeout keeps a mis-wired reply from hanging on the 10 s default.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return $client;

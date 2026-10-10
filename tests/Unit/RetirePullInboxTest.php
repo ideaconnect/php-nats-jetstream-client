@@ -532,7 +532,7 @@ final class RetirePullInboxTest extends TestCase
     private function client(int $requestTimeoutMs = 2_000, ?\Closure $errorListener = null, bool $reconnect = true): array
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: $reconnect,
@@ -541,7 +541,7 @@ final class RetirePullInboxTest extends TestCase
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             errorListener: $errorListener,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 

@@ -166,13 +166,13 @@ final class HandlerFailureDuringOperationTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectDelayMs: 1,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $poison = $this->poisonSubscription($client);
@@ -214,11 +214,11 @@ final class HandlerFailureDuringOperationTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $failing = $connection->subscribe('failing', static function () use ($failure): void {
@@ -259,12 +259,12 @@ final class HandlerFailureDuringOperationTest extends TestCase
         };
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
             logger: $logger,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         [$frames] = $this->poisonAndLater($client);
@@ -302,7 +302,7 @@ final class HandlerFailureDuringOperationTest extends TestCase
 
     private function clientReportingTo(ReconnectingTransport $transport, LifecycleRecorder $recorder, bool $failOperations = false): NatsClient
     {
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 2_000,
@@ -311,7 +311,7 @@ final class HandlerFailureDuringOperationTest extends TestCase
                 handlerErrorsFailOperations: $failOperations,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
 

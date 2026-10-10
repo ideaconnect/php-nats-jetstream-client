@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
@@ -33,11 +34,20 @@ use PHPUnit\Framework\TestCase;
  */
 final class JetStreamContext_7MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     private function connect(TransportInterface $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client;
@@ -67,7 +77,7 @@ final class JetStreamContext_7MutationTest extends TestCase
 
         self::assertTrue($threw, 'a stalled batch must surface as a JetStreamException');
 
-        $unsub = array_filter($transport->writes, static fn (string $w): bool => str_contains($w, 'UNSUB'));
+        $unsub = array_filter($transport->writes, static fn(string $w): bool => str_contains($w, 'UNSUB'));
         self::assertNotSame(
             [],
             $unsub,
@@ -99,7 +109,7 @@ final class JetStreamContext_7MutationTest extends TestCase
 
         self::assertTrue($threw, 'a missed heartbeat must surface as a JetStreamException');
 
-        $unsub = array_filter($transport->writes, static fn (string $w): bool => str_contains($w, 'UNSUB'));
+        $unsub = array_filter($transport->writes, static fn(string $w): bool => str_contains($w, 'UNSUB'));
         self::assertNotSame(
             [],
             $unsub,

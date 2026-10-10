@@ -17,6 +17,7 @@ use IDCT\NATS\Services\BasicJsonSchemaValidator;
 use IDCT\NATS\Services\ServiceEndpoint;
 use IDCT\NATS\Services\ServiceEndpointHandlerInterface;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -99,20 +100,13 @@ final class ServiceTestSubscribeHookCancellation implements Cancellation
 
 final class ServiceTest extends TestCase
 {
-    /** @var list<NatsClient> Clients that tearDown() closes, so that a failed test leaves no serving loop behind. */
-    private array $opened = [];
+    use OwnsTestResources;
 
     protected function tearDown(): void
     {
-        foreach ($this->opened as $client) {
-            try {
-                $client->disconnect()->await(new TimeoutCancellation(1));
-            } catch (\Throwable) {
-                // Already closed.
-            }
-        }
-
-        $this->opened = [];
+        // Every client a test makes is registered as it is constructed (#183), so that a failed test leaves no serving
+        // loop behind either: stopping a service unsubscribes its endpoints, and its client still has to be closed.
+        $this->releaseOwnedResources();
     }
 
     /** @return list<string> */
@@ -134,7 +128,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $doneCount = 0;
@@ -161,7 +155,7 @@ final class ServiceTest extends TestCase
      */
     public function testEndpointStatsHandlerMergesCustomData(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
 
         $service = $client->service('metrics', '1.0.0')->addEndpoint(
             'work',
@@ -182,7 +176,7 @@ final class ServiceTest extends TestCase
      */
     public function testGroupedEndpointForwardsMetadataAndStatsHandler(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
 
         $service = $client->service('grp', '1.0.0');
         $service->addGroup('v1')->addEndpoint(
@@ -211,7 +205,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n", // answers the drain flush
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -236,7 +230,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')->addEndpoint(
@@ -266,7 +260,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.INFO.echo 5 _INBOX.info 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0', 'Echo service')
@@ -290,7 +284,7 @@ final class ServiceTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -317,7 +311,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.STATS 8 _INBOX.stats 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // No service metadata, no endpoint metadata: the empty-map default is exactly the broken case.
@@ -352,7 +346,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.INFO.echo 5 _INBOX.info 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $schema = ['type' => 'object', 'properties' => ['msg' => ['type' => 'string']]];
@@ -376,7 +370,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.INFO.echo 5 _INBOX.info 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0', 'Echo service')
@@ -400,7 +394,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.STATS.echo 8 _INBOX.stats 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0', 'Echo service')
@@ -431,7 +425,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -458,7 +452,7 @@ final class ServiceTest extends TestCase
             "MSG svc.good 14 _INBOX.good 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('svc', '1.0.0')
@@ -489,7 +483,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -513,7 +507,7 @@ final class ServiceTest extends TestCase
             "MSG svc.v1.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0');
@@ -545,7 +539,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0');
@@ -572,7 +566,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.SCHEMA.echo 11 _INBOX.schema 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $schema = ['type' => 'object', 'properties' => ['msg' => ['type' => 'string']]];
@@ -602,7 +596,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req2 4\r\nboom\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -642,7 +636,7 @@ final class ServiceTest extends TestCase
         date_default_timezone_set('Pacific/Kiritimati');
 
         try {
-            $client = new NatsClient(new NatsOptions(), new FakeTransport());
+            $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
             $service = $client->service('echo', '1.0.0');
 
             $started = $service->statsSnapshot()['started'] ?? null;
@@ -670,7 +664,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 4\r\nboom\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -703,7 +697,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 4\r\nboom\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -732,7 +726,7 @@ final class ServiceTest extends TestCase
     public function testStatsOmitsNonSpecAliasKeys(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -750,7 +744,7 @@ final class ServiceTest extends TestCase
     public function testServiceRejectsInvalidName(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -762,7 +756,7 @@ final class ServiceTest extends TestCase
     public function testServiceRejectsNonSemverVersion(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -778,7 +772,7 @@ final class ServiceTest extends TestCase
             "MSG svc.v 13 _INBOX.r 2\r\nhi\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $events = [];
@@ -800,7 +794,7 @@ final class ServiceTest extends TestCase
     public function testStartRollsBackAndClearsStateOnPartialFailure(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // The second endpoint's subject is invalid (whitespace): addEndpoint accepts it, but the
@@ -833,7 +827,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req1 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -864,7 +858,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req1 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $handled = false;
@@ -902,7 +896,7 @@ final class ServiceTest extends TestCase
     public function testRequestValidatorThatThrowsIsAnsweredLikeAHandlerThatThrows(): void
     {
         $transport = new FakeTransport([...$this->infoAndPong(), "MSG svc.v 13 _INBOX.req 2\r\n{}\r\n"]);
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $events = [];
@@ -942,7 +936,7 @@ final class ServiceTest extends TestCase
     public function testRequestValidatorThatThrowsAServiceErrorGetsTheReplyItChose(): void
     {
         $transport = new FakeTransport([...$this->infoAndPong(), "MSG svc.v 13 _INBOX.req 2\r\n{}\r\n"]);
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $service = $client->service('val', '1.0.0')
@@ -979,7 +973,7 @@ final class ServiceTest extends TestCase
             "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $events = [];
@@ -1023,7 +1017,7 @@ final class ServiceTest extends TestCase
             "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1053,7 +1047,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req1 16\r\n{\"id\":\"invalid\"}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1096,7 +1090,7 @@ final class ServiceTest extends TestCase
             "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1129,7 +1123,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1161,7 +1155,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(reconnectEnabled: false), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(reconnectEnabled: false), $transport));
         $client->connect()->await();
 
         $events = [];
@@ -1212,7 +1206,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(reconnectEnabled: false), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(reconnectEnabled: false), $transport));
         $client->connect()->await();
 
         $events = [];
@@ -1264,7 +1258,7 @@ final class ServiceTest extends TestCase
             "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1306,7 +1300,7 @@ final class ServiceTest extends TestCase
             ...$this->infoAndPong(),
             "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$headers}{$payload}\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $seen = [];
@@ -1348,7 +1342,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1372,7 +1366,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1395,7 +1389,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -1416,7 +1410,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1440,7 +1434,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1470,7 +1464,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1493,7 +1487,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1515,7 +1509,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1535,7 +1529,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ], blockWhenEmpty: true);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $client->service('echo', '1.0.0')
@@ -1557,7 +1551,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ], blockWhenEmpty: true);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $client->service('echo', '1.0.0')
@@ -1576,7 +1570,7 @@ final class ServiceTest extends TestCase
     public function testAddEndpointRejectsDuplicateSubject(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1589,7 +1583,7 @@ final class ServiceTest extends TestCase
     public function testAddEndpointRejectsEmptyName(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0');
@@ -1602,7 +1596,7 @@ final class ServiceTest extends TestCase
     public function testAddEndpointRejectsEmptySubject(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0');
@@ -1615,7 +1609,7 @@ final class ServiceTest extends TestCase
     public function testClassHandlerWithRequiredConstructorArgIsRejected(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0');
@@ -1630,7 +1624,7 @@ final class ServiceTest extends TestCase
     public function testStopToleratesClosedConnection(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1654,7 +1648,7 @@ final class ServiceTest extends TestCase
             ...$this->infoAndPong(),
             FakeTransport::EOF, // peer close -> recover -> reconnect disabled -> Closed
         ]);
-        $client = new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1676,7 +1670,7 @@ final class ServiceTest extends TestCase
             // $SRV.INFO.calc is the 5th discovery subscription (sid 5); request it with a reply inbox.
             "MSG \$SRV.INFO.calc 5 _INBOX.r 0\r\n\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // An invalid-UTF-8 description makes the INFO discovery payload fail to JSON-encode.
@@ -1696,7 +1690,7 @@ final class ServiceTest extends TestCase
     public function testStartIsIdempotentWhenAlreadyStarted(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1730,7 +1724,7 @@ final class ServiceTest extends TestCase
             "HMSG svc.echo 13 _INBOX.req {$headerBytes} {$totalBytes}\r\n{$merged}\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // ServiceError with null body: the runtime builds the errorPayload and must include correlation_id.
@@ -1759,7 +1753,7 @@ final class ServiceTest extends TestCase
             "MSG svc.fire 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $handled = false;
@@ -1797,7 +1791,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $fired = 0;
@@ -1819,7 +1813,7 @@ final class ServiceTest extends TestCase
     public function testDoneHandlerExceptionIsSwallowed(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1850,7 +1844,7 @@ final class ServiceTest extends TestCase
             "MSG \$SRV.PING 1 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1880,7 +1874,7 @@ final class ServiceTest extends TestCase
             "MSG svc.work 13 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $handled = false;
@@ -1913,7 +1907,7 @@ final class ServiceTest extends TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1938,7 +1932,7 @@ final class ServiceTest extends TestCase
     public function testRunRejectsNonPositiveTimeout(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1959,7 +1953,7 @@ final class ServiceTest extends TestCase
             "PONG\r\n",
         ], blockWhenEmpty: true);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -1978,7 +1972,7 @@ final class ServiceTest extends TestCase
      */
     public function testStatsHandlerExceptionIsSwallowed(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
 
         $service = $client->service('svc', '1.0.0')->addEndpoint(
             'work',
@@ -2004,7 +1998,7 @@ final class ServiceTest extends TestCase
     public function testRunBreaksImmediatelyWhenCancellationAlreadyRequested(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -2040,7 +2034,7 @@ final class ServiceTest extends TestCase
     public function testStartRollbackSwallowsUnsubscribeFailureOnClosedConnection(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // Add a valid endpoint so discovery subscriptions and one endpoint get registered.
@@ -2074,7 +2068,7 @@ final class ServiceTest extends TestCase
     public function testDrainSwallowsUnsubscribeWriteFailure(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -2106,7 +2100,7 @@ final class ServiceTest extends TestCase
             // No second PONG: flush will timeout/fail because there is no PONG response queued.
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -2130,7 +2124,7 @@ final class ServiceTest extends TestCase
     public function testRunWithBothTimeoutAndExternalCancellationUsesCompositeCancellation(): void
     {
         $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -2167,7 +2161,7 @@ final class ServiceTest extends TestCase
         // Every write of the error reply (an HPUB to the request's reply-to) fails at the transport.
         $transport->throwOnWriteContaining = '_INBOX.reply9';
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $handled = false;
@@ -2207,7 +2201,7 @@ final class ServiceTest extends TestCase
     public function testStopSwallowsUnsubscribeWriteFailureAndStillFiresDone(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $doneCount = 0;
@@ -2370,13 +2364,12 @@ final class ServiceTest extends TestCase
             "MSG px.slow 1 1\r\nx\r\n",
             "MSG svc.echo 14 _INBOX.req 5\r\nhello\r\n",
         ], blockWhenEmpty: true);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             pingIntervalSeconds: 0,
             errorListener: static function (\Throwable $error) use (&$errors): void {
                 $errors[] = $error::class . ': ' . $error->getMessage();
             },
-        ), $transport);
-        $this->opened[] = $client;
+        ), $transport));
         $client->connect()->await();
         $client->subscribe('px.slow', static function (): void {
             // A wait of the handler's own that runs out.
@@ -2433,12 +2426,12 @@ final class ServiceTest extends TestCase
             "-ERR 'maximum subscriptions exceeded'\r\n",
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
         ]);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             pingIntervalSeconds: 0,
             errorListener: static function (\Throwable $error) use (&$errors): void {
                 $errors[] = $error->getMessage();
             },
-        ), $transport);
+        ), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -2495,8 +2488,7 @@ final class ServiceTest extends TestCase
     public function testRunCancellationDuringReconnectBackoffStopsService(): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(new NatsOptions(connectTimeoutMs: 500, pingIntervalSeconds: 0, waitForReconnect: false), $transport);
-        $this->opened[] = $client;
+        $client = $this->own(new NatsClient(new NatsOptions(connectTimeoutMs: 500, pingIntervalSeconds: 0, waitForReconnect: false), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -2701,13 +2693,12 @@ final class ServiceTest extends TestCase
     {
         $errors = [];
         $transport = new FakeTransport([...$this->infoAndPong(), "MSG px.work 1 1\r\nx\r\n"], blockWhenEmpty: true);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             pingIntervalSeconds: 0,
             errorListener: static function (\Throwable $error) use (&$errors): void {
                 $errors[] = $error::class . ': ' . $error->getMessage();
             },
-        ), $transport);
-        $this->opened[] = $client;
+        ), $transport));
         $client->connect()->await();
         $shutdown = new DeferredCancellation();
         $waiting = false;
@@ -2741,7 +2732,7 @@ final class ServiceTest extends TestCase
      */
     public function testEndpointRejectsClassStringNotImplementingHandlerInterface(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $service = $client->service('echo', '1.0.0');
 
         try {
@@ -2768,7 +2759,7 @@ final class ServiceTest extends TestCase
         bool $reconnect = true,
         bool $handlerFailuresFailOperations = false,
     ): NatsClient {
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: $reconnect,
             reconnectDelayMs: 1,
@@ -2778,8 +2769,7 @@ final class ServiceTest extends TestCase
                 $errors[] = $error->getMessage();
             },
             handlerErrorsFailOperations: $handlerFailuresFailOperations,
-        ), $transport);
-        $this->opened[] = $client;
+        ), $transport));
         $client->connect()->await();
 
         return $client;

@@ -718,12 +718,12 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $seen = [];
@@ -1170,7 +1170,7 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
     public function testTheSecondFailingSubscriptionsExceptionIsSeenNowhereWithoutAnErrorListener(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection(new NatsOptions(connectTimeoutMs: 500, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(connectTimeoutMs: 500, pingIntervalSeconds: 0), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $seen = [];
@@ -1684,12 +1684,12 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
 
     private function connection(ReconnectingTransport $transport, LifecycleRecorder $recorder, ?LoggerInterface $logger = null): NatsConnection
     {
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
             logger: $logger,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
 
@@ -1698,7 +1698,7 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
 
     private function client(TransportInterface $transport, LifecycleRecorder $recorder, bool $failOperations = false): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             reconnectEnabled: true,
@@ -1709,7 +1709,7 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
             handlerErrorsFailOperations: $failOperations,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 
@@ -1723,7 +1723,7 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
         bool $overflowsFailOperations = false,
         bool $failOperations = false,
     ): NatsClient {
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             pingIntervalSeconds: 0,
@@ -1732,7 +1732,7 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
             slowConsumerPolicy: SlowConsumerPolicy::Error,
             slowConsumerErrorsFailOperations: $overflowsFailOperations,
             handlerErrorsFailOperations: $failOperations,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 

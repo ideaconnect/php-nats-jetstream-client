@@ -9,8 +9,8 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
-use Revolt\EventLoop;
 
 /**
  * Kills the two #119 read-path survivors in KeyValueBucket:
@@ -19,15 +19,20 @@ use Revolt\EventLoop;
  */
 final class KeyValueBucket_4MutationTest extends TestCase
 {
-    /**
-     * A KV replay can leave a live TimeoutCancellation / delay() timer on the loop; cancel every
-     * registered callback before each test so a leaked timer cannot fire into a later test's fiber.
-     */
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        // The heartbeat watchdogs (#113) the test armed are cancelled by the ids recorded since setUp().
+        $this->releaseOwnedResourcesAndTheirWatchdogs();
+    }
+
+    /** The scope is made first, so that it knows the loop callbacks registered before the test (#183). */
     protected function setUp(): void
     {
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
+        $this->resources();
     }
 
     /**
@@ -64,7 +69,7 @@ final class KeyValueBucket_4MutationTest extends TestCase
         $counting = new LoopTickCountingTransport($transport);
 
         // Small request timeout so a mis-delivered mux reply fails fast instead of hanging the 10 s default.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $counting);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $counting));
         $client->connect()->await();
 
         // A single live headers-only delivery on the deliver subscription (sid 2). Its $JS.ACK last
@@ -129,11 +134,8 @@ final class KeyValueBucket_4MutationTest extends TestCase
             'keys() must read the next chunk at once, not idle-sleep 1 ms per partial chunk',
         );
 
-        // Tear down and quiesce any residual TimeoutCancellation/delay timers the replay left pending.
+        // Closed here as well as at tearDown (#183), which joins the close and checks nothing is left running.
         $client->disconnect()->await();
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
     }
 
     /**
@@ -164,7 +166,7 @@ final class KeyValueBucket_4MutationTest extends TestCase
         ]);
 
         // Small request timeout so a mis-delivered mux reply fails fast instead of hanging the 10 s default.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 2000), $transport));
         $client->connect()->await();
 
         // Mux request inbox (#118): the deliver subscription (sid 2) intentionally gets NO frame - the
@@ -212,11 +214,7 @@ final class KeyValueBucket_4MutationTest extends TestCase
         // finally the mutant removes.
         self::assertStringContainsString("UNSUB 2\r\n", implode('', $transport->writes));
 
-        // Tear down and cancel any event-loop timers the timed-out replay may have left pending, so no
-        // residual callback fires into a later test's clean loop.
+        // Closed here as well as at tearDown (#183), which joins the close and checks nothing is left running.
         $client->disconnect()->await();
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
     }
 }

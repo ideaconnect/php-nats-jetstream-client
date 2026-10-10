@@ -8,6 +8,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\PullServerTrait;
 use PHPUnit\Framework\TestCase;
 
@@ -20,14 +21,23 @@ use PHPUnit\Framework\TestCase;
  */
 final class JetStreamContext_12MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
     use PullServerTrait;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
 
     /** @return int count of pull-request PUBs written so far */
     private function pullPubCount(FakeTransport $transport): int
     {
         return count(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'PUB $JS.API.CONSUMER.MSG.NEXT.'),
+            static fn(string $w): bool => str_starts_with($w, 'PUB $JS.API.CONSUMER.MSG.NEXT.'),
         ));
     }
 
@@ -102,7 +112,7 @@ final class JetStreamContext_12MutationTest extends TestCase
             return ["MSG evt.s $pullSid \$JS.ACK.S.C.1.1.1.0.0 1\r\nx\r\n"];
         };
 
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
         $js = $client->jetStream();
 
@@ -170,7 +180,7 @@ final class JetStreamContext_12MutationTest extends TestCase
             return [sprintf("HMSG %s %d %d %d\r\n%s\r\n", $replyTo, $pullSid, strlen($hdr), strlen($hdr), $hdr)];
         };
 
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
         $js = $client->jetStream();
 
@@ -235,7 +245,7 @@ final class JetStreamContext_12MutationTest extends TestCase
             return [sprintf("HMSG %s %d %d %d\r\n%s\r\n", $replyTo, $pullSid, strlen($hdr), strlen($hdr), $hdr)];
         };
 
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
         $js = $client->jetStream();
 

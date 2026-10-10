@@ -12,6 +12,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
@@ -23,6 +24,15 @@ use function Amp\async;
  */
 final class NatsConnection_5MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /**
      * A transport whose readLine() always returns an empty string, counting the calls. Used to count
      * how many handshake polls awaitServerInfo() performs before giving up - which equals the value
@@ -76,14 +86,14 @@ final class NatsConnection_5MutationTest extends TestCase
     {
         $transport = $this->countingTransport();
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: $connectTimeoutMs,
                 reconnectEnabled: false,
                 retryOnFailedInitialConnect: false,
             ),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -143,7 +153,7 @@ final class NatsConnection_5MutationTest extends TestCase
             "-ERR 'My Fatal Boom'\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         try {
@@ -174,12 +184,12 @@ final class NatsConnection_5MutationTest extends TestCase
             "-ERR 'Permissions Violation for Subscription to foo'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(errorListener: static function (\Throwable $err) use (&$errors): void {
                 $errors[] = $err->getMessage();
             }),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->processIncoming()->await();
@@ -210,12 +220,12 @@ final class NatsConnection_5MutationTest extends TestCase
             "INFO {not-json\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(errorListener: static function (\Throwable $err) use (&$errors): void {
                 $errors[] = $err->getMessage();
             }),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Must not throw out of the read loop despite the malformed INFO.
@@ -245,7 +255,7 @@ final class NatsConnection_5MutationTest extends TestCase
             "MSG updates 1 5\r\nhello\r\nMSG updates 1 6\r\nworld!\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
@@ -273,7 +283,7 @@ final class NatsConnection_5MutationTest extends TestCase
             "HMSG updates 1 0 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;

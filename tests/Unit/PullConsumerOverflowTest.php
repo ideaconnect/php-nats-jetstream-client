@@ -594,7 +594,7 @@ final class PullConsumerOverflowTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: true,
@@ -606,7 +606,7 @@ final class PullConsumerOverflowTest extends TestCase
             connectionListener: $recorder->connectionListener(),
             errorListener: $recorder->errorListener(),
             handlerErrorsFailOperations: $handlerErrorsFailOperations,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

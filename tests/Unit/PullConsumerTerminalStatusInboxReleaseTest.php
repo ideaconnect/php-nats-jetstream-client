@@ -468,7 +468,7 @@ final class PullConsumerTerminalStatusInboxReleaseTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectDelayMs: 5,
@@ -476,7 +476,7 @@ final class PullConsumerTerminalStatusInboxReleaseTest extends TestCase
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             errorListener: $errorListener,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

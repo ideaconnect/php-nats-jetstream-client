@@ -9,6 +9,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -25,13 +26,22 @@ use function Amp\delay;
  */
 final class ReconnectDisabledCauseTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     public function testAReadThatFailsSaysWhyTheConnectionEnded(): void
     {
         $connection = $this->connect(new FakeTransport([self::INFO, "PONG\r\n", FakeTransport::EOF]));
 
-        $error = $this->reconnectDisabledError(static fn () => $connection->processIncoming()->await());
+        $error = $this->reconnectDisabledError(static fn() => $connection->processIncoming()->await());
 
         self::assertInstanceOf(TransportClosedException::class, $error->getPrevious());
         self::assertSame('Socket closed by peer (EOF)', $error->getPrevious()->getMessage());
@@ -43,7 +53,7 @@ final class ReconnectDisabledCauseTest extends TestCase
         $connection = $this->connect($transport);
         $transport->throwOnWriteContaining = 'PUB ';
 
-        $error = $this->reconnectDisabledError(static fn () => $connection->publish('updates', 'payload')->await());
+        $error = $this->reconnectDisabledError(static fn() => $connection->publish('updates', 'payload')->await());
 
         self::assertInstanceOf(TransportClosedException::class, $error->getPrevious());
         self::assertSame('Simulated write failure', $error->getPrevious()->getMessage());
@@ -58,7 +68,7 @@ final class ReconnectDisabledCauseTest extends TestCase
         $connection = $this->connect($transport);
         $transport->throwOnWriteContaining = 'SUB ';
 
-        $error = $this->reconnectDisabledError(static fn () => $connection->subscribe('updates', static function (): void {})->await());
+        $error = $this->reconnectDisabledError(static fn() => $connection->subscribe('updates', static function (): void {})->await());
 
         self::assertInstanceOf(TransportClosedException::class, $error->getPrevious());
         self::assertSame('Simulated write failure', $error->getPrevious()->getMessage());
@@ -68,7 +78,7 @@ final class ReconnectDisabledCauseTest extends TestCase
     {
         $connection = $this->connect(new FakeTransport([self::INFO, "PONG\r\n", "BOGUS\r\n"]));
 
-        $error = $this->reconnectDisabledError(static fn () => $connection->processIncoming()->await());
+        $error = $this->reconnectDisabledError(static fn() => $connection->processIncoming()->await());
 
         self::assertInstanceOf(ProtocolException::class, $error->getPrevious());
         self::assertSame('Unsupported control frame: BOGUS', $error->getPrevious()->getMessage());
@@ -93,10 +103,10 @@ final class ReconnectDisabledCauseTest extends TestCase
         // The recovery closes the socket last; holding the close keeps the recovery running for the join.
         $transport->closeDelay = 0.5;
 
-        $heartbeat = async(fn () => $this->invokePrivate($connection, 'pingTimerTick'));
+        $heartbeat = async(fn() => $this->invokePrivate($connection, 'pingTimerTick'));
         delay(0.05);
 
-        $error = $this->reconnectDisabledError(fn () => $this->invokePrivate($connection, 'recoverConnection'));
+        $error = $this->reconnectDisabledError(fn() => $this->invokePrivate($connection, 'recoverConnection'));
         $heartbeat->await();
 
         self::assertInstanceOf($previousClass, $error->getPrevious());
@@ -156,10 +166,10 @@ final class ReconnectDisabledCauseTest extends TestCase
         $transport->pushReadChunk("-ERR 'Stale Connection'\r\n");
         $transport->closeDelay = 0.5;
 
-        $read = async(static fn () => $connection->processIncoming()->await());
+        $read = async(static fn() => $connection->processIncoming()->await());
         delay(0.05);
 
-        $error = $this->reconnectDisabledError(fn () => $this->invokePrivate($connection, 'recoverConnection'));
+        $error = $this->reconnectDisabledError(fn() => $this->invokePrivate($connection, 'recoverConnection'));
 
         self::assertInstanceOf(ConnectionException::class, $error->getPrevious());
         self::assertSame("Server sent error frame: 'Stale Connection'", $error->getPrevious()->getMessage());
@@ -173,7 +183,7 @@ final class ReconnectDisabledCauseTest extends TestCase
 
     private function connect(FakeTransport $transport): NatsConnection
     {
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         return $connection;

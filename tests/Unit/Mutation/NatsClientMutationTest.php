@@ -9,6 +9,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -19,6 +20,15 @@ use function Amp\async;
  */
 final class NatsClientMutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -45,7 +55,7 @@ final class NatsClientMutationTest extends TestCase
             "MSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // Start subscribeQueue() concurrently. Its body registers the subscription handler and then
@@ -83,7 +93,7 @@ final class NatsClientMutationTest extends TestCase
             "PONG\r\n", // answers the flush() PING
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $writesBeforeFlush = count($transport->writes);

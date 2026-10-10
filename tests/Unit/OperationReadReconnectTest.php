@@ -337,7 +337,7 @@ final class OperationReadReconnectTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient($this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $client = $this->own(new NatsClient($this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         self::scriptAnswers($transport, '', answering: false);
@@ -393,7 +393,7 @@ final class OperationReadReconnectTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $transport->closeDelay = $closeDelay;
-        $client = new NatsClient($this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $transport->answerPings = false;
@@ -543,7 +543,7 @@ final class OperationReadReconnectTest extends TestCase
                 $outcomes[$name] = [$error, (hrtime(true) - $start) / 1e9];
             }
         };
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         $holder->client = $client;
@@ -617,7 +617,7 @@ final class OperationReadReconnectTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 2_000, reconnectEnabled: false, pingIntervalSeconds: 0), $watched);
+        $client = $this->own(new NatsClient(new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 2_000, reconnectEnabled: false, pingIntervalSeconds: 0), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         self::scriptAnswers($transport, '', answering: false);
@@ -646,7 +646,7 @@ final class OperationReadReconnectTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 5, 20, null), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 5, 20, null), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         self::scriptAnswers($transport, '', answering: false);
@@ -697,11 +697,11 @@ final class OperationReadReconnectTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(match ($failure) {
+        $client = $this->own(new NatsClient(match ($failure) {
             'waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null),
             'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, null, 5, 20, null),
             default => new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 2_000, reconnectEnabled: false, pingIntervalSeconds: 0),
-        }, $watched);
+        }, $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         $inbox = new class {
@@ -813,12 +813,12 @@ final class OperationReadReconnectTest extends TestCase
     ): void {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(match ($recovery) {
+        $client = $this->own(new NatsClient(match ($recovery) {
             'waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null),
             'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, null, 5, 20, null),
             'reconnect off' => new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 2_000, reconnectEnabled: false, pingIntervalSeconds: 0),
             default => $this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null),
-        }, $watched);
+        }, $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         self::scriptAnswers($transport, '', answering: false);
@@ -938,7 +938,7 @@ final class OperationReadReconnectTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             maxReconnectAttempts: 1_000,
@@ -947,7 +947,7 @@ final class OperationReadReconnectTest extends TestCase
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             handlerErrorsFailOperations: true,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         self::scriptAnswers($transport, '', answering: false);
@@ -1181,7 +1181,7 @@ final class OperationReadReconnectTest extends TestCase
 
     private function connectWatched(WatchedTransport $watched): NatsClient
     {
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

@@ -11,6 +11,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
 use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\PullServerTrait;
 use PHPUnit\Framework\TestCase;
 
@@ -25,7 +26,16 @@ use function Amp\delay;
  */
 final class PullPipelineTest extends TestCase
 {
+    use OwnsTestResources;
+
     use PullServerTrait;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
 
     public function testSinglePullDeliversItsBatch(): void
     {
@@ -47,8 +57,8 @@ final class PullPipelineTest extends TestCase
         self::assertSame(['a', 'b'], $received);
 
         // One long-lived pull inbox SUB, and exactly one UNSUB at teardown (no per-pull churn).
-        $subs = array_filter($transport->writes, static fn (string $w): bool => str_starts_with($w, 'SUB _INBOX.JS.PULL.'));
-        $unsubs = array_filter($transport->writes, static fn (string $w): bool => str_starts_with($w, 'UNSUB '));
+        $subs = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'SUB _INBOX.JS.PULL.'));
+        $unsubs = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'UNSUB '));
         self::assertCount(1, $subs);
         self::assertCount(1, $unsubs);
     }
@@ -58,7 +68,7 @@ final class PullPipelineTest extends TestCase
     {
         return count(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'PUB $JS.API.CONSUMER.MSG.NEXT.'),
+            static fn(string $w): bool => str_starts_with($w, 'PUB $JS.API.CONSUMER.MSG.NEXT.'),
         ));
     }
 
@@ -493,7 +503,7 @@ final class PullPipelineTest extends TestCase
         self::assertSame(0, $processed);
         self::assertSame(3, $this->pullPubCount($transport), 'stop() latched at the 3rd pull must end the run without a 4th pull');
         // The long-lived pull inbox is still released exactly once on the stop exit path.
-        $unsubs = array_filter($transport->writes, static fn (string $w): bool => str_starts_with($w, 'UNSUB '));
+        $unsubs = array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'UNSUB '));
         self::assertCount(1, $unsubs);
     }
 
@@ -509,7 +519,7 @@ final class PullPipelineTest extends TestCase
     public function testIdleHeartbeatMissWakesTheEngineButIsNotTerminal(): void
     {
         $transport = new FakeTransport($this->infoAndPong(), blockWhenEmpty: true);
-        $client = new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $errors = [];
@@ -528,9 +538,9 @@ final class PullPipelineTest extends TestCase
             },
         );
         $ctl = new PullPipelineControl(
-            stopFn: static fn (): bool => false,
-            drainFn: static fn (): bool => false,
-            getPinFn: static fn (): ?string => null,
+            stopFn: static fn(): bool => false,
+            drainFn: static fn(): bool => false,
+            getPinFn: static fn(): ?string => null,
             setPinFn: static function (?string $pinId): void {},
         );
 

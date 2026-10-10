@@ -10,6 +10,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Services\ServiceEndpoint;
 use IDCT\NATS\Services\ServiceError;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Targeted tests that kill Infection survivors in src/Services/Service.php (chunk 1).
@@ -21,6 +22,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class Service_1MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** @return list<string> */
     private function infoAndPong(): array
     {
@@ -32,7 +42,7 @@ final class Service_1MutationTest extends \PHPUnit\Framework\TestCase
 
     private function connectedClient(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client;

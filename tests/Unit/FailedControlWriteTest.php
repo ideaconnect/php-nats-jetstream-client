@@ -77,7 +77,7 @@ final class FailedControlWriteTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
@@ -85,7 +85,7 @@ final class FailedControlWriteTest extends TestCase
                 connectionListener: $recorder->connectionListener(),
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->failNextWriteContaining('SUB orders');
@@ -183,10 +183,10 @@ final class FailedControlWriteTest extends TestCase
     public function testRecoveryThatNothingWaitsForFailsWithoutAnUnhandledError(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0, waitForReconnect: false),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->failNextWriteContaining('SUB orders');

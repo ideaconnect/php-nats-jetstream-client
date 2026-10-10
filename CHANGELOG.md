@@ -15,6 +15,34 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.25.4] - 2026-10-10
+
+### Testing & CI
+
+- `[docs]` Unit tests no longer leave clients running into the tests after them (#183). A test that ended with its
+  client Open, reconnecting, or with an operation still waiting kept that client's heartbeat, its reconnect attempts
+  (ten over about 43 s with the defaults, each a burst of up to 500 handshake polls on a double that answers at once)
+  and its operations' 1 ms loops running through the rest of the suite: CPU taken from unrelated tests, and bursts that
+  flaked a test counting process-wide event-loop registrations (d551d6b). The issue's review counted, in `ServiceTest`
+  alone, 66 connections still Open when their test finished, 61 with a referenced heartbeat timer. A new test-resource
+  scope (`tests/Support/TestResourceScope.php`, through the `OwnsTestResources` trait) owns what a test starts: every
+  client and connection, registered as it is constructed (weakly, so the lifetime tests still see what they drop
+  collected, and through the connection inside a client, which outlives the client a test drops when its method
+  returns), the background operations with what ends each, the fixture gates (a held dial, a stalled write, a held
+  handler) and the test's loop callbacks. Its shutdown, from `tearDown()`, runs under one deadline on a referenced
+  timer: it stops what starts new work, starts every disconnect at once, releases the gates only once each close
+  intent has run, joins each close and each owned operation, and fails the test, naming the resource, when a
+  connection is not Closed, an operation is still pending, a fixture is not idle or a cleanup step threw; a test that
+  already failed keeps its own failure and gets the cleanup report on stderr. All 97 unit classes that construct a
+  client or connection now register them (`ReconnectScenarios` delegates its `$opened` cleanup to the scope, which
+  joins the closes instead of swallowing whatever a one-second wait threw and sleeping 50 ms). The seven classes that
+  cancelled every event-loop callback before or after each test (`JetStreamContextTest`, `KeyValueBucketTest`,
+  `ObjectStoreBucketTest` and four mutation classes), which hid the clients they left Open, now close their clients and
+  cancel only the heartbeat watchdogs their own tests armed, by the ids recorded since `setUp()`; their timer-counting
+  assertions count only the test's own timers. Tests that inject a failing transport close, or a listener that
+  reconnects on Closed, reset it for the shutdown. `TestResourceScopeTest` covers the scope itself. No production code
+  changed.
+
 ## [2.25.3] - 2026-10-10
 
 ### Upgrade notes

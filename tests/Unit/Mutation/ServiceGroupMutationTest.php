@@ -8,6 +8,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Kills the surviving UnwrapTrim mutants in {@see \IDCT\NATS\Services\ServiceGroup::joinSubject()}.
@@ -18,6 +19,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class ServiceGroupMutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /**
      * @return array<int, string> The 'subject' of each registered endpoint, in registration order.
      */
@@ -37,7 +47,7 @@ final class ServiceGroupMutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testGroupPrefixIsTrimmedOfSurroundingDots(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
 
         $service = $client->service('grp', '1.0.0');
         // Clean subject ('echo'): only the prefix trim on line 49 can change the result here.
@@ -55,7 +65,7 @@ final class ServiceGroupMutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testEndpointSubjectIsTrimmedOfSurroundingDots(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
 
         $service = $client->service('grp', '1.0.0');
         // Clean prefix ('svc'): only the subject trim on line 50 can change the result here.

@@ -8,6 +8,7 @@ use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -20,6 +21,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class DrainScanPendingDirtyTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -29,7 +39,7 @@ final class DrainScanPendingDirtyTest extends TestCase
     public function testMessageToOneOfManyIdleSubscriptionsIsDelivered(): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $seen = [];
@@ -62,7 +72,7 @@ final class DrainScanPendingDirtyTest extends TestCase
     public function testCrossSidDeliveryOrderMatchesRegistrationOrderNotWireOrder(): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $order = [];
@@ -96,7 +106,7 @@ final class DrainScanPendingDirtyTest extends TestCase
      */
     public function testDirtySetTracksOnlyActiveSidAndClearsWhenQueueEmpties(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $delivered = [];
         $handler = static function (NatsMessage $message) use (&$delivered): void {
@@ -139,7 +149,7 @@ final class DrainScanPendingDirtyTest extends TestCase
      */
     public function testHasUndeliveredDrainBacklogTracksDirtySet(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->setPrivate($connection, 'subscriptions', [
             7 => static function (NatsMessage $message): void {},

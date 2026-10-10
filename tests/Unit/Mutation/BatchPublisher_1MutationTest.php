@@ -8,6 +8,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -18,6 +19,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class BatchPublisher_1MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** The FakeTransport backing the most recent {@see clientWithVersion()} client (write inspection). */
     private FakeTransport $transport;
 
@@ -35,7 +45,7 @@ final class BatchPublisher_1MutationTest extends TestCase
 
         $this->transport = new FakeTransport([$info, "PONG\r\n"]);
         $this->muxReplies($this->transport, $reads);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $this->transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $this->transport));
         $client->connect()->await();
 
         return $client;

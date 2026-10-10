@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Mutation-killing tests for src/JetStream/JetStreamContext.php (chunk 6).
@@ -21,6 +22,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -72,7 +82,7 @@ final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
             return [sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $muxSid, strlen($json), $json)];
         };
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return $client;
@@ -173,7 +183,7 @@ final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
     public function testRejectsJsReplyWhenSecondTokenIsNotAck(): void
     {
         // kills LogicalOr @ line 2002 (|| -> &&)
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $js = $client->jetStream();
 
         $message = new NatsMessage(
@@ -195,7 +205,7 @@ final class JetStreamContext_6MutationTest extends \PHPUnit\Framework\TestCase
     public function testReturnsNullWhenFirstTokenIsNotJs(): void
     {
         // kills ReturnRemoval @ line 2003 (guard must short-circuit with null)
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $js = $client->jetStream();
 
         $message = new NatsMessage(

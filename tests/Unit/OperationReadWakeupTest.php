@@ -800,7 +800,7 @@ final class OperationReadWakeupTest extends TestCase
                 return $this->server->close();
             }
         };
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $hooked);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $hooked));
         $this->opened[] = $client;
         $client->connect()->await();
 

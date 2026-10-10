@@ -10,6 +10,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Targeted mutation-killing tests for src/JetStream/KeyValue/KeyValueBucket.php (chunk 1).
@@ -20,6 +21,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /** Direct Get reply (HMSG): stored value as body with Nats-* (+ optional KV-Operation) headers. */
@@ -46,7 +56,7 @@ final class KeyValueBucket_1MutationTest extends \PHPUnit\Framework\TestCase
 
     private function connect(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return $client;

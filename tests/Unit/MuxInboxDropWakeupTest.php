@@ -519,7 +519,7 @@ final class MuxInboxDropWakeupTest extends TestCase
      */
     public function testADropFiresTheWakeUpOfEveryRequestWaitingAndNothingElse(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
         $noop = static function (NatsMessage $message): void {};
         $wake = new \ReflectionMethod(NatsConnection::class, 'wakeMuxWaiters');
         $register = new \ReflectionMethod(NatsConnection::class, 'registerMuxWaiter');
@@ -651,7 +651,7 @@ final class MuxInboxDropWakeupTest extends TestCase
             ? []
             : $server->replyFrame($replyTo, 'echo:' . $payload);
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: true,
             maxReconnectAttempts: 3,
@@ -662,7 +662,7 @@ final class MuxInboxDropWakeupTest extends TestCase
             connectionListener: $recorder->connectionListener(),
             errorListener: $recorder->errorListener(),
             waitForReconnect: true,
-        ), $server);
+        ), $server));
         $this->opened[] = $connection;
         $connection->connect()->await();
         // Replayed ahead of the inbox, so it keeps the one slot left after the reconnect.
@@ -719,7 +719,7 @@ final class MuxInboxDropWakeupTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $errorListener), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $errorListener), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         $transport->answerPings = false;

@@ -201,7 +201,7 @@ final class CloseIntentTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
@@ -214,7 +214,7 @@ final class CloseIntentTest extends TestCase
                 retryOnFailedInitialConnect: true,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $transport->refuseDials();
         $connect = $connection->connect();
@@ -317,7 +317,7 @@ final class CloseIntentTest extends TestCase
     public function testDisconnectWaitsForAConnectWhoseDialItCannotStop(): void
     {
         $inner = new ReconnectingTransport();
-        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), new UncancellableDialTransport($inner));
+        $connection = $this->own(new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), new UncancellableDialTransport($inner)));
         $this->opened[] = $connection;
         $inner->holdNextDial();
         $first = $connection->connect();
@@ -529,7 +529,7 @@ final class CloseIntentTest extends TestCase
     public function testConnectAfterADisconnectThatOvertookADiallingConnectDialsAfresh(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport);
+        $connection = $this->own(new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport));
         $this->opened[] = $connection;
         $transport->holdNextDial();
         $first = $connection->connect();
@@ -619,7 +619,7 @@ final class CloseIntentTest extends TestCase
                 }
             }
         };
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: true,
@@ -631,7 +631,7 @@ final class CloseIntentTest extends TestCase
                 logger: $logger,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $reader = $this->startRecoveryInBackground($connection, $transport);
@@ -653,7 +653,7 @@ final class CloseIntentTest extends TestCase
     public function testReconnectOutlivesALoggerThatThrowsOnEveryAttempt(): void
     {
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: true,
@@ -665,7 +665,7 @@ final class CloseIntentTest extends TestCase
                 logger: new ThrowingLogger('reconnect attempt'),
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $reader = $this->startRecoveryInBackground($connection, $transport);
@@ -685,10 +685,10 @@ final class CloseIntentTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0, connectionListener: $recorder->connectionListener()),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $transport->holdNextDial();
         $connect = $connection->connect();
@@ -880,7 +880,7 @@ final class CloseIntentTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: $path === 'reconnect exhausted' || $path === 'reconnect auth',
@@ -893,7 +893,7 @@ final class CloseIntentTest extends TestCase
                 retryOnFailedInitialConnect: $path === 'retries exhausted' || $path === 'retry auth',
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $holder = new class {
             /** @var ?Future<void> */
@@ -1181,7 +1181,7 @@ final class CloseIntentTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $recorder->errorListener()), $watched);
+        $connection = $this->own(new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $recorder->errorListener()), $watched));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $seen = [];
@@ -1253,7 +1253,7 @@ final class CloseIntentTest extends TestCase
     /** A connection that retries a failed first dial (retryOnFailedInitialConnect, reconnect disabled). */
     private function retryingInitialConnect(ReconnectingTransport $transport, LifecycleRecorder $recorder, int $retryDelayMs, int $maxAttempts = 10): NatsConnection
     {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 reconnectEnabled: false,
@@ -1266,7 +1266,7 @@ final class CloseIntentTest extends TestCase
                 retryOnFailedInitialConnect: true,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
 
         return $connection;
@@ -1292,10 +1292,10 @@ final class CloseIntentTest extends TestCase
     /** A connection that has not connected yet, with its lifecycle recorded. */
     private function unconnected(ReconnectingTransport $transport, LifecycleRecorder $recorder): NatsConnection
     {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             $this->options(true, 2_000, 1_000, 0, 2, $recorder->connectionListener(), 5, 20, null),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
 
         return $connection;

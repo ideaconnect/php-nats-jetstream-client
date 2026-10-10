@@ -11,6 +11,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Mutation-killing tests for the request / requestMany code paths in
@@ -23,6 +24,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -39,7 +49,7 @@ final class NatsConnection_2MutationTest extends \PHPUnit\Framework\TestCase
             array_merge([self::INFO, "PONG\r\n"], $reads),
             blockWhenEmpty: $blockWhenEmpty,
         );
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         return [$connection, $transport];

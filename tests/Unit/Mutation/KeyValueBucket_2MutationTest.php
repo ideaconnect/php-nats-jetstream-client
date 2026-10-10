@@ -10,6 +10,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use Revolt\EventLoop;
 
 /**
@@ -21,6 +22,8 @@ use Revolt\EventLoop;
  */
 final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
     // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out (the code these mutants pin);
     // batched multi_last Direct Get requires 2.11+ and is covered separately by the #110 pins.
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
@@ -66,7 +69,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     /** @param list<string> $queue */
     private function connect(array $queue): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $queue)));
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $queue))));
         $client->connect()->await();
 
         return $client;
@@ -79,9 +82,14 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
      */
     protected function tearDown(): void
     {
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
+        // #183: what the test registered is closed and checked, then the heartbeat watchdogs it armed.
+        $this->releaseOwnedResourcesAndTheirWatchdogs();
+    }
+
+    /** The scope is made first, so that it knows the loop callbacks registered before the test (#183). */
+    protected function setUp(): void
+    {
+        $this->resources();
     }
 
     /**
@@ -103,7 +111,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $this->muxReplies($transport, $muxFrames);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return [$client, $transport];

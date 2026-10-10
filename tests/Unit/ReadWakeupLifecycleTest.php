@@ -691,7 +691,7 @@ final class ReadWakeupLifecycleTest extends TestCase
      */
     private function watchedClient(WatchedTransport $watched, array $overrides = []): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(...array_merge([
+        $client = $this->own(new NatsClient(new NatsOptions(...array_merge([
             'connectTimeoutMs' => 500,
             'requestTimeoutMs' => 2_000,
             'reconnectEnabled' => true,
@@ -701,7 +701,7 @@ final class ReadWakeupLifecycleTest extends TestCase
             'reconnectJitterMs' => 0,
             'pingIntervalSeconds' => 0,
             'waitForReconnect' => true,
-        ], $overrides)), $watched);
+        ], $overrides)), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

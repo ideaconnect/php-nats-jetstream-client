@@ -20,6 +20,7 @@ use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\HeldDrainParticipant;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\SubscriptionLimitServer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -41,6 +42,7 @@ use function Amp\Future\awaitAll;
  */
 final class MuxInboxRejectionTest extends TestCase
 {
+    use OwnsTestResources;
     private const LIMIT_ERROR = "Server sent error frame: 'maximum subscriptions exceeded'";
     private const MUX_DROPPED = 'the server may have rejected the shared reply-inbox subscription';
     private const CLOSED = '/^Connection (is not open|was closed while the reply inbox was being set up)$/';
@@ -50,15 +52,13 @@ final class MuxInboxRejectionTest extends TestCase
 
     protected function tearDown(): void
     {
+        // Each connection is registered before it connects; the shutdown of #183 closes them, joins their closes and
+        // checks that nothing is left running.
         foreach ($this->opened as $connection) {
-            try {
-                $connection->disconnect()->await(new TimeoutCancellation(1));
-            } catch (\Throwable) {
-                // Already closed.
-            }
+            $this->own($connection);
         }
-
         $this->opened = [];
+        $this->releaseOwnedResources();
     }
 
     /**

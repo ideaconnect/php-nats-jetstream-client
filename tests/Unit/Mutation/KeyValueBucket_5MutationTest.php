@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -23,6 +24,8 @@ use Revolt\EventLoop;
  */
 final class KeyValueBucket_5MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -32,14 +35,19 @@ final class KeyValueBucket_5MutationTest extends TestCase
      */
     protected function tearDown(): void
     {
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
+        // #183: what the test registered is closed and checked, then the heartbeat watchdogs it armed.
+        $this->releaseOwnedResourcesAndTheirWatchdogs();
+    }
+
+    /** The scope is made first, so that it knows the loop callbacks registered before the test (#183). */
+    protected function setUp(): void
+    {
+        $this->resources();
     }
 
     private function connect(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return $client;
@@ -226,10 +234,8 @@ final class KeyValueBucket_5MutationTest extends TestCase
         // second num_pending=0 delivery. On the mutant it fires twice.
         self::assertSame(1, $caughtUpCount, 'onCaughtUp must fire once even across multiple caught-up deliveries');
 
+        // Closed here as well as at tearDown (#183), which joins the close and checks nothing is left running.
         $client->disconnect()->await();
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
     }
 
     // ─── getStatus() last_sequence int-cast (line 882) ───────────────────────
