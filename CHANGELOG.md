@@ -15,6 +15,44 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- A pull consumer run whose reply inbox the server rejects while its handler or `onError` runs, or while one of its
+  pulls is being written, now ends with that rejection as soon as that code returns (#206). A finite run
+  (`setIterations()`) that has delivered its last batch throws the `JetStreamException` instead of returning its count,
+  and so does a run that a later pull's terminal status, such as `409 Consumer Deleted`, would have ended, whose status
+  then never reaches `onError`. A `stop()` made by then still makes `handle()` return its count, and a handler or
+  `onError` that throws still ends the run with its own exception.
+
+### Fixed
+
+- [bugfix] A pull consumer run whose reply inbox the server rejected while the engine was not reading for it pulled
+  again on the dead inbox, and failed only at that pull's deadline, `setExpiresMs()` plus a second later (#206).
+  nats-server rejects the inbox mid-run when a configuration reload withdraws the subscribe permission (`Permissions
+  Violation for Subscription to "_INBOX.JS.PULL.<nuid>.*"`, the connection staying open), and rejects a reconnect's
+  replay of it when the new server is at the account's subscription limit. Whichever fiber's read met the `-ERR`
+  recorded the rejection, the handler's own `processIncoming()`, an application's read loop while the handler or
+  `onError` waited, or a failed write's recovery, and the engine looked at it at the top of its loop only. That pass
+  went on to refill the pipeline, one pull for each one retired, and to read until the new pulls' deadline; a finite
+  run with no pull left returned its count without the error, a later pull's terminal status ended the run as if
+  nothing had happened, the idle backoff (up to 500 ms) was not woken, and a pull whose write failed was retried on the
+  new connection after its recovery's replay had been rejected. Such pulls are not harmless: nats-server serves a
+  waiting pull only when its reply subject has interest, except that with leaf nodes or gateways enabled it serves one
+  younger than 2 s anyway, so the batch went to an inbox nobody held, lost on a consumer with `ack_policy: none` or
+  `max_deliver: 1`, delivered again after `ack_wait` otherwise. Measured on nats-server 2.12.15 with `leafnodes { port:
+  7422 }` and no leaf node connected, a pull for 3 messages whose reply subject had no subscriber left the consumer at
+  `num_pending 0`, `delivered.stream_seq 3`. The run now looks at the rejection again after every wait that can let
+  another fiber run: before each pull it retires, after a terminal status's `onError` and after its hand-over, and after
+  the issue phase. The rejection fires a wake-up of its own, which ends the pump read and the idle backoff at once, and
+  each pull goes out through a guarded publish whose guard refuses it before the first write, before the retry after a
+  failed write's recovery, once a sealed reconnect flush lets it go on, and in the writer of a publish made while the
+  connection drains (`NatsClient::publishGuarded()`, `@internal`). No new pull and no retry goes out once the run knows
+  its inbox was rejected; a pull the socket has already taken, or one already in the reconnect buffer, still does. The
+  run hands what its pulls hold to the handler first, as before any failure of the run (#197), a handler that fails
+  there being reported, and then throws the rejection. Found by the review of #197 (2.22.0).
+
 ## [2.25.0] - 2026-10-10
 
 ### Upgrade notes

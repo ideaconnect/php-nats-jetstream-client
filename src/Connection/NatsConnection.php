@@ -1568,10 +1568,15 @@ final class NatsConnection
      *        its PING's place on the wire ({@see enqueuePongSlot()}). A writer that runs after the caller stopped
      *        waiting still queues it with its PING, whose PONG is then owed to it; a write that fails takes it out
      *        again, since its PING never reached the wire.
+     * @param (\Closure():void)|null $beforeWrite A guarded publish's guard ({@see publishGuarded()}, #206), called by
+     *        the writer before it queues anything or hands the bytes over: the writer runs in a fiber of its own, after
+     *        the caller's last check, so a rejection recorded in between still stops the write. What it throws fails the
+     *        write, nothing written. Must not suspend.
      */
-    private function writeBounded(string $bytes, Cancellation $cancellation, ?DeferredFuture $pongSlot = null): void
+    private function writeBounded(string $bytes, Cancellation $cancellation, ?DeferredFuture $pongSlot = null, ?\Closure $beforeWrite = null): void
     {
-        $write = async(function () use ($bytes, $pongSlot): void {
+        $write = async(function () use ($bytes, $pongSlot, $beforeWrite): void {
+            $beforeWrite?->__invoke();
             if ($pongSlot !== null) {
                 $this->pongWaiters[] = $pongSlot;
             }
@@ -2297,6 +2302,33 @@ final class NatsConnection
     }
 
     /**
+     * Publishes as {@see publish()} does, reconnect buffering and the retry after a failed write's recovery included,
+     * with $beforeWrite called before each attempt to send the frame, in the step that makes it: before the frame is
+     * written or buffered, before the retry that follows a failed write's recovery, once a sealed reconnect flush lets
+     * it go on, and, while the connection drains, in the writer that hands it to the transport. The guard refuses the
+     * send by throwing: the publish then fails with its exception, nothing written and no recovery run for it. A write
+     * that an earlier attempt handed to the transport is not recalled, nor a frame already buffered.
+     *
+     * For the pull consumer engine, whose pull must not go out on a reply inbox the server rejected, whichever fiber's
+     * read recorded the rejection, also while the pull's write waited for the socket or for the recovery whose replay
+     * of the inbox the new server rejected ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #206).
+     *
+     * @internal For the pull consumer engine (#206); not part of the supported API.
+     *
+     * @param \Closure():void $beforeWrite Must not suspend.
+     * @return Future<void>
+     */
+    public function publishGuarded(string $subject, string $payload, string $replyTo, \Closure $beforeWrite): Future
+    {
+        return async(function () use ($subject, $payload, $replyTo, $beforeWrite): void {
+            $frame = $this->encodePublishFrame($subject, $payload, null, $replyTo);
+
+            $this->writePublishFrame($frame, $beforeWrite);
+            $this->recordOutbound($payload);
+        });
+    }
+
+    /**
      * Publishes payload bytes with NATS headers to the given subject. A header value may be a single
      * string or a list of strings for multi-value (multimap) headers (ADR-4).
      * Delivery and recovery follow the same rules as {@see publish()}.
@@ -2454,9 +2486,19 @@ final class NatsConnection
      *   - otherwise: buffer while a reconnect is in flight (flushed on reconnect) and yield one
      *     event-loop tick so a synchronous publisher drives that reconnect, else fail loudly - a
      *     publish after the connection has Closed still throws (#146).
+     *
+     * $beforeWrite, a guarded publish's ({@see publishGuarded()}, #206), is called before each attempt to send the
+     * frame: first, whatever the state, before the retry after a failed write's recovery, on every pass the frame
+     * makes through here once the state has changed, so also once a sealed flush lets it go on, and in the Draining
+     * branch's writer as well, right before the transport takes the bytes, since that writer runs in a fiber of its
+     * own. It is never called inside a try whose catch recovers a failed write, so that what it throws fails the
+     * publish as it is, with no recovery run for it.
+     *
+     * @param (\Closure():void)|null $beforeWrite Must not suspend.
      */
-    private function writePublishFrame(string $frame): void
+    private function writePublishFrame(string $frame, ?\Closure $beforeWrite = null): void
     {
+        $beforeWrite?->__invoke();
         if ($this->state === ConnectionState::Open) {
             $generation = $this->connectionGeneration;
             try {
@@ -2493,11 +2535,14 @@ final class NatsConnection
                             : new TransportClosedException('Transport is not connected', 0, $writeError);
                     }
 
-                    $this->writePublishFrame($frame);
+                    $this->writePublishFrame($frame, $beforeWrite);
 
                     return;
                 }
 
+                // The recovery ran other fibers' reads and the replay of every subscription: a guarded publish's inbox
+                // can have been rejected meanwhile (#206).
+                $beforeWrite?->__invoke();
                 $this->transport->write($frame)->await();
             }
 
@@ -2520,6 +2565,7 @@ final class NatsConnection
                     $drainDeadline !== null
                         ? $this->remainingBudgetCancellation($drainDeadline)
                         : new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)),
+                    beforeWrite: $beforeWrite,
                 );
             } catch (CancelledException) {
                 throw new TimeoutException('Publish during drain timed out (transport backpressure)');
@@ -2536,7 +2582,7 @@ final class NatsConnection
         $flushGate = $this->reconnectFlushGate;
         if ($flushGate !== null) {
             $flushGate->getFuture()->await();
-            $this->writePublishFrame($frame);
+            $this->writePublishFrame($frame, $beforeWrite);
 
             return;
         }

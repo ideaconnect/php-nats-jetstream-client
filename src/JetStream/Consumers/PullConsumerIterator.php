@@ -328,7 +328,11 @@ final class PullConsumerIterator
      * them (see below), and the future then fails with that error, unchanged. A handler that throws during that
      * delivery ends it, and its exception goes to the connection's error listener and logger, since the run's own
      * failure is the one thrown; on a closed connection that includes a handler whose ack failed. A handler that throws
-     * at any other time ends the run at once with its own exception, the other messages left undelivered.
+     * at any other time ends the run at once with its own exception, the other messages left undelivered. A rejection
+     * of the inbox ends the run whichever fiber's read records it (#206): one recorded while the handler or onError
+     * runs, or while a pull is written, ends it as soon as that code returns, a finite run that has delivered its last
+     * batch and one a later pull's terminal status would have ended included, and no pull goes out on the inbox once
+     * the run knows of it; a stop() made by then still ends the run with its count.
      *
      * The client's drain() hands over what the run's pulls hold, and its disconnect() discards it, wherever the run is
      * (#207), as they do with what the connection itself has received. Once the drain's flush is done, the run hands
