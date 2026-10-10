@@ -725,10 +725,10 @@ final class WaitForReconnectTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             $this->options(true, 2_000, 1, 0, 2, $recorder->connectionListener(), 1, 1, $recorder->errorListener()),
             $watched,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $seen = [];
@@ -1431,7 +1431,7 @@ final class WaitForReconnectTest extends TestCase
     public function testQueuePolledDuringAReconnectThatGivesUpFailsWithItsError(): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $queue = $client->subscribeQueue('jobs')->await();

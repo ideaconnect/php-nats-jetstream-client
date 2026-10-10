@@ -5,11 +5,11 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Unit\Mutation;
 
 use Amp\TimeoutCancellation;
-use IDCT\NATS\Core\NatsClient;
-use IDCT\NATS\Core\NatsMessage;
-use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -27,9 +27,18 @@ use function Amp\Future\await;
  */
 final class SubscriptionQueue_2MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private function makeConnectedClient(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client;
@@ -81,7 +90,7 @@ final class SubscriptionQueue_2MutationTest extends TestCase
 
         // Outer bound: fail loudly rather than hang if a regression parks the caller.
         $result = await(
-            [async(static fn (): array => $queue->fetchAll())],
+            [async(static fn(): array => $queue->fetchAll())],
             new TimeoutCancellation(5.0),
         )[0];
 

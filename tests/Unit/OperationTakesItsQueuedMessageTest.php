@@ -622,11 +622,11 @@ final class OperationTakesItsQueuedMessageTest extends TestCase
     /** A NatsConnection connected through $watched, for the reflection-level own-sid tests. */
     private function connectWatchedConnection(WatchedTransport $watched): NatsConnection
     {
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             pingIntervalSeconds: 0,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $connection;
         $connection->connect()->await();
 
@@ -671,11 +671,11 @@ final class OperationTakesItsQueuedMessageTest extends TestCase
      */
     private function watchedClient(WatchedTransport $watched, array $overrides = []): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(...array_merge([
+        $client = $this->own(new NatsClient(new NatsOptions(...array_merge([
             'connectTimeoutMs' => 500,
             'requestTimeoutMs' => 2_000,
             'pingIntervalSeconds' => 0,
-        ], $overrides)), $watched);
+        ], $overrides)), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

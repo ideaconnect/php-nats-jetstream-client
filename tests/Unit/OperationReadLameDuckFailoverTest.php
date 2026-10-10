@@ -1440,7 +1440,7 @@ final class OperationReadLameDuckFailoverTest extends TestCase
      */
     private function clientOver(ReconnectingTransport|WatchedTransport $transport, array $overrides = []): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(...array_merge([
+        $client = $this->own(new NatsClient(new NatsOptions(...array_merge([
             'connectTimeoutMs' => 500,
             'requestTimeoutMs' => 2_000,
             'reconnectEnabled' => true,
@@ -1450,7 +1450,7 @@ final class OperationReadLameDuckFailoverTest extends TestCase
             'reconnectJitterMs' => 0,
             'pingIntervalSeconds' => 0,
             'waitForReconnect' => true,
-        ], $overrides)), $transport);
+        ], $overrides)), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 

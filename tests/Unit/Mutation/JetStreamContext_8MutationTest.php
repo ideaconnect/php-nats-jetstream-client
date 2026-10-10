@@ -12,6 +12,7 @@ use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
 use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -23,6 +24,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class JetStreamContext_8MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** @return list<string> INFO + PONG so connect() succeeds. */
     private function infoPong(): array
     {
@@ -34,7 +44,7 @@ final class JetStreamContext_8MutationTest extends TestCase
 
     private function context(FakeTransport $transport, ?NatsOptions $options = null): JetStreamContext
     {
-        $client = new NatsClient($options ?? new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient($options ?? new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client->jetStream();
@@ -149,7 +159,7 @@ final class JetStreamContext_8MutationTest extends TestCase
     {
         return count(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'PUB $JS.API.CONSUMER.MSG.NEXT.'),
+            static fn(string $w): bool => str_starts_with($w, 'PUB $JS.API.CONSUMER.MSG.NEXT.'),
         ));
     }
 
@@ -171,9 +181,9 @@ final class JetStreamContext_8MutationTest extends TestCase
     private function inertControl(): PullPipelineControl
     {
         return new PullPipelineControl(
-            stopFn: static fn (): bool => false,
-            drainFn: static fn (): bool => false,
-            getPinFn: static fn (): ?string => null,
+            stopFn: static fn(): bool => false,
+            drainFn: static fn(): bool => false,
+            getPinFn: static fn(): ?string => null,
             setPinFn: static function (?string $pinId): void {},
         );
     }

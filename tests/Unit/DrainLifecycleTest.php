@@ -146,7 +146,7 @@ final class DrainLifecycleTest extends TestCase
                 }
             }
         };
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 2_000,
@@ -160,7 +160,7 @@ final class DrainLifecycleTest extends TestCase
                 logger: $logger,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $reader = $this->startRecoveryInBackground($connection, $transport);
@@ -793,7 +793,7 @@ final class DrainLifecycleTest extends TestCase
                 $holder->failure = $e;
             }
         };
-        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport);
+        $connection = $this->own(new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport));
         $this->opened[] = $connection;
         $holder->connection = $connection;
 
@@ -1434,12 +1434,12 @@ final class DrainLifecycleTest extends TestCase
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], blockWhenEmpty: true);
         // A ten-second budget: a flush that read on past the EOF would take five times the bound below.
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             requestTimeoutMs: 10_000,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $connection->subscribe('orders', static function (): void {})->await();
         $transport->pushReadChunk("-ERR 'maximum subscriptions exceeded'\r\n");
@@ -1463,12 +1463,12 @@ final class DrainLifecycleTest extends TestCase
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], blockWhenEmpty: true);
         // A ten-second budget: a flush that read on past the failed PONG would take five times the bound below.
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             requestTimeoutMs: 10_000,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $connection->subscribe('orders', static function (): void {})->await();
         $transport->throwOnWriteContaining = 'PONG';
@@ -1492,12 +1492,12 @@ final class DrainLifecycleTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $service = $client->service('echo', '1.0.0')
@@ -1605,7 +1605,7 @@ final class DrainLifecycleTest extends TestCase
         $listener = $recorder->errorListener();
         // A 0.3 s budget, room for 20 messages per subscription, and a listener taking 150 ms per report: a drain
         // that made every report after its delivery pass would take 3 s.
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 300,
@@ -1618,7 +1618,7 @@ final class DrainLifecycleTest extends TestCase
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
             ),
             $transport,
-        );
+        ));
         $client->connect()->await();
         if ($report === 'handler') {
             $sid = $client->subscribe('work', static function (): void {
@@ -1984,6 +1984,10 @@ final class DrainLifecycleTest extends TestCase
         };
         $connection = $this->connect($transport, maxReconnectAttempts: 2, connectionListener: $listener);
         $holder->connection = $connection;
+        // The supervisor would reconnect on the Closed of the shutdown too (#183).
+        $this->resources()->onStop(static function () use ($holder): void {
+            $holder->connection = null;
+        }, 'the supervisor that reconnects on Closed');
         $reader = $this->startRecoveryInBackground($connection, $transport);
 
         $connection->drain()->await();
@@ -2070,11 +2074,11 @@ final class DrainLifecycleTest extends TestCase
     public function testDrainEndsPromptlyWhileAnotherFiberReads(string $reader): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             pingIntervalSeconds: 0,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $stop = new DeferredCancellation();
@@ -2243,11 +2247,11 @@ final class DrainLifecycleTest extends TestCase
     public function testDrainEndsPromptlyAlongsideALoopThatLeftTheRestOfAFailingSubscriptionQueued(): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             pingIntervalSeconds: 0,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $seen = [];
@@ -2302,7 +2306,7 @@ final class DrainLifecycleTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched);
+        $connection = $this->own(new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $watched));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $seen = [];
@@ -2396,11 +2400,11 @@ final class DrainLifecycleTest extends TestCase
     public function testADrainEndsPromptlyWhileAServiceLoopDeliversARead(string $drain): void
     {
         $transport = new ReconnectingTransport();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 10_000,
             pingIntervalSeconds: 0,
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $done = [];
@@ -2503,7 +2507,7 @@ final class DrainLifecycleTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 150,
@@ -2517,7 +2521,7 @@ final class DrainLifecycleTest extends TestCase
                 logger: new ThrowingLogger('reconnect attempt'),
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $sid = $connection->subscribe('updates', static function (): void {})->await();
@@ -2538,14 +2542,14 @@ final class DrainLifecycleTest extends TestCase
     public function testDrainStillAnnouncesTheCloseWhenTheLoggerThrowsOnIt(): void
     {
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 connectionListener: $recorder->connectionListener(),
                 logger: new ThrowingLogger('NATS connection Closed'),
             ),
             new ReconnectingTransport(),
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
 

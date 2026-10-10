@@ -151,7 +151,7 @@ final class PullConsumerInboxRejectionTest extends TestCase
         $limited = new SubscriptionLimitServer();
         $limited->limit = 2;
         [$rejected, $listener] = self::rejectionListener();
-        $client = new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 1, 1, $listener), $limited);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 1, 1, $listener), $limited));
         $this->opened[] = $client;
         $client->connect()->await();
         $client->subscribe('app.one', static function (): void {})->await();
@@ -835,7 +835,7 @@ final class PullConsumerInboxRejectionTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         [$rejected, $listener] = self::rejectionListener($recorder);
-        $client = new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 1, 1, $listener), $watched);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 3, 0, 2, null, 1, 1, $listener), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

@@ -1068,7 +1068,7 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
                 $alsoOnError($error);
             };
         }
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             reconnectEnabled: $reconnect,
@@ -1081,7 +1081,7 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
             errorListener: $errorListener,
             logger: $logger,
             waitForReconnect: $waitForReconnect,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

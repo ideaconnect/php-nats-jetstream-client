@@ -12,10 +12,27 @@ use IDCT\NATS\JetStream\ObjectStore\ObjectInfo;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 final class ObjectStoreBucketTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        // The heartbeat watchdogs (#113) the test armed are cancelled by the ids recorded since setUp().
+        $this->releaseOwnedResourcesAndTheirWatchdogs();
+    }
+
+    /** The scope is made first, so that it knows the loop callbacks registered before the test (#183). */
+    protected function setUp(): void
+    {
+        $this->resources();
+    }
+
     /** URL-safe base64 (with padding), matching the official Object Store meta-subject encoding. */
     private function encodeName(string $name): string
     {
@@ -200,7 +217,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($deletePayload), $deletePayload),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = $client->jetStream()->objectStore('assets');
@@ -234,7 +251,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $stored = $client->jetStream()->objectStore('assets')
@@ -269,7 +286,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->objectStore('assets')->put('logo.txt', 'hello')->await();
@@ -294,7 +311,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->objectStore('assets')->put('logo.txt', 'hello', ['team' => 'brand'])->await();
@@ -317,7 +334,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // 3-byte chunks: a single 'hello' block re-chunks to 'hel' + 'lo' (2 chunks).
@@ -353,7 +370,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),       // meta
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // 2-byte chunks: one 'abcdef' block re-chunks to 'ab' + 'cd' + 'ef' (3 chunks).
@@ -372,7 +389,7 @@ final class ObjectStoreBucketTest extends TestCase
 
     public function testConstructorRejectsNonPositiveChunkSize(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('chunk size');
@@ -396,7 +413,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $stored = $client->jetStream()->objectStore('assets')->put('empty.txt', '')->await();
@@ -432,7 +449,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->objectStore('assets')->put('logo.txt', 'world')->await();
@@ -463,7 +480,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 2),   // single-chunk fast path (Direct Get on the NUID subject)
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $fetched = $client->jetStream()->objectStore('assets')->get('doc.txt')->await();
@@ -498,7 +515,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $fetched = $client->jetStream()->objectStore('assets')->get('doc.txt')->await();
@@ -528,7 +545,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'CORRUPTED!!', 2), // body does not match the metadata digest
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -559,7 +576,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $captured = '';
@@ -615,7 +632,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer), // CONSUMER.DELETE
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $captured = [];
@@ -648,7 +665,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directReplyFromEnvelope($meta, 1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $called = false;
@@ -683,7 +700,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $deleted = $client->jetStream()->objectStore('assets')->delete('logo.txt')->await();
@@ -710,7 +727,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),       // meta publish ack
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $info = $client->jetStream()->objectStore('assets')->put('doc.txt', 'hello', [], 'A friendly doc')->await();
@@ -742,7 +759,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 3),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $fetched = $client->jetStream()->objectStore('assets')->get('shortcut')->await();
@@ -769,7 +786,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($reply), $reply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->objectStore('assets')->create(
@@ -802,7 +819,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($updated), $updated), // STREAM.UPDATE
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         self::assertTrue($client->jetStream()->objectStore('assets')->seal()->await());
@@ -831,7 +848,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $link = $client->jetStream()->objectStore('assets')->addLink('shortcut', 'real.bin')->await();
@@ -864,7 +881,7 @@ final class ObjectStoreBucketTest extends TestCase
             ),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         try {
@@ -898,7 +915,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $link = $client->jetStream()->objectStore('assets')->addLink('latest', 'v2.bin')->await();
@@ -930,7 +947,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 3 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         try {
@@ -965,7 +982,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('alias.bin', ['nuid' => '', 'options' => ['link' => ['bucket' => 'assets', 'name' => 'real.bin']]], 4),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
         $bucket = $client->jetStream()->objectStore('assets');
 
@@ -1006,7 +1023,7 @@ final class ObjectStoreBucketTest extends TestCase
             'HMSG _INBOX.b 3 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1030,7 +1047,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->pubAck(3)), $this->pubAck(3)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $link = $client->jetStream()->objectStore('assets')->addBucketLink('mirror', 'other-bucket')->await();
@@ -1061,7 +1078,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $info = $client->jetStream()->objectStore('assets')->updateMeta('logo.txt', 'brand.txt')->await();
@@ -1093,7 +1110,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 2 %d\r\n%s\r\n", strlen($this->pubAck(8)), $this->pubAck(8)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $info = $client->jetStream()->objectStore('assets')->updateMeta('logo.txt', null, ['team' => 'brand', 'owner' => 'x'])->await();
@@ -1153,7 +1170,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('old.txt', $oldExtra, 8),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = $client->jetStream()->objectStore('assets');
@@ -1192,7 +1209,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('b.txt', $extra, 5),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
@@ -1259,7 +1276,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),      // terminator page
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
@@ -1294,7 +1311,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directReplyFromEnvelope($meta, 1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $info = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -1318,7 +1335,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),            // STREAM.MSG.GET fallback
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $info = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -1354,7 +1371,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),                    // STREAM.MSG.GET fallback
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
@@ -1406,7 +1423,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),            // STREAM.MSG.GET fallback
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
@@ -1438,7 +1455,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 404, 'Message Not Found'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         self::assertNull($client->jetStream()->objectStore('assets')->info('missing.txt')->await());
@@ -1481,7 +1498,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $seen = null;
@@ -1522,7 +1539,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->objectStore('assets')->watch(static function (ObjectInfo $info): void {})->await();
@@ -1564,7 +1581,7 @@ final class ObjectStoreBucketTest extends TestCase
         $options = new NatsOptions(pingIntervalSeconds: 0, errorListener: static function (\Throwable $e) use (&$errors): void {
             $errors[] = $e;
         });
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
 
         // 30 ms heartbeat -> the watchdog reacts after ~60 ms of silence.
@@ -1610,7 +1627,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
         $bucket = $client->jetStream()->objectStore('assets');
 
@@ -1658,7 +1675,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
         $bucket = $client->jetStream()->objectStore('assets');
 
@@ -1697,7 +1714,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->objectStore('assets')->watch(
@@ -1743,7 +1760,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $seen = [];
@@ -1806,7 +1823,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($createReply), $createReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $seen = [];
@@ -1844,7 +1861,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("HMSG _INBOX.x 1 %d %d\r\n%s%s\r\n", $h, $h + strlen((string) $markerBody), $hdrs, (string) $markerBody),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $info = $client->jetStream()->objectStore('assets')->info('logo.txt')->await();
@@ -1859,7 +1876,7 @@ final class ObjectStoreBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = $client->jetStream()->objectStore('assets');
@@ -1875,7 +1892,7 @@ final class ObjectStoreBucketTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -1900,7 +1917,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(4)), $this->pubAck(4)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
@@ -1935,7 +1952,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
@@ -2025,7 +2042,7 @@ final class ObjectStoreBucketTest extends TestCase
             return [];
         };
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // chunkSize 4, 8 bytes -> exactly 2 chunks.
@@ -2068,7 +2085,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.f 6 %d\r\n%s\r\n", strlen('{"success":true,"purged":4}'), '{"success":true,"purged":4}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // chunkSize 4, 14 bytes -> 4 pipelined chunks matching the four acks above.
@@ -2111,7 +2128,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
@@ -2165,7 +2182,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),  // delete consumer
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $fetched = $client->jetStream()->objectStore('assets')->get('multi.bin')->await();
@@ -2203,7 +2220,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(3, 500, 'boom'),                                 // Direct Get -> non-404 error
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2226,7 +2243,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($error), $error),  // metaSubjects() -> error
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2254,7 +2271,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($purgeError), $purgeError),            // purge -> error (swallowed)
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $deleted = $client->jetStream()->objectStore('assets')->delete('logo.txt')->await();
@@ -2286,7 +2303,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4), // logo.txt -> present
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
@@ -2311,7 +2328,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($lookupError), $lookupError),               // lookup -> 500 swallowed
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $deleted = $client->jetStream()->objectStore('assets')->delete('logo.txt')->await();
@@ -2335,7 +2352,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($this->notFound()), $this->notFound()),    // lookup -> 404
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2371,7 +2388,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),       // delete consumer
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2408,7 +2425,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),       // delete consumer
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // No digest to verify against, but the chunk-count gate still rejects the short read.
@@ -2444,7 +2461,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2465,7 +2482,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 404, 'Message Not Found'), // info() -> 404
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->get('missing.txt')->await();
@@ -2488,7 +2505,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directReplyFromEnvelope($meta, 1), // info() -> deleted tombstone
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->get('gone.txt')->await();
@@ -2518,7 +2535,7 @@ final class ObjectStoreBucketTest extends TestCase
             $frames[] = $this->directMetaReply('loop.txt', $linkMeta, $i);
         }
         $this->muxReplies($transport, $frames);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2540,7 +2557,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('bucket-link', ['options' => ['link' => ['bucket' => 'other-bucket']]], 1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2564,7 +2581,7 @@ final class ObjectStoreBucketTest extends TestCase
             $frames[] = $this->directMetaReply('loop.txt', $linkMeta, $i);
         }
         $this->muxReplies($transport, $frames);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2585,7 +2602,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 404, 'Message Not Found'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $called = false;
@@ -2620,7 +2637,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 3),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $captured = '';
@@ -2658,7 +2675,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(2, 404, 'Not Found'),     // single-chunk Direct Get -> 404
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2688,7 +2705,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(2, 500, 'Stream Error Occurred'), // single-chunk Direct Get -> 500 (rethrow)
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2730,7 +2747,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),                 // delete consumer
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $fetched = $client->jetStream()->objectStore('assets')->get('doc.txt')->await();
@@ -2762,7 +2779,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // No digest to check -> must succeed even though digest field is empty.
@@ -2798,7 +2815,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directChunkReply($nuid, 'hello', 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2819,7 +2836,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 500, 'Downstream Error'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2846,7 +2863,7 @@ final class ObjectStoreBucketTest extends TestCase
             $frame,
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -2872,7 +2889,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($msgGetError), $msgGetError),              // STREAM.MSG.GET -> 500
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2898,7 +2915,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($msgGetNoData), $msgGetNoData),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -2921,7 +2938,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directReplyFromEnvelope($meta, 1), // info('gone.txt') -> deleted tombstone
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2942,7 +2959,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 404, 'Message Not Found'), // info() -> 404 (null)
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2966,7 +2983,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('brand.txt', ['nuid' => 'n2', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 2),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -2990,7 +3007,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($emptyStreamInfo), $emptyStreamInfo),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->list()->await();
@@ -3031,7 +3048,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('good.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();
@@ -3064,7 +3081,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamReply), $streamReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $status = $client->jetStream()->objectStore('assets')->getStatus()->await();
@@ -3092,7 +3109,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamReply), $streamReply),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $status = $client->jetStream()->objectStore('assets')->getStatus()->await();
@@ -3121,7 +3138,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.c 3 %d\r\n%s\r\n", strlen($this->pubAck(2)), $this->pubAck(2)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // Producer yields: empty, empty, 'hello', empty, null.
@@ -3160,7 +3177,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $store = new ObjectStoreBucket($client, $client->jetStream(), 'assets');
@@ -3195,7 +3212,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($msgGetNoMessage), $msgGetNoMessage),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -3221,7 +3238,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($invalidB64Data), $invalidB64Data),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
@@ -3253,7 +3270,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"error":{"code":500,"description":"purge failed"}}'), '{"error":{"code":500,"description":"purge failed"}}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // Should not throw despite the purge failure.
@@ -3282,7 +3299,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // Renaming onto a deleted target must succeed (deleted != live conflict).
@@ -3309,7 +3326,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('blink', ['options' => ['link' => ['bucket' => 'assets', 'name' => '']]], 1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $this->expectException(JetStreamException::class);
@@ -3351,7 +3368,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 5 %d\r\n%s\r\n", strlen($deleteConsumer), $deleteConsumer),             // delete consumer
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $captured = '';
@@ -3383,7 +3400,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($emptyStreamInfo), $emptyStreamInfo),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $result = $client->jetStream()->objectStore('assets')->list()->await();
@@ -3413,7 +3430,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.d 4 %d\r\n%s\r\n", strlen('{"success":true,"purged":1}'), '{"success":true,"purged":1}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // 3-byte chunks: one 'hello' block re-chunks to 'hel' + 'lo'; the second chunk's ack fails.
@@ -3465,7 +3482,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),     // terminator page
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         try {
@@ -3502,7 +3519,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.e 5 %d\r\n%s\r\n", strlen($this->pubAck(9)), $this->pubAck(9)),       // meta ack
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         // 4-byte chunks: 10 bytes split into 3 pipelined chunks, exercising the order check.
@@ -3554,7 +3571,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($lookupError), $lookupError),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 300), $transport));
         $client->connect()->await();
 
         try {
@@ -3595,7 +3612,7 @@ final class ObjectStoreBucketTest extends TestCase
 
         // Every reply is queued: the timeout only bounds a failure, and a short one let a slow runner time out a
         // chunk's request.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 1);
@@ -3636,7 +3653,7 @@ final class ObjectStoreBucketTest extends TestCase
 
         // Every reply is queued: the timeout only bounds a failure, and a short one let a slow runner time out a
         // chunk's request.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 1);
@@ -3678,7 +3695,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.p 1 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
@@ -3722,7 +3739,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.p 1 %d\r\n%s\r\n", strlen('{"success":true,"purged":2}'), '{"success":true,"purged":2}'),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
@@ -3810,7 +3827,7 @@ final class ObjectStoreBucketTest extends TestCase
             return [];
         };
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $bucket = new ObjectStoreBucket($client, $client->jetStream(), 'assets', 4);
@@ -3842,11 +3859,8 @@ final class ObjectStoreBucketTest extends TestCase
         }
         self::assertSame(3, $chunkPubsBeforePurge, 'both original publishes AND the drained 503-retry must precede the purge');
 
-        // Quiesce: no fibers/timers may leak into later tests.
+        // Closed here as well as at tearDown (#183), which joins the close and checks nothing is left running.
         $client->disconnect()->await();
-        foreach (\Revolt\EventLoop::getIdentifiers() as $id) {
-            \Revolt\EventLoop::cancel($id);
-        }
     }
 
     /**
@@ -3881,7 +3895,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 1),
         ]);
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         $objects = $client->jetStream()->objectStore('assets')->list()->await();

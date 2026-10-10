@@ -11,6 +11,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -21,9 +22,18 @@ use PHPUnit\Framework\TestCase;
  */
 final class MuxRequestInboxInternalsTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private function connection(?NatsOptions $options = null): NatsConnection
     {
-        return new NatsConnection($options ?? new NatsOptions(), new FakeTransport());
+        return $this->own(new NatsConnection($options ?? new NatsOptions(), new FakeTransport()));
     }
 
     private function message(string $subject): NatsMessage
@@ -192,7 +202,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
 
             return [sprintf("MSG %s 1 2\r\nok\r\n", explode(' ', $head)[2])];
         };
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $this->setPrivate($connection, 'muxSidsToRelease', [7, 8]);
 
@@ -229,7 +239,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
 
             return $frames;
         };
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         self::assertSame('ok', $connection->request('svc.echo', 'x', 1_000)->await()->payload);
         $this->setPrivate($connection, 'muxSidsToRelease', [7]);

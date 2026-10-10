@@ -10,6 +10,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -22,6 +23,8 @@ use Revolt\EventLoop;
  */
 final class JetStreamContext_4MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -31,9 +34,14 @@ final class JetStreamContext_4MutationTest extends TestCase
      */
     protected function tearDown(): void
     {
-        foreach (EventLoop::getIdentifiers() as $id) {
-            EventLoop::cancel($id);
-        }
+        // #183: what the test registered is closed and checked, then the heartbeat watchdogs it armed.
+        $this->releaseOwnedResourcesAndTheirWatchdogs();
+    }
+
+    /** The scope is made first, so that it knows the loop callbacks registered before the test (#183). */
+    protected function setUp(): void
+    {
+        $this->resources();
     }
 
     /**
@@ -43,7 +51,7 @@ final class JetStreamContext_4MutationTest extends TestCase
     private function connectedClientWith(array $frames, ?FakeTransport &$transport = null): NatsClient
     {
         $transport = new FakeTransport(array_merge([self::INFO, "PONG\r\n"], $frames));
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 
         return $client;

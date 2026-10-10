@@ -13,6 +13,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LoopTickCountingTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
@@ -29,6 +30,15 @@ use function Amp\Future\await;
  */
 final class NatsConnection_8MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** @return list<string> */
     private function infoAndPong(): array
     {
@@ -40,7 +50,7 @@ final class NatsConnection_8MutationTest extends TestCase
 
     private function connect(TransportInterface $transport, ?NatsOptions $options = null): NatsConnection
     {
-        $connection = new NatsConnection($options ?? new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection($options ?? new NatsOptions(), $transport));
         $connection->connect()->await();
 
         return $connection;
@@ -214,7 +224,7 @@ final class NatsConnection_8MutationTest extends TestCase
         $startedNs = hrtime(true);
         // Outer bound: fail loudly rather than hang if a regression parks the caller.
         $messages = await(
-            [async(static fn (): array => $connection->requestMany('request.subject', 'ping', null, 1, 5_000)->await())],
+            [async(static fn(): array => $connection->requestMany('request.subject', 'ping', null, 1, 5_000)->await())],
             new TimeoutCancellation(10.0),
         )[0];
         $elapsedSeconds = (hrtime(true) - $startedNs) / 1e9;

@@ -208,7 +208,7 @@ final class GuardedPublishTest extends TestCase
         // The backlog MSG, and the flush's PONG behind it, arrive once the drain's UNSUB is written: the handler runs
         // while the connection is Draining.
         $transport->enqueueOnWriteContaining = ['UNSUB' => ["MSG updates 1 5\r\nhello\r\n", "PONG\r\n"]];
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 2_000, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
         $publishing = new class {
             public int $calls = 0;

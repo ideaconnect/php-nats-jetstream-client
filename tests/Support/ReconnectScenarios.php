@@ -5,7 +5,6 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Support;
 
 use Amp\Future;
-use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
@@ -18,25 +17,27 @@ use function Amp\delay;
 /**
  * Helpers for unit tests that take a connection over a {@see ReconnectingTransport} through outages.
  * The test case calls {@see closeOpenedConnections()} from its tearDown().
+ *
+ * What a test opens belongs to its {@see TestResourceScope} (#183, {@see OwnsTestResources}): the helpers below register
+ * each connection they make, and a connection the test adds to $opened is registered at tearDown. The shutdown closes
+ * each, joins its close, releases the fixture gates registered with the scope and checks that nothing is left running,
+ * under one deadline, where it used to disconnect each within a second, swallow whatever that threw, and wait 50 ms.
  */
 trait ReconnectScenarios
 {
+    use OwnsTestResources;
+
     /** @var list<NatsConnection|NatsClient> */
     private array $opened = [];
 
     private function closeOpenedConnections(): void
     {
         foreach ($this->opened as $connection) {
-            try {
-                $connection->disconnect()->await(new TimeoutCancellation(1));
-            } catch (\Throwable) {
-                // Already closed, or closing races a recovery: nothing to tear down.
-            }
+            $this->own($connection);
         }
-
         $this->opened = [];
-        // Let a recovery that was backing off observe the close before the next test runs.
-        delay(0.05);
+
+        $this->releaseOwnedResources();
     }
 
     private function connect(
@@ -67,7 +68,7 @@ trait ReconnectScenarios
             ),
             $transport,
         );
-        $this->opened[] = $connection;
+        $this->opened[] = $this->own($connection);
         $connection->connect()->await();
 
         return $connection;
@@ -79,7 +80,7 @@ trait ReconnectScenarios
         int $maxPingsOut = 2,
     ): NatsClient {
         $client = new NatsClient($this->options(true, 2_000, 1_000, $pingIntervalSeconds, $maxPingsOut, null, 5, 20, null), $transport);
-        $this->opened[] = $client;
+        $this->opened[] = $this->own($client);
         $client->connect()->await();
 
         return $client;

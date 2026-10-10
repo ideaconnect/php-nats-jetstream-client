@@ -12,6 +12,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Targeted tests that kill surviving Infection mutants in src/Connection/NatsConnection.php
@@ -19,6 +20,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO_TEMPLATE
         = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":%d,"headers":true}'
         . "\r\n";
@@ -46,7 +56,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "HMSG updates 1 0 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -79,7 +89,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "MSG updates 1 1\r\nA\r\nMSG updates 1 1\r\nB\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 maxPendingMessagesPerSubscription: 1,
                 slowConsumerPolicy: SlowConsumerPolicy::DropOldest,
@@ -88,7 +98,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $delivered = [];
@@ -119,7 +129,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "MSG updates 1 1\r\nA\r\nMSG updates 1 1\r\nB\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 maxPendingMessagesPerSubscription: 1,
                 slowConsumerPolicy: SlowConsumerPolicy::DropNewest,
@@ -128,7 +138,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $delivered = [];
@@ -162,7 +172,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "MSG updates 1 1\r\nA\r\nMSG updates 1 1\r\nB\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 maxPendingMessagesPerSubscription: 1,
                 slowConsumerPolicy: SlowConsumerPolicy::Error,
@@ -171,7 +181,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
 
@@ -212,7 +222,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             $frame,
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -252,7 +262,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             $frame,
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -294,7 +304,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             $frame,
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         self::assertSame(0, $connection->maxPayload());
@@ -327,7 +337,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         // Real: succeeds (no enforcement when max_payload == 0). Mutant: throws ProtocolException.
@@ -356,7 +366,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -377,7 +387,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         // Real: the depth-512 INFO exceeds the depth-512 limit and aborts the handshake. The mutant
         // (depth 513) would accept it and reach Open.
@@ -406,7 +416,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "-ERR Authorization Violation\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         $thrown = null;
         try {
@@ -435,7 +445,7 @@ final class NatsConnection_6MutationTest extends \PHPUnit\Framework\TestCase
             "-ERR Maximum Connections Exceeded\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         $thrown = null;
         try {

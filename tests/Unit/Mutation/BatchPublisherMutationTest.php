@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\BatchPublisher;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -17,6 +18,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class BatchPublisherMutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -33,7 +43,7 @@ final class BatchPublisherMutationTest extends TestCase
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $this->muxReplies($transport, $reads);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $transport));
         $client->connect()->await();
 
         return $client;
@@ -167,7 +177,7 @@ final class BatchPublisherMutationTest extends TestCase
             // Commit PubAck for the commit request.
             self::msg('_INBOX.b', 2, $commitAck),
         ]);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 2_000), $transport));
         $client->connect()->await();
 
         $client->jetStream()->batch('b-start')

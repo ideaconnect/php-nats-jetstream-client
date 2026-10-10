@@ -12,6 +12,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\PullServerTrait;
 use PHPUnit\Framework\TestCase;
 
@@ -25,11 +26,20 @@ use PHPUnit\Framework\TestCase;
  */
 final class PullConsumerIteratorTest extends TestCase
 {
+    use OwnsTestResources;
+
     use PullServerTrait;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
 
     public function testFluentBuilderSetsProperties(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $js = $client->jetStream();
 
         $iter = $js->pullConsumer('ORDERS', 'PROC')
@@ -45,7 +55,7 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testDefaultValues(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         // #120: the default batch is now 100 (was 1) - a single pull fetches a full batch and the engine
@@ -57,7 +67,7 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testSetBatchingRejectsZero(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -66,7 +76,7 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testSetExpiresMsRejectsZero(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -75,7 +85,7 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testSetIterationsRejectsZero(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -84,7 +94,7 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testSetIterationsAcceptsNull(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C')
             ->setIterations(5)
             ->setIterations(null);
@@ -94,7 +104,7 @@ final class PullConsumerIteratorTest extends TestCase
 
     public function testSetDepthRejectsZero(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -436,7 +446,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetGroupRejectsInvalidName(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -448,7 +458,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetGroupAcceptsNull(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C')->setGroup('g1')->setGroup(null);
 
         // No exception; setGroup returns $this so we can still call methods.
@@ -460,7 +470,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetPriorityRejectsNegative(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -472,7 +482,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetPriorityRejectsAboveNine(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $this->expectException(JetStreamException::class);
@@ -484,7 +494,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetPriorityAcceptsValidValues(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $result = $iter->setPriority(5);
@@ -500,7 +510,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetPriorityAcceptsNull(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C')->setPriority(3)->setPriority(null);
         self::assertInstanceOf(PullConsumerIterator::class, $iter);
     }
@@ -510,7 +520,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetMinPendingStoresValue(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $result = $iter->setMinPending(42);
@@ -522,7 +532,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetMinPendingAcceptsNull(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C')->setMinPending(10)->setMinPending(null);
         self::assertInstanceOf(PullConsumerIterator::class, $iter);
     }
@@ -532,7 +542,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetMinAckPendingStoresValue(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $result = $iter->setMinAckPending(7);
@@ -544,7 +554,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetMinAckPendingAcceptsNull(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C')->setMinAckPending(5)->setMinAckPending(null);
         self::assertInstanceOf(PullConsumerIterator::class, $iter);
     }
@@ -554,7 +564,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetMaxBytesStoresValue(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $result = $iter->setMaxBytes(1024);
@@ -566,7 +576,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetMaxBytesAcceptsNull(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C')->setMaxBytes(512)->setMaxBytes(null);
         self::assertInstanceOf(PullConsumerIterator::class, $iter);
     }
@@ -576,7 +586,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetNoWaitStoresValue(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $result = $iter->setNoWait(true);
@@ -591,7 +601,7 @@ final class PullConsumerIteratorTest extends TestCase
      */
     public function testSetNoWaitDefaultsToTrue(): void
     {
-        $client = new NatsClient(new NatsOptions(), new FakeTransport());
+        $client = $this->own(new NatsClient(new NatsOptions(), new FakeTransport()));
         $iter = $client->jetStream()->pullConsumer('S', 'C');
 
         $result = $iter->setNoWait();
@@ -797,7 +807,7 @@ final class PullConsumerIteratorTest extends TestCase
             [['msg' => 'm1']],
             [['msg' => 'm2']],
         ]);
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
         $js = $client->jetStream();
 

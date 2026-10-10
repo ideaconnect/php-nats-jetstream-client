@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3326 unit tests, 155 integration tests, 49 Behat scenarios.
+Indicative totals: 3363 unit tests, 157 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -3006,6 +3006,24 @@ SlowConsumerPolicy::Error where a subscriber that cannot keep up meets the clien
 - `testCloseSendsUnsubForOwnSid` - `close()` (alias of unsubscribe) writes `UNSUB {sid}` for the queue's own sid.
 - `testNextWithTimeoutReturnsNullWhenNoMessageArrivesBeforeDeadline` - with a 0.02s timeout on a blocking transport, the TimeoutCancellation fires inside processIncoming (CancelledException caught) and `next()` returns null.
 - `testFetchAllFinalDrainCollectsConcurrentlyEnqueuedMessage` - while `fetchAll()` is suspended in processIncoming, a concurrent fiber enqueues a 'late' message; after the timeout cancels, the final drain loop collects it (one message 'late').
+
+### tests/Unit/TestResourceScopeTest.php
+The test-resource scope of #183 (`tests/Support/TestResourceScope.php`, used through `tests/Support/OwnsTestResources.php` by every unit class that makes a client or connection), driven directly: each case makes its own scope, leaves something running the way a test would, closes the scope and checks what the shutdown did. Holds without a release path are released by the case itself after the check.
+- `testAConnectionLeftOpenIsClosed` - A connection left Open with a referenced 30 s heartbeat timer is Closed by the shutdown, which reports nothing.
+- `testARecoveryBackingOffIsStoppedAndNoDialFollows` - A recovery backing off 1 s between refused dials: the shutdown ends within 0.5 s, the connection is Closed, and no dial follows in the next 50 ms.
+- `testAHeldUncancellableDialIsReleasedBeforeItsDisconnectIsJoined` - A recovery's dial that the transport cannot stop, held: the release hook lets it go once the close intent has run, the shutdown ends well before the 5 s connect timeout bounding the disconnect's own wait, and the reader that started the recovery is settled.
+- `testAParkedReadEndsThroughItsOwnCancellation` - A read parked on a blocking fake socket, which the transport's close does not wake, is ended by its own cancellation source, registered as the operation's end control; every started read resolved.
+- `testAnAbandonedFlushIsJoined` - A flush whose caller stopped waiting after 10 ms (PINGs unanswered) is still pending; owned, it is joined, and the disconnect ends it.
+- `testAHeldHandlerIsReleasedOnlyAfterTheCloseIntent` - A handler held on a gate is released by its hook only once the connection's close intent has run (the hook sees isDiscardingUndelivered() true), and the read it held is settled.
+- `testTheDeadlineIsSharedAndFiresWithNothingElseOnTheLoop` - Two connections whose disconnects each wait for a held dial nobody releases (5 s connect timeouts): both are reported ("disconnect() did not complete in time") at the 0.3 s budget, not at twice it, with nothing else keeping the loop running.
+- `testAStuckConnectionDoesNotHoldAnothersAfterCloseHook` - Connection a sticks on a held dial; connection b is closed and its after-close hook runs (seeing it Closed); only a is reported.
+- `testOnlyTheCallbacksItOwnsAreCancelled` - A loop callback the scope does not own survives the shutdown; one registered with ownCallback() is cancelled.
+- `testAConnectionTheTestDropsIsStillCollected` - Weakly owned: a connection the test drops is collected by gc_collect_cycles(), and the shutdown has nothing left to do.
+- `testAClosedListenerCannotRestartTheConnectionUnnoticed` - A listener that connects again on Closed restarts the connection during the shutdown, which reports it as still open/connecting; with a stop hook disabling the listener first, the connection stays Closed and nothing is reported.
+- `testACleanupStepThatThrowsIsReportedAndTheOthersStillRun` - A release hook that throws is reported with its label; the next release hook still opens its gate, and the operation the gate held is settled, not reported.
+- `testAFailedOperationIsSettledAndAPendingOneIsReported` - An owned operation that failed as the test expected is settled and not reported; one that never settles is reported as still pending at the 0.2 s deadline.
+- `testAWriteThatOutlivesTheCloseIsCheckedAndReleased` - A request ended at its own 50 ms timeout while its write (a stall that outlives its session) still runs, the connection Closed: the transport's idle check reports it unless the stall's release is registered, which settles it.
+- `testOneRegistrationPerConnectionAndNoneAfterTheClose` - Registering a client twice keeps one registration, the client is Closed by the shutdown, and a closed scope refuses a new registration with a LogicException.
 
 ### tests/Unit/WaitForReconnectTest.php
 Operations issued while a reconnect is in flight wait for it within one budget (`NatsOptions::$waitForReconnect`). Most tests keep a recovery owned by another fiber in flight - backing off between dials refused by `tests/Support/ReconnectingTransport.php` - and let the dials through from a timer, which fires only while the operation under test hands the event loop control.

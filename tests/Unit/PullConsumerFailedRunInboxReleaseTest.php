@@ -414,14 +414,14 @@ final class PullConsumerFailedRunInboxReleaseTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             errorListener: $errorListener,
             handlerErrorsFailOperations: true,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

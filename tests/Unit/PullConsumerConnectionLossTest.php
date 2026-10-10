@@ -244,7 +244,7 @@ final class PullConsumerConnectionLossTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: 2_000,
             pingIntervalSeconds: 0,
@@ -252,7 +252,7 @@ final class PullConsumerConnectionLossTest extends TestCase
             slowConsumerPolicy: SlowConsumerPolicy::Error,
             slowConsumerErrorsFailOperations: true,
             handlerErrorsFailOperations: true,
-        ), $watched);
+        ), $watched));
         $this->opened[] = $client;
         $client->connect()->await();
         $otherFailure = $failure === 'handler error'
@@ -971,7 +971,7 @@ final class PullConsumerConnectionLossTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
-        $client = new NatsClient(match ($failure) {
+        $client = $this->own(new NatsClient(match ($failure) {
             'waiting disabled', 'lame duck, waiting disabled', 'fatal -ERR, waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, $connectionListener, 5, 20, $errorListener),
             'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, $connectionListener, 5, 20, $errorListener),
             'reconnect off', 'fatal -ERR, reconnect off' => new NatsOptions(
@@ -983,7 +983,7 @@ final class PullConsumerConnectionLossTest extends TestCase
                 errorListener: $errorListener,
             ),
             default => $this->options(true, 2_000, 1_000, 0, 2, $connectionListener, 5, 20, $errorListener),
-        }, $watched);
+        }, $watched));
         $this->opened[] = $client;
         $client->connect()->await();
 

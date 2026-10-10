@@ -726,7 +726,7 @@ final class ReconnectedListenerTest extends TestCase
                 delay(0.05);
             }
         };
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $holder->client = $client;
@@ -783,7 +783,7 @@ final class ReconnectedListenerTest extends TestCase
                 $holder->close->await();
             }
         };
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $holder->client = $client;
@@ -1426,7 +1426,7 @@ final class ReconnectedListenerTest extends TestCase
     /** @param \Closure(ConnectionEvent, ?\Throwable): void $listener */
     private function unconnected(ReconnectingTransport $transport, \Closure $listener): NatsConnection
     {
-        $connection = new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport);
+        $connection = $this->own(new NatsConnection($this->options(true, 2_000, 1_000, 0, 2, $listener, 5, 20, null), $transport));
         $this->opened[] = $connection;
 
         return $connection;
@@ -1441,7 +1441,7 @@ final class ReconnectedListenerTest extends TestCase
         int|float $pingIntervalSeconds = 0,
         int $maxPingsOut = 2,
     ): NatsConnection {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 requestTimeoutMs: 2_000,
@@ -1456,7 +1456,7 @@ final class ReconnectedListenerTest extends TestCase
                 logger: $logger,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         if ($connect) {
             $connection->connect()->await();

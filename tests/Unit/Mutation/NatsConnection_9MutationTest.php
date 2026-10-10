@@ -13,6 +13,7 @@ use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FlakyTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 use SplQueue;
 
@@ -27,11 +28,20 @@ use function Amp\async;
  */
 final class NatsConnection_9MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     private function connect(FakeTransport $transport, ?NatsOptions $options = null): NatsConnection
     {
-        $connection = new NatsConnection($options ?? new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection($options ?? new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         return $connection;
@@ -58,8 +68,7 @@ final class NatsConnection_9MutationTest extends TestCase
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $connection = $this->connect($transport);
 
-        $sid = $connection->subscribe('updates', static function (NatsMessage $m): void {
-        })->await();
+        $sid = $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
 
         // The server already sent (and we counted at intake, #112) the full max with the local queue
         // empty; arming auto-unsub at exactly that max must satisfy immediately.
@@ -87,8 +96,7 @@ final class NatsConnection_9MutationTest extends TestCase
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $connection = $this->connect($transport);
 
-        $sid = $connection->subscribe('updates', static function (NatsMessage $m): void {
-        })->await();
+        $sid = $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
 
         // Model an in-flight reconnect: subscriptionMeta is retained (to be replayed) while state is
         // no longer Open, so unsubscribe() takes the not-open branch with the sid still registered.
@@ -127,7 +135,7 @@ final class NatsConnection_9MutationTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 servers: ['nats://127.0.0.1:4222'],
                 pingIntervalSeconds: 0,
@@ -141,7 +149,7 @@ final class NatsConnection_9MutationTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -176,7 +184,7 @@ final class NatsConnection_9MutationTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 servers: ['nats://127.0.0.1:4222'],
                 pingIntervalSeconds: 0,
@@ -190,7 +198,7 @@ final class NatsConnection_9MutationTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -269,8 +277,7 @@ final class NatsConnection_9MutationTest extends TestCase
         $connection = $this->connect($transport);
 
         // A subscription whose received count already met its auto-unsub max (remaining <= 0).
-        $this->setProp($connection, 'subscriptions', [1 => static function (NatsMessage $m): void {
-        }]);
+        $this->setProp($connection, 'subscriptions', [1 => static function (NatsMessage $m): void {}]);
         $this->setProp($connection, 'subscriptionMeta', [1 => ['subject' => 'updates', 'queue' => null]]);
         $this->setProp($connection, 'autoUnsubMax', [1 => 3]);
         $this->setProp($connection, 'receivedCounts', [1 => 3]);
@@ -300,10 +307,8 @@ final class NatsConnection_9MutationTest extends TestCase
 
         // sid 1 is satisfied (dropped during replay); sid 2 is live and must still be re-SUBbed.
         $this->setProp($connection, 'subscriptions', [
-            1 => static function (NatsMessage $m): void {
-            },
-            2 => static function (NatsMessage $m): void {
-            },
+            1 => static function (NatsMessage $m): void {},
+            2 => static function (NatsMessage $m): void {},
         ]);
         $this->setProp($connection, 'subscriptionMeta', [
             1 => ['subject' => 'satisfied', 'queue' => null],

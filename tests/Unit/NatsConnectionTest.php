@@ -9,10 +9,10 @@ use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
+use Amp\Socket\ClientTlsContext;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\ConnectionStats;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
-use Amp\Socket\ClientTlsContext;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Connection\NatsConnection;
@@ -29,6 +29,7 @@ use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FixedNonceSigner;
 use IDCT\NATS\Tests\Support\FlakyTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\TransportInterface;
@@ -40,6 +41,16 @@ use function Amp\delay;
 
 final class NatsConnectionTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly, so that the
+        // lifetime tests still see what they drop collected: the shutdown closes what is left and checks that nothing
+        // goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /**
      * Verifies a successful handshake transitions state to open and sends CONNECT/PING.
      */
@@ -50,10 +61,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             options: new NatsOptions(servers: ['nats://127.0.0.1:4222'], name: 'unit-test-client'),
             transport: $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -79,7 +90,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -105,7 +116,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -128,7 +139,7 @@ final class NatsConnectionTest extends TestCase
             "UNKNOWN\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Unsupported control frame: UNKNOWN');
@@ -153,7 +164,7 @@ final class NatsConnectionTest extends TestCase
             'INCOMPLETE_NO_CRLF',
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Expected PONG after CONNECT');
@@ -175,7 +186,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR Maximum Connections Exceeded\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Server error during connect');
@@ -194,10 +205,10 @@ final class NatsConnectionTest extends TestCase
         ]);
 
         // Reconnect is ENABLED, yet an auth error must fail fast (a single connect attempt).
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 5),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -221,10 +232,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(jwt: 'jwt-token', nkey: 'UABC123', nonceSigner: new FixedNonceSigner('sig:')),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -239,7 +250,7 @@ final class NatsConnectionTest extends TestCase
     public function testPublishRequiresOpenConnection(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -253,7 +264,7 @@ final class NatsConnectionTest extends TestCase
     public function testDisconnectClosesTransportAndState(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
 
         $connection->disconnect()->await();
 
@@ -271,7 +282,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('orders.created', static function (NatsMessage $message): void {})->await();
@@ -294,7 +305,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nm4\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -327,7 +338,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nm3\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -378,7 +389,7 @@ final class NatsConnectionTest extends TestCase
             reconnectJitterMs: 0,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -447,7 +458,7 @@ final class NatsConnectionTest extends TestCase
             pingIntervalSeconds: 0,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -491,7 +502,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nm1\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -528,7 +539,7 @@ final class NatsConnectionTest extends TestCase
             maxPendingMessagesPerSubscription: 2,
             slowConsumerPolicy: SlowConsumerPolicy::DropOldest,
         );
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -559,7 +570,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nm1\r\nMSG updates 1 2\r\nm2\r\nMSG updates 1 2\r\nm3\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -599,7 +610,7 @@ final class NatsConnectionTest extends TestCase
             "MSG a 1 2\r\na1\r\nMSG b 2 2\r\nb2\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $receivedB = [];
@@ -645,7 +656,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nm1\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -678,7 +689,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
@@ -701,7 +712,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
@@ -726,7 +737,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nm2\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $count = 0;
@@ -763,7 +774,7 @@ final class NatsConnectionTest extends TestCase
             "MSG tasks.process 1 4\r\nwork\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -796,7 +807,7 @@ final class NatsConnectionTest extends TestCase
             "INFO {not-json\r\nMSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -828,7 +839,7 @@ final class NatsConnectionTest extends TestCase
             $frame,
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -858,7 +869,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -887,7 +898,7 @@ final class NatsConnectionTest extends TestCase
             "MSG svc.echo 1 _INBOX.reply 4\r\nping\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $connection->subscribe('svc.echo', static function (NatsMessage $message): void {
@@ -916,7 +927,7 @@ final class NatsConnectionTest extends TestCase
             "MSG svc.echo 1 _INBOX.reply 4\r\nping\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $connection->subscribe('svc.echo', static function (NatsMessage $message): void {
@@ -944,7 +955,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $caught = null;
@@ -987,12 +998,12 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectionListener: static function (ConnectionEvent $e, ?\Throwable $err) use (&$events): void {
                 $events[] = $e;
             }),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
         $connection->disconnect()->await();
@@ -1012,13 +1023,13 @@ final class NatsConnectionTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","max_payload":1048576,"headers":true,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             // reconnectEnabled: false isolates event emission from the lame-duck auto-failover (#47).
             new NatsOptions(reconnectEnabled: false, connectionListener: static function (ConnectionEvent $e) use (&$events): void {
                 $events[] = $e;
             }),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
         $connection->processIncoming()->await();
@@ -1043,7 +1054,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 1\r\nA\r\nMSG updates 1 1\r\nB\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 maxPendingMessagesPerSubscription: 1,
                 slowConsumerPolicy: SlowConsumerPolicy::DropOldest,
@@ -1052,7 +1063,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -1074,12 +1085,12 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Permissions Violation for Subscription to foo'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(errorListener: static function (\Throwable $err) use (&$errors): void {
                 $errors[] = $err->getMessage();
             }),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->processIncoming()->await();
@@ -1101,7 +1112,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 4\r\nlast\r\nPONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $delivered = [];
@@ -1131,7 +1142,7 @@ final class NatsConnectionTest extends TestCase
             "MSG x 1 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(servers: ['nats://127.0.0.1:4222']), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(servers: ['nats://127.0.0.1:4222']), $transport));
         $connection->connect()->await();
 
         self::assertSame('nats://127.0.0.1:4222', $connection->connectedUrl());
@@ -1163,7 +1174,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $rtt = $connection->rtt()->await();
@@ -1183,7 +1194,7 @@ final class NatsConnectionTest extends TestCase
             'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"connect_urls":["10.0.0.2:4222","10.0.0.3:4222"]}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         self::assertSame([], $connection->discoveredServers());
@@ -1259,7 +1270,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         // Drive the read loop in the background: it reads EOF, starts reconnect, and blocks in connect().
@@ -1343,7 +1354,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -1446,7 +1457,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -1537,7 +1548,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -1638,7 +1649,7 @@ final class NatsConnectionTest extends TestCase
         };
 
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -1648,7 +1659,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -1763,7 +1774,7 @@ final class NatsConnectionTest extends TestCase
         // waitForReconnect off: a publish buffered during the reconnect then returns without yielding, so
         // the publisher below re-fills the buffer during every flush write - the pressure the seal exists
         // for. (With the one-tick yield the flush drains the buffer before it can be re-filled.)
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, waitForReconnect: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, waitForReconnect: false), $transport));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -1910,7 +1921,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         // P1: its first publish's direct write fails -> recovery -> re-send after recovery; then it
@@ -2034,7 +2045,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
         $connection->subscribe('s.x', static function (): void {})->await();
 
@@ -2138,7 +2149,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 150,
                 reconnectJitterMs: 0,
@@ -2146,7 +2157,7 @@ final class NatsConnectionTest extends TestCase
                 maxPingsOut: 1000,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('s.x', static function (): void {})->await();
 
@@ -2316,10 +2327,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, waitForReconnect: $waitForReconnect),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('s.x', static function (): void {})->await();
 
@@ -2430,7 +2441,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -2477,7 +2488,7 @@ final class NatsConnectionTest extends TestCase
             "HMSG updates 1 12 17\r\n{$merged}\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $received = null;
@@ -2505,7 +2516,7 @@ final class NatsConnectionTest extends TestCase
             "PING\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
         $frames = $connection->processIncoming()->await();
 
@@ -2529,7 +2540,7 @@ final class NatsConnectionTest extends TestCase
             slowConsumerPolicy: SlowConsumerPolicy::DropOldest,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $delivered = [];
@@ -2558,7 +2569,7 @@ final class NatsConnectionTest extends TestCase
             slowConsumerPolicy: SlowConsumerPolicy::DropNewest,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $delivered = [];
@@ -2587,7 +2598,7 @@ final class NatsConnectionTest extends TestCase
             slowConsumerPolicy: SlowConsumerPolicy::Error,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -2609,10 +2620,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
             "MSG updates 1 5\r\nfirst\r\nMSG updates 1 6\r\nsecond\r\n",
         ]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(maxPendingMessagesPerSubscription: 1, slowConsumerPolicy: SlowConsumerPolicy::Error),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $sid = $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -2645,7 +2656,7 @@ final class NatsConnectionTest extends TestCase
             slowConsumerPolicy: SlowConsumerPolicy::Error,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $receivedA = [];
@@ -2692,7 +2703,7 @@ final class NatsConnectionTest extends TestCase
             maxPendingMessagesPerSubscription: 1,
             slowConsumerPolicy: SlowConsumerPolicy::Error,
         );
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -2754,7 +2765,7 @@ final class NatsConnectionTest extends TestCase
                 $errors[] = $err->getMessage();
             },
         );
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -2795,7 +2806,7 @@ final class NatsConnectionTest extends TestCase
             "PING\r\nMSG updates 1 5\r\nhello\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -2839,7 +2850,7 @@ final class NatsConnectionTest extends TestCase
             },
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -2880,7 +2891,7 @@ final class NatsConnectionTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
         };
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $response = $connection->request('svc.echo', '{"x":1}', 50)->await();
@@ -2891,7 +2902,7 @@ final class NatsConnectionTest extends TestCase
         self::assertStringStartsWith('PUB svc.echo _INBOX.', $transport->writes[3]);
         self::assertSame([], array_values(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+            static fn(string $w): bool => str_starts_with($w, 'UNSUB '),
         )));
     }
 
@@ -2924,13 +2935,13 @@ final class NatsConnectionTest extends TestCase
             return ["-ERR 'Permissions Violation for Subscription to \"$subject\"'\r\n"];
         };
 
-        $muxSubs = static fn (): int => count(array_filter(
+        $muxSubs = static fn(): int => count(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'SUB _INBOX.') && str_contains($w, '.* '),
+            static fn(string $w): bool => str_starts_with($w, 'SUB _INBOX.') && str_contains($w, '.* '),
         ));
 
         // 5 s timeout: a regressed fix would wait it out and throw TimeoutException instead.
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport));
         $connection->connect()->await();
 
         try {
@@ -3001,7 +3012,7 @@ final class NatsConnectionTest extends TestCase
             ];
         };
 
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport));
         $connection->connect()->await();
 
         try {
@@ -3049,7 +3060,7 @@ final class NatsConnectionTest extends TestCase
             return [];
         };
 
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport));
         $connection->connect()->await();
 
         $replies = $connection->requestMany('svc.scatter', 'go', null, 5, 5000)->await();
@@ -3082,13 +3093,13 @@ final class NatsConnectionTest extends TestCase
             return ["-ERR 'Permissions Violation for Subscription to \"$subject\"'\r\n"];
         };
 
-        $muxSubs = static fn (): int => count(array_filter(
+        $muxSubs = static fn(): int => count(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'SUB _INBOX.') && str_contains($w, '.* '),
+            static fn(string $w): bool => str_starts_with($w, 'SUB _INBOX.') && str_contains($w, '.* '),
         ));
 
         // 5 s timeout: a regressed fix (no wait-loop guard) would wait it out and return [] instead.
-        $connection = new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5000), $transport));
         $connection->connect()->await();
 
         // First use: the rejection is read mid-wait with nothing collected -> the wait-loop throw.
@@ -3136,7 +3147,7 @@ final class NatsConnectionTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 5\r\nhello\r\n", $replyTo)];
         };
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $response = $connection->request('svc.echo', '{"x":1}', 10)->await();
@@ -3154,7 +3165,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $this->expectException(TimeoutException::class);
@@ -3166,7 +3177,7 @@ final class NatsConnectionTest extends TestCase
             // Post-#118 cleanup is removeMuxWaiter (no wire frame): there is no per-request UNSUB.
             self::assertSame([], array_values(array_filter(
                 $transport->writes,
-                static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+                static fn(string $w): bool => str_starts_with($w, 'UNSUB '),
             )));
         }
     }
@@ -3194,7 +3205,7 @@ final class NatsConnectionTest extends TestCase
             )];
         };
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $replies = $connection->requestMany('svc.scan', 'q', null, 3, 1000)->await();
@@ -3204,7 +3215,7 @@ final class NatsConnectionTest extends TestCase
         self::assertStringStartsWith('PUB svc.scan _INBOX.', $transport->writes[3]);
         self::assertSame([], array_values(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+            static fn(string $w): bool => str_starts_with($w, 'UNSUB '),
         )));
     }
 
@@ -3235,7 +3246,7 @@ final class NatsConnectionTest extends TestCase
             )];
         };
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $replies = $connection->requestMany('svc.scan', 'q', null, 2, 1000)->await();
@@ -3272,7 +3283,7 @@ final class NatsConnectionTest extends TestCase
             )];
         };
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         // No maxResponses: collection ends because no further reply arrives within the 20ms stall.
@@ -3293,7 +3304,7 @@ final class NatsConnectionTest extends TestCase
             'HMSG _INBOX.any 1 ' . strlen($status) . ' ' . strlen($status) . "\r\n" . $status . "\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $replies = $connection->requestMany('svc.scan', 'q', null, null, 1000)->await();
@@ -3312,7 +3323,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 5\r\nfirst\r\nMSG updates 1 6\r\nsecond\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $sid = 0;
@@ -3339,10 +3350,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(servers: ['nats://127.0.0.1:4001', 'nats://127.0.0.1:4002', 'nats://127.0.0.1:4003']),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertSame('tcp://127.0.0.1:4001|5000', $transport->connectCalls[0]);
@@ -3358,13 +3369,13 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 servers: ['nats://127.0.0.1:4001', 'nats://127.0.0.1:4002', 'nats://127.0.0.1:4003'],
                 randomizeServers: true,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertContains($transport->connectCalls[0], [
@@ -3383,7 +3394,7 @@ final class NatsConnectionTest extends TestCase
             ['INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n", "PONG\r\n"],
         ], connectFailures: 1);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 retryOnFailedInitialConnect: true,
@@ -3392,7 +3403,7 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
             ),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -3414,7 +3425,7 @@ final class NatsConnectionTest extends TestCase
         ], connectFailures: 1);
 
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -3426,7 +3437,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -3449,10 +3460,10 @@ final class NatsConnectionTest extends TestCase
             ['INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n", "PONG\r\n"],
         ], connectFailures: 1);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, retryOnFailedInitialConnect: false),
             $transport,
-        );
+        ));
 
         $this->expectException(ConnectionException::class);
         $connection->connect()->await();
@@ -3470,10 +3481,10 @@ final class NatsConnectionTest extends TestCase
             "-ERR Maximum Connections Exceeded\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, retryOnFailedInitialConnect: false),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -3544,7 +3555,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 2,
@@ -3553,7 +3564,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         try {
@@ -3578,10 +3589,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(servers: ['nats://alice:s3cret@127.0.0.1:4222']),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // The userinfo is stripped from the dialed DSN...
@@ -3614,7 +3625,7 @@ final class NatsConnectionTest extends TestCase
         };
 
         $options = new NatsOptions(inboxPrefix: 'TMPBOX');
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $connection->request('svc.echo', '{"x":1}', 50)->await();
@@ -3633,7 +3644,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $this->expectException(TimeoutException::class);
@@ -3652,7 +3663,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $deferredCancellation = new DeferredCancellation();
@@ -3737,7 +3748,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $a = async(static fn(): NatsMessage => $connection->request('svc.a', 'x', 2_000)->await());
@@ -3784,7 +3795,7 @@ final class NatsConnectionTest extends TestCase
             blockWhenEmpty: true,
         );
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         // Request A owns the read pump (parked on the idle blocking socket until its deadline).
@@ -3849,7 +3860,7 @@ final class NatsConnectionTest extends TestCase
             reconnectJitterMs: 0,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -3902,7 +3913,7 @@ final class NatsConnectionTest extends TestCase
             public ?int $connects = null;
             public ?string $serverId = null;
         };
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1,
@@ -3924,7 +3935,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $afterReconnect->client = $client;
         $client->connect()->await();
 
@@ -3992,7 +4003,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 2,
@@ -4001,7 +4012,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $client->connect()->await();
 
         $caught = false;
@@ -4096,7 +4107,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 5,
@@ -4105,7 +4116,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $client->connect()->await();
 
         self::assertSame(0, $client->processIncoming()->await());
@@ -4155,7 +4166,7 @@ final class NatsConnectionTest extends TestCase
             connectTimeoutMs: 250,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -4245,10 +4256,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -4307,7 +4318,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -4319,7 +4330,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->disconnect()->await();
 
@@ -4358,7 +4369,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -4370,7 +4381,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Simulate close-intent already latched (as disconnect()/drain() would set it).
@@ -4395,7 +4406,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -4438,7 +4449,7 @@ final class NatsConnectionTest extends TestCase
         );
 
         $options = new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0, pingIntervalSeconds: 0);
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -4476,7 +4487,7 @@ final class NatsConnectionTest extends TestCase
         );
 
         $options = new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0);
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $received = [];
@@ -4515,7 +4526,7 @@ final class NatsConnectionTest extends TestCase
         );
 
         $options = new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0, pingIntervalSeconds: 0);
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         self::assertSame(0, $connection->processIncoming()->await());
@@ -4538,7 +4549,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         try {
@@ -4565,7 +4576,7 @@ final class NatsConnectionTest extends TestCase
             FakeTransport::EOF,
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 pingIntervalSeconds: 0,
@@ -4574,7 +4585,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (): void {})->await();
 
@@ -4606,10 +4617,10 @@ final class NatsConnectionTest extends TestCase
             $info, "PONG\r\n", "MSG updates 1 5\r\nghost\r\n", // epoch 1: manual connect; stray MSG for the dead sid
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -4647,13 +4658,13 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->closeDelay = 0.01;
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
-        $pump = async(static fn (): int => $connection->processIncoming()->await());
+        $pump = async(static fn(): int => $connection->processIncoming()->await());
 
         // Let the pump hit EOF and enter the terminal path; it suspends inside the close await
         // with state already Closed. Bounded spin so a regression cannot hang the suite.
@@ -4704,7 +4715,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         // The heartbeat self-read hits EOF: it must recover (after clearing readInProgress), not swallow.
@@ -4728,7 +4739,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         (new \ReflectionMethod($connection, 'consumeHeartbeatResponse'))->invoke($connection);
@@ -4764,7 +4775,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -4775,7 +4786,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->subscribe('updates', static function (NatsMessage $message): void {
@@ -4831,7 +4842,7 @@ final class NatsConnectionTest extends TestCase
         };
 
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -4843,7 +4854,7 @@ final class NatsConnectionTest extends TestCase
                 logger: $throwingLogger,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->subscribe('updates', static function (NatsMessage $message): void {
@@ -4882,7 +4893,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -4895,7 +4906,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->subscribe('updates', static function (NatsMessage $message): void {
@@ -4929,7 +4940,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 5\r\nboom!\r\n", // captured during replay; delivered by the post-recovery drain
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -4941,7 +4952,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->subscribe('updates', static function (NatsMessage $message) use ($transport): void {
@@ -4987,7 +4998,7 @@ final class NatsConnectionTest extends TestCase
             reconnectJitterMs: 0,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -5007,10 +5018,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $frames = $connection->processIncoming()->await();
@@ -5030,10 +5041,10 @@ final class NatsConnectionTest extends TestCase
             "INFO {\"server_id\":\"S1\",\"server_name\":\"n1\",\"version\":\"2.12.1\",\"jetstream\":true,\"max_payload\":128,\"headers\":true}\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $serverInfo = $connection->serverInfo();
@@ -5060,10 +5071,10 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Permissions Violation for Publish to updates'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $frames = $connection->processIncoming()->await();
@@ -5089,7 +5100,7 @@ final class NatsConnectionTest extends TestCase
             reconnectEnabled: false,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $writesBeforePing = count($transport->writes);
@@ -5116,11 +5127,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
         // Register a handler whose closure captures state, as real applications do.
-        $connection->subscribe('updates', static function (NatsMessage $message): void {
-        })->await();
+        $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
         self::assertSame(ConnectionState::Open, $connection->state());
 
         $weak = \WeakReference::create($connection);
@@ -5149,7 +5159,7 @@ final class NatsConnectionTest extends TestCase
             reconnectEnabled: false,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $writesAfterConnect = count($transport->writes);
@@ -5178,7 +5188,7 @@ final class NatsConnectionTest extends TestCase
             reconnectEnabled: false,
         );
 
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
         $connection->disconnect()->await();
 
@@ -5202,14 +5212,14 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
                 reconnectEnabled: false,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         delay(0.1);
@@ -5227,10 +5237,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5249,10 +5259,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->publish('test.subject', str_repeat('x', 64))->await();
@@ -5270,10 +5280,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5293,10 +5303,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ConnectionException::class);
@@ -5320,10 +5330,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ConnectionException::class);
@@ -5346,10 +5356,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertStringContainsString('"no_responders":true', $transport->writes[0]);
@@ -5381,10 +5391,10 @@ final class NatsConnectionTest extends TestCase
             ];
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(NatsException::class);
@@ -5402,10 +5412,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5420,10 +5430,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5438,10 +5448,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5456,10 +5466,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5479,10 +5489,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Prime the memo, then publish again through the memo-hit path.
@@ -5501,10 +5511,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5519,10 +5529,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('foo.*', function (): void {})->await();
@@ -5539,10 +5549,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5557,10 +5567,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -5578,10 +5588,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->subscribe('foo', function (): void {})->await();
@@ -5623,7 +5633,7 @@ final class NatsConnectionTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 2 1\r\nR\r\n", $replyTo)];
         };
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $log = [];
@@ -5666,7 +5676,7 @@ final class NatsConnectionTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
-        $lifecycle = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, logger: $logger), $connectClose);
+        $lifecycle = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, logger: $logger), $connectClose));
         $lifecycle->connect()->await();
         $lifecycle->disconnect()->await();
 
@@ -5677,10 +5687,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","max_payload":1048576,"headers":true,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
         ]);
-        $discoveryConnection = new NatsConnection(
+        $discoveryConnection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, reconnectEnabled: false, logger: $logger),
             $discovery,
-        );
+        ));
         $discoveryConnection->connect()->await();
         $discoveryConnection->processIncoming()->await();
 
@@ -5704,7 +5714,7 @@ final class NatsConnectionTest extends TestCase
             connectFailures: 0,
             readFailures: 0,
         );
-        $reconnecting = new NatsConnection(
+        $reconnecting = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -5714,7 +5724,7 @@ final class NatsConnectionTest extends TestCase
                 logger: $logger,
             ),
             $flaky,
-        );
+        ));
         $reconnecting->connect()->await();
         self::assertSame(0, $reconnecting->processIncoming()->await());
         self::assertSame(ConnectionState::Open, $reconnecting->state());
@@ -5730,8 +5740,8 @@ final class NatsConnectionTest extends TestCase
         // The failed first recovery attempt logged a per-attempt backoff warning at warning level.
         $backoffWarnings = array_filter(
             $logger->records,
-            static fn (array $record): bool =>
-                $record['level'] === 'warning'
+            static fn(array $record): bool
+                => $record['level'] === 'warning'
                 && str_starts_with($record['message'], 'NATS reconnect attempt ')
                 && str_contains($record['message'], 'failed; retrying in'),
         );
@@ -5746,7 +5756,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",   // the flush() PONG
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $connection->flush()->await();
@@ -5765,7 +5775,7 @@ final class NatsConnectionTest extends TestCase
             "MSG events 1 5\r\nworld\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $sid = $connection->subscribe('events', function (): void {})->await();
 
@@ -5800,10 +5810,10 @@ final class NatsConnectionTest extends TestCase
             FakeTransport::EOF,
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 200, reconnectEnabled: true),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('events', function (): void {})->await();
 
@@ -5828,10 +5838,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 150),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('events', function (): void {})->await();
 
@@ -5843,7 +5853,7 @@ final class NatsConnectionTest extends TestCase
     public function testDrainRequiresOpenConnection(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -5859,10 +5869,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -5899,10 +5909,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n", // answers drain()'s flush PING
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 2000),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -5957,10 +5967,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n", // answers drain()'s flush PING
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 2000),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // sid 1: suspends, keeping the drainAllPending() foreach open before it reaches sid 2.
@@ -6012,7 +6022,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n", // answers drain()'s flush PING
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 requestTimeoutMs: 2000,
@@ -6021,7 +6031,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->subscribe('hold', static function () use ($gate): void {
@@ -6069,7 +6079,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n", // answers drain()'s flush PING so the budget is spent on the backlog wait
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 // Short overall drain budget so the deadline is reached quickly while the handler
@@ -6080,7 +6090,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -6152,7 +6162,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n", // answers drain()'s flush PING
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 requestTimeoutMs: 2000,
@@ -6161,7 +6171,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -6225,7 +6235,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         try {
@@ -6241,7 +6251,7 @@ final class NatsConnectionTest extends TestCase
         self::assertSame([], $waiters, 'the timed-out request must remove its mux waiter during cleanup');
         self::assertSame([], array_values(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_starts_with($w, 'UNSUB '),
+            static fn(string $w): bool => str_starts_with($w, 'UNSUB '),
         )));
     }
 
@@ -6257,10 +6267,10 @@ final class NatsConnectionTest extends TestCase
             "HMSG updates 1 20 10\r\n1234567890\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, reconnectEnabled: false),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -6290,7 +6300,7 @@ final class NatsConnectionTest extends TestCase
         ]);
 
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 reconnectEnabled: true,
@@ -6302,7 +6312,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -6314,7 +6324,7 @@ final class NatsConnectionTest extends TestCase
 
         self::assertSame(['hi'], $received, 'the MSG parsed before the garbage line must reach its handler');
         self::assertNotEmpty(
-            array_filter($errors, static fn (\Throwable $err): bool => $err instanceof ProtocolException),
+            array_filter($errors, static fn(\Throwable $err): bool => $err instanceof ProtocolException),
             'the parse failure must surface through the error listener',
         );
         self::assertCount(2, $transport->connectCalls, 'the corrupt stream must still trigger recovery');
@@ -6343,7 +6353,7 @@ final class NatsConnectionTest extends TestCase
         ]);
 
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 reconnectEnabled: true,
@@ -6355,7 +6365,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -6374,7 +6384,7 @@ final class NatsConnectionTest extends TestCase
 
         self::assertSame(['hi'], $received, 'the recovered sibling MSG must reach its handler');
         self::assertNotEmpty(
-            array_filter($errors, static fn (\Throwable $err): bool => $err instanceof ProtocolException),
+            array_filter($errors, static fn(\Throwable $err): bool => $err instanceof ProtocolException),
             'the parse failure must surface through the error listener even when a handler throws',
         );
         self::assertCount(2, $transport->connectCalls, 'a throwing handler must not suppress recovery of the corrupt stream');
@@ -6394,7 +6404,7 @@ final class NatsConnectionTest extends TestCase
         ]);
 
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 reconnectEnabled: false,
@@ -6403,7 +6413,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -6415,7 +6425,7 @@ final class NatsConnectionTest extends TestCase
 
         self::assertSame(['hi'], $received, 'the MSG parsed before the garbage line must survive the heartbeat read');
         self::assertNotEmpty(
-            array_filter($errors, static fn (\Throwable $err): bool => $err instanceof ProtocolException),
+            array_filter($errors, static fn(\Throwable $err): bool => $err instanceof ProtocolException),
             'the heartbeat-read parse failure must surface through the error listener',
         );
         self::assertCount(1, $transport->connectCalls, 'the heartbeat read must not trigger recovery itself');
@@ -6442,7 +6452,7 @@ final class NatsConnectionTest extends TestCase
         ]);
 
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 reconnectEnabled: true,
@@ -6454,7 +6464,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -6477,10 +6487,10 @@ final class NatsConnectionTest extends TestCase
     {
         // Use reflection to test private backoffDelayMs method.
         $transport = new FakeTransport();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 100, reconnectMaxDelayMs: 5000, reconnectJitterMs: 0),
             $transport,
-        );
+        ));
 
         $method = new \ReflectionMethod($connection, 'backoffDelayMs');
 
@@ -6502,10 +6512,10 @@ final class NatsConnectionTest extends TestCase
      */
     public function testBackoffDelayStaysAtTheCapForVeryHighAttemptNumbers(): void
     {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 100, reconnectMaxDelayMs: 5000, reconnectJitterMs: 0),
             new FakeTransport(),
-        );
+        ));
 
         $method = new \ReflectionMethod($connection, 'backoffDelayMs');
 
@@ -6534,7 +6544,7 @@ final class NatsConnectionTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 2\r\nok\r\n", $replyTo)];
         };
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $reply = $connection->requestWithHeaders('svc.echo', 'hi', ['X-Test' => '1'], 100)->await();
@@ -6546,7 +6556,7 @@ final class NatsConnectionTest extends TestCase
 
     public function testProcessIncomingRequiresOpenConnection(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -6555,7 +6565,7 @@ final class NatsConnectionTest extends TestCase
 
     public function testUnsubscribeOnUnopenedConnectionIsSilentNoOp(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         // Must not throw: finally-based inbox cleanup runs on broken connections, and an exception
         // here would both leak the subscription entry and mask the caller's original error (#116).
@@ -6566,7 +6576,7 @@ final class NatsConnectionTest extends TestCase
 
     public function testPublishWithHeadersRequiresOpenConnection(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -6581,7 +6591,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Maximum Payload Violation'\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         try {
@@ -6603,7 +6613,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(servers: []), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(servers: []), $transport));
         $connection->connect()->await();
 
         self::assertSame('tcp://127.0.0.1:4222|5000', $transport->connectCalls[0]);
@@ -6616,7 +6626,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -6686,7 +6696,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1,
@@ -6695,7 +6705,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->publish('orders.created', '{"id":1}')->await();
@@ -6766,7 +6776,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1,
@@ -6775,7 +6785,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $connection->publishWithHeaders('orders.created', '{"id":1}', ['X-Test' => '1'])->await();
@@ -6854,7 +6864,7 @@ final class NatsConnectionTest extends TestCase
             public ?ConnectionState $state = null;
             public ?int $connects = null;
         };
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0.05,
                 maxPingsOut: 0,
@@ -6875,7 +6885,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $afterReconnect->connection = $connection;
         $connection->connect()->await();
 
@@ -6916,7 +6926,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -6925,7 +6935,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -7013,7 +7023,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0.05,
                 maxPingsOut: 3,
@@ -7023,7 +7033,7 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
             ),
             $transport,
-        );
+        ));
         // The first PING write, the handshake's, fails, and connect() returns once the reconnect it handed that
         // failure to has returned.
         $connection->connect()->await();
@@ -7050,10 +7060,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -7075,10 +7085,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -7103,10 +7113,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false),
             $transport,
-        );
+        ));
 
         $connection->connect()->await();
 
@@ -7122,7 +7132,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -7137,7 +7147,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -7152,7 +7162,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $connection->publish('orders.created', 'data', '_INBOX.reply.1')->await();
@@ -7167,7 +7177,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -7182,7 +7192,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(ProtocolException::class);
@@ -7272,7 +7282,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // First request times out: the underlying read must be cancelled, not orphaned.
@@ -7367,10 +7377,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0.05, maxPingsOut: 1, reconnectEnabled: false),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         // The handshake wrote a PING of its own: only the ones after it are the heartbeat's.
         $handshakePings = $transport->pings;
@@ -7448,10 +7458,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 30, maxPingsOut: 5, reconnectEnabled: false),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = null;
@@ -7478,7 +7488,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         // Simulate a read already owning the socket (e.g. the heartbeat self-read).
@@ -7502,7 +7512,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         (new \ReflectionProperty($connection, 'readInProgress'))->setValue($connection, true);
@@ -7565,7 +7575,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         $invoke = new \ReflectionMethod($connection, 'consumeHeartbeatResponse');
@@ -7597,7 +7607,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -7625,7 +7635,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n", // ... and the flush ends only on the PONG.
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $connection->subscribe('events', static function (NatsMessage $message) use (&$received): void {
             $received[] = $message->payload;
@@ -7647,10 +7657,10 @@ final class NatsConnectionTest extends TestCase
         // The transport has TLS materials, so upgradeTls() actually establishes TLS.
         $transport->canUpgrade = true;
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(tlsRequired: true, tlsHandshakeFirst: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -7669,10 +7679,10 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->canUpgrade = false; // no TLS materials -> upgradeTls cannot establish TLS
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(tlsRequired: false, tlsHandshakeFirst: false, reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -7697,10 +7707,10 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->canUpgrade = true;
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(tlsRequired: false, tlsHandshakeFirst: false, reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertSame(1, $transport->upgradeTlsCalls);
@@ -7717,10 +7727,10 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->tlsActiveOnConnect = true; // handshake-first established TLS during connect()
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(tlsRequired: true, tlsHandshakeFirst: true, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -7740,10 +7750,10 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->tlsActiveOnConnect = false; // handshake-first did NOT establish TLS
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(tlsRequired: false, tlsHandshakeFirst: true, reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -7766,7 +7776,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -7785,7 +7795,7 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->canUpgrade = true;
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 tlsRequired: false,
                 tlsHandshakeFirst: false,
@@ -7794,7 +7804,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -7814,7 +7824,7 @@ final class NatsConnectionTest extends TestCase
         ]);
         $transport->canUpgrade = false;
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 tlsRequired: false,
                 tlsHandshakeFirst: false,
@@ -7823,7 +7833,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -7846,7 +7856,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testRttThrowsWhenConnectionNotOpen(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -7866,10 +7876,10 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Maximum Connections Exceeded'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 200),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('events', function (): void {})->await();
 
@@ -7943,7 +7953,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
         // Drive the read loop in the background: hits EOF, starts reconnect, blocks in connect().
@@ -8031,10 +8041,10 @@ final class NatsConnectionTest extends TestCase
         };
 
         // reconnectBufferSize is tiny (1 byte) so any real publish frame overflows.
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, reconnectBufferSize: 1),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -8059,7 +8069,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testSubscribeThrowsWhenConnectionNotOpen(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -8076,7 +8086,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // Force state to Closed (as if disconnect() was called).
@@ -8098,7 +8108,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // SID 999 was never subscribed; drainSubscription() should return without sending UNSUB/PING.
@@ -8120,10 +8130,10 @@ final class NatsConnectionTest extends TestCase
             // No PONG response for flush -> flush times out, but drainSubscription() must still succeed.
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('events', static function (NatsMessage $message): void {})->await();
@@ -8144,7 +8154,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testFlushThrowsWhenConnectionNotOpen(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -8162,10 +8172,10 @@ final class NatsConnectionTest extends TestCase
             // No PONG for the flush PING -> TimeoutException.
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 100),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $this->expectException(TimeoutException::class);
@@ -8178,7 +8188,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testRequestThrowsWhenConnectionNotOpen(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -8195,7 +8205,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -8213,7 +8223,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(\InvalidArgumentException::class);
@@ -8226,7 +8236,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testRequestManyThrowsWhenConnectionNotOpen(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Connection is not open');
@@ -8245,7 +8255,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(TimeoutException::class);
@@ -8274,7 +8284,7 @@ final class NatsConnectionTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 2\r\nok\r\n", $replyTo)];
         };
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $replies = $connection->requestMany('svc.scan', 'q', ['X-H' => '1'], 1, 1000)->await();
@@ -8294,7 +8304,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         // discoveredServers() should be pre-seeded from the initial INFO connect_urls.
@@ -8312,10 +8322,10 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, reconnectEnabled: false, servers: ['nats://10.0.0.1:4222']),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $pool = (new \ReflectionMethod($connection, 'serverPool'))->invoke($connection);
@@ -8345,7 +8355,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 retryOnFailedInitialConnect: true,
@@ -8354,7 +8364,7 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
             ),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -8381,7 +8391,7 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 retryOnFailedInitialConnect: true,
@@ -8390,7 +8400,7 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
             ),
             $transport,
-        );
+        ));
 
         $this->expectException(ConnectionException::class);
         $connection->connect()->await();
@@ -8420,7 +8430,7 @@ final class NatsConnectionTest extends TestCase
         );
 
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 5,
@@ -8432,7 +8442,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         try {
@@ -8475,7 +8485,7 @@ final class NatsConnectionTest extends TestCase
         );
 
         $options = new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 3, reconnectDelayMs: 1, reconnectJitterMs: 0, pingIntervalSeconds: 0);
-        $connection = new NatsConnection($options, $transport);
+        $connection = $this->own(new NatsConnection($options, $transport));
         $connection->connect()->await();
 
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
@@ -8498,7 +8508,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Maximum Connections Exceeded'\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Server error during connect');
@@ -8518,10 +8528,10 @@ final class NatsConnectionTest extends TestCase
             // All reads return '' (never delivers PONG), exhausting the budget.
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, connectTimeoutMs: 10, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         $this->expectException(ConnectionException::class);
         $this->expectExceptionMessage('Expected PONG after CONNECT');
@@ -8540,7 +8550,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Invalid Subject'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 errorListener: static function (\Throwable $err) use (&$errors): void {
@@ -8548,7 +8558,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // "Invalid Subject" must be treated as recoverable: connection stays open, error listener notified.
@@ -8576,10 +8586,10 @@ final class NatsConnectionTest extends TestCase
             readFailures: 0,
         );
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // consumeHeartbeatResponse() reads EOF -> calls recoverConnection() -> reconnect disabled -> throws.
@@ -8599,7 +8609,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 connectionListener: static function (ConnectionEvent $e, ?\Throwable $err): void {
@@ -8607,7 +8617,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         // connect() calls emitEvent(Connected); the throwing listener must be swallowed.
         $connection->connect()->await();
@@ -8629,7 +8639,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Permissions Violation for Subscription to foo'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 errorListener: static function (\Throwable $err) use (&$errors): void {
@@ -8638,7 +8648,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // A recoverable -ERR triggers emitError(); the throwing error listener must be swallowed.
@@ -8659,7 +8669,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // Null out serverInfo to hit the early-return guard.
@@ -8693,7 +8703,7 @@ final class NatsConnectionTest extends TestCase
             'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 1,
@@ -8708,7 +8718,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Read the discovery INFO (pool grows to 2).
@@ -8731,7 +8741,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('events', static function (NatsMessage $message): void {})->await();
@@ -8767,7 +8777,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $deferredCancellation = new DeferredCancellation();
@@ -8788,7 +8798,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $connection->publishWithHeaders('events', 'hello', ['X-T' => '1'])->await();
@@ -8831,7 +8841,7 @@ final class NatsConnectionTest extends TestCase
             return $replyTo === '' ? [] : [sprintf("MSG %s 1 1\r\nA\r\n", $replyTo)];
         };
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // totalTimeoutMs=2000ms, stallMs=50ms: after receiving A, wait for stall to expire.
@@ -8861,7 +8871,7 @@ final class NatsConnectionTest extends TestCase
             blockWhenEmpty: true,
         );
 
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $deferredCancellation = new DeferredCancellation();
@@ -8968,10 +8978,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Trigger a reconnect by invoking recoverConnection() twice concurrently via reflection.
@@ -9064,16 +9074,21 @@ final class NatsConnectionTest extends TestCase
                 });
             }
 
+            /** Reset by the test's shutdown (#183), once what it asserts is done. */
+            public bool $closeFails = true;
+
             public function close(): Future
             {
-                return async(static function (): void {
+                return async(function (): void {
                     // Always throw: retryInitialConnect() must swallow this.
-                    throw new \RuntimeException('close failed intentionally');
+                    if ($this->closeFails) {
+                        throw new \RuntimeException('close failed intentionally');
+                    }
                 });
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 retryOnFailedInitialConnect: true,
@@ -9084,7 +9099,12 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
+
+        // The close failure is the subject of the assertions above, not of the shutdown (#183).
+        $this->resources()->onStop(static function () use ($transport): void {
+            $transport->closeFails = false;
+        }, 'the injected close failure');
 
         $connection->connect()->await();
 
@@ -9156,16 +9176,21 @@ final class NatsConnectionTest extends TestCase
                 });
             }
 
+            /** Reset by the test's shutdown (#183), once what it asserts is done. */
+            public bool $closeFails = true;
+
             public function close(): Future
             {
-                return async(static function (): void {
+                return async(function (): void {
                     // Always throw: performRecovery() must swallow this and keep retrying.
-                    throw new \RuntimeException('close failed intentionally');
+                    if ($this->closeFails) {
+                        throw new \RuntimeException('close failed intentionally');
+                    }
                 });
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -9174,7 +9199,12 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
+
+        // The close failure is the subject of the assertions above, not of the shutdown (#183).
+        $this->resources()->onStop(static function () use ($transport): void {
+            $transport->closeFails = false;
+        }, 'the injected close failure');
 
         $connection->connect()->await();
 
@@ -9274,7 +9304,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -9282,7 +9312,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await(); // dial 1
 
         // Drive the read loop: it reads EOF, recovery attempt 1 (dial 2) fails, attempt 2 (dial 3)
@@ -9333,7 +9363,7 @@ final class NatsConnectionTest extends TestCase
             "PONG\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 160,
                 requestTimeoutMs: 200,
@@ -9341,7 +9371,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // No PONG is queued for drain's flush PING, so drain() stays in its bounded flush loop
@@ -9437,7 +9467,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends
                 // only when the test releases it, after disconnect() has returned.
@@ -9451,7 +9481,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await(); // dial 1
 
         // EOF -> recovery; attempt 1 (dial 2) suspends inside the held transport connect.
@@ -9514,7 +9544,7 @@ final class NatsConnectionTest extends TestCase
         /** @var list<\Throwable> $captured */
         $captured = [];
         $connection = null;
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -9534,7 +9564,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // EOF -> recovery; the Disconnected listener fires inside the recovery fiber and awaits a
@@ -9643,7 +9673,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -9654,7 +9684,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await(); // dial 1
 
         // The publish's transport write suspends: a failure continuation still in flight.
@@ -9744,7 +9774,7 @@ final class NatsConnectionTest extends TestCase
         $captured = [];
         $attempted = false;
         $connection = null;
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 pingIntervalSeconds: 0,
@@ -9763,7 +9793,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         // The bounded await turns a regression (permanent deadlock) into a test failure instead of
         // hanging the suite.
@@ -9841,7 +9871,7 @@ final class NatsConnectionTest extends TestCase
 
         /** @var list<ConnectionEvent> $events */
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -9856,7 +9886,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         // The Connected listener parks on the gate: state is Open but the connect() closure is
         // still suspended inside the emission.
@@ -9944,7 +9974,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends
                 // only when the test releases it, after disconnect() has returned.
@@ -9955,7 +9985,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
 
         $connect = $connection->connect();
         delay(0.05); // recovery attempt 1 is parked inside the held dial
@@ -9995,10 +10025,10 @@ final class NatsConnectionTest extends TestCase
             'release.second' => ["PONG\r\n"],  // the pong answering flush B's PING
         ];
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 1_200),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $flushA = $connection->flush();
@@ -10059,10 +10089,10 @@ final class NatsConnectionTest extends TestCase
             ],
         ];
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0.05, maxPingsOut: 5, requestTimeoutMs: 300),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $delivered = [];
@@ -10098,7 +10128,7 @@ final class NatsConnectionTest extends TestCase
             $info, "PONG\r\n",  // reconnect handshake succeeds
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 requestTimeoutMs: 400,
@@ -10108,7 +10138,7 @@ final class NatsConnectionTest extends TestCase
                 reconnectJitterMs: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         try {
@@ -10138,7 +10168,7 @@ final class NatsConnectionTest extends TestCase
             'PONG' . "\r\n" . 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
         $connection->connect()->await();
 
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -10168,7 +10198,7 @@ final class NatsConnectionTest extends TestCase
             'ls":["10.0.0.9:4222"]}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -10176,7 +10206,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         self::assertSame([], $connection->discoveredServers());
@@ -10214,7 +10244,7 @@ final class NatsConnectionTest extends TestCase
             'PONG' . "\r\n" . 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.9:4222"]}' . "\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 servers: ['nats://127.0.0.1:4222', 'nats://127.0.0.1:4223'],
                 reconnectEnabled: true,
@@ -10224,7 +10254,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // The read that hits EOF drives the recovery whose handshake carries the coalesced lame-duck INFO.
@@ -10257,7 +10287,7 @@ final class NatsConnectionTest extends TestCase
             'SUB events' => ['INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.9:4222"]}' . "\r\n"],
         ];
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 servers: ['nats://127.0.0.1:4222', 'nats://127.0.0.1:4223'],
                 reconnectEnabled: true,
@@ -10267,7 +10297,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('events', static function (): void {})->await();
 
@@ -10293,7 +10323,7 @@ final class NatsConnectionTest extends TestCase
             "MSG foo 1 3\r\nabc\r\n-ERR 'Authorization Violation'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -10301,7 +10331,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('foo', static function (): void {
@@ -10345,7 +10375,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR 'Boom One'\r\n-ERR 'Boom Two'\r\n",
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 errorListener: static function (\Throwable $error) use (&$errors): void {
@@ -10353,7 +10383,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $caught = null;
@@ -10388,7 +10418,7 @@ final class NatsConnectionTest extends TestCase
             FakeTransport::EOF, // the read fails -> recovery -> exhaustion (no reconnect handshake available)
         ]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -10400,7 +10430,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('foo', static fn(): null => null)->await();
@@ -10442,7 +10472,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testPublishHeaderBlockValidatesEverySubject(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $this->expectException(ProtocolException::class);
 
@@ -10459,7 +10489,7 @@ final class NatsConnectionTest extends TestCase
     public function testPublishHeaderBlockSplitsSegmentsAtCap(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         // Each payload is > half the 512 KiB segment cap, so any two frames together exceed it: the
@@ -10483,7 +10513,7 @@ final class NatsConnectionTest extends TestCase
     public function testPublishHeaderBlockRecordsOutboundPerMessage(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $before = $connection->statistics();
@@ -10504,7 +10534,7 @@ final class NatsConnectionTest extends TestCase
     public function testUnsubscribeUnknownSidWritesNoUnsub(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
 
         $connection->unsubscribe(999)->await();
@@ -10519,7 +10549,7 @@ final class NatsConnectionTest extends TestCase
     public function testConnectAuthFailureClosesTransport(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "-ERR Authorization Violation\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false), $transport));
 
         try {
             $connection->connect()->await();
@@ -10541,7 +10571,7 @@ final class NatsConnectionTest extends TestCase
         $errors = [];
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n", FakeTransport::EOF]);
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -10553,7 +10583,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $sid1 = $connection->subscribe('foo', static fn(): null => null)->await();
@@ -10592,7 +10622,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testHasUndeliveredDrainBacklogTrueWhileDispatchInFlight(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         (new \ReflectionProperty(NatsConnection::class, 'dispatchingSids'))->setValue($connection, [7 => true]);
         (new \ReflectionProperty(NatsConnection::class, 'pendingDirty'))->setValue($connection, []);
@@ -10607,7 +10637,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testCountUndeliveredDrainBacklogSumsAllQueues(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         /** @var \SplQueue<NatsMessage> $q1 */
         $q1 = new \SplQueue();
@@ -10634,7 +10664,7 @@ final class NatsConnectionTest extends TestCase
     public function testResubscribeAllReArmsAutoUnsubWithRemainingAllowance(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
 
         (new \ReflectionProperty(NatsConnection::class, 'state'))->setValue($connection, ConnectionState::Connecting);
         (new \ReflectionProperty(NatsConnection::class, 'subscriptionMeta'))
@@ -10658,7 +10688,7 @@ final class NatsConnectionTest extends TestCase
     public function testResubscribeAllDropsAutoUnsubAtExhaustedMax(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
 
         (new \ReflectionProperty(NatsConnection::class, 'state'))->setValue($connection, ConnectionState::Connecting);
         (new \ReflectionProperty(NatsConnection::class, 'subscriptionMeta'))
@@ -10680,7 +10710,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testDiscardPongSlotRemovesOnlyTheGivenSlot(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         /** @var DeferredFuture<null> $slotA */
         $slotA = new DeferredFuture();
@@ -10703,7 +10733,7 @@ final class NatsConnectionTest extends TestCase
      */
     public function testInboundFrameBoundFallsBackToSixtyFourMiB(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $method = new \ReflectionMethod(NatsConnection::class, 'inboundFrameBound');
         self::assertSame(64 * 1024 * 1024, $method->invoke($connection), 'the no-max_payload fallback must be exactly 64 MiB');
@@ -10741,7 +10771,7 @@ final class NatsConnectionTest extends TestCase
             holdChunkContaining: 'INFO',
             holdSeconds: 0.03,
         );
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
 
         $first = $connection->connect();
         $second = $connection->connect();
@@ -10765,7 +10795,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 pingIntervalSeconds: 0,
@@ -10774,7 +10804,12 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
+
+        // The close failure is the subject of the assertions above, not of the shutdown (#183).
+        $this->resources()->onStop(static function () use ($transport): void {
+            $transport->throwOnClose = null;
+        }, 'the injected close failure');
         $connection->connect()->await();
 
         $transport->pushReadChunk(FakeTransport::EOF);
@@ -10799,7 +10834,7 @@ final class NatsConnectionTest extends TestCase
     public function testPublishHeaderBlockWritesNothingForEmptyBatch(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $writesBefore = count($transport->writes);
@@ -10819,7 +10854,7 @@ final class NatsConnectionTest extends TestCase
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":false}' . "\r\n",
             "PONG\r\n",
         ]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $this->expectException(ConnectionException::class);
@@ -10843,7 +10878,7 @@ final class NatsConnectionTest extends TestCase
     public function testFlushWhosePingWriteFailsWithReconnectOffFailsWithTheClose(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0, requestTimeoutMs: 300), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0, requestTimeoutMs: 300), $transport));
         $connection->connect()->await();
 
         $transport->throwOnWriteContaining = 'PING';
@@ -10878,7 +10913,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -10888,7 +10923,7 @@ final class NatsConnectionTest extends TestCase
                 logger: $throwingLogger,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -10917,7 +10952,7 @@ final class NatsConnectionTest extends TestCase
     public function testRequestManyParkedBehindForeignReadCollectsReplyOnceSlotFrees(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // A foreign fiber takes the read slot and parks on the idle socket.
@@ -10979,7 +11014,7 @@ final class NatsConnectionTest extends TestCase
     public function testRequestManyParkedBehindForeignReadHonorsTotalDeadline(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $readerCancellation = new DeferredCancellation();
@@ -11022,7 +11057,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 2,
@@ -11036,7 +11071,7 @@ final class NatsConnectionTest extends TestCase
                 logger: $logger,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $transport->pushReadChunk(FakeTransport::EOF);
 
@@ -11069,7 +11104,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 // The close below is awaited from inside the fake transport's write, on a fiber the recovery
                 // itself waits for; disconnect() waits for the recovery it stopped, so here only until the
@@ -11086,7 +11121,12 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
+
+        // The close failure is the subject of the assertions above, not of the shutdown (#183).
+        $this->resources()->onStop(static function () use ($transport): void {
+            $transport->throwOnClose = null;
+        }, 'the injected close failure');
         $connection->connect()->await();
 
         // Reconnect handshake material, consumed by recovery attempt 1 after the EOF.
@@ -11125,7 +11165,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 // The close below is awaited from inside the fake transport's write, on a fiber the recovery
                 // itself waits for; disconnect() waits for the recovery it stopped, so here only until the
@@ -11142,7 +11182,12 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
+
+        // The close failure is the subject of the assertions above, not of the shutdown (#183).
+        $this->resources()->onStop(static function () use ($transport): void {
+            $transport->throwOnClose = null;
+        }, 'the injected close failure');
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message): void {})->await();
 
@@ -11177,7 +11222,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $received = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -11186,7 +11231,7 @@ final class NatsConnectionTest extends TestCase
                 pingIntervalSeconds: 0,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
             $received[] = $message->payload;
@@ -11220,7 +11265,7 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 5\r\nhello\r\n",
             "PONG\r\n",
         ]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
 
         $connection->connect()->await(new TimeoutCancellation(5.0));
 
@@ -11236,10 +11281,10 @@ final class NatsConnectionTest extends TestCase
     public function testConnectTimesOutAgainstSilentServer(): void
     {
         $transport = new FakeTransport([], blockWhenEmpty: true);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, connectTimeoutMs: 150, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         $startedNs = hrtime(true);
         try {
@@ -11263,7 +11308,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 pingIntervalSeconds: 0,
                 errorListener: static function (\Throwable $e) use (&$errors): void {
@@ -11271,7 +11316,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $sid = $connection->subscribe('js.reply.inbox', static function (NatsMessage $message): void {})->await();
@@ -11303,10 +11348,10 @@ final class NatsConnectionTest extends TestCase
     public function testHeartbeatTickSkipsSelfReadWhenDisconnectLandsDuringPingWrite(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, maxPingsOut: 2),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $readsBeforeTick = $transport->startedReads;
@@ -11342,7 +11387,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -11354,7 +11399,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Reconnect handshake material for the recovery the violation must trigger.
@@ -11383,7 +11428,7 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $errors = [];
         $events = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 pingIntervalSeconds: 0,
@@ -11395,7 +11440,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $violation = new ProtocolException('WebSocket RSV1 violation surfaced on the heartbeat read');
@@ -11432,7 +11477,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -11442,7 +11487,7 @@ final class NatsConnectionTest extends TestCase
                 logger: $throwingLogger,
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // Reconnect handshake material for the recovery the violation must trigger.
@@ -11468,7 +11513,7 @@ final class NatsConnectionTest extends TestCase
     public function testReadFailureRecoveryRunsEvenWhenLoggerThrows(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -11478,7 +11523,7 @@ final class NatsConnectionTest extends TestCase
                 logger: new ThrowingLogger('Socket closed by peer'),
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $transport->throwOnNextRead = new TransportClosedException('Socket closed by peer (EOF)');
@@ -11501,7 +11546,7 @@ final class NatsConnectionTest extends TestCase
     public function testHeartbeatReadReportsAFatalFrameWithoutEscapingWhenLoggerThrows(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -11511,7 +11556,7 @@ final class NatsConnectionTest extends TestCase
                 logger: new ThrowingLogger('Server sent error frame'),
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $transport->pushReadChunk("-ERR 'Unknown Protocol Operation'\r\n");
         // Reconnect handshake material for the recovery the fatal frame triggers.
@@ -11530,10 +11575,10 @@ final class NatsConnectionTest extends TestCase
     public function testHeartbeatReadReportsACorruptStreamWithoutEscapingWhenLoggerThrows(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(pingIntervalSeconds: 0, logger: new ThrowingLogger('Unsupported control frame')),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $received = [];
         $connection->subscribe('updates', static function (NatsMessage $message) use (&$received): void {
@@ -11558,7 +11603,7 @@ final class NatsConnectionTest extends TestCase
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: true,
                 maxReconnectAttempts: 3,
@@ -11570,7 +11615,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $received = [];
@@ -11609,10 +11654,10 @@ final class NatsConnectionTest extends TestCase
     public function testHeartbeatReadContainsThrowingHandlerDuringBacklogDrain(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $invocations = 0;
@@ -11646,7 +11691,7 @@ final class NatsConnectionTest extends TestCase
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
         $transport->throwOnClose = new \RuntimeException('close failed during GC teardown');
 
-        $connection = new NatsConnection(new NatsOptions(), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(), $transport));
         $connection->connect()->await();
         self::assertSame(ConnectionState::Open, $connection->state());
 
@@ -11668,7 +11713,7 @@ final class NatsConnectionTest extends TestCase
     public function testSubjectValidationMemoResetAtCapKeepsValidating(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // Fill the memo to its 512-subject cap, then cross it.
@@ -11704,7 +11749,7 @@ final class NatsConnectionTest extends TestCase
         $captured = [];
         /** @var NatsConnection|null $connection */
         $connection = null;
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 pingIntervalSeconds: 0,
@@ -11721,7 +11766,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -11758,7 +11803,7 @@ final class NatsConnectionTest extends TestCase
         // constructor consumes; re-seeding below replays the identical permutation there.
         $seed = null;
         for ($candidate = 1; $candidate <= 100; $candidate++) {
-            mt_srand($candidate);
+            srand($candidate);
             $copy = $servers;
             shuffle($copy);
             if ($copy[0] !== $servers[0]) {
@@ -11769,20 +11814,20 @@ final class NatsConnectionTest extends TestCase
         self::assertNotNull($seed, 'no candidate seed moved index 0 - statistically impossible');
 
         // Replay the chosen seed to recompute the expected permutation's first server.
-        mt_srand($seed);
+        srand($seed);
         $expected = $servers;
         shuffle($expected);
         $expectedFirst = $expected[0];
         self::assertNotSame($servers[0], $expectedFirst, 'sanity: the chosen seed moves index 0');
 
-        mt_srand($seed);
+        srand($seed);
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(servers: $servers, randomizeServers: true, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
-        mt_srand();
+        srand();
 
         self::assertSame(
             'tcp://' . substr($expectedFirst, strlen('nats://')) . '|5000',
@@ -11799,7 +11844,7 @@ final class NatsConnectionTest extends TestCase
     public function testDestructOnNeverOpenedConnectionLeavesTransportUntouched(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
 
         unset($connection);
         // The responder closure cycle keeps the object alive past unset(); collect it now.
@@ -11816,7 +11861,7 @@ final class NatsConnectionTest extends TestCase
     public function testAsyncSubscriptionRejectionOnlyNotifiesTheNamedSubjectsHandler(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $alphaSid = $connection->subscribe('svc.alpha', static function (NatsMessage $m): void {})->await();
@@ -11850,7 +11895,7 @@ final class NatsConnectionTest extends TestCase
     public function testRequestWithPendingExternalCancellationTimesOutWithTimeoutException(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $cancelSource = new DeferredCancellation();
@@ -11915,10 +11960,10 @@ final class NatsConnectionTest extends TestCase
 
         // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
         // when the test releases it, after disconnect() has returned.
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         $owner = $connection->connect();
         $joiner = $connection->connect();
@@ -11956,10 +12001,10 @@ final class NatsConnectionTest extends TestCase
             "-ERR Maximum Connections Exceeded\r\n",
             "-ERR Maximum Connections Exceeded\r\n",
         ]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 1, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         $owner = $connection->connect();
         $joiner = $connection->connect();
@@ -11986,10 +12031,10 @@ final class NatsConnectionTest extends TestCase
     public function testJoinerSharesAuthenticationFailureOfInFlightConnect(): void
     {
         $transport = new FakeTransport(["-ERR Authorization Violation\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: true, maxReconnectAttempts: 5, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         $owner = $connection->connect();
         $joiner = $connection->connect();
@@ -12019,10 +12064,10 @@ final class NatsConnectionTest extends TestCase
     public function testJoinerSharesTerminalWrappedFailureOfInFlightConnect(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "-ERR Maximum Connections Exceeded\r\n"]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
 
         $owner = $connection->connect();
         $joiner = $connection->connect();
@@ -12105,10 +12150,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -12147,7 +12192,7 @@ final class NatsConnectionTest extends TestCase
 
         /** @var list<string> $errors */
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -12158,7 +12203,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         /** @var list<string> $received */
@@ -12195,10 +12240,10 @@ final class NatsConnectionTest extends TestCase
             "MSG updates 1 2\r\nhi\r\n-ERR Some Fatal Failure\r\nBOGUS LINE\r\n",
             $info, "PONG\r\n",
         ]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         /** @var list<array{string, int}> $received */
@@ -12290,10 +12335,10 @@ final class NatsConnectionTest extends TestCase
 
         // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
         // when the test releases it, after disconnect() has returned.
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $pump = async(static fn(): int => $connection->processIncoming()->await());
@@ -12386,10 +12431,10 @@ final class NatsConnectionTest extends TestCase
 
         // A short connect timeout: disconnect() waits that long for the dial it cannot stop, which ends only
         // when the test releases it, after disconnect() has returned.
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectTimeoutMs: 100, reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
 
@@ -12474,7 +12519,7 @@ final class NatsConnectionTest extends TestCase
 
         /** @var list<string> $errors */
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectDelayMs: 1,
                 reconnectJitterMs: 0,
@@ -12485,7 +12530,7 @@ final class NatsConnectionTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         /** @var list<string> $received */
@@ -12566,7 +12611,7 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 maxReconnectAttempts: 2,
@@ -12576,7 +12621,7 @@ final class NatsConnectionTest extends TestCase
                 retryOnFailedInitialConnect: true,
             ),
             $transport,
-        );
+        ));
 
         $owner = $connection->connect();
         $joiner = $connection->connect();
@@ -12609,7 +12654,7 @@ final class NatsConnectionTest extends TestCase
             "-ERR Maximum Connections Exceeded\r\n",
             "-ERR Maximum Connections Exceeded\r\n",
         ]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: false,
                 maxReconnectAttempts: 1,
@@ -12620,7 +12665,7 @@ final class NatsConnectionTest extends TestCase
                 retryOnFailedInitialConnect: true,
             ),
             $transport,
-        );
+        ));
 
         $startedNs = hrtime(true);
         try {
@@ -12695,10 +12740,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 3, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $first = $connection->publish('orders.a', 'a1');
@@ -12719,7 +12764,7 @@ final class NatsConnectionTest extends TestCase
     public function testPingTimerTickOnNotOpenConnectionWritesNothing(): void
     {
         $transport = new FakeTransport();
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
 
         $tick = new \ReflectionMethod($connection, 'pingTimerTick');
         $tick->invoke($connection);
@@ -12757,7 +12802,7 @@ final class NatsConnectionTest extends TestCase
 
         // Exactly at the cap: both frames share ONE segment write (handshake wrote CONNECT + PING).
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $connection->publishHeaderBlock($messages($secondPayload))->await();
         self::assertCount(3, $transport->writes, 'frames summing exactly to the segment cap must share one write');
@@ -12765,7 +12810,7 @@ final class NatsConnectionTest extends TestCase
 
         // One byte past the cap: the first frame is flushed before appending - two segment writes.
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $connection->publishHeaderBlock($messages($secondPayload + 1))->await();
         self::assertCount(4, $transport->writes, 'frames one byte past the segment cap must split into two writes');
@@ -12821,10 +12866,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
 
@@ -12892,10 +12937,10 @@ final class NatsConnectionTest extends TestCase
             }
         };
 
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0),
             $transport,
-        );
+        ));
         $connection->connect()->await();
         $connection->subscribe('updates', static function (NatsMessage $m): void {})->await();
 
@@ -12916,7 +12961,7 @@ final class NatsConnectionTest extends TestCase
     public function testAutoUnsubBacklogSurvivesAHandlerThrowAndIsDeliveredBeforeTheDrop(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         /** @var list<string> $received */
@@ -12958,10 +13003,10 @@ final class NatsConnectionTest extends TestCase
             self::HANDSHAKE_INFO, "PONG\r\n",
             self::HANDSHAKE_INFO, "PONG\r\n",
         ]);
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0, maxReconnectAttempts: 2, pingIntervalSeconds: 0, maxPingsOut: 1),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         // One liveness budget already consumed without a PONG; the next tick trips maxPingsOut.
@@ -12988,7 +13033,7 @@ final class NatsConnectionTest extends TestCase
     public function testHeartbeatTickDoesNotStartASecondReadWhileAUserReadIsInFlight(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0.08, maxPingsOut: 5), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0.08, maxPingsOut: 5), $transport));
         $connection->connect()->await();
 
         $readCancel = new DeferredCancellation();
@@ -13015,7 +13060,7 @@ final class NatsConnectionTest extends TestCase
     public function testPublisherParkedOnTheFlushGateWritesOnceTheGateOpensOnAnOpenConnection(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         // Model the #165 seal window: state Connecting with a sealed flush gate armed.
@@ -13050,7 +13095,7 @@ final class NatsConnectionTest extends TestCase
     public function testRequestManyExternalCancellationSurfacesPromptly(): void
     {
         $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         $cancelSource = new DeferredCancellation();

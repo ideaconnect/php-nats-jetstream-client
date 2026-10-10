@@ -12,6 +12,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\TestCase;
@@ -32,18 +33,14 @@ final class Service_4ThrowingIsRequestedCancellation implements Cancellation
         return 'noop';
     }
 
-    public function unsubscribe(string $id): void
-    {
-    }
+    public function unsubscribe(string $id): void {}
 
     public function isRequested(): bool
     {
         throw new \RuntimeException('mut13-boom-isRequested');
     }
 
-    public function throwIfRequested(): void
-    {
-    }
+    public function throwIfRequested(): void {}
 }
 
 /**
@@ -126,6 +123,15 @@ final class Service_4CancelThenServeTransport implements TlsAwareTransportInterf
 
 final class Service_4MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** @return list<string> */
     private function infoAndPong(): array
     {
@@ -151,7 +157,7 @@ final class Service_4MutationTest extends TestCase
     public function testFinallyStopsServiceWhenLoopConditionThrows(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')
@@ -197,7 +203,7 @@ final class Service_4MutationTest extends TestCase
         $transport = new Service_4CancelThenServeTransport();
         // reconnect disabled + no heartbeat: the mutant's later EOF read reaches Closed and stops,
         // so the test still terminates instead of hanging.
-        $client = new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')

@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Services\ServiceEndpointHandlerInterface;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 /**
  * Targeted unit tests that pin the discovery INFO response shape and the class-handler
@@ -19,6 +20,15 @@ use IDCT\NATS\Tests\Support\FakeTransport;
  */
 final class Service_3MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** @return list<string> */
     private function infoAndPong(): array
     {
@@ -69,7 +79,7 @@ final class Service_3MutationTest extends \PHPUnit\Framework\TestCase
             "MSG \$SRV.INFO.calc 5 _INBOX.info 0\r\n\r\n",
         ]);
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         // Service name "calc" deliberately differs from the endpoint name "adder" so the endpoint
@@ -136,7 +146,7 @@ final class Service_3MutationTest extends \PHPUnit\Framework\TestCase
     public function testClassHandlerInstantiationFailureUsesZeroCode(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $service = $client->service('calc', '1.0.0');

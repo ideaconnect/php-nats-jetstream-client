@@ -15,6 +15,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Transport\TransportInterface;
 use PHPUnit\Framework\TestCase;
 
@@ -23,9 +24,18 @@ use function Amp\delay;
 
 final class SubscriptionQueueTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private function makeConnectedClient(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client;
@@ -106,9 +116,7 @@ final class SubscriptionQueueTest extends TestCase
 
             public function readLine(?Cancellation $cancellation = null): Future
             {
-                return async(function (): string {
-                    return array_shift($this->reads) ?? '';
-                });
+                return async(fn(): string => array_shift($this->reads) ?? '');
             }
 
             public function close(): Future
@@ -117,7 +125,7 @@ final class SubscriptionQueueTest extends TestCase
             }
         };
 
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         $queueFuture = $client->subscribeQueue('updates');
@@ -469,7 +477,7 @@ final class SubscriptionQueueTest extends TestCase
             $errors[] = $e;
         });
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
         $queue = new SubscriptionQueue($client, 99, 2, SlowConsumerPolicy::DropOldest);
 
@@ -499,7 +507,7 @@ final class SubscriptionQueueTest extends TestCase
             $errors[] = $e;
         });
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
         $queue = new SubscriptionQueue($client, 99, 2, SlowConsumerPolicy::DropNewest);
 
@@ -539,7 +547,7 @@ final class SubscriptionQueueTest extends TestCase
             $errors[] = $e;
         });
         $transport = new FakeTransport($this->infoAndPong());
-        $client = new NatsClient($options, $transport);
+        $client = $this->own(new NatsClient($options, $transport));
         $client->connect()->await();
         $queue = new SubscriptionQueue($client, 99, 2, SlowConsumerPolicy::Error);
 

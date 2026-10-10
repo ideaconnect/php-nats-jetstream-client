@@ -155,7 +155,7 @@ final class FailedRequestWriteTest extends TestCase
     public function testReconnectDisabledClosesTheConnectionInsteadOfRetrying(string $variant): void
     {
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->failNextWriteContaining('PUB svc');
@@ -294,7 +294,7 @@ final class FailedRequestWriteTest extends TestCase
     public function testInlineWriteBackpressureIsBoundedByTheRequestTimeout(string $variant): void
     {
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->wedgeOnWriteContaining = 'PUB svc';
@@ -317,7 +317,7 @@ final class FailedRequestWriteTest extends TestCase
     public function testInlineWriteBackpressureIsBoundedByCallerCancellation(string $variant): void
     {
         $transport = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport));
         $this->opened[] = $connection;
         $connection->connect()->await();
         $transport->wedgeOnWriteContaining = 'PUB svc';

@@ -19,6 +19,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\SubscriptionLimitServer;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -51,6 +52,8 @@ use function Amp\delay;
  */
 final class JetStreamInboxRejectionTest extends TestCase
 {
+    use OwnsTestResources;
+
     private const LIMIT = 'because the connection is at its subscription limit (maximum subscriptions exceeded)';
     private const SERVER_ERR = "Server sent error frame: 'maximum subscriptions exceeded'";
     private const MUX_DROPPED = 'the server may have rejected the shared reply-inbox subscription';
@@ -74,6 +77,9 @@ final class JetStreamInboxRejectionTest extends TestCase
 
     protected function tearDown(): void
     {
+        // #183: what the test registered is closed and checked first.
+        $this->releaseOwnedResources();
+
         foreach ($this->opened as $client) {
             try {
                 $client->disconnect()->await(new TimeoutCancellation(1));
@@ -115,14 +121,14 @@ final class JetStreamInboxRejectionTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: false,
             pingIntervalSeconds: 0.05,
             // The heartbeat's PINGs go unanswered until the retry: far more ticks than the test takes.
             maxPingsOut: 100,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
         $transport->answerPings = false;
@@ -782,7 +788,7 @@ final class JetStreamInboxRejectionTest extends TestCase
      */
     public function testDroppingASubscriptionsStateRemovesItsGuard(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
         /** @var DeferredFuture<null> $slot */
         $slot = new DeferredFuture();
         self::setPrivate($connection, 'guardedSids', [7 => true, 8 => true]);
@@ -801,7 +807,7 @@ final class JetStreamInboxRejectionTest extends TestCase
      */
     public function testTheMarksLeaveASidThatIsNoLongerRegisteredAlone(): void
     {
-        $connection = new NatsConnection(new NatsOptions(), new FakeTransport());
+        $connection = $this->own(new NatsConnection(new NatsOptions(), new FakeTransport()));
 
         $connection->markSubscriptionUnbounded(7);
         $connection->markSubscriptionRejectionHandler(7, static function (): void {});
@@ -897,7 +903,7 @@ final class JetStreamInboxRejectionTest extends TestCase
 
     private function connect(SubscriptionLimitServer $server, bool $reconnect = false, ?LifecycleRecorder $recorder = null): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(
+        $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: $reconnect,
             maxReconnectAttempts: 3,
@@ -907,7 +913,7 @@ final class JetStreamInboxRejectionTest extends TestCase
             pingIntervalSeconds: 0,
             errorListener: $recorder?->errorListener(),
             waitForReconnect: true,
-        ), $server);
+        ), $server));
         $this->opened[] = $client;
         $client->connect()->await();
 

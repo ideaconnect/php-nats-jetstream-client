@@ -1025,7 +1025,7 @@ final class PullConsumerWakeUpTest extends TestCase
     /** A connected client over the watched transport, closed in tearDown; no heartbeat, so only the engine reads. */
     private function client(WatchedTransport $transport): NatsClient
     {
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 

@@ -8,6 +8,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -20,6 +21,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class KeyValueBucket_3MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /**
      * Reply frames stashed by {@see queue()} for {@see connected()} to deliver over the muxed request
      * inbox (#118). Post-#118 request()/requestMany() no longer subscribe a fresh inbox per call; one
@@ -41,7 +51,7 @@ final class KeyValueBucket_3MutationTest extends TestCase
 
         // A small request timeout keeps any genuine timeout (e.g. a wiring mistake) failing fast instead
         // of stalling on the 10 s default; every test here delivers all of its replies, so it never fires.
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1_500), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1_500), $transport));
         $client->connect()->await();
 
         return $client;

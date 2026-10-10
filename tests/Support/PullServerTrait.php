@@ -155,7 +155,7 @@ trait PullServerTrait
     {
         return array_values(array_filter(
             $transport->writes,
-            static fn (string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
+            static fn(string $w): bool => str_contains($w, 'CONSUMER.MSG.NEXT'),
         ));
     }
 }

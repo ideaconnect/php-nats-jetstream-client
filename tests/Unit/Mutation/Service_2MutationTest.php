@@ -12,6 +12,7 @@ use IDCT\NATS\Services\Service;
 use IDCT\NATS\Services\ServiceEndpoint;
 use IDCT\NATS\Services\ServiceError;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 
 use function Amp\async;
 
@@ -26,6 +27,15 @@ use function Amp\async;
  */
 final class Service_2MutationTest extends \PHPUnit\Framework\TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     /** @return list<string> */
     private function infoAndPong(): array
     {
@@ -37,7 +47,7 @@ final class Service_2MutationTest extends \PHPUnit\Framework\TestCase
 
     private function connectedClient(FakeTransport $transport): NatsClient
     {
-        $client = new NatsClient(new NatsOptions(), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(), $transport));
         $client->connect()->await();
 
         return $client;
@@ -434,7 +444,7 @@ final class Service_2MutationTest extends \PHPUnit\Framework\TestCase
             "MSG svc.echo 13 _INBOX.req 5\r\nhello\r\n",
             FakeTransport::EOF, // peer close -> recover -> reconnect disabled -> Closed -> loop ends
         ]);
-        $client = new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $service = $client->service('echo', '1.0.0')

@@ -353,7 +353,7 @@ final class LameDuckChunkRemainderTest extends TestCase
     {
         $transport = new FakeTransport([ReconnectingTransport::INFO, self::PONG, $lameDuck . self::PING . self::STALE_INFO]);
         $recorder = new LifecycleRecorder();
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 reconnectEnabled: $reconnectEnabled,
                 maxReconnectAttempts: 1,
@@ -363,7 +363,7 @@ final class LameDuckChunkRemainderTest extends TestCase
                 connectionListener: $recorder->connectionListener(),
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         $frames = $connection->processIncoming()->await();
@@ -518,7 +518,7 @@ final class LameDuckChunkRemainderTest extends TestCase
     /** Connects a client that reports its errors to $recorder. */
     private function connectClientReporting(ReconnectingTransport $transport, LifecycleRecorder $recorder): NatsClient
     {
-        $client = new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $recorder->errorListener()), $transport);
+        $client = $this->own(new NatsClient($this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, $recorder->errorListener()), $transport));
         $this->opened[] = $client;
         $client->connect()->await();
 

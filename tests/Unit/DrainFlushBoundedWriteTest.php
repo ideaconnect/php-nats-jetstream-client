@@ -13,6 +13,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\WedgedWriteTransport;
 use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\TestCase;
@@ -30,6 +31,16 @@ use function Amp\delay;
  */
 final class DrainFlushBoundedWriteTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly, so that the
+        // lifetime tests still see what they drop collected: the shutdown closes what is left and checks that nothing
+        // goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /**
@@ -40,7 +51,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
     {
         // Writes 1-3 succeed (CONNECT, PING, SUB); the drain-phase UNSUB (4th) wedges.
         $transport = new WedgedWriteTransport([self::INFO, "PONG\r\n"], wedgeAfterWrites: 3);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
         $client->subscribe('orders.>', static function (NatsMessage $m): void {})->await();
 
@@ -63,7 +74,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
     {
         // Writes 1-2 succeed (CONNECT, PING handshake); flush()'s PING (3rd) wedges.
         $transport = new WedgedWriteTransport([self::INFO, "PONG\r\n"], wedgeAfterWrites: 2);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $startedNs = hrtime(true);
@@ -95,7 +106,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
         // Writes 1-2 succeed (CONNECT, handshake PING); with no subscriptions the drain-phase
         // flush PING (3rd) is the first drain write - and wedges.
         $transport = new WedgedWriteTransport([self::INFO, "PONG\r\n"], wedgeAfterWrites: 2);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $startedNs = hrtime(true);
@@ -116,7 +127,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $errors = [];
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 requestTimeoutMs: 300,
                 pingIntervalSeconds: 0,
@@ -125,7 +136,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $client->connect()->await();
 
         // Arm AFTER the handshake so only the drain-phase PING write dies.
@@ -149,7 +160,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $errors = [];
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 requestTimeoutMs: 300,
                 pingIntervalSeconds: 0,
@@ -158,7 +169,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $client->connect()->await();
         $client->subscribe('orders.>', static function (NatsMessage $message): void {})->await();
 
@@ -191,10 +202,10 @@ final class DrainFlushBoundedWriteTest extends TestCase
             }
         };
 
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0, logger: $throwingLogger),
             $transport,
-        );
+        ));
         $client->connect()->await();
 
         $transport->throwOnWriteContaining = 'PING';
@@ -221,7 +232,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
             'UNSUB' => ["MSG updates 1 5\r\nhello\r\n", "PONG\r\n"],
         ];
 
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         $received = [];
@@ -273,7 +284,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
         $transport->enqueueOnWriteContaining = ['UNSUB' => [$backlog, "PONG\r\n"]];
 
         $errors = [];
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 // 3 s budget (3rd-round review): the discrimination margins scale with it - the
                 // post-fix run takes ~1 budget, the smallest pre-fix overshoot adds a FULL extra
@@ -286,7 +297,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $client->connect()->await();
 
         $received = [];
@@ -343,12 +354,16 @@ final class DrainFlushBoundedWriteTest extends TestCase
     public function testDrainStillClosesWhenTransportCloseThrows(): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 300, pingIntervalSeconds: 0), $transport));
         $client->connect()->await();
 
         // Answer drain's flush PING promptly so the teardown is reached well inside the budget.
         $transport->enqueueOnWriteContaining = ['PING' => ["PONG\r\n"]];
         $transport->throwOnClose = new \RuntimeException('close() failed on the already-broken socket');
+        // The close failure is the subject of the assertions below, not of the shutdown (#183).
+        $this->resources()->onStop(static function () use ($transport): void {
+            $transport->throwOnClose = null;
+        }, 'the injected close failure');
 
         // Pre-fix the RuntimeException rethrew out of this await with state stranded in Draining.
         $client->drain()->await(new TimeoutCancellation(5.0));
@@ -369,7 +384,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
 
         /** @var list<string> $errors */
         $errors = [];
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 requestTimeoutMs: 300,
                 pingIntervalSeconds: 0,
@@ -378,7 +393,7 @@ final class DrainFlushBoundedWriteTest extends TestCase
                 },
             ),
             $transport,
-        );
+        ));
         $connection->connect()->await();
 
         /** @var DeferredFuture<void> $gate */

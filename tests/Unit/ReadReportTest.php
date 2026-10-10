@@ -129,7 +129,7 @@ final class ReadReportTest extends TestCase
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
-        $client = new NatsClient(
+        $client = $this->own(new NatsClient(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 pingIntervalSeconds: 0,
@@ -139,7 +139,7 @@ final class ReadReportTest extends TestCase
                 logger: new ThrowingLogger('Slow consumer'),
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $client;
         $client->connect()->await();
         $queue = $client->subscribeQueue('jobs')->await();
@@ -198,7 +198,7 @@ final class ReadReportTest extends TestCase
         ?\Closure $errorListener,
         ?LoggerInterface $logger = null,
     ): NatsConnection {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(
                 connectTimeoutMs: 500,
                 pingIntervalSeconds: 0,
@@ -208,7 +208,7 @@ final class ReadReportTest extends TestCase
                 logger: $logger,
             ),
             $transport,
-        );
+        ));
         $this->opened[] = $connection;
         $connection->connect()->await();
 

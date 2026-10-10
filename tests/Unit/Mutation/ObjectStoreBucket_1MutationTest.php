@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -18,6 +19,15 @@ use PHPUnit\Framework\TestCase;
  */
 final class ObjectStoreBucket_1MutationTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO_LINE = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     private function digestOf(string $data): string
@@ -66,7 +76,7 @@ final class ObjectStoreBucket_1MutationTest extends TestCase
         // frames DYNAMICALLY on the captured mux reply-to instead of pre-seeding them (see muxReplies()).
         $transport = new FakeTransport([self::INFO_LINE, "PONG\r\n"]);
         $this->muxReplies($transport, $reads);
-        $client = new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
         $this->lastTransport = $transport;
 

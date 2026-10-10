@@ -13,6 +13,7 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
+use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -31,6 +32,15 @@ use function Amp\delay;
  */
 final class ServerErrorKeepingConnectionTest extends TestCase
 {
+    use OwnsTestResources;
+
+    protected function tearDown(): void
+    {
+        // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
+        // closes what is left and checks that nothing goes on running into the next test.
+        $this->releaseOwnedResources();
+    }
+
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     #[DataProvider('errorsTheServerKeepsTheConnectionOpenFor')]
@@ -39,14 +49,14 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR '{$error}'\r\n"]);
         // One quick reconnect attempt: a regression that ends the connection fails at once instead of after
         // the default ten attempts with their backoff.
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: $reconnect,
             maxReconnectAttempts: 1,
             reconnectDelayMs: 1,
             reconnectMaxDelayMs: 1,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
 
         try {
@@ -83,7 +93,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     public function testAnErrTheServerClosesTheConnectionAfterStillEndsIt(string $error): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR '{$error}'\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         try {
@@ -118,11 +128,11 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "INFO {$payload}\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
 
         $connection->processIncoming()->await();
@@ -149,10 +159,10 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     #[DataProvider('infoPayloadsThatAreNoObject')]
     public function testAnInitialInfoThatIsNotAJsonObjectFailsTheConnectAsBrokenJsonDoes(string $payload): void
     {
-        $connection = new NatsConnection(
+        $connection = $this->own(new NatsConnection(
             new NatsOptions(connectTimeoutMs: 500, reconnectEnabled: false, pingIntervalSeconds: 0),
             new FakeTransport(["INFO {$payload}\r\n", "PONG\r\n"]),
-        );
+        ));
 
         try {
             $connection->connect()->await();
@@ -176,11 +186,11 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             self::INFO, "PONG\r\n",
             "-ERR 'maximum subscriptions exceeded'\r\n-ERR 'Stale Connection'\r\n",
         ]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
 
         try {
@@ -204,13 +214,13 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             maxPendingMessagesPerSubscription: 1,
             slowConsumerPolicy: SlowConsumerPolicy::Error,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $sid = $connection->subscribe('updates', static function (): void {})->await();
         $overflow = "MSG updates {$sid} 5\r\nfirst\r\nMSG updates {$sid} 6\r\nsecond\r\n";
@@ -252,14 +262,14 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             self::INFO, "PONG\r\n",                     // the reconnect's handshake
             ...$answers,
         ]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: true,
             maxReconnectAttempts: 1,
             reconnectDelayMs: 1,
             reconnectMaxDelayMs: 1,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $connection->subscribe('first', static function (): void {})->await();
         $connection->subscribe('second', static function (): void {})->await();
@@ -293,7 +303,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     public function testTheHeartbeatsReadEndsTheConnectionOnlyOnAFatalErr(string $chunk, ConnectionState $state): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
         $transport->pushReadChunk($chunk);
 
@@ -319,11 +329,11 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR 'maximum subscriptions exceeded'\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
 
         $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
@@ -347,7 +357,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             "-ERR 'maximum subscriptions exceeded'\r\nBOGUS\r\n",
             self::INFO, "PONG\r\n", // the reconnect after the corrupt stream
         ]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: true,
             maxReconnectAttempts: 1,
             reconnectDelayMs: 1,
@@ -355,7 +365,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
 
         $read = $connection->readIncomingForOperation(alwaysReport: true)->await();
@@ -517,12 +527,12 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new ReconnectingTransport();
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $seen = [];
         $hold = new HeldUpDelivery(fallbackSeconds: 2.0);
@@ -567,12 +577,12 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             requestTimeoutMs: 1_000,
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $transport->enqueueOnWriteContaining = ["PING\r\n" => ["-ERR 'maximum subscriptions exceeded'\r\n", "PONG\r\n"]];
 
@@ -604,7 +614,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     public function testAReadForAServingLoopStillThrowsAnErrThatEndsTheConnection(): void
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "-ERR 'Stale Connection'\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport);
+        $connection = $this->own(new NatsConnection(new NatsOptions(reconnectEnabled: false, pingIntervalSeconds: 0), $transport));
         $connection->connect()->await();
 
         try {
@@ -631,14 +641,14 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             "-ERR 'maximum subscriptions exceeded'\r\nBOGUS LINE\r\n",  // its replay's answer, then garbage
             self::INFO, "PONG\r\n",                                    // the second attempt, clean
         ]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: true,
             maxReconnectAttempts: 3,
             reconnectDelayMs: 1,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $connection->subscribe('first', static function (): void {})->await();
 
@@ -665,7 +675,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             self::INFO, "PONG\r\n",                       // the reconnect's handshake
             "-ERR 'maximum subscriptions exceeded'\r\n", // the replayed second SUB, rejected again
         ]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: true,
             maxReconnectAttempts: 2,
             reconnectDelayMs: 1,
@@ -674,7 +684,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             pingIntervalSeconds: 0,
             connectionListener: $recorder->connectionListener(),
             errorListener: $recorder->errorListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $connection->subscribe('first', static function (): void {})->await();
         $connection->subscribe('second', static function (): void {})->await();
@@ -704,12 +714,12 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     {
         $recorder = new LifecycleRecorder();
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             maxPingsOut: $maxPingsOut,
             connectionListener: $recorder->connectionListener(),
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         (new \ReflectionProperty(NatsConnection::class, 'outstandingPings'))->setValue($connection, $maxPingsOut);
 
@@ -739,12 +749,12 @@ final class ServerErrorKeepingConnectionTest extends TestCase
     private function connectionWithAFailingHandler(LifecycleRecorder $recorder, array &$seen, bool $handlerFailuresFailOperations = false): NatsConnection
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n", "MSG a 1 1\r\nx\r\nMSG a 1 1\r\ny\r\nMSG b 2 1\r\nz\r\n"]);
-        $connection = new NatsConnection(new NatsOptions(
+        $connection = $this->own(new NatsConnection(new NatsOptions(
             reconnectEnabled: false,
             pingIntervalSeconds: 0,
             errorListener: $recorder->errorListener(),
             handlerErrorsFailOperations: $handlerFailuresFailOperations,
-        ), $transport);
+        ), $transport));
         $connection->connect()->await();
         $connection->subscribe('a', static function (NatsMessage $message) use (&$seen): void {
             $seen[] = 'a:' . $message->payload;
