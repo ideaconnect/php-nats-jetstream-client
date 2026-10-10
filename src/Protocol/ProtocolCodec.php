@@ -23,7 +23,7 @@ final class ProtocolCodec
      * from-source checkout). Bump to the current major.minor as part of the release checklist so a
      * source build does not advertise a stale version in the server's connz/monitoring.
      */
-    private const FALLBACK_CLIENT_VERSION = '2.24.5';
+    private const FALLBACK_CLIENT_VERSION = '2.24.6';
 
     /**
      * Builds the CONNECT frame payload for the initial client handshake.
