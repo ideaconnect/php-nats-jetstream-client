@@ -15,6 +15,42 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- An infinite pull consumer run that ends on a terminal status (such as `409 Consumer Deleted`) now closes its inbox
+  before it calls `onError` (#211): `onError` and `handle()`'s result come up to one round trip later (at most
+  `requestTimeoutMs`), the handler gets what the server sent the pulls behind the status before the inbox's `UNSUB`,
+  and that counts in `handle()`'s result. An error listener may get a `TimeoutException` ("Releasing the pull consumer
+  inbox ...") as a warning when the server does not answer the release's `PING` in time. A rejection of the inbox, a
+  `stop()` or the client's `drain()` that comes during that round trip ends the run as it does elsewhere, `onError` not
+  called.
+
+### Fixed
+
+- [bugfix] An infinite pull consumer run that ended on its head pull's terminal status dropped what the server sent the
+  pulls behind it after that status (#211). The case: a consumer deleted and recreated under the same name (to change a
+  field the server does not let you update, say) while the handler works on a batch. The waiting pull's `409 Consumer
+  Deleted` waits unread on the socket; when the handler returns the run refills, and the refill reaches the recreated
+  consumer, which serves it at once. The engine then reads the 409 and ends the run. Since 2.24.3 it hands over what the
+  pulls behind the status hold (#187), which covered the refill's messages when they came in the same read as the 409;
+  when they came a read later, the likelier timing, they were read after the run's `UNSUB` and dropped: gone on a
+  consumer with `ack_policy: none` or `max_deliver: 1`, delivered again after `ack_wait` otherwise. Before it reports
+  the status to `onError`, the run now closes its inbox to new deliveries through the release a failing run uses since
+  2.25.2 (`NatsClient::retirePullInbox()`, #212): `UNSUB` and a `PING` in one write, what the server sent before the
+  `UNSUB` read into the pulls (or the overflow) until the `PONG`, within one `requestTimeoutMs` budget, whatever the
+  pulls' expiry and also with nothing behind the status, the routing then sealed. The run's rejection observer outlives
+  the routing until the run's final `unsubscribe()`, so that a permissions violation naming the inbox, read by
+  `onError` or during the hand-over, still ends the run with the rejection, as it does since 2.25.1 (#206). After the
+  release the run's lifecycle rules apply in their order: a `stop()` or a close that discards returns the count
+  delivered so far, without `onError` and without the tail; the client's `drain()` asking for the hand-over, or a
+  rejection of the inbox, ends the run as they do elsewhere, `onError` not called; otherwise `onError` gets the status
+  once, and the pulls behind it and the overflow are handed over and counted. The run never pulls again on that path,
+  also when the connection ended during the release. A finite run, 423 pin recovery and the routine statuses (404, 408,
+  503, non-terminal 409) are unchanged. Measured against nats-server 2.12 with the worker reading one frame at a time:
+  the handler used to get m-1 only, and now gets m-1 and m-2. Found by the review of #197 (2.22.0).
+
 ## [2.25.2] - 2026-10-10
 
 ### Upgrade notes

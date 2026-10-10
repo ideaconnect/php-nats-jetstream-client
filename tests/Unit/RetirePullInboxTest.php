@@ -497,6 +497,35 @@ final class RetirePullInboxTest extends TestCase
     }
 
     /**
+     * The run's rejection observer outlives the inbox's routing (#211): a permissions violation naming the inbox, read
+     * after the release sealed it, still reaches the observer, once, so that a run whose terminal onError or hand-over is
+     * under way learns of it; the run's final unsubscribe() then removes it with the record, writing nothing, and a later
+     * violation naming the inbox reaches nothing.
+     */
+    public function testARetiredInboxKeepsItsRejectionObserverUntilTheFinalUnsubscribe(): void
+    {
+        [$transport, $client] = $this->client();
+        /** @var list<string> $rejections */
+        $rejections = [];
+        $sid = $client->subscribeGuarded(self::INBOX, static function (): void {}, static function (string $error) use (&$rejections): void {
+            $rejections[] = $error;
+        })->await();
+        $client->markSubscriptionUnbounded($sid);
+        $violation = sprintf("-ERR 'Permissions Violation for Subscription to \"%s\"'\r\n", self::INBOX);
+
+        self::assertSame(InboxRetirement::Fenced, $client->retirePullInbox($sid, new NullCancellation())->await(new TimeoutCancellation(5)));
+        $transport->pushFrame($violation);
+        self::readTheErr($client);
+        self::assertCount(1, $rejections, 'the observer heard of the rejection after the seal');
+
+        $client->unsubscribe($sid)->await();
+        $transport->pushFrame($violation);
+        self::readTheErr($client);
+        self::assertCount(1, $rejections, 'nothing after the final unsubscribe');
+        self::assertSame(['UNSUB ' . $sid], $transport->controlLinesStartingWith('UNSUB '));
+    }
+
+    /**
      * @param (\Closure(\Throwable): void)|null $errorListener
      * @return array{ReconnectingTransport, NatsClient}
      */

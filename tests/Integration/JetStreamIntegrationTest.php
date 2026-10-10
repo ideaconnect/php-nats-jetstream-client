@@ -20,6 +20,7 @@ use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\JetStream\ObjectStore\ObjectData;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\Tests\Support\DroppingTransport;
+use IDCT\NATS\Tests\Support\FrameAtATimeTransport;
 use IDCT\NATS\Transport\AmpSocketTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -2565,6 +2566,72 @@ final class JetStreamIntegrationTest extends TestCase
             self::assertSame(1, $info['num_pending'] ?? null, 'm-3 stayed in the stream');
             $next = $js->fetchNext($stream, 'worker', 4000)->await();
             self::assertSame('m-3', $next->payload, 'the next independent pull got m-3');
+        } finally {
+            $run->ignore();
+            $worker->disconnect()->await();
+            $js->deleteStream($stream)->await();
+            $admin->disconnect()->await();
+        }
+    }
+
+    /**
+     * An infinite pull consumer run that ends on its head pull's terminal status hands over what a later pull received
+     * after it (#211). The worker reads one protocol frame at a time (tests/Support/FrameAtATimeTransport.php), a
+     * deliberate read boundary between the status and what follows it. The run (batch 1, depth 2, a 30 s expiry) gets
+     * m-1 with its first pull while its second waits; on m-1 the handler has the consumer deleted, the waiting pull's
+     * "409 Consumer Deleted" then queued on the worker's socket, unread, recreated under the same name (deliver_policy
+     * new, the same ack settings) and m-2 published. When the handler returns the run refills, the recreated consumer
+     * serves m-2 to the refill, and the engine reads the 409 in a read of its own. The handler gets m-1 and m-2, onError
+     * the 409 once, and handle() returns 2. m-2 used to be read after the run's UNSUB and dropped: delivered, so lost
+     * under ack_policy none or max_deliver 1, and never handled.
+     *
+     * @param array<string, mixed> $consumerConfig
+     */
+    #[DataProvider('consumersThatLoseWhatAFailedRunDrops')]
+    public function testAPullConsumerRunEndedByATerminalStatusHandsOverWhatALaterPullReceivedAfterIt(array $consumerConfig, bool $acks): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITTERMINAL' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $js = $admin->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, 'worker', $subject, $consumerConfig)->await();
+        $js->publish($subject, 'm-1')->await();
+
+        $options = new NatsOptions(servers: [$this->integrationServerUrl()]);
+        $worker = new NatsClient($options, new FrameAtATimeTransport(new AmpSocketTransport($options)));
+        $worker->connect()->await();
+        /** @var \ArrayObject<int, string> $handled */
+        $handled = new \ArrayObject();
+        /** @var \ArrayObject<int, string> $reported */
+        $reported = new \ArrayObject();
+        $run = $worker->jetStream()->pullConsumer($stream, 'worker')->setBatching(1)->setDepth(2)->setExpiresMs(30_000)
+            ->setOnError(static function (\Throwable $status) use ($reported): void {
+                $reported[] = $status->getMessage();
+            })
+            ->handle(function (NatsMessage $message, JetStreamContext $context) use ($handled, $js, $admin, $stream, $subject, $consumerConfig, $acks): void {
+                $handled[] = $message->payload;
+                if ($acks) {
+                    $context->ack($message)->await();
+                }
+                if ($message->payload === 'm-1') {
+                    // The run's second pull is waiting: deleting the consumer answers it with a 409, left unread.
+                    $this->waitForWaitingPulls($admin, $stream, 1);
+                    $js->deleteConsumer($stream, 'worker')->await();
+                    $js->createConsumer($stream, 'worker', $subject, ['deliver_policy' => 'new'] + $consumerConfig)->await();
+                    $js->publish($subject, 'm-2')->await();
+                }
+            });
+
+        try {
+            $processed = $run->await(new TimeoutCancellation(10));
+
+            self::assertSame(['m-1', 'm-2'], $handled->getArrayCopy());
+            self::assertSame(['JetStream pull request ended with status 409: Consumer Deleted'], $reported->getArrayCopy());
+            self::assertSame(2, $processed);
         } finally {
             $run->ignore();
             $worker->disconnect()->await();
