@@ -3762,8 +3762,9 @@ final class JetStreamContext
      * state goes, what its queue held routed into the pulls first, unless a stop() or a close that discards came. The
      * server then stops serving the run's pulls: what is published during the hand-over stays in the stream for the next
      * pull, neither delivered nor counted, where the server used to deliver it to the failed run's pulls for as long as
-     * the hand-over lasted, and the run dropped it unacked, read after the run's UNSUB or as a straggler. A cleanup that
-     * fails or runs out of its budget is reported, never thrown: the run's own failure is the one the caller throws. A
+     * the hand-over lasted, and the run dropped it unacked, read after the run's UNSUB or as a straggler. A release that
+     * fails or runs out of its budget is reported by the connection, never thrown: the run's own failure is the one the
+     * caller throws. A
      * message the server sent after the release, or one the fence could not collect in time, is not delivered: it stays
      * unacked, for the server to deliver again after the ack wait, or never on a consumer without acks or with
      * max_deliver 1. A close that discards what the connection received and has not delivered (nats.go Close()
@@ -3792,12 +3793,8 @@ final class JetStreamContext
         callable $handler,
         PullPipelineControl $ctl,
     ): void {
-        try {
-            $this->client->retirePullInbox($sid, $ctl->stopInterruption(), $drainParticipant->wakeUp())->await();
-        } catch (\Throwable $cleanupFailure) {
-            // Reported, never thrown: the run's own failure is the one its caller throws.
-            $this->emitClientError($cleanupFailure);
-        }
+        // Never throws: what ends the release early is reported, and the run's own failure is the one its caller throws.
+        $this->client->retirePullInbox($sid, $ctl->stopInterruption(), $drainParticipant->wakeUp())->await();
 
         try {
             $this->deliverWhatTheRunHolds($inflight, $issueOrder, $overflow, $handler, $ctl);

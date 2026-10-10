@@ -19,9 +19,6 @@ use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
-use function Amp\async;
-use function Amp\delay;
-
 /**
  * The connection-owned release of a pull consumer run's inbox, NatsClient::retirePullInbox() (#212), state by state:
  * what it writes, what it routes to the inbox's router before the inbox goes, and how it reports the way it ended
@@ -253,6 +250,109 @@ final class RetirePullInboxTest extends TestCase
     }
 
     /**
+     * A drain whose request for the hand-over was made already when the release starts: the operation does not wait,
+     * and ends DrainFlushed at once, the inbox gone.
+     */
+    public function testADrainThatAskedForTheHandOverAlreadyEndsItDrainFlushedAtOnce(): void
+    {
+        [, $client] = $this->client();
+        [$sid] = $this->inbox($client);
+        $participant = new HeldDrainParticipant();
+        $client->addDrainParticipant($participant);
+        $drain = $client->drain();
+        $this->waitUntil(static fn(): bool => $participant->asked === 1);
+        $ready = new DeferredCancellation();
+        $ready->cancel();
+
+        $started = hrtime(true);
+        $outcome = $client->retirePullInbox($sid, new NullCancellation(), $ready->getCancellation())->await(new TimeoutCancellation(1));
+        $elapsed = $this->secondsSince($started);
+        $participant->release();
+        $drain->await(new TimeoutCancellation(5));
+
+        self::assertSame(InboxRetirement::DrainFlushed, $outcome);
+        self::assertLessThan(0.1, $elapsed);
+        self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
+     * A drain that never asks for the hand-over within the request timeout (200 ms): the operation stops waiting at its
+     * budget and ends Released, not DrainFlushed, the inbox gone all the same.
+     */
+    public function testADrainThatNeverAsksForTheHandOverEndsItReleasedAtTheRequestTimeout(): void
+    {
+        [, $client] = $this->client(200);
+        [$sid] = $this->inbox($client);
+        $participant = new HeldDrainParticipant();
+        $client->addDrainParticipant($participant);
+        $drain = $client->drain();
+        $this->waitUntil(static fn(): bool => $participant->asked === 1);
+        $never = new DeferredCancellation();
+
+        $started = hrtime(true);
+        $outcome = $client->retirePullInbox($sid, new NullCancellation(), $never->getCancellation())->await(new TimeoutCancellation(2));
+        $elapsed = $this->secondsSince($started);
+        $participant->release();
+        try {
+            $drain->await(new TimeoutCancellation(5));
+        } catch (\Throwable) {
+            // The drain's own budget may have run out meanwhile; it closes the connection all the same.
+        }
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertGreaterThanOrEqual(0.15, $elapsed);
+        self::assertLessThan(1.5, $elapsed);
+        self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
+     * A rejected inbox whose UNSUB is owed, released with a stop already made: the operation does not wait for the
+     * write, ends Released, and the owed UNSUB still goes out, once.
+     */
+    public function testAnOwedUnsubStillGoesOutWhenTheStopWasMadeAlready(): void
+    {
+        [$transport, $client] = $this->client();
+        $transport->answerPings = false;
+        [$sid] = $this->inbox($client);
+        $transport->pushFrame("-ERR 'maximum subscriptions exceeded'\r\n");
+        self::readTheErr($client);
+        $transport->answerPings = true;
+        $stop = new DeferredCancellation();
+        $stop->cancel();
+
+        $outcome = $client->retirePullInbox($sid, $stop->getCancellation())->await(new TimeoutCancellation(5));
+        $this->waitUntil(static fn(): bool => $transport->controlLinesStartingWith('UNSUB ') !== []);
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertSame(['UNSUB ' . $sid], $transport->controlLinesStartingWith('UNSUB '));
+    }
+
+    /**
+     * The write of UNSUB and PING fails on a socket that died: no PONG can come, the operation ends Released at once
+     * rather than at its budget, the write's failure is reported to the error listener, and the inbox is gone.
+     */
+    public function testAReleaseWhoseWriteFailsEndsItReleasedAndReportsTheFailure(): void
+    {
+        /** @var \ArrayObject<int, \Throwable> $reported */
+        $reported = new \ArrayObject();
+        [$transport, $client] = $this->client(5_000, static function (\Throwable $error) use ($reported): void {
+            $reported[] = $error;
+        });
+        [$sid] = $this->inbox($client);
+        $failure = new \RuntimeException('the socket died under the release');
+        $transport->failNextWriteContaining('UNSUB ' . $sid . "\r\nPING\r\n", $failure);
+
+        $started = hrtime(true);
+        $outcome = $client->retirePullInbox($sid, new NullCancellation())->await(new TimeoutCancellation(5));
+        $elapsed = $this->secondsSince($started);
+        $this->waitUntil(static fn(): bool => in_array($failure, $reported->getArrayCopy(), true));
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertLessThan(1.0, $elapsed);
+        self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
      * @param (\Closure(\Throwable): void)|null $errorListener
      * @return array{ReconnectingTransport, NatsClient}
      */
@@ -290,6 +390,16 @@ final class RetirePullInboxTest extends TestCase
         $client->markSubscriptionUnbounded($sid);
 
         return [$sid, $routed];
+    }
+
+    /** Reads the -ERR pushed last, which the server keeps the connection open for. */
+    private static function readTheErr(NatsClient $client): void
+    {
+        try {
+            $client->processIncoming(new TimeoutCancellation(1))->await();
+        } catch (\Throwable) {
+            // Your own read throws such an -ERR.
+        }
     }
 
     /** How many writes the client made whose bytes are exactly $bytes. */

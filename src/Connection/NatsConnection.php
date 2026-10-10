@@ -3373,7 +3373,8 @@ final class NatsConnection
      * reaches the run; a frame for the sid read after that is dropped as one for an unknown sid. A guarded inbox the
      * client already treated as rejected, whose UNSUB is owed ({@see rejectUnconfirmedSubscriptions()}), has that UNSUB
      * written once, within the same budget. A timeout, and a read failure of the driver, are reported through the error
-     * listener in a fiber of their own, so that a listener that suspends cannot hold the operation; nothing is thrown.
+     * listener in a fiber of their own, so that a listener that suspends cannot hold the operation, and so is anything
+     * else that ends it early (a router that throws while the seal routes the queue): nothing is thrown.
      * A plain {@see unsubscribe()} of the sid afterwards writes nothing.
      *
      * The fence is best effort: a timed-out UNSUB can still leave interest on the server until its write lands, and a
@@ -3445,6 +3446,12 @@ final class NatsConnection
                 }
 
                 return $this->fencePullInbox($sid, $stop, $owner);
+            } catch (\Throwable $failure) {
+                // Nothing is thrown: the run's own outcome comes first. The seal has removed the inbox's local state
+                // whatever failed (a router that threw while it routed the queue).
+                $this->reportRetirementFailure($failure);
+
+                return InboxRetirement::Released;
             } finally {
                 EventLoop::cancel($timer);
             }
@@ -3543,12 +3550,21 @@ final class NatsConnection
         }
 
         if ($diagnostic !== null) {
-            async(function () use ($diagnostic): void {
-                $this->emitErrorSafely($diagnostic, 'warning');
-            })->ignore();
+            $this->reportRetirementFailure($diagnostic);
         }
 
         return $outcome;
+    }
+
+    /**
+     * Reports what ended a {@see retirePullInbox()} without a completed fence, as a warning, from a fiber of its own: an
+     * error listener that suspends must not hold the operation, nor keep the inbox routable.
+     */
+    private function reportRetirementFailure(\Throwable $failure): void
+    {
+        async(function () use ($failure): void {
+            $this->emitErrorSafely($failure, 'warning');
+        })->ignore();
     }
 
     /**
@@ -3568,16 +3584,19 @@ final class NatsConnection
             && !$this->isDiscardingUndelivered()
             && !$this->drainDeliverySealed
         ) {
-            while (!$queue->isEmpty()) {
-                /** @var NatsMessage $message */
-                $message = $queue->dequeue();
-                $this->deliveredCounts[$sid] = ($this->deliveredCounts[$sid] ?? 0) + 1;
-                try {
+            try {
+                while (!$queue->isEmpty()) {
+                    /** @var NatsMessage $message */
+                    $message = $queue->dequeue();
+                    $this->deliveredCounts[$sid] = ($this->deliveredCounts[$sid] ?? 0) + 1;
                     $router($message);
-                } catch (\Throwable) {
-                    // The router of a pull inbox never throws; nothing must keep the seal from completing.
                 }
+            } finally {
+                // The router of a pull inbox never throws; should one, the inbox still goes, and the caller reports it.
+                $this->dropSubscriptionState($sid);
             }
+
+            return;
         }
 
         $this->dropSubscriptionState($sid);

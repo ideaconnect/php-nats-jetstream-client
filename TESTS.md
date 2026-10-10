@@ -2748,6 +2748,10 @@ The listener a reconnect announces the new connection to - Reconnected, or Conne
 - `testWhileTheClientDrainsItWaitsForTheDrainsRequestForTheHandOver` - A drain held by a drain participant: the operation writes no UNSUB of its own (only the drain's goes out), waits for `$drainReady`, fired 50 ms later, and ends DrainFlushed.
 - `testAnInboxRejectedForTheSubscriptionLimitGetsItsOwedUnsubOnce` - A limit -ERR read before the guarded inbox's PONG drops it with an UNSUB owed: the release writes that UNSUB once, Released, and the plain unsubscribe after it writes nothing more.
 - `testAConnectionEndingUnderTheFenceEndsItReleasedWithoutAReplay` - A fatal -ERR read while the release waits for its PONG: Released, the connection reopened, and the reconnect does not subscribe the inbox again.
+- `testADrainThatAskedForTheHandOverAlreadyEndsItDrainFlushedAtOnce` - `$drainReady` fired before the release starts: DrainFlushed within 100 ms, without waiting, the inbox gone.
+- `testADrainThatNeverAsksForTheHandOverEndsItReleasedAtTheRequestTimeout` - `$drainReady` never fired and a 200 ms request timeout: Released (not DrainFlushed) at the budget, the inbox gone.
+- `testAnOwedUnsubStillGoesOutWhenTheStopWasMadeAlready` - A limit-rejected inbox released with a stop already made: Released without waiting for the write, and the owed UNSUB still goes out, once.
+- `testAReleaseWhoseWriteFailsEndsItReleasedAndReportsTheFailure` - The write of UNSUB and PING fails: Released well within a second rather than at the 5 s budget, the write's failure reported to the error listener, the inbox gone.
 
 ### tests/Unit/RepublishAndTransformTest.php
 - `testRepublishMinimal` - Asserts Republish::create(src, dest)->toArray() yields exactly ['src','dest'] with no headers_only key.
