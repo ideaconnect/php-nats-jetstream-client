@@ -127,6 +127,22 @@ final class NatsClient
     }
 
     /**
+     * Publishes as {@see publish()} does, with $beforeWrite called before each attempt to send the frame, a retry after
+     * a failed write's recovery included; what it throws fails the publish, nothing written. For the pull consumer
+     * engine, whose pull must not go out on a reply inbox the server rejected (#206). See
+     * {@see NatsConnection::publishGuarded()}.
+     *
+     * @internal Low-level mechanism for the JetStream pull inbox; not part of the supported API.
+     *
+     * @param \Closure():void $beforeWrite Must not suspend.
+     * @return Future<void>
+     */
+    public function publishGuarded(string $subject, string $payload, string $replyTo, \Closure $beforeWrite): Future
+    {
+        return $this->connection->publishGuarded($subject, $payload, $replyTo, $beforeWrite);
+    }
+
+    /**
      * @internal Budgeted batch publication; callbacks must not suspend.
      * @param \Closure():?string $payload
      * @param \Closure():void $beforeWrite

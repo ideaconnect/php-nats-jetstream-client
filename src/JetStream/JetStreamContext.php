@@ -22,6 +22,7 @@ use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
+use IDCT\NATS\JetStream\Consumers\PullInboxRejection;
 use IDCT\NATS\JetStream\Consumers\PullInFlight;
 use IDCT\NATS\JetStream\Consumers\PullMessageBuffer;
 use IDCT\NATS\JetStream\Consumers\PullOverflow;
@@ -2695,6 +2696,23 @@ final class JetStreamContext
      * iterator starts a run with fresh ones and leaves this run's alone, where it used to clear the shared
      * flags and replace this run's wake-ups, so that this run went on next to the new one.
      *
+     * A rejection of the run's inbox that another fiber's read records while the engine is not reading for it (#206) -
+     * the handler's own read or an application's loop while the handler or onError waits, a read while a pull's write
+     * waits, or a reconnect's replay, after a configuration reload withdrew the subscribe permission or with the new
+     * server at its subscription limit - ends the run as one the engine's own read meets: the handler gets what the
+     * pulls hold, and handle() throws the rejection. The engine looks at it after every wait that can let another fiber
+     * run: before each pull the retire phase retires, after a terminal status's onError and after its hand-over, and
+     * after the issue phase. The rejection fires a wake-up of its own, which ends the pump read and the idle backoff at
+     * once ({@see PullInboxRejection}), and each pull is written through a guarded publish
+     * ({@see \IDCT\NATS\Core\NatsClient::publishGuarded()}) whose guard refuses it, a retry after a failed write's
+     * recovery included: no new pull and no retry goes out once the run knows its inbox was rejected, though a write the
+     * transport already took, or a frame already in the reconnect buffer, still goes out. A finite run that delivered
+     * its last batch throws the rejection too, and so does a run that a later pull's terminal status would have ended.
+     * A stop() keeps its precedence, and a handler or onError that throws still ends the run with its own exception. The
+     * run used to see such a rejection only at the top of its loop, after a refill on the dead inbox had waited out its
+     * deadline (setExpiresMs() plus a second); on a server with leaf nodes or gateways, nats-server serves a pull younger
+     * than 2 s whose reply subject has no local interest, so such a pull could take a batch nobody received.
+     *
      * A run that ends with a failure of its own waits or writes first hands the handler what its pulls have received
      * (#197): the pump read failing with anything but the CancelledException that ends a wait (the connection lost with
      * waiting for a reconnect disabled, a reconnect that gave up, reconnect off, a fatal -ERR or a PONG the socket
@@ -2933,22 +2951,32 @@ final class JetStreamContext
             // the inbox: by permissions (#167's pull twin), or by its subscription limit before the inbox is
             // confirmed, whichever fiber's read met the -ERR. With the SUB dead, every pull's replies would be
             // undeliverable, every retire a silent client-side deadline (classified routine), and the engine
-            // would spin forever with zero signal on any channel.
-            /** @var string|null $inboxRejection The -ERR the server rejected the inbox with, when it did. */
-            $inboxRejection = null;
+            // would spin forever with zero signal on any channel. The rejection fires a wake-up of the run's own,
+            // which ends the engine's waits (#206), and the engine looks at it again after every wait that can let
+            // another fiber run and before every pull it writes ({@see PullInboxRejection}).
+            $inboxRejection = new PullInboxRejection();
             try {
-                $sid = $this->client->subscribeGuarded($base . '.*', $router, static function (string $error) use (&$inboxRejection): void {
-                    $inboxRejection ??= $error;
-                })->await();
+                $sid = $this->client->subscribeGuarded($base . '.*', $router, $inboxRejection->reject(...))->await();
             } catch (ConnectionException $e) {
                 // The SUB write failed, and the new server rejected the reconnect's replay of the SUB (#175): the
                 // replay recorded the rejection, and the subscribe reports it. The run fails as it does below.
-                if ($inboxRejection !== null) {
-                    throw $this->pullInboxRejectedException($base, $inboxRejection, $e);
+                $rejection = $inboxRejection->error();
+                if ($rejection !== null) {
+                    throw $this->pullInboxRejectedException($base, $rejection, $e);
                 }
 
                 throw $e;
             }
+            // The guard of every pull's publication (#206): a rejection recorded while the pull's write waited for the
+            // socket, or for the recovery a failed write ran, whose replay of the inbox the new server rejected, fails
+            // the write before a retry or a fresh write goes out, rather than sending a pull no reply can reach. On a
+            // server with leaf nodes or gateways, such a pull could take a batch nobody receives.
+            $unlessRejected = function () use ($inboxRejection, $base): void {
+                $rejection = $inboxRejection->error();
+                if ($rejection !== null) {
+                    throw $this->pullInboxRejectedException($base, $rejection);
+                }
+            };
             $this->client->markSubscriptionUnbounded($sid);
 
             $totalProcessed = 0;
@@ -3036,9 +3064,18 @@ final class JetStreamContext
                     // before the rejection goes to the handler first, as before any failure of the run (#197): the
                     // pulls of a run whose replayed inbox the new server rejected, or whose subscribe permission a
                     // server's configuration reload withdrew, can hold messages the server counted as delivered,
-                    // and the connection, which a rejection leaves open, still takes the handler's acks.
-                    if ($inboxRejection !== null) {
-                        $rejected = $this->pullInboxRejectedException($base, $inboxRejection);
+                    // and the connection, which a rejection leaves open, still takes the handler's acks. Another
+                    // fiber's read can record the rejection while the engine is not reading: the handler's own read,
+                    // an application's loop, while the handler or onError waits, or while a pull's write waits. The
+                    // engine comes back here from wherever it sees it next (#206): before each pull the retire phase
+                    // retires, after a terminal status's onError and after its hand-over, and after the issue phase,
+                    // before the pump read; the guard of each pull's write refuses it, and the idle backoff and the
+                    // pump read end at once. It used to see it here only, after the next pulls, written on the dead
+                    // inbox, had waited out their deadline, and a finite run with no pull left to issue, or one a
+                    // later pull's terminal status ended, returned its count without the error.
+                    $rejection = $inboxRejection->error();
+                    if ($rejection !== null) {
+                        $rejected = $this->pullInboxRejectedException($base, $rejection);
                         $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $overflow, $handler, $ctl);
 
                         throw $rejected;
@@ -3092,6 +3129,15 @@ final class JetStreamContext
                         // (their buffers are left undelivered -> unacked -> redelivered later).
                         if ($ctl->isStopRequested()) {
                             break;
+                        }
+
+                        // The server rejected the inbox while the handler of the pull, or of the overflow, delivered
+                        // before, or onError, waited (#206): back to the top, which hands the rest over and throws the
+                        // rejection, before another pull is examined. Retired now, a terminal status of the next pull
+                        // would end the run as if nothing had happened, through onError, and the issue phase would
+                        // write the next pulls on the dead inbox.
+                        if ($inboxRejection->error() !== null) {
+                            continue 2;
                         }
 
                         // The handler of the pull, or of the overflow, delivered before, or onError, can have run a
@@ -3254,6 +3300,15 @@ final class JetStreamContext
                         break;
                     }
 
+                    // The server rejected the inbox while the onError of a terminal status waited (#206): the run ends with
+                    // the rejection, at the top, which hands the pulls behind that status over as before any failure of
+                    // the run (#197), a handler failing there reported, rather than end with its count. Every other way
+                    // out of the phase is right behind its check before each retire. A stop() keeps its precedence at
+                    // the top, as over any rejection seen there.
+                    if ($inboxRejection->error() !== null) {
+                        continue;
+                    }
+
                     if ($terminated) {
                         // The run ends here, on a terminal status, or a finite run on its last pull. What the pulls
                         // behind the one that ended it hold, and the overflow behind them, goes to the handler first,
@@ -3262,6 +3317,13 @@ final class JetStreamContext
                         // throws ends the run with its own exception. A finite run has nothing there: its one pull in
                         // flight is the one that ended it, and it fills no overflow.
                         $totalProcessed += $this->deliverWhatTheRunHolds($inflight, $issueOrder, $overflow, $handler, $ctl);
+
+                        // A rejection recorded while the handler waited in that hand-over ends the run with it too, at the
+                        // top (#206): what the hand-over delivered counts, and the pulls it emptied give the top nothing
+                        // twice; only what reached the overflow meanwhile is handed over there.
+                        if ($inboxRejection->error() !== null) {
+                            continue;
+                        }
 
                         break;
                     }
@@ -3288,15 +3350,17 @@ final class JetStreamContext
                             // The wait holds the run's wake-ups (neither flag is set here, checked just above,
                             // so neither has fired): a stop() or drain() from another fiber ends the backoff at
                             // once instead of at its end, and the loop top then sees the flag (#181), and so
-                            // does the client's drain() asking for the hand-over (#207).
+                            // does the client's drain() asking for the hand-over (#207), and a rejection of the
+                            // inbox that another fiber's read records, checked after the retire phase (#206).
                             try {
                                 delay(
                                     PullConsumerIterator::idleBackoffMs($consecutiveEmptyPulls) / 1000,
-                                    cancellation: self::pullWaitCancellation($ctl, null, $drainParticipant->wakeUp()),
+                                    cancellation: self::pullWaitCancellation($ctl, null, $drainParticipant->wakeUp(), $inboxRejection->wakeUp()),
                                 );
                             } catch (CancelledException) {
                                 // Woken: stop() breaks at the loop top, drain() exits there with nothing in flight, and
-                                // so does the client's drain() asking for the hand-over (#207).
+                                // so does the client's drain() asking for the hand-over (#207); a rejection is thrown
+                                // there (#206).
                             }
                         }
                         $idleDraining = false;
@@ -3321,7 +3385,11 @@ final class JetStreamContext
                     // while the overflow holds messages the handler has not got (#187), which a request the server
                     // kept across a reconnect can bring while a write is awaited, nor once a reconnect has come
                     // since the pulls in flight were issued: the top of the loop ends those first, so that a pull
-                    // issued now would not be ended with them (#187).
+                    // issued now would not be ended with them (#187). Nor once the server has rejected the inbox
+                    // (#206), which another fiber's read can record while the previous pull's write is awaited: the
+                    // guard of each pull's publication checks it in the step that writes, before a retry after a
+                    // failed write's recovery too, and refuses the write, the issue phase then ending with the
+                    // rejection as with a failed write, so that no reply-less pull goes out.
                     $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered, $everPinned);
                     while (
                         count($inflight) < $effectiveDepth
@@ -3356,24 +3424,35 @@ final class JetStreamContext
 
                         $requestPayload = $this->buildPullRequest($cfg->batch, $cfg->expiresMs, $fields);
                         try {
-                            $this->client->publish(
+                            // Published as any publish is, reconnect buffering and the retry after a failed write's
+                            // recovery included (#187), with the inbox's rejection checked before each attempt (#206).
+                            $this->client->publishGuarded(
                                 $subject,
                                 json_encode($requestPayload, JSON_THROW_ON_ERROR),
                                 $prefix . $token,
+                                $unlessRejected,
                             )->await();
                         } catch (\Throwable $failure) {
                             // The pull's write failed: the socket was dead and the reconnect the write ran gave up, or
                             // reconnect is off, or the connection was closed already, or the request was refused before
-                            // it was written (longer than a max_payload an INFO lowered), whatever the throwable. The
-                            // pulls issued before it can hold what the server sent them, with depth above 1 while a
-                            // later pull refills the pipeline: the handler gets that first, unless the application
-                            // closed the connection (a disconnect() under a held-up write fails it with the transport's
-                            // own error), and the run then ends with the write's error, as for the pump read below
-                            // (#197).
+                            // it was written (longer than a max_payload an INFO lowered), whatever the throwable, or the
+                            // guard found the inbox rejected and threw the rejection, nothing written (#206). The pulls
+                            // issued before it can hold what the server sent them, with depth above 1 while a later
+                            // pull refills the pipeline: the handler gets that first, unless the application closed the
+                            // connection (a disconnect() under a held-up write fails it with the transport's own error),
+                            // and the run then ends with the write's error, as for the pump read below (#197).
                             $this->deliverReceivedBeforeFailing($inflight, $issueOrder, $overflow, $handler, $ctl);
 
                             throw $failure;
                         }
+                    }
+
+                    // A rejection recorded while the issue phase awaited its writes (#206), the last one's included: back
+                    // to the top, which throws it, rather than read until their deadline for pulls no reply can reach.
+                    // Nothing from here to the pump read's wait suspends, and that wait ends at once on a rejection
+                    // recorded from then on: it holds the rejection's wake-up, which has not fired here.
+                    if ($inboxRejection->error() !== null) {
+                        continue;
                     }
 
                     // A reconnect while the issue phase awaited its writes (a write that met the dead socket ran it
@@ -3452,11 +3531,14 @@ final class JetStreamContext
                     // fires: stop() then breaks at the loop top; drain() stops issuing there and goes on
                     // pumping the pulls in flight, their reads from then on without its fired wake-up, so a
                     // latched drain never ends a wait at once (#181); the client's drain() asking for the
-                    // hand-over has it made at the loop top (#207).
+                    // hand-over has it made at the loop top (#207), and a rejection of the inbox recorded while
+                    // this read waits, by another fiber's read or by the replay of a reconnect this read waits
+                    // for, is thrown there (#206).
                     $waitCancellation = self::pullWaitCancellation(
                         $ctl,
                         new TimeoutCancellation(($waitUntilNs - $nowNs) / 1e9),
                         $drainParticipant->wakeUp(),
+                        $inboxRejection->wakeUp(),
                     );
                     try {
                         $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
@@ -3467,8 +3549,8 @@ final class JetStreamContext
                         }
                     } catch (CancelledException) {
                         // This wait segment ended (the earliest deadline or heartbeat check came due, or
-                        // a stop()/drain() woke the engine): loop to re-evaluate stop()/drain() and the
-                        // deadlines against any freshly buffered frames.
+                        // a stop()/drain() or the inbox's rejection woke the engine): loop to re-evaluate
+                        // stop()/drain(), the rejection and the deadlines against any freshly buffered frames.
                     } catch (\Throwable $failure) {
                         if ($finite || !$this->goesOnAfterItsReadFailed($failure)) {
                             // The read failed, and the run ends with its error: the connection lost with waiting for a
@@ -3765,27 +3847,30 @@ final class JetStreamContext
     /**
      * What a wait of {@see consumePipelined()} waits with (#181): $deadline, when the wait has one (the pump
      * read's earliest pull deadline or heartbeat miss; the idle backoff has none), plus each of the run's
-     * three wake-ups, stop()'s and drain()'s of the iterator and the client's drain() asking for the run's
-     * hand-over ($clientDrain, #207), while it has not fired yet. A fired wake-up is left out whatever
-     * fired it: composed, it would end this wait and every later one at once, a spin of reads in queued
-     * callbacks that runs ahead of every timer and socket read in the process. One fired by its own stop()
-     * or drain() has its flag set, and the flag is seen at the top of the loop, as is the client's drain()
-     * request, which its wake-up never fires without. The iterator's two are the run's own, like its flags
+     * four wake-ups, stop()'s and drain()'s of the iterator, the client's drain() asking for the run's
+     * hand-over ($clientDrain, #207) and the server's rejection of the run's inbox ($inboxRejected, #206),
+     * while it has not fired yet. A fired wake-up is left out whatever fired it: composed, it would end this
+     * wait and every later one at once, a spin of reads in queued callbacks that runs ahead of every timer
+     * and socket read in the process. One fired by its own stop() or drain() has its flag set, and the flag
+     * is seen at the top of the loop, as is the client's drain() request, which its wake-up never fires
+     * without, and the rejection, which the engine checks right before each wait, and so never waits once
+     * it has fired. The iterator's two are the run's own, like its flags
      * ({@see \IDCT\NATS\JetStream\Consumers\PullRunLifecycle}, #189), and fire only once their flag is set
      * while the run lasts: a later handle() on the same iterator used to replace them, Amp firing a
      * replaced one as it destructed it with its flag unset, and still nothing spun, since a fired one is
      * left out. The wake-ups are read in the engine's fiber right before the wait starts, with no
-     * suspension in between, so a stop() or drain() from another fiber either fired before this check or
-     * fires a wake-up this wait holds. With one part, or none, the composite forwards that part or never
-     * fires.
+     * suspension in between, so a stop() or drain() from another fiber, or a rejection another fiber's read
+     * records, either fired before this check or fires a wake-up this wait holds. With one part, or none,
+     * the composite forwards that part or never fires.
      */
     private static function pullWaitCancellation(
         PullPipelineControl $ctl,
         ?Cancellation $deadline,
         Cancellation $clientDrain,
+        Cancellation $inboxRejected,
     ): Cancellation {
         $parts = $deadline === null ? [] : [$deadline];
-        foreach ([$ctl->stopInterruption(), $ctl->drainInterruption(), $clientDrain] as $wakeUp) {
+        foreach ([$ctl->stopInterruption(), $ctl->drainInterruption(), $clientDrain, $inboxRejected] as $wakeUp) {
             if (!$wakeUp->isRequested()) {
                 $parts[] = $wakeUp;
             }

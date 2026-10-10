@@ -654,6 +654,52 @@ final class JetStreamInboxRejectionTest extends TestCase
     }
 
     /**
+     * Guard, passes on both (#206 kept it): the pull pipeline's twin of the previous test. A run whose inbox SUB write
+     * fails - the socket dies while the write is held up - and whose replay the new server rejects for the limit (the
+     * limit lowered to one, app.one replayed first): the subscribe the run still waits in reports the rejection, and
+     * handle() fails within 1 s of the drop with the JetStreamException saying the inbox may have been rejected for the
+     * limit, the subscribe's own error as its previous one, without writing a pull. The recovery completes Open with
+     * the -ERR reported, and the new connection holds only app.one.
+     */
+    public function testAPullConsumerWhoseSubWriteFailedAndWhoseReplayIsRejectedFailsWithTheLimitError(): void
+    {
+        $server = $this->pullServer(limit: 2);
+        $recorder = new LifecycleRecorder();
+        $client = $this->connect($server, reconnect: true, recorder: $recorder);
+        $connection = self::connectionOf($client);
+        // Replayed ahead of the inbox, so it keeps the one slot left after the reconnect.
+        $this->subscribe($client, 'app.one');
+        $this->answerPulls = false;
+
+        $server->stallNextWriteContaining('SUB _INBOX.JS.PULL', 5.0);
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setExpiresMs(2_000)->setBatching(1)->setDepth(1)->handle(static function (): void {});
+        $run->ignore();
+        // The inbox is registered, unconfirmed, in the step that hands its SUB write to the socket, where it is held up.
+        $this->waitUntil(static fn(): bool => self::privateArray($connection, 'unconfirmedSids') !== []);
+        self::assertSame([], $server->controlLines('SUB _INBOX.JS.PULL'), 'the SUB write is held up');
+
+        $server->limit = 1;
+        $start = hrtime(true);
+        $server->dropConnection();
+        try {
+            $run->await(new TimeoutCancellation(2.0));
+            self::fail('expected the run to fail: the new server rejected its replayed inbox');
+        } catch (JetStreamException $e) {
+            self::assertStringContainsString('Pull consumer reply inbox "_INBOX.JS.PULL.', $e->getMessage());
+            self::assertStringContainsString('may have been rejected by the server because the connection is at its subscription limit', $e->getMessage());
+            self::assertInstanceOf(ConnectionException::class, $e->getPrevious(), 'the subscribe reported the rejection');
+        }
+        $elapsed = self::secondsSince($start);
+
+        self::assertLessThan(1.0, $elapsed, sprintf('the run failed after %.3f s', $elapsed));
+        self::assertSame([], $this->pulls->getArrayCopy(), 'no pull was written');
+        $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open);
+        self::assertSame(1, $server->epoch());
+        self::assertNotSame([], $recorder->errorsContaining('maximum subscriptions exceeded'), 'the replayed inbox SUB was rejected');
+        self::assertSame(['app.one'], array_values($server->heldSubscriptions()));
+    }
+
+    /**
      * The pull pipeline's replay: a run in flight across a reconnect whose replay of its inbox the new server rejects
      * for the limit (the limit lowered to one, app.one replayed first). handle() fails within 1 s of the drop with the
      * JetStreamException saying the inbox may have been rejected for the limit, where the engine used to re-issue its
