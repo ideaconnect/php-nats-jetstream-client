@@ -2752,6 +2752,8 @@ The listener a reconnect announces the new connection to - Reconnected, or Conne
 - `testADrainThatNeverAsksForTheHandOverEndsItReleasedAtTheRequestTimeout` - `$drainReady` never fired and a 200 ms request timeout: Released (not DrainFlushed) at the budget, the inbox gone.
 - `testAnOwedUnsubStillGoesOutWhenTheStopWasMadeAlready` - A limit-rejected inbox released with a stop already made: Released without waiting for the write, and the owed UNSUB still goes out, once.
 - `testAReleaseWhoseWriteFailsEndsItReleasedAndReportsTheFailure` - The write of UNSUB and PING fails: Released well within a second rather than at the 5 s budget, the write's failure reported to the error listener, the inbox gone.
+- `testADisconnectMadeRightBehindTheReleaseWinsOverItsWrite` - disconnect() called right after retirePullInbox(), in the same tick: the close begins before the release's write is admitted, the write's guard refuses it, no UNSUB with a PING goes out, nothing is reported, Released.
+- `testARouterThatThrowsWhileTheSealRoutesTheQueueIsReportedNotThrown` - A router that throws leaves b queued behind its throw on a (#177); the release, made while a reconnect is held mid-dial, routes b in its seal, and the router's throw there is reported to the error listener, not thrown: Released, the inbox gone.
 
 ### tests/Unit/RepublishAndTransformTest.php
 - `testRepublishMinimal` - Asserts Republish::create(src, dest)->toArray() yields exactly ['src','dest'] with no headers_only key.

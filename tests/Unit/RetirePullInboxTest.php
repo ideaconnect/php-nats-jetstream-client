@@ -353,6 +353,78 @@ final class RetirePullInboxTest extends TestCase
     }
 
     /**
+     * A disconnect() made right behind the release wins over it: the close begins before the release's write is
+     * admitted, so the write's guard refuses it, nothing more goes out for the inbox (no UNSUB with a PING), nothing is
+     * reported, and the operation ends Released.
+     */
+    public function testADisconnectMadeRightBehindTheReleaseWinsOverItsWrite(): void
+    {
+        /** @var \ArrayObject<int, \Throwable> $reported */
+        $reported = new \ArrayObject();
+        [$transport, $client] = $this->client(2_000, static function (\Throwable $error) use ($reported): void {
+            $reported[] = $error;
+        });
+        [$sid] = $this->inbox($client);
+
+        $release = $client->retirePullInbox($sid, new NullCancellation());
+        $close = $client->disconnect();
+        $outcome = $release->await(new TimeoutCancellation(5));
+        $close->await(new TimeoutCancellation(5));
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertSame(0, self::writesOf($transport, 'UNSUB ' . $sid . "\r\nPING\r\n"));
+        self::assertSame([], $reported->getArrayCopy());
+        self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
+     * An inbox router that throws while the seal routes what the inbox's queue holds does not make the release throw:
+     * the inbox goes all the same, the router's exception is reported to the error listener, and the operation ends
+     * Released. The backlog is left queued behind the router's throw on the message before it (#177), and the release
+     * comes while a reconnect is under way, whose seal routes it.
+     */
+    public function testARouterThatThrowsWhileTheSealRoutesTheQueueIsReportedNotThrown(): void
+    {
+        /** @var \ArrayObject<int, \Throwable> $reported */
+        $reported = new \ArrayObject();
+        [$transport, $client] = $this->client(2_000, static function (\Throwable $error) use ($reported): void {
+            $reported[] = $error;
+        });
+        $thrown = new \RuntimeException('the router gives up');
+        /** @var \ArrayObject<int, string> $routed */
+        $routed = new \ArrayObject();
+        $sid = $client->subscribeGuarded(self::INBOX, static function (NatsMessage $message) use ($thrown, $routed): void {
+            $routed[] = $message->payload;
+
+            throw $thrown;
+        }, static function (): void {})->await();
+        $client->markSubscriptionUnbounded($sid);
+        $transport->pushFrame(ReconnectingTransport::msgFrame('evt.s', $sid, 'a') . ReconnectingTransport::msgFrame('evt.s', $sid, 'b'));
+        $this->waitUntil(static function () use ($client, $routed): bool {
+            try {
+                $client->processIncoming(new TimeoutCancellation(0.1))->await();
+            } catch (\Throwable) {
+                // The router's throw on a, which leaves b queued; or a read that found nothing yet.
+            }
+
+            return $routed->count() > 0;
+        });
+        self::assertSame(['a'], $routed->getArrayCopy(), 'b stays queued behind the throw on a');
+        $reported->exchangeArray([]);
+        $reader = $this->startRecoveryHeldMidDial($client, $transport);
+
+        $outcome = $client->retirePullInbox($sid, new NullCancellation())->await(new TimeoutCancellation(1));
+        $this->waitUntil(static fn(): bool => in_array($thrown, $reported->getArrayCopy(), true));
+        $transport->releaseDial();
+        $reader->await(new TimeoutCancellation(5));
+        $this->waitUntilOpen($client);
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertSame(['a', 'b'], $routed->getArrayCopy(), 'the seal routed b');
+        self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
      * @param (\Closure(\Throwable): void)|null $errorListener
      * @return array{ReconnectingTransport, NatsClient}
      */
