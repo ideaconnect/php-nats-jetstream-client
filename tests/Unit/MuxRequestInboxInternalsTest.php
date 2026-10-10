@@ -173,6 +173,73 @@ final class MuxRequestInboxInternalsTest extends TestCase
         self::assertSame([], $this->getPrivate($connection, 'unboundedSids'));
     }
 
+    /**
+     * The set-up of the inbox writes every UNSUB it owes for muxes dropped before, in order, ahead of its SUB and in the
+     * same write, taken as the write is made (#213): two owed sids, 7 and 8, go out as "UNSUB 7", "UNSUB 8", then the
+     * SUB and its PING, and nothing is owed afterwards.
+     */
+    public function testTheSetUpWritesEveryOwedUnsubscribeAheadOfItsSub(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $transport->onWrite = static function (string $bytes): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false || !str_starts_with($head, 'PUB svc.echo ')) {
+                return [];
+            }
+
+            return [sprintf("MSG %s 1 2\r\nok\r\n", explode(' ', $head)[2])];
+        };
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+        $this->setPrivate($connection, 'muxSidsToRelease', [7, 8]);
+
+        self::assertSame('ok', $connection->request('svc.echo', 'x', 1_000)->await()->payload);
+
+        $installs = array_values(array_filter($transport->writes, static fn(string $bytes): bool => str_contains($bytes, 'SUB _INBOX.')));
+        self::assertCount(1, $installs);
+        self::assertMatchesRegularExpression('/^UNSUB 7\r\nUNSUB 8\r\nSUB _INBOX\.[0-9a-f]+\.\* 1\r\nPING\r\n$/', $installs[0]);
+        self::assertSame([], $this->getPrivate($connection, 'muxSidsToRelease'));
+        $connection->disconnect()->await();
+    }
+
+    /**
+     * The drain releases the reply inbox together with every UNSUB still owed for muxes dropped before, in one write,
+     * once its delivery phase is over (#213): with sid 7 owed and the inbox on sid 1, the drain writes "UNSUB 7" and
+     * "UNSUB 1" together, and owes nothing afterwards.
+     */
+    public function testTheDrainReleasesTheReplyInboxWithEveryOwedUnsubscribeInOneWrite(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $transport->onWrite = static function (string $bytes): array {
+            $frames = [];
+            $head = strtok($bytes, "\r\n");
+            if ($head !== false && str_starts_with($head, 'PUB svc.echo ')) {
+                $frames[] = sprintf("MSG %s 1 2\r\nok\r\n", explode(' ', $head)[2]);
+            }
+
+            if (str_contains($bytes, "PING\r\n")) {
+                $frames[] = "PONG\r\n";
+            }
+
+            return $frames;
+        };
+        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0), $transport);
+        $connection->connect()->await();
+        self::assertSame('ok', $connection->request('svc.echo', 'x', 1_000)->await()->payload);
+        $this->setPrivate($connection, 'muxSidsToRelease', [7]);
+
+        $connection->drain()->await();
+
+        self::assertContains("UNSUB 7\r\nUNSUB 1\r\n", $transport->writes);
+        self::assertSame([], $this->getPrivate($connection, 'muxSidsToRelease'));
+    }
+
     private function invokePrivate(object $object, string $method, mixed ...$args): mixed
     {
         $ref = new \ReflectionMethod($object, $method);

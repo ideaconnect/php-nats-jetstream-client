@@ -17,6 +17,7 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\FlakyTransport;
+use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use SplQueue;
 
 use function Amp\async;
@@ -231,10 +232,20 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
     // kills MethodCallRemoval @ line 367 (drain delivers remaining buffered messages)
     public function testDrainDeliversBufferedMessagesNotDrainedByTheFlushLoop(): void
     {
-        // After the flush loop ends (here by deadline, having drained nothing), drain() must still hand
-        // any buffered message to its callback. Without that final drainAllPending() it is silently lost.
-        $transport = new FakeTransport([self::HANDSHAKE_INFO, "PONG\r\n"], blockWhenEmpty: true);
-        $connection = new NatsConnection(new NatsOptions(pingIntervalSeconds: 0, requestTimeoutMs: 1), $transport);
+        // A drain whose budget runs out before the reconnect it waited for is done winds down without a connection,
+        // and its final backlog pass must still hand a buffered message to its callback. Without that pass it is
+        // silently lost. (A drain with a connection hands nothing over past its deadline since #213: the deadline
+        // seals its delivery phase, and the message is reported as discarded instead.)
+        $transport = new ReconnectingTransport();
+        $connection = new NatsConnection(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 100,
+            maxReconnectAttempts: 1_000,
+            reconnectDelayMs: 5,
+            reconnectMaxDelayMs: 20,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+        ), $transport);
         $connection->connect()->await();
 
         $delivered = [];
@@ -242,7 +253,8 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
             $delivered[] = $m->payload;
         })->await();
 
-        // Buffer a message that the flush loop will never read (the socket blocks until the deadline).
+        // Buffer a message that no read delivers before the drain does: the connection drops right after, its
+        // reconnect's dials refused, so it stays Connecting through the drain's whole budget.
         $queue = new SplQueue();
         $queue->enqueue(new NatsMessage('updates', $sid, null, 'buffered'));
         $pending = self::getProp($connection, 'pendingMessages');
@@ -252,10 +264,18 @@ final class NatsConnection_1MutationTest extends \PHPUnit\Framework\TestCase
         $dirty = self::getProp($connection, 'pendingDirty');
         $dirty[$sid] = true;
         self::setProp($connection, 'pendingDirty', $dirty);
+        $transport->refuseDials();
+        $transport->dropConnection();
+        $reader = async(static fn(): int => $connection->readIncomingForOperation()->await()->frames);
+        $reader->ignore();
+        while ($connection->state() !== ConnectionState::Connecting) {
+            delay(0.001);
+        }
 
-        $connection->drain()->await();
+        $connection->drain()->await(new TimeoutCancellation(5));
 
         self::assertSame(['buffered'], $delivered);
+        self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
     // kills MethodCallRemoval @ line 402 (record outbound on buffered publish) and

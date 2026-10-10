@@ -18,6 +18,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Tests\Support\HeldDrainParticipant;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\SubscriptionLimitServer;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -637,34 +638,32 @@ final class MuxInboxRejectionTest extends TestCase
     }
 
     /**
-     * A drain() that begins while a request sets the mux up - while its SUB is written, or while the request waits
-     * for a new mux to be confirmed - unsubscribes that mux: the request fails with "Connection is not open", as one
-     * issued during the drain does, and is not sent. Its PUB used to go out once the set-up was over, with a reply
-     * subject the server no longer held, and the request failed only when the drain closed the connection.
+     * A drain() that begins while a request sets the mux up - while its SUB is written, held up by backpressure, or
+     * while the request waits for a new mux to be confirmed - keeps that mux subscribed while it delivers (#213): the
+     * request is sent once its set-up is over and gets its reply, the drain's delivery phase held open by a
+     * participant still handing over. The drain unsubscribes the mux once that phase is over, behind the request. The
+     * rejection protection holds: after a drop the request is still sent only once the server has confirmed the new
+     * mux. Until #213 the drain unsubscribed the mux at once and the request failed with "Connection is not open"
+     * without being sent; a handler's ackSync() during the drain failed the same way.
      */
     #[DataProvider('drainsDuringTheSetUp')]
-    public function testARequestWhoseMuxSetUpADrainOvertakesIsNotSent(bool $afterADrop): void
+    public function testARequestWhoseMuxSetUpADrainOvertakesIsSentWhileTheDrainDelivers(bool $afterADrop): void
     {
         $server = $this->echoServer(limit: 1);
         $connection = $this->connect($server);
-        $sent = 0;
-        if ($afterADrop) {
-            $appSid = $this->subscribe($connection, 'app.updates');
-            try {
-                $connection->request('svc.echo', 'one', 1_000)->await();
-                self::fail('expected the request to fail: the server rejected its reply inbox');
-            } catch (ConnectionException $e) {
-                self::assertSame(self::LIMIT_ERROR, $e->getMessage());
-            }
-            $sent = 1;
-            $connection->unsubscribe($appSid)->await();
-            $server->answerPings = false;
+        $participant = new HeldDrainParticipant();
+        $connection->addDrainParticipant($participant);
+        $sent = $afterADrop ? $this->dropTheMuxAndFreeASlot($connection, $server) : 0;
+        if (!$afterADrop) {
+            $server->stallNextWriteContaining('SUB _INBOX.', 30.0);
         }
 
         $request = $connection->request('svc.echo', 'two', 3_000);
         if ($afterADrop) {
             // The request has written the new mux SUB and the PING behind it, and waits for the PONG.
             $this->waitUntil(static fn(): bool => count(self::muxInstallWrites($server)) === 2);
+        } else {
+            $this->waitUntil(static fn(): bool => $server->writesStalled() === 1);
         }
         $drain = $connection->drain();
         if ($afterADrop) {
@@ -674,16 +673,72 @@ final class MuxInboxRejectionTest extends TestCase
             $server->pushFrame("PONG\r\n");
             delay(0.02);
             $server->pushFrame("PONG\r\n");
+        } else {
+            // The drain's PING waits behind the mux SUB, as bytes on a socket do.
+            delay(0.02);
+            $server->releaseStalledWrites();
         }
-        $drain->await();
+
+        self::assertSame('echo:two', $request->await(new TimeoutCancellation(2))->payload, 'sent and answered while the drain delivers');
+        $this->waitUntil(static fn(): bool => $participant->asked === 1);
+        self::assertFalse($drain->isComplete(), 'the participant holds the delivery phase open');
+        $participant->release();
+        $drain->await(new TimeoutCancellation(2));
+
+        self::assertCount($sent + 1, $server->controlLines('PUB svc.echo'));
+        $mux = self::muxSidOf(self::muxInstallWrites($server)[$sent]);
+        $lines = $server->controlLines();
+        $pubs = array_keys(array_filter($lines, static fn(string $line): bool => str_starts_with($line, 'PUB svc.echo ')));
+        $releases = array_keys(array_filter($lines, static fn(string $line): bool => $line === 'UNSUB ' . $mux));
+        self::assertCount(1, $releases, 'the drain released the mux once');
+        self::assertGreaterThan(max([-1, ...$pubs]), $releases[0], 'the mux was released behind the request');
+        self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /**
+     * The same set-ups, outlasting the drain's delivery phase, which its deadline ends (a budget of 300 ms): the mux SUB
+     * still held up, or the new mux still unconfirmed, the server never answering the drain's PING. The request ends with
+     * the phase, wherever it waits, with "Connection is not open", and is not sent; the drain closes within its budget.
+     * A SUB still being written is not followed by an UNSUB that could overtake it: the close releases what the server
+     * holds.
+     */
+    #[DataProvider('drainsDuringTheSetUp')]
+    public function testARequestWhoseMuxSetUpOutlastsTheDrainsDeliveryIsNotSent(bool $afterADrop): void
+    {
+        $server = $this->echoServer(limit: 1);
+        $connection = $this->connect($server, requestTimeoutMs: 300);
+        $sent = $afterADrop ? $this->dropTheMuxAndFreeASlot($connection, $server) : 0;
+        if (!$afterADrop) {
+            $server->stallNextWriteContaining('SUB _INBOX.', 30.0);
+        }
+
+        $request = $connection->request('svc.echo', 'two', 5_000);
+        if ($afterADrop) {
+            $this->waitUntil(static fn(): bool => count(self::muxInstallWrites($server)) === 2);
+        } else {
+            $this->waitUntil(static fn(): bool => $server->writesStalled() === 1);
+        }
+        $unsubscribes = count($server->controlLines('UNSUB'));
+        $start = hrtime(true);
+        $connection->drain()->await(new TimeoutCancellation(5));
+        $drainedIn = self::secondsSince($start);
 
         try {
-            $request->await();
-            self::fail('expected the request to fail: the drain unsubscribed its reply inbox');
+            $request->await(new TimeoutCancellation(1));
+            self::fail('expected the request to fail: the drain\'s delivery phase ended before it could be sent');
         } catch (ConnectionException $e) {
             self::assertSame('Connection is not open', $e->getMessage());
         }
+        self::assertLessThan(2.0, $drainedIn, sprintf('the drain took %.3f s of its 300 ms budget', $drainedIn));
         self::assertCount($sent, $server->controlLines('PUB svc.echo'), 'the request was not sent');
+        $released = array_slice($server->controlLines('UNSUB'), $unsubscribes);
+        if ($afterADrop) {
+            // The new mux's SUB is out: the drain's release of it may follow it, when the drain's flush ended a hair
+            // before its deadline as the event loop measures it, the delivery phase then over with time to spare.
+            self::assertContains($released, [[], ['UNSUB ' . self::muxSidOf(self::muxInstallWrites($server)[1])]]);
+        } else {
+            self::assertSame([], $released, 'no UNSUB ahead of the SUB still on its way');
+        }
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
 
@@ -706,6 +761,9 @@ final class MuxInboxRejectionTest extends TestCase
      * held by the server, so the mux always takes the connection's last slot. Where the window falls depends on how
      * many event-loop hops the flush takes before its PING, so the request starts after each count of hops, from 0
      * until it comes after the flush's PING. A request whose own read meets the -ERR fails with it, as any read does.
+     * The rejected SUB is written right behind the mux SUB and its PING: the mux SUB goes out from a writer of its own,
+     * within the request's budget (#194, #213), so a subscribe made in the same step as the request would be written
+     * ahead of it.
      */
     #[DataProvider('flushesBesideTheFirstRequest')]
     public function testAFlushStartedBesideTheFirstRequestDoesNotLeaveTheMuxOpenToAnotherSubscriptionsRejection(string $flush): void
@@ -736,16 +794,28 @@ final class MuxInboxRejectionTest extends TestCase
                 } else {
                     $flushing = $flush === 'rtt' ? $client->rtt() : $client->flush();
                 }
-                /** @var DeferredFuture<array{Future<NatsMessage>, Future<int>}> $requested */
-                $requested = new DeferredFuture();
-                self::afterHops($hops, static function () use ($client, $requested): void {
-                    // In one step: the first request, and a SUB the server rejects, behind the mux SUB.
-                    $requested->complete([
-                        $client->request('svc.echo', 'hello', 1_000),
-                        $client->subscribe('app.rejected', static function (): void {}),
-                    ]);
+                $issued = new class {
+                    /** @var Future<NatsMessage>|null */
+                    public ?Future $request = null;
+                    /** @var Future<int>|null */
+                    public ?Future $rejected = null;
+                };
+                // A SUB the server rejects, right behind the mux SUB and the PING written with it.
+                $server->afterWrite = static function (string $bytes) use ($server, $client, $issued): void {
+                    if (preg_match('/^SUB _INBOX\.\S+\.\* \d+\r$/m', $bytes) === 1) {
+                        $server->afterWrite = null;
+                        $issued->rejected = $client->subscribe('app.rejected', static function (): void {});
+                    }
+                };
+                self::afterHops($hops, static function () use ($client, $issued): void {
+                    $issued->request = $client->request('svc.echo', 'hello', 1_000);
                 });
-                [$request, $rejected] = $requested->getFuture()->await();
+                $this->waitUntil(static fn(): bool => $issued->request !== null && $issued->rejected !== null);
+                $request = $issued->request;
+                $rejected = $issued->rejected;
+                if ($request === null || $rejected === null) {
+                    self::fail('the request or the rejected subscribe was never made');
+                }
                 $flushing->await();
                 try {
                     $rejected->await();
@@ -1090,6 +1160,8 @@ final class MuxInboxRejectionTest extends TestCase
      * A request on a new connection does not wait for a mux set-up still under way for the connection a terminal
      * close ended: it subscribes the mux on the new connection. The request whose set-up outlived the close reports
      * the closed connection and is not sent on the new one. That set-up is held up until the new request is done.
+     * The disconnect() ends the first request as it begins, with the request lifetime of its connection (#213), rather
+     * than once its SUB write is let through: the request no longer waits for that write past the close.
      */
     public function testARequestAfterACloseAndConnectDoesNotJoinASetUpLeftFromTheClosedConnection(): void
     {
@@ -1099,20 +1171,24 @@ final class MuxInboxRejectionTest extends TestCase
         $first = $connection->request('svc.echo', 'one', 10_000);
         delay(0.01);
         $connection->disconnect()->await();
+
+        try {
+            $first->await(new TimeoutCancellation(2));
+            self::fail('expected the first request to fail with the closed connection');
+        } catch (ConnectionException $e) {
+            self::assertSame('Connection is not open', $e->getMessage());
+        }
+
         $connection->connect()->await();
 
         $start = hrtime(true);
         self::assertSame('echo:two', $connection->request('svc.echo', 'two', 10_000)->await()->payload);
         self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait for the set-up of the closed connection');
         $server->releaseStalledWrites();
+        delay(0.01);
 
-        try {
-            $first->await();
-            self::fail('expected the first request to fail with the closed connection');
-        } catch (ConnectionException $e) {
-            self::assertSame('Connection was closed while the reply inbox was being set up', $e->getMessage());
-        }
         self::assertCount(1, $server->controlLines('PUB svc.echo', 1), 'only the second request was sent');
+        self::assertSame([], $server->controlLines('UNSUB', 1), 'the abandoned set-up wrote nothing on the new connection');
     }
 
     /** A terminal close while a request waits for the server to confirm the mux: it reports the closed connection. */
@@ -1466,9 +1542,11 @@ final class MuxInboxRejectionTest extends TestCase
         bool $waitForReconnect = true,
         int|float $pingIntervalSeconds = 0,
         ?LifecycleRecorder $recorder = null,
+        int $requestTimeoutMs = 10_000,
     ): NatsConnection {
         $connection = new NatsConnection(new NatsOptions(
             connectTimeoutMs: 500,
+            requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: $reconnect,
             maxReconnectAttempts: 3,
             reconnectDelayMs: 1,
@@ -1487,6 +1565,37 @@ final class MuxInboxRejectionTest extends TestCase
     private function subscribe(NatsConnection $connection, string $subject): int
     {
         return $connection->subscribe($subject, static function (): void {})->await();
+    }
+
+    /**
+     * Has the server reject the mux at its limit of one subscription, held by another one, then frees that slot and
+     * stops answering PINGs: the next request subscribes a new mux and waits for the server to confirm it.
+     *
+     * @return int How many requests were sent: the one the rejection failed.
+     */
+    private function dropTheMuxAndFreeASlot(NatsConnection $connection, SubscriptionLimitServer $server): int
+    {
+        $appSid = $this->subscribe($connection, 'app.updates');
+        try {
+            $connection->request('svc.echo', 'one', 1_000)->await();
+            self::fail('expected the request to fail: the server rejected its reply inbox');
+        } catch (ConnectionException $e) {
+            self::assertSame(self::LIMIT_ERROR, $e->getMessage());
+        }
+        $connection->unsubscribe($appSid)->await();
+        $server->answerPings = false;
+
+        return 1;
+    }
+
+    /** The sid of the mux a write from {@see muxInstallWrites()} subscribed. */
+    private static function muxSidOf(string $install): int
+    {
+        if (preg_match('/^SUB _INBOX\.\S+\.\* (\d+)\r$/m', $install, $match) !== 1) {
+            self::fail('not a write that subscribed a mux: ' . $install);
+        }
+
+        return (int) $match[1];
     }
 
     /**
