@@ -271,6 +271,16 @@ final class NatsConnection
      */
     private array $subscriptionRejectionHandlers = [];
     /**
+     * Pull consumer inboxes being retired ({@see retirePullInbox()}, #211), by sid, with their subject: the record that
+     * keeps the run's rejection observer ({@see $subscriptionRejectionHandlers}) after the sid has left the replay and
+     * its routing has been sealed, so that a permissions violation naming the inbox still reaches the run while its
+     * terminal onError and its hand-over run. Diagnostic ownership only: it never makes the sid replayable or routable.
+     * The run's final {@see unsubscribe()} removes it, with the callback; a terminal close clears it.
+     *
+     * @var array<int, string>
+     */
+    private array $retiringInboxes = [];
+    /**
      * Sids subscribed through {@see subscribeGuarded()}: the reply inboxes of the JetStream pull fetch, the pull
      * pipeline and the batched Direct Get, whose rejection by the subscription limit must reach the operation
      * waiting on them, whichever fiber's read meets the -ERR (#175). Each gets the reply inbox's rule: a PING is
@@ -1487,6 +1497,7 @@ final class NatsConnection
         $this->terminalCloses++;
         $this->unboundedSids = [];
         $this->subscriptionRejectionHandlers = [];
+        $this->retiringInboxes = [];
         // The guarded inboxes went with their subscriptions, and the server dropped whatever it held with the
         // connection: nothing is left to confirm, reject or release (#175).
         $this->guardedSids = [];
@@ -3075,6 +3086,10 @@ final class NatsConnection
     {
         return async(function () use ($sid, $maxMessages): void {
             if (!isset($this->subscriptionMeta[$sid])) {
+                // A pull consumer inbox retired before (#211): its rejection observer goes now, with nothing to write.
+                if (isset($this->retiringInboxes[$sid])) {
+                    unset($this->retiringInboxes[$sid], $this->subscriptionRejectionHandlers[$sid]);
+                }
                 $this->releaseRejectedSubscription($sid);
 
                 return;
@@ -3372,9 +3387,12 @@ final class NatsConnection
      * what the sid's queue holds goes through its router, and then the sid's local state goes, so that nothing more
      * reaches the run; a frame for the sid read after that is dropped as one for an unknown sid. A guarded inbox the
      * client already treated as rejected, whose UNSUB is owed ({@see rejectUnconfirmedSubscriptions()}), has that UNSUB
-     * written once, within the same budget. A timeout, and a read failure of the driver, are reported through the error
-     * listener in a fiber of their own, so that a listener that suspends cannot hold the operation, and so is anything
-     * else that ends it early (a router that throws while the seal routes the queue): nothing is thrown.
+     * written once, within the same budget. The run's rejection observer, the callback its guarded subscribe registered,
+     * outlives the routing (#211, {@see $retiringInboxes}): a permissions violation naming the inbox, read while the run's
+     * terminal onError or hand-over runs, still reaches the run, until its final {@see unsubscribe()} removes it. A
+     * timeout, and a read failure of the driver, are reported through the error listener in a fiber of their own, so
+     * that a listener that suspends cannot hold the operation, and so is anything else that ends it early (a router that
+     * throws while the seal routes the queue): nothing is thrown.
      * A plain {@see unsubscribe()} of the sid afterwards writes nothing.
      *
      * The fence is best effort: a timed-out UNSUB can still leave interest on the server until its write lands, and a
@@ -3417,6 +3435,12 @@ final class NatsConnection
                     }
 
                     return InboxRetirement::Released;
+                }
+
+                // The run's rejection observer outlives the sid's routing, until the run's final unsubscribe() (#211).
+                $subject = $this->subscriptionMeta[$sid]['subject'] ?? null;
+                if ($subject !== null && isset($this->subscriptionRejectionHandlers[$sid])) {
+                    $this->retiringInboxes[$sid] = $subject;
                 }
 
                 if ($this->state === ConnectionState::Draining) {
@@ -7137,8 +7161,10 @@ final class NatsConnection
                 // may appear quoted or bare in the server's -ERR text.
                 if (preg_match('/subscription to "?([^\s"\']+)"?/i', $error, $subjectMatch) === 1) {
                     $rejectedSubject = $subjectMatch[1];
-                    foreach ($this->subscriptionMeta as $rejectedSid => $meta) {
-                        if ($meta['subject'] === $rejectedSubject && isset($this->subscriptionRejectionHandlers[$rejectedSid])) {
+                    // A pull consumer inbox being retired has left subscriptionMeta, and keeps its observer (#211).
+                    $subjects = array_map(static fn(array $meta): string => $meta['subject'], $this->subscriptionMeta) + $this->retiringInboxes;
+                    foreach ($subjects as $rejectedSid => $subscribedSubject) {
+                        if ($subscribedSubject === $rejectedSubject && isset($this->subscriptionRejectionHandlers[$rejectedSid])) {
                             // A guarded inbox the server has rejected by name has nothing left to confirm or to
                             // take for the limit's (#175); its owner fails and unsubscribes it.
                             unset($this->unconfirmedSids[$rejectedSid]);
@@ -8591,7 +8617,10 @@ final class NatsConnection
         unset($this->autoUnsubMax[$sid]);
         // Hygiene: the slow-consumer exemption flag must never outlive its sid (#118).
         unset($this->unboundedSids[$sid]);
-        unset($this->subscriptionRejectionHandlers[$sid]);
+        // A pull consumer inbox being retired keeps its rejection observer until its run's final unsubscribe() (#211).
+        if (!isset($this->retiringInboxes[$sid])) {
+            unset($this->subscriptionRejectionHandlers[$sid]);
+        }
         // Nor the guard of a guarded inbox (#175): nothing is left to confirm or reject once the sid is gone. The
         // pong slot of the PING behind its SUB stays queued, since that PING's PONG is still owed.
         unset($this->guardedSids[$sid]);

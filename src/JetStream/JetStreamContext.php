@@ -2825,11 +2825,27 @@ final class JetStreamContext
      * group pin captured from the first; while it holds a message, every newer one joins it, so that none overtakes it
      * through a pull, and the run issues nothing. Wherever the run ends it is handed over behind the pulls, as their
      * buffers are: on the client's drain() asking for it, before a failure, and on a terminal status, which now also
-     * hands over what the pulls behind the one it ended hold, where they used to be left undelivered; stop() and a
+     * hands over what the pulls behind the one it ended hold, where they used to be left undelivered, after the run has
+     * closed its inbox to new deliveries and read in what the server sent those pulls before the UNSUB (#211, below);
+     * stop() and a
      * close that discards leave it undelivered, as they leave a pull's buffer. A run whose requests the server holds
      * more of than the run counts can bring more messages than its pulls asked for: they all reach the handler, and the
      * run pulls again once they have. A finite run is unchanged: it never resets, keeps its exact count, and drops a
      * message past its last pull's batch.
+     *
+     * An infinite run that ends on a terminal status closes its inbox to new deliveries before onError (#211,
+     * {@see collectBeforeTheTerminalStatus()}): one bounded UNSUB/PING/PONG round trip through
+     * {@see \IDCT\NATS\Core\NatsClient::retirePullInbox()}, whatever the pulls' expiry and also with nothing behind
+     * the status, which routes what the server sent the pulls behind it before the UNSUB into them, or into the
+     * overflow, and seals the routing, the rejection observer kept until the run's final unsubscribe. A consumer
+     * deleted and recreated under the same name while the handler works leaves the waiting pull's 409 Consumer Deleted
+     * unread, and the refill the run then issues reaches the recreated consumer: its messages, read after the status,
+     * used to be read after the run's UNSUB and dropped. After that wait the run's lifecycle rules apply in their order:
+     * a stop() or a close that discards returns the count delivered so far, with no onError and no tail; the client's
+     * drain() asking for the hand-over, or a rejection of the inbox (#206), goes back to the top of the loop, which hands
+     * the rest over or throws the rejection, onError not called; otherwise onError gets the status once, and the pulls
+     * behind it and the overflow are handed over and counted, with the #206 checks after onError and after that
+     * hand-over. No path pulls again. A finite run, 423 pin recovery and the routine statuses keep their paths.
      *
      * @internal Engine entry point for {@see PullConsumerIterator}; not part of the supported public API.
      *
@@ -3296,7 +3312,25 @@ final class JetStreamContext
                         }
 
                         // Terminal error (terminal 409 "Consumer Deleted", server error, ...): surface
-                        // once and stop the run.
+                        // once and stop the run. No further pull goes out: the run's inbox is first closed to new
+                        // deliveries (#211), within one request-timeout budget, so that what the server sent the pulls
+                        // behind this one before it had the UNSUB - the answer to a refill a recreated consumer served,
+                        // still on the socket when the status was read - is routed into them, to be handed over below,
+                        // rather than read after the run's UNSUB and dropped. The fence runs even with nothing behind
+                        // this pull: an empty tail does not prove that nothing is on its way.
+                        $this->collectBeforeTheTerminalStatus($sid, $drainParticipant, $ctl);
+                        // The fence waited, and the run's lifecycle rules apply again, in their order. A stop, or a close
+                        // that discards what the connection received: the count delivered so far, with no terminal
+                        // callback and no tail.
+                        if ($ctl->isStopRequested() || $this->client->isDiscardingUndelivered()) {
+                            return $totalProcessed;
+                        }
+                        // The client's drain() asked for the hand-over, or the server rejected the inbox (#206): back to
+                        // the top, which hands the rest over and ends with the count, or throws the rejection, onError
+                        // not called. The drain keeps its precedence there over the rejection. Neither path pulls again.
+                        if ($drainParticipant->isHandOverRequested() || $inboxRejection->error() !== null) {
+                            continue 2;
+                        }
                         if ($cfg->onError !== null) {
                             ($cfg->onError)($this->pullStatusException($code, $description));
                         }
@@ -3793,14 +3827,40 @@ final class JetStreamContext
         callable $handler,
         PullPipelineControl $ctl,
     ): void {
-        // Never throws: what ends the release early is reported, and the run's own failure is the one its caller throws.
-        $this->client->retirePullInbox($sid, $ctl->stopInterruption(), $drainParticipant->wakeUp())->await();
+        $this->retireRunInbox($sid, $drainParticipant, $ctl);
 
         try {
             $this->deliverWhatTheRunHolds($inflight, $issueOrder, $overflow, $handler, $ctl);
         } catch (\Throwable $handlerFailure) {
             $this->emitClientError($handlerFailure);
         }
+    }
+
+    /**
+     * What an infinite {@see consumePipelined()} run does once its retire phase has selected a terminal status, before
+     * onError and before the hand-over of the pulls behind that status (#211): it closes the run's inbox to new
+     * deliveries ({@see retireRunInbox()}), so that what the server sent those pulls before it had the UNSUB is routed
+     * into them, or into the overflow, and handed over and counted with the rest, where it used to be read after the run's
+     * UNSUB and dropped. The case: a consumer deleted and recreated under the same name while the handler works, the
+     * waiting pull's 409 Consumer Deleted unread, the refill served by the recreated consumer in a later read than that
+     * status. One bounded round trip, whatever the pulls' expiry, also with nothing behind the status; the run's
+     * rejection observer stays in place through onError and the hand-over, the engine's checks of the rejection after
+     * them still meaningful. A finite run, 423 pin recovery and the routine statuses keep their paths.
+     */
+    private function collectBeforeTheTerminalStatus(int $sid, PullPipelineDrainParticipant $drainParticipant, PullPipelineControl $ctl): void
+    {
+        $this->retireRunInbox($sid, $drainParticipant, $ctl);
+    }
+
+    /**
+     * Closes a {@see consumePipelined()} run's inbox to new deliveries through
+     * {@see \IDCT\NATS\Core\NatsClient::retirePullInbox()}, with the run's stop as its stop and the run's drain
+     * participant's wake-up as the readiness of a drain under way. It never throws: what ends the release early is
+     * reported by the connection, and the run's own outcome comes first.
+     */
+    private function retireRunInbox(int $sid, PullPipelineDrainParticipant $drainParticipant, PullPipelineControl $ctl): void
+    {
+        $this->client->retirePullInbox($sid, $ctl->stopInterruption(), $drainParticipant->wakeUp())->await();
     }
 
     /**
