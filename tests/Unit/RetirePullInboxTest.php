@@ -16,8 +16,11 @@ use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\HeldDrainParticipant;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
+use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
+
+use function Amp\delay;
 
 /**
  * The connection-owned release of a pull consumer run's inbox, NatsClient::retirePullInbox() (#212), state by state:
@@ -188,10 +191,12 @@ final class RetirePullInboxTest extends TestCase
         });
 
         $outcome = $client->retirePullInbox($sid, new NullCancellation(), $ready->getCancellation())->await(new TimeoutCancellation(1));
+        $sealed = !$client->isSubscriptionActive($sid);
         $participant->release();
         $drain->await(new TimeoutCancellation(5));
 
         self::assertSame(InboxRetirement::DrainFlushed, $outcome);
+        self::assertTrue($sealed, 'the inbox gone before the drain closes');
         self::assertSame(['UNSUB ' . $sid], $transport->controlLinesStartingWith('UNSUB '), 'only the drain\'s UNSUB');
     }
 
@@ -350,6 +355,73 @@ final class RetirePullInboxTest extends TestCase
         self::assertSame(InboxRetirement::Released, $outcome);
         self::assertLessThan(1.0, $elapsed);
         self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
+     * A stop() made while the release waits for its PONG (PINGs unanswered, a 5 s budget) ends it at once: Released,
+     * well before the budget, and nothing is reported, since the stop, not the server, ended the wait.
+     */
+    public function testAStopWhileWaitingForThePongEndsItAtOnceWithoutAReport(): void
+    {
+        /** @var \ArrayObject<int, \Throwable> $reported */
+        $reported = new \ArrayObject();
+        [$transport, $client] = $this->client(5_000, static function (\Throwable $error) use ($reported): void {
+            $reported[] = $error;
+        });
+        [$sid] = $this->inbox($client);
+        $transport->answerPings = false;
+        $stop = new DeferredCancellation();
+        EventLoop::delay(0.05, static function () use ($stop): void {
+            $stop->cancel();
+        });
+
+        $started = hrtime(true);
+        $outcome = $client->retirePullInbox($sid, $stop->getCancellation())->await(new TimeoutCancellation(5));
+        $elapsed = $this->secondsSince($started);
+        delay(0.05);
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertLessThan(1.0, $elapsed);
+        self::assertSame(1, self::writesOf($transport, 'UNSUB ' . $sid . "\r\nPING\r\n"));
+        self::assertSame([], $reported->getArrayCopy());
+        self::assertFalse($client->isSubscriptionActive($sid));
+    }
+
+    /**
+     * A disconnect() made while the release waits for its PONG (PINGs unanswered, a 5 s budget) ends it at once:
+     * Released, and the release reports nothing of its own (no TimeoutException), since the close, which discards what
+     * the connection holds, ended the wait. The only report is the close's EOF met by the read in flight, which a flush()
+     * waiting for its PONG reports alike.
+     */
+    public function testADisconnectWhileWaitingForThePongEndsItWithoutAReport(): void
+    {
+        /** @var \ArrayObject<int, \Throwable> $reported */
+        $reported = new \ArrayObject();
+        [$transport, $client] = $this->client(5_000, static function (\Throwable $error) use ($reported): void {
+            $reported[] = $error;
+        });
+        [$sid] = $this->inbox($client);
+        $transport->answerPings = false;
+        /** @var \ArrayObject<int, \Amp\Future<void>> $closes */
+        $closes = new \ArrayObject();
+        EventLoop::delay(0.05, static function () use ($client, $closes): void {
+            $closes[] = $client->disconnect();
+        });
+
+        $started = hrtime(true);
+        $outcome = $client->retirePullInbox($sid, new NullCancellation())->await(new TimeoutCancellation(5));
+        $elapsed = $this->secondsSince($started);
+        $close = $closes[0] ?? null;
+        self::assertNotNull($close);
+        $close->await(new TimeoutCancellation(5));
+        delay(0.05);
+
+        self::assertSame(InboxRetirement::Released, $outcome);
+        self::assertLessThan(1.0, $elapsed);
+        self::assertSame([], array_values(array_filter(
+            $reported->getArrayCopy(),
+            static fn(\Throwable $error): bool => !$error instanceof TransportClosedException,
+        )), 'nothing of the release\'s own');
     }
 
     /**
