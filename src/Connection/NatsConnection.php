@@ -13,6 +13,7 @@ use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\Enum\InboxRetirement;
 use IDCT\NATS\Connection\Enum\SlowConsumerPolicy;
 use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsHeaders;
@@ -40,6 +41,7 @@ use SplQueue;
 
 use function Amp\async;
 use function Amp\delay;
+use function Amp\Future\awaitAny;
 use function Amp\Future\awaitFirst;
 
 /**
@@ -3337,6 +3339,288 @@ final class NatsConnection
 
             $this->dropSubscriptionState($sid);
         });
+    }
+
+    /**
+     * Closes a JetStream pull consumer run's inbox to new deliveries before the run hands what it holds to its handler
+     * (#212): the server stops serving the run's pulls, so that what is published meanwhile stays in the stream for the
+     * next pull, rather than go to a run that is ending, where it was dropped unacked. What the server sent the inbox
+     * before it had the UNSUB is still routed to the run, through the inbox's own router, before the local state goes.
+     *
+     * For a guarded, unbounded pull inbox ({@see subscribeGuarded()}, {@see markSubscriptionUnbounded()}) whose router
+     * never suspends and never calls application code, with one run owning it; not a replacement for
+     * {@see drainSubscription()}, whose public contract is unchanged. One budget, max(0.1 s, requestTimeoutMs), on a
+     * referenced timer, bounds the whole operation, whatever it waits for: the pull's expiry, which can be 30 s or more,
+     * never does. The stop and the connection's request lifetime ({@see $requestLifetime}), which a disconnect() and the
+     * seal of a drain()'s delivery phase cancel, end it as well. What it does depends on the state it finds:
+     *
+     * - Open: the sid leaves the replay first ({@see resubscribeAll()} never subscribes it again), then `UNSUB <sid>`
+     *   and a PING go out in one write, whose pong slot is queued in the step that hands the bytes to the transport, and
+     *   whose guard refuses the write once the operation has ended, on another connection generation, or once a close
+     *   discards what the connection holds. A read driver of its own reads until that PONG, the inbox's router still
+     *   in place, so that what the server sent before the UNSUB reaches the run. The operation waits for the PONG
+     *   itself, not for the read: a handler of another subscription that the read runs and that suspends cannot hold it
+     *   past its budget. When it ends before the write was admitted, a bare UNSUB goes out instead, detached, on the
+     *   same connection only.
+     * - Draining: the client's drain() owns the UNSUB (its scan still finds the sid) and its flush; the operation waits
+     *   for $drainReady, the run's drain participant's wake-up, which the drain fires once its flush phase is over, or
+     *   the end of its budget, the stop, or the seal of the drain's delivery.
+     * - A reconnect under way, or closed: the sid leaves the replay, and {@see finishReplayWindow()} releases it if the
+     *   reconnect had subscribed it again already; nothing waits for the reconnect.
+     *
+     * However it ends, it seals synchronously: unless the run was stopped or a close discards what the connection holds,
+     * what the sid's queue holds goes through its router, and then the sid's local state goes, so that nothing more
+     * reaches the run; a frame for the sid read after that is dropped as one for an unknown sid. A guarded inbox the
+     * client already treated as rejected, whose UNSUB is owed ({@see rejectUnconfirmedSubscriptions()}), has that UNSUB
+     * written once, within the same budget. A timeout, and a read failure of the driver, are reported through the error
+     * listener in a fiber of their own, so that a listener that suspends cannot hold the operation, and so is anything
+     * else that ends it early (a router that throws while the seal routes the queue): nothing is thrown.
+     * A plain {@see unsubscribe()} of the sid afterwards writes nothing.
+     *
+     * The fence is best effort: a timed-out UNSUB can still leave interest on the server until its write lands, and a
+     * PONG proves the server processed the UNSUB, not that every topology (gateways, leaf nodes) has dropped the pulls.
+     *
+     * @internal For the pull consumer engine ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}); not
+     *           part of the supported API.
+     *
+     * @param Cancellation $stop The run's stop() wake-up: ends the collection, and the routing of what is queued; the
+     *        UNSUB still goes out.
+     * @param Cancellation|null $drainReady Fires once a drain() of the connection has asked the run for its hand-over.
+     * @return Future<InboxRetirement>
+     */
+    public function retirePullInbox(int $sid, Cancellation $stop, ?Cancellation $drainReady = null): Future
+    {
+        return async(function () use ($sid, $stop, $drainReady): InboxRetirement {
+            $budget = max(0.1, $this->options->requestTimeoutMs / 1000);
+            // Referenced, unlike a TimeoutCancellation's timer: what the operation waits for may hold no watcher that
+            // keeps the event loop running (a handler waiting on a gate), and its deadline must still come.
+            $deadline = new DeferredCancellation();
+            $timer = EventLoop::delay($budget, static function () use ($deadline): void {
+                $deadline->cancel();
+            });
+            $owner = new CompositeCancellation($deadline->getCancellation(), $stop, $this->requestLifetime->getCancellation());
+
+            try {
+                if (!isset($this->subscriptions[$sid])) {
+                    // A guarded inbox the client treated as rejected (#175): its state went with the -ERR, and its UNSUB
+                    // is owed. Written now, before the run's hand-over, rather than by the run's final unsubscribe().
+                    if (!$this->takeOwedRelease($sid)) {
+                        return InboxRetirement::Gone;
+                    }
+
+                    if ($this->state === ConnectionState::Open) {
+                        try {
+                            $this->sendSubscriptionRelease($sid, $this->connectionGeneration)->await($owner);
+                        } catch (CancelledException) {
+                            // The write goes on in its own fiber; the run does not wait for it.
+                        }
+                    }
+
+                    return InboxRetirement::Released;
+                }
+
+                if ($this->state === ConnectionState::Draining) {
+                    // The drain unsubscribes the sid and flushes; its request for the hand-over says its flush is over.
+                    $ready = false;
+                    if ($drainReady !== null) {
+                        try {
+                            self::awaitSignal($drainReady, $owner);
+                            $ready = true;
+                        } catch (CancelledException) {
+                            // Its budget, the stop, or the seal of the drain's delivery came first.
+                        }
+                    }
+                    $this->sealRetiringInbox($sid, $stop);
+
+                    return $ready ? InboxRetirement::DrainFlushed : InboxRetirement::Released;
+                }
+
+                // From here on no reconnect subscribes the sid again; a replay that already did is undone by
+                // finishReplayWindow() before the connection goes Open. The router and the queue stay until the seal.
+                unset($this->subscriptionMeta[$sid]);
+
+                if ($this->state !== ConnectionState::Open) {
+                    $this->sealRetiringInbox($sid, $stop);
+
+                    return InboxRetirement::Released;
+                }
+
+                return $this->fencePullInbox($sid, $stop, $owner);
+            } catch (\Throwable $failure) {
+                // Nothing is thrown: the run's own outcome comes first. The seal has removed the inbox's local state
+                // whatever failed (a router that threw while it routed the queue).
+                $this->reportRetirementFailure($failure);
+
+                return InboxRetirement::Released;
+            } finally {
+                EventLoop::cancel($timer);
+            }
+        });
+    }
+
+    /**
+     * The Open branch of {@see retirePullInbox()}: UNSUB and PING in one write, a read driver until that PING's PONG,
+     * then the seal. Returns how it ended.
+     */
+    private function fencePullInbox(int $sid, Cancellation $stop, Cancellation $owner): InboxRetirement
+    {
+        $generation = $this->connectionGeneration;
+        $slot = $this->newPongSlot();
+        // Fired by the seal: a writer that has not run by then writes nothing.
+        $seal = new DeferredCancellation();
+        $admitted = false;
+        // Called by the writer right before it queues the slot and hands the bytes to the transport, with nothing
+        // suspending in between: a write admitted here is the one whose PONG the slot waits for.
+        $guard = function () use ($seal, &$admitted, $generation): void {
+            if (
+                $seal->isCancelled()
+                || $this->connectionGeneration !== $generation
+                || !$this->isUsableForOperations(acceptDraining: true)
+                || $this->isDiscardingUndelivered()
+            ) {
+                throw new ConnectionException('The release of the pull consumer inbox was not written');
+            }
+
+            $admitted = true;
+        };
+
+        $outcome = InboxRetirement::Released;
+        $diagnostic = null;
+        $driverStop = new DeferredCancellation();
+        try {
+            // Ended before it began (a stop made already, the request lifetime over): no fence, the bare UNSUB below.
+            $owner->throwIfRequested();
+            $this->writeBounded($this->codec->encodeUnsubscribe($sid) . $this->codec->encodePing(), $owner, $slot, $guard);
+
+            $readCancellation = new CompositeCancellation($owner, $driverStop->getCancellation());
+            $driver = async(function () use ($sid, $slot, $readCancellation, $generation): void {
+                try {
+                    while (!$slot->isComplete() && !$readCancellation->isRequested() && $this->connectionGeneration === $generation) {
+                        // The inbox's own queue first (ownSid), and what the server sent it before the UNSUB, through
+                        // its router. A full queue elsewhere, a handler that throws and an -ERR the server keeps the
+                        // connection open for are reported, as in drainSubscription()'s flush: the run already fails.
+                        $read = $this->readChunk(
+                            $readCancellation,
+                            \Fiber::getCurrent(),
+                            reportOverflows: true,
+                            ownSid: $sid,
+                            reportHandlerFailures: true,
+                            reportFailuresKeepingTheConnection: true,
+                            pongSlot: $slot,
+                        )->await();
+                        if (!$read->consumedBytes) {
+                            delay(0.001, cancellation: $readCancellation);
+                        }
+                    }
+                } catch (CancelledException) {
+                    // The operation ended, or its budget did.
+                }
+            });
+            $driver->ignore();
+
+            // The PONG, whichever fiber's read takes it, or the driver's failure; never the read itself, which can be
+            // delivering another subscription's handler that suspends.
+            awaitAny([$slot->getFuture(), $driver], $owner);
+            if ($slot->isComplete()) {
+                $slot->getFuture()->await();
+                $outcome = InboxRetirement::Fenced;
+            }
+        } catch (CancelledException) {
+            if (!$stop->isRequested() && !$this->isDiscardingUndelivered() && $admitted) {
+                $diagnostic = new TimeoutException(sprintf(
+                    'Releasing the pull consumer inbox (sid %d) timed out before the server answered its PING: what the server sent it before the UNSUB may be lost',
+                    $sid,
+                ));
+            }
+        } catch (\Throwable $failure) {
+            // The write failed (a dead socket, or the guard refused it), or the connection ended under the fence, its
+            // PONG gone with the socket; a read failure of the driver is reported, as nothing else reports it.
+            if ($admitted && !$slot->isComplete()) {
+                $diagnostic = $failure;
+            }
+        } finally {
+            $driverStop->cancel();
+        }
+
+        $seal->cancel();
+        $this->sealRetiringInbox($sid, $stop);
+        if (!$admitted) {
+            // The operation ended before its write was admitted: a bare UNSUB, detached, on this connection only.
+            $this->sendSubscriptionRelease($sid, $generation);
+        }
+
+        if ($diagnostic !== null) {
+            $this->reportRetirementFailure($diagnostic);
+        }
+
+        return $outcome;
+    }
+
+    /**
+     * Reports what ended a {@see retirePullInbox()} without a completed fence, as a warning, from a fiber of its own: an
+     * error listener that suspends must not hold the operation, nor keep the inbox routable.
+     */
+    private function reportRetirementFailure(\Throwable $failure): void
+    {
+        async(function () use ($failure): void {
+            $this->emitErrorSafely($failure, 'warning');
+        })->ignore();
+    }
+
+    /**
+     * The seal of {@see retirePullInbox()}, with nothing suspending: unless the run was stopped or a close discards what
+     * the connection holds, what the sid's queue holds goes through its router (which never suspends), in order, and
+     * then the sid's local state goes, so that nothing more is routed to the run.
+     */
+    private function sealRetiringInbox(int $sid, Cancellation $stop): void
+    {
+        $queue = $this->pendingMessages[$sid] ?? null;
+        $router = $this->subscriptions[$sid] ?? null;
+        if (
+            $queue !== null
+            && $router !== null
+            && !isset($this->dispatchingSids[$sid])
+            && !$stop->isRequested()
+            && !$this->isDiscardingUndelivered()
+            && !$this->drainDeliverySealed
+        ) {
+            try {
+                while (!$queue->isEmpty()) {
+                    /** @var NatsMessage $message */
+                    $message = $queue->dequeue();
+                    $this->deliveredCounts[$sid] = ($this->deliveredCounts[$sid] ?? 0) + 1;
+                    $router($message);
+                }
+            } finally {
+                // The router of a pull inbox never throws; should one, the inbox still goes, and the caller reports it.
+                $this->dropSubscriptionState($sid);
+            }
+
+            return;
+        }
+
+        $this->dropSubscriptionState($sid);
+    }
+
+    /** Waits until $signal fires, within $within, whose CancelledException ends the wait. */
+    private static function awaitSignal(Cancellation $signal, Cancellation $within): void
+    {
+        if ($signal->isRequested()) {
+            return;
+        }
+
+        /** @var DeferredFuture<null> $fired */
+        $fired = new DeferredFuture();
+        $id = $signal->subscribe(static function () use ($fired): void {
+            if (!$fired->isComplete()) {
+                $fired->complete();
+            }
+        });
+        try {
+            $fired->getFuture()->await($within);
+        } finally {
+            $signal->unsubscribe($id);
+        }
     }
 
     /**

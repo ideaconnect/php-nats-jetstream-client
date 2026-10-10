@@ -71,11 +71,19 @@ trait PullServerTrait
                 return [];
             }
 
-            // Learn the long-lived pull inbox sid from "SUB _INBOX.JS.PULL.<base>.* <sid>".
+            // Learn the long-lived pull inbox sid from "SUB _INBOX.JS.PULL.<base>.* <sid>". The PING the guarded
+            // subscribe writes behind it is answered, in protocol order, as a server answers every PING: a PING
+            // written later - the one behind a failing run's UNSUB of its inbox (#212) - then gets its own PONG.
             if (str_starts_with($head, 'SUB _INBOX.JS.PULL.') && str_contains($head, '.* ')) {
                 $pullSid = (int) (explode(' ', $head)[2] ?? 1);
 
-                return [];
+                return self::pongsFor($bytes);
+            }
+
+            // A failing run releases its inbox before it hands what its pulls hold over (#212): UNSUB, and a PING
+            // whose PONG fences what the server sent before the UNSUB.
+            if (str_starts_with($head, 'UNSUB ')) {
+                return self::pongsFor($bytes);
             }
 
             if (!str_starts_with($head, 'PUB ' . $pullSubject . ' ')) {
@@ -130,6 +138,16 @@ trait PullServerTrait
 
             return $frames;
         };
+    }
+
+    /**
+     * A PONG for each PING in $bytes, the client's write of protocol frames: a server answers every PING, in order.
+     *
+     * @return list<string>
+     */
+    private static function pongsFor(string $bytes): array
+    {
+        return array_fill(0, substr_count($bytes, "PING\r\n"), "PONG\r\n");
     }
 
     /** @return list<string> The CONSUMER.MSG.NEXT pull requests recorded on the transport, in order. */

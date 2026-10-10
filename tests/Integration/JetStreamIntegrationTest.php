@@ -21,6 +21,7 @@ use IDCT\NATS\JetStream\ObjectStore\ObjectData;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\Tests\Support\DroppingTransport;
 use IDCT\NATS\Transport\AmpSocketTransport;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\async;
@@ -2480,6 +2481,95 @@ final class JetStreamIntegrationTest extends TestCase
             $second?->ignore();
             $js->deleteStream($stream)->await();
             $client->disconnect()->await();
+        }
+    }
+
+    /** @return iterable<string, array{array<string, mixed>, bool}> */
+    public static function consumersThatLoseWhatAFailedRunDrops(): iterable
+    {
+        yield 'ack_policy none' => [['ack_policy' => 'none'], false];
+        yield 'explicit acks, max_deliver 1' => [['ack_policy' => 'explicit', 'max_deliver' => 1], true];
+    }
+
+    /**
+     * A pull consumer run that fails closes its inbox to new deliveries before it hands what its pull holds to its
+     * handler (#212), so that what is published during the hand-over stays in the stream for the next pull. The worker
+     * runs with handlerErrorsFailOperations and a subscription whose handler throws; its run (batch 3, depth 1, a 30 s
+     * expiry) holds m-1 and m-2, its pull waiting for a third, when a message on that subscription ends the run. On m-1
+     * the handler has m-3 published and gives the server 300 ms to deliver it, acking each message where the consumer
+     * takes acks. The handler gets m-1 and m-2, handle() throws the subscription handler's exception, the consumer counts
+     * two delivered and one pending, and the next independent pull gets m-3. The server used to deliver m-3 to the
+     * failed run's pull, whose inbox was released only after the hand-over: delivered, so lost under ack_policy none or
+     * max_deliver 1, and never handled.
+     *
+     * @param array<string, mixed> $consumerConfig
+     */
+    #[DataProvider('consumersThatLoseWhatAFailedRunDrops')]
+    public function testAFailedPullConsumerRunLeavesWhatIsPublishedDuringItsHandOverForTheNextPull(array $consumerConfig, bool $acks): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITFAILED' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $boom = 'it.' . strtolower($stream) . '.boom';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $js = $admin->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, 'worker', $subject, $consumerConfig)->await();
+        $js->publish($subject, 'm-1')->await();
+        $js->publish($subject, 'm-2')->await();
+
+        $worker = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()], handlerErrorsFailOperations: true));
+        $worker->connect()->await();
+        $worker->subscribe($boom, static function (): void {
+            throw new \RuntimeException('the other subscription\'s handler failed');
+        })->await();
+        $worker->flush()->await();
+        /** @var \ArrayObject<int, string> $handled */
+        $handled = new \ArrayObject();
+        $run = $worker->jetStream()->pullConsumer($stream, 'worker')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(static function (NatsMessage $message, JetStreamContext $context) use ($handled, $js, $subject, $acks): void {
+                $handled[] = $message->payload;
+                if ($message->payload === 'm-1') {
+                    $js->publish($subject, 'm-3')->await();
+                    // Time for the server to deliver m-3 to a pull whose inbox still had interest.
+                    delay(0.3);
+                }
+                if ($acks) {
+                    $context->ack($message)->await();
+                }
+            });
+
+        try {
+            // The run's pull holds m-1 and m-2 and waits for a third message.
+            $this->waitFor(static function () use ($js, $stream): bool {
+                $info = $js->getConsumer($stream, 'worker')->await()->raw;
+
+                return ($info['delivered']['consumer_seq'] ?? 0) === 2 && ($info['num_waiting'] ?? 0) === 1;
+            }, 'the run\'s pull holding m-1 and m-2');
+            delay(0.1);
+            $admin->publish($boom, 'x')->await();
+
+            try {
+                $run->await(new TimeoutCancellation(10));
+                self::fail('the run did not fail');
+            } catch (\RuntimeException $failure) {
+                self::assertSame('the other subscription\'s handler failed', $failure->getMessage());
+            }
+            $info = $js->getConsumer($stream, 'worker')->await()->raw;
+
+            self::assertSame(['m-1', 'm-2'], $handled->getArrayCopy());
+            self::assertIsArray($info['delivered'] ?? null);
+            self::assertSame(2, $info['delivered']['consumer_seq'] ?? null, 'm-3 was not delivered to the failed run');
+            self::assertSame(1, $info['num_pending'] ?? null, 'm-3 stayed in the stream');
+            $next = $js->fetchNext($stream, 'worker', 4000)->await();
+            self::assertSame('m-3', $next->payload, 'the next independent pull got m-3');
+        } finally {
+            $run->ignore();
+            $worker->disconnect()->await();
+            $js->deleteStream($stream)->await();
+            $admin->disconnect()->await();
         }
     }
 

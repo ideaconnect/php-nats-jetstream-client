@@ -9,6 +9,7 @@ use Amp\Future;
 use IDCT\NATS\Connection\ConnectionStats;
 use IDCT\NATS\Connection\DrainParticipant;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\Enum\InboxRetirement;
 use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
@@ -160,6 +161,19 @@ final class NatsClient
     public function releaseSubscriptionWithin(int $sid, Cancellation $budget): Future
     {
         return $this->connection->releaseSubscriptionWithin($sid, $budget);
+    }
+
+    /**
+     * Closes a pull consumer run's inbox to new deliveries, routing what the server sent it before its UNSUB to the run
+     * first, within one request-timeout budget (#212). See {@see NatsConnection::retirePullInbox()}.
+     *
+     * @internal Low-level mechanism for the JetStream pull inbox; not part of the supported API.
+     *
+     * @return Future<InboxRetirement>
+     */
+    public function retirePullInbox(int $sid, Cancellation $stop, ?Cancellation $drainReady = null): Future
+    {
+        return $this->connection->retirePullInbox($sid, $stop, $drainReady);
     }
 
     /**
