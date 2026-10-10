@@ -19,9 +19,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Upgrade notes
 
-- The library now requires `amphp/amp ^3.1.3`, up from `^3.1` (#200). An application whose lock holds amp 3.1.0 to
-  3.1.2 gets 3.1.3 with its next `composer update` of this library. 3.1.3 is a patch release with the same requirements
-  as 3.1.2 (`php >=8.1`, `revolt/event-loop ^1 || ^0.2`).
+- The library now requires `amphp/amp ^3.1.3`, up from `^3.1` (#200). 3.1.3 is a patch release with the same
+  requirements as 3.1.2 (`php >=8.1`, `revolt/event-loop ^1 || ^0.2`). An application whose lock holds amp 3.1.0 to
+  3.1.2 gets this release and amp 3.1.3 with `composer update`, or with
+  `composer update idct/php-nats-jetstream-client --with-all-dependencies` (`-W`). Without `-W`, updating this package
+  alone keeps the locked amp, and Composer stays on 2.24.4 without an error.
 
 ### Fixed
 
