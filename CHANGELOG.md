@@ -15,6 +15,30 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- The library now requires `amphp/amp ^3.1.3`, up from `^3.1` (#200). An application whose lock holds amp 3.1.0 to
+  3.1.2 gets 3.1.3 with its next `composer update` of this library. 3.1.3 is a patch release with the same requirements
+  as 3.1.2 (`php >=8.1`, `revolt/event-loop ^1 || ^0.2`).
+
+### Fixed
+
+- [bugfix] Under `amphp/amp` 3.1.0 to 3.1.2, which `composer.json` still allowed, a request with waiting for a reconnect
+  disabled lost a reply that came in the same read as a server's lame-duck `INFO` (#200). Before 3.1.3,
+  `CompositeCancellation::isRequested()` and `throwIfRequested()` reported a part that had fired only one event-loop tick
+  later. With `waitForReconnect: false` the read that met the lame-duck `INFO` asks such a composite whether the
+  request's wake-up has fired - that is, whether its reply came in the chunk - and the request then returns the reply.
+  Under 3.1.2 it was told no, so the request failed with `Connection is not open`, its reply delivered and dropped,
+  every time the reply came behind the `INFO` (reconnect on, a cluster to fail over to). `requestMany()` and
+  `fetchBatch()` returned what they had received, and a `SubscriptionQueue` poll kept its message for the next poll.
+  amp 3.1.3 asks the composite's parts directly, and the library now requires it. Two existing tests, which CI ran under
+  the newest amp only, pin this and fail under 3.1.2:
+  `OperationReadLameDuckFailoverTest::testWithWaitingDisabledAnOperationWhoseReadBringsTheLameDuckInfoFailsAtOnce`
+  (the reply case) and `OperationReadReconnectLifecycleTest::testAnOperationParkedOnTheReconnectItStartedDoesNotSpin`,
+  whose look counter a 3.1.2 composite never asked.
+
 ## [2.24.4] - 2026-10-10
 
 ### Upgrade notes
