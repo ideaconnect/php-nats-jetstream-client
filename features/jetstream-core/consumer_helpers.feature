@@ -67,3 +67,11 @@ Feature: JetStream consumer helper workflows
     And I have a random durable consumer name
     When I process pull-consumer iteration for 5 JetStream messages in batches of 2
     Then pull-consumer iteration should process 5 messages total
+
+  Scenario: Restarting a pull consumer with stop and handle in one tick hands later messages to the new run only
+    Given I am connected to NATS
+    And I have a random JetStream stream with primary and secondary subjects
+    And I have a random durable consumer name
+    When I restart a pull consumer waiting on an empty stream with stop and handle in one tick and publish 3 JetStream messages
+    Then the stopped pull-consumer run should have processed 0 messages
+    And only the restarted pull-consumer run should have processed 3 messages

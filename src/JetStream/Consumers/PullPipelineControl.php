@@ -12,32 +12,32 @@ use Amp\NullCancellation;
  * ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}) shares with the live
  * {@see PullConsumerIterator} that launched it.
  *
- * Every accessor reads/writes the iterator's own fields through the closures the iterator supplies,
- * so a handler that calls stop()/drain() mid-run is observed on the very next check, and a pin
- * captured mid-run is written straight back to the iterator. handle()'s resetLifecycle() clears the
- * stop/drain flags between runs but NOT the pin, so a captured pin survives into the next run (#120).
+ * Every accessor reads/writes live state through the closures the iterator supplies: the stop/drain
+ * flags of this run's own {@see PullRunLifecycle} (#189), so a handler, or another fiber, that calls
+ * stop()/drain() mid-run is observed on the very next check, and the iterator's pin, so a pin captured
+ * mid-run is written straight back to the iterator. Each handle() run has its own flags, which no later
+ * run touches, while the pin is the iterator's, so a captured pin survives into the next run (#120).
  *
  * Besides the flags, the run has two one-shot wake-ups, {@see stopInterruption()} and
  * {@see drainInterruption()}: cancellations that stop() and drain() fire right after setting their flag,
  * so that a call from another fiber ends the engine's wait on the socket, or in its idle backoff, at
  * once instead of at the earliest pull's deadline (#181). The engine composes a wake-up into a wait only
  * while it has not fired: once stop() or drain() fired it, their flag is seen at the top of the loop, and
- * a fired wake-up left out of the later waits cannot end them at once. The same rule covers a wake-up
- * that fired with its flag unset, which a later handle() on the iterator replaced (Amp fires a
- * DeferredCancellation as it is destructed): the run it belonged to waits to its deadlines as before
- * #181, with no spin. Given none, a wake-up never fires.
+ * a fired wake-up left out of the later waits cannot end them at once. The wake-ups are the run's own,
+ * like its flags, and live as long as the run (#189): a later handle() on the iterator no longer replaces
+ * them, so neither fires without its flag while the run lasts. Given none, a wake-up never fires.
  *
  * @internal Not part of the supported public API.
  */
 final class PullPipelineControl
 {
     /**
-     * @param \Closure():bool $stopFn Reads the iterator's live stop flag.
-     * @param \Closure():bool $drainFn Reads the iterator's live drain flag.
+     * @param \Closure():bool $stopFn Reads the run's live stop flag (#189).
+     * @param \Closure():bool $drainFn Reads the run's live drain flag (#189).
      * @param \Closure():?string $getPinFn Reads the iterator's current pin id.
      * @param \Closure(?string):void $setPinFn Writes the captured/cleared pin id back onto the iterator.
-     * @param Cancellation $stopInterruption Fires once stop() has set its flag during this run (#181).
-     * @param Cancellation $drainInterruption Fires once drain() has set its flag during this run (#181).
+     * @param Cancellation $stopInterruption Fires once stop() has set the run's stop flag (#181).
+     * @param Cancellation $drainInterruption Fires once drain() has set the run's drain flag (#181).
      */
     public function __construct(
         private readonly \Closure $stopFn,
@@ -73,9 +73,8 @@ final class PullPipelineControl
     /**
      * The run's stop() wake-up: requested once stop() has set its flag, so a wait composed with it ends
      * at once (#181). Compose it only while it is not requested yet: a wait that included a fired one
-     * would end before it began, and so would every later wait. Once stop() fired it the flag is set and
-     * {@see isStopRequested()} ends the run; fired with the flag unset, it was replaced by a later
-     * handle() on the iterator, and the run waits to its deadlines as before #181.
+     * would end before it began, and so would every later wait. Once it has fired the flag is set, and
+     * {@see isStopRequested()} ends the run.
      */
     public function stopInterruption(): Cancellation
     {

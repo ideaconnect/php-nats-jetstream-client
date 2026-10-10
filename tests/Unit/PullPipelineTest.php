@@ -597,10 +597,10 @@ final class PullPipelineTest extends TestCase
     }
 
     /**
-     * resetLifecycle() clears stop/drain between runs but deliberately KEEPS the pin: a pinned
-     * group's captured pin must survive into the next handle() run, so its very first pull re-joins
-     * the server-side pin instead of racing an unpinned bootstrap (buildPull() emits the `id` field
-     * from the retained pin).
+     * Each handle() run has its own stop/drain flags (#189), but the pin is deliberately the
+     * iterator's: a pinned group's captured pin must survive into the next handle() run, so its very
+     * first pull re-joins the server-side pin instead of racing an unpinned bootstrap (buildPull()
+     * emits the `id` field from the retained pin).
      */
     public function testCapturedPinPersistsIntoTheNextRun(): void
     {

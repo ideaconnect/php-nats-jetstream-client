@@ -41,7 +41,8 @@ use PHPUnit\Framework\TestCase;
  * In these tests the server answers a pull with more messages than the run asked for, standing in for the requests a
  * reconnect leaves on the server; the scripted server in tests/Support/ReconnectingTransport.php delivers them, seen
  * through tests/Support/WatchedTransport.php. A handler holds a message on a gate where the test acts while it runs;
- * the time bounds only keep a broken run from hanging the suite. Each test fails on 2.24.2, except the declared guard.
+ * the time bounds only keep a broken run from hanging the suite. Each test fails on 2.24.2, except the declared guard;
+ * the three #189 restart data sets also fail on 2.24.6, where the handle() after the stop cleared it.
  */
 final class PullConsumerOverflowTest extends TestCase
 {
@@ -272,6 +273,101 @@ final class PullConsumerOverflowTest extends TestCase
         self::assertSame(['C-1', 'C-2'], $handled->getArrayCopy());
         self::assertSame(2, $processed);
         self::assertSame(['JetStream pull request ended with status 409: Consumer Deleted'], $errors->getArrayCopy());
+    }
+
+    /** @return iterable<string, array{string, string, list<string>}> How the run hands over, where it restarts, what it delivers. */
+    public static function restartsWhileTheRunHandsOver(): iterable
+    {
+        yield 'the overflow behind a retired pull' => ['retire', 'C-2', ['C-1', 'C-2']];
+        yield 'the overflow of a run whose inbox is rejected' => ['rejected', 'C-2', ['C-1', 'C-2']];
+        yield 'the pull and the overflow behind a terminal status' => ['terminal', 'C-1', ['C-1']];
+    }
+
+    /**
+     * The restart idiom from the handler while the run hands over what it holds leaves the rest undelivered (#189): the
+     * handler stops the run and starts another on $restartOn, and the first handler gets $expected only, the rest left
+     * undelivered as after any stop():
+     *
+     *  - behind a retired pull: batch 1, depth 1, the first pull answered with C-1 to C-3, so that the overflow holds C-2
+     *    and C-3, and the restart on C-2, the overflow's first: the run returns 2;
+     *  - the same, the -ERR with which the server rejects the run's inbox in the same chunk: handle() still throws the
+     *    rejection;
+     *  - behind a terminal status: batch 1, depth 2, the second pull answered with a 409 Consumer Deleted for the first
+     *    one, then C-1, which the second pull takes, and C-2 and C-3, which go to the overflow, and the restart on C-1:
+     *    the run returns 1, onError having heard the 409 once.
+     *
+     * In each the second run pulls on an inbox of its own, until a stop() ends it. The handle() after the stop used to
+     * clear it before the delivery checked it again: the first handler got everything the run held, and behind a
+     * retired pull the first run went on pulling next to the second.
+     *
+     * @param list<string> $expected
+     */
+    #[DataProvider('restartsWhileTheRunHandsOver')]
+    public function testARestartFromTheHandlerLeavesTheRestOfWhatTheRunHoldsUndelivered(string $handOver, string $restartOn, array $expected): void
+    {
+        [$transport, , $client] = $this->client();
+        $firstReplyTo = null;
+        $server = $this->pullServer($transport, static function (string $consumer, int $pull, int $sid, string $replyTo) use ($handOver, &$firstReplyTo): array {
+            $firstReplyTo ??= $replyTo;
+            if ($handOver === 'terminal') {
+                return $pull === 2
+                    ? [self::statusFrame($firstReplyTo, $sid, 409, 'Consumer Deleted') . self::messages($sid, $consumer, 1, 3)]
+                    : [];
+            }
+            if ($pull !== 1) {
+                return [];
+            }
+
+            $rejection = sprintf("-ERR 'Permissions Violation for Subscription to \"%s.*\" (sid \"%d\")'\r\n", self::inboxOf($replyTo), $sid);
+
+            return [self::messages($sid, $consumer, 1, 3) . ($handOver === 'rejected' ? $rejection : '')];
+        });
+
+        $handled = self::log();
+        $errors = self::log();
+        $restarted = new class {
+            /** @var Future<int>|null The run the first run's handler started. */
+            public ?Future $run = null;
+        };
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(1)->setDepth($handOver === 'terminal' ? 2 : 1)->setExpiresMs(30_000)
+            ->setOnError(static function (\Throwable $error) use ($errors): void {
+                $errors[] = $error->getMessage();
+            });
+        $run = $iterator->handle(static function (NatsMessage $message) use ($handled, $iterator, $restarted, $restartOn): void {
+            $handled[] = $message->payload;
+            if ($message->payload === $restartOn) {
+                $iterator->stop();
+                $restarted->run = $iterator->handle(static function (NatsMessage $message) use ($handled): void {
+                    $handled[] = 'second run: ' . $message->payload;
+                });
+                // Settled below; should the test fail first, nothing is to report the run's failure.
+                $restarted->run->ignore();
+            }
+        });
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame($expected, $handled->getArrayCopy(), 'the stop leaves the rest undelivered');
+        if ($handOver === 'rejected') {
+            self::assertInstanceOf(JetStreamException::class, $error);
+            self::assertStringContainsString('was rejected by server permissions', $error->getMessage(), 'the run still ends with its failure');
+        } else {
+            self::assertNull($error, sprintf('handle() threw %s', $error?->getMessage() ?? ''));
+            self::assertSame(count($expected), $processed);
+        }
+        self::assertSame($handOver === 'terminal' ? ['JetStream pull request ended with status 409: Consumer Deleted'] : [], $errors->getArrayCopy());
+        $second = $restarted->run;
+        if ($second === null) {
+            self::fail('the handler never restarted the consumer');
+        }
+        $firstRunsPulls = $handOver === 'terminal' ? 2 : 1;
+        $this->waitUntil(static fn(): bool => ($server->pulls['C'] ?? 0) > $firstRunsPulls);
+        self::assertSame(self::inboxSid($transport), $server->sids['C'], 'the latest pull is on the second run\'s inbox');
+
+        $iterator->stop();
+        [$secondProcessed, $secondError] = self::settle($second);
+        self::assertNull($secondError, sprintf('the second run threw %s', $secondError?->getMessage() ?? ''));
+        self::assertSame(0, $secondProcessed);
+        self::assertSame($expected, $handled->getArrayCopy(), 'the second run got nothing the first run held');
     }
 
     /** @return iterable<string, array{bool}> */

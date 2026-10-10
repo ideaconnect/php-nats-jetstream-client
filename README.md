@@ -2008,11 +2008,11 @@ $client->disconnect()->await();
 
 ### Pull Consumer Batching/Iteration
 
-> 📄 **Runnable examples:** [`examples/pull-consumer-batching-iteration.php`](examples/pull-consumer-batching-iteration.php), [`examples/pull-consumer-graceful-drain.php`](examples/pull-consumer-graceful-drain.php)
+> 📄 **Runnable examples:** [`examples/pull-consumer-batching-iteration.php`](examples/pull-consumer-batching-iteration.php), [`examples/pull-consumer-graceful-drain.php`](examples/pull-consumer-graceful-drain.php), [`examples/pull-consumer-restart.php`](examples/pull-consumer-restart.php)
 
-_Verified by: [PullConsumerIteratorTest](tests/Unit/PullConsumerIteratorTest.php); [PullConsumerWakeUpTest](tests/Unit/PullConsumerWakeUpTest.php); [PullConsumerConnectionLossTest](tests/Unit/PullConsumerConnectionLossTest.php); [PullConsumerConnectionEndingFrameTest](tests/Unit/PullConsumerConnectionEndingFrameTest.php); [PullConsumerClientDrainTest](tests/Unit/PullConsumerClientDrainTest.php); [PullConsumerReconnectTest](tests/Unit/PullConsumerReconnectTest.php); [PullConsumerOverflowTest](tests/Unit/PullConsumerOverflowTest.php); [JetStreamIntegrationTest::testJetStreamPullIteratorBatching](tests/Integration/JetStreamIntegrationTest.php); [features/jetstream-core/consumer_helpers.feature](features/jetstream-core/consumer_helpers.feature)._
+_Verified by: [PullConsumerIteratorTest](tests/Unit/PullConsumerIteratorTest.php); [PullConsumerWakeUpTest](tests/Unit/PullConsumerWakeUpTest.php); [PullConsumerConnectionLossTest](tests/Unit/PullConsumerConnectionLossTest.php); [PullConsumerConnectionEndingFrameTest](tests/Unit/PullConsumerConnectionEndingFrameTest.php); [PullConsumerClientDrainTest](tests/Unit/PullConsumerClientDrainTest.php); [PullConsumerReconnectTest](tests/Unit/PullConsumerReconnectTest.php); [PullConsumerOverflowTest](tests/Unit/PullConsumerOverflowTest.php); [JetStreamIntegrationTest::testJetStreamPullIteratorBatching](tests/Integration/JetStreamIntegrationTest.php); [JetStreamIntegrationTest::testAPullConsumerRestartedWithStopAndHandleInOneTickHandsWhatFollowsToTheNewHandler](tests/Integration/JetStreamIntegrationTest.php); [features/jetstream-core/consumer_helpers.feature](features/jetstream-core/consumer_helpers.feature)._
 
-The fluent `PullConsumerIterator` drives the pipelined pull engine: it keeps up to `setDepth()` (default 2) pull round-trips in flight while your handler processes earlier ones, preserving message order, with configurable batch size, expiry, and iteration count. `setOnError()` receives errors the engine does not treat as routine, and `stop()` / `drain()` end the run from inside the handler or from another fiber (a signal handler's timer, a supervisor), ending the engine's wait on the socket at once; a `drain()` still lets the pulls already in flight complete first. Await a run's future before you call `handle()` again on the same iterator, since its runs share the stop/drain flags:
+The fluent `PullConsumerIterator` drives the pipelined pull engine: it keeps up to `setDepth()` (default 2) pull round-trips in flight while your handler processes earlier ones, preserving message order, with configurable batch size, expiry, and iteration count. `setOnError()` receives errors the engine does not treat as routine, and `stop()` / `drain()` end the run from inside the handler or from another fiber (a signal handler's timer, a supervisor), ending the engine's wait on the socket at once; a `drain()` still lets the pulls already in flight complete first:
 
 ```php
 <?php
@@ -2040,6 +2040,42 @@ $totalProcessed = $js->pullConsumer('ORDERS', 'PROC')
 	})->await();
 
 echo "Processed {$totalProcessed} messages total." . PHP_EOL;
+
+$client->disconnect()->await();
+```
+
+`stop()` and `drain()` act on the runs active when they are called, and each `handle()` run has stop and drain flags of its own (#189), so `stop()` followed by `handle()` restarts the consumer, in the same tick too, as a supervisor that changes the batch size on a signal does: the earlier run ends on its stop, its pull inbox released and whatever it holds left undelivered as after any `stop()`, and the new run starts clean, with the settings it was started with. After `drain()` and `handle()` the earlier run still delivers its pulls in flight to its own handler, next to the new run, and then ends without pulling again. The earlier run's handler may still be running when the new run starts, while it awaits an ack as another fiber restarts the consumer, say, or when the handler restarts its own consumer: await the earlier run's future first where two handlers must never run at once. Runs started on one iterator without a `stop()` in between all go on, sharing a priority group's pin, and one `stop()` ends them all, each at once. A `stop()` or `drain()` outside a run changes no later run. Up to 2.24.6 the runs of one iterator shared its two flags, so a `handle()` while a run was still active cleared a `stop()` or `drain()` that run had not seen yet: the earlier run went on next to the new one, with its own handler and settings, the two splitting the stream between them, until a later `stop()` reached it at its pull's deadline (its expiry plus a second).
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\JetStream\JetStreamContext;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$handler = function (NatsMessage $msg, JetStreamContext $js): void {
+	$js->ack($msg)->await();
+};
+
+// An infinite run (no setIterations()).
+$iterator = $client->jetStream()->pullConsumer('ORDERS', 'PROC')->setBatching(10);
+$run = $iterator->handle($handler);
+
+// Later, a supervisor reconfigures the consumer: the current run ends on its stop, and the
+// new run pulls with the new batch size. Awaiting the stopped run first is optional.
+$iterator->stop();
+$newRun = $iterator->setBatching(3)->handle($handler);
+$stoppedRunProcessed = $run->await();
+
+// At shutdown, one stop() ends every run still active on the iterator.
+$iterator->stop();
+$newRun->await();
 
 $client->disconnect()->await();
 ```
