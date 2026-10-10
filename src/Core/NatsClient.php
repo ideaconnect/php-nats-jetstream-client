@@ -370,7 +370,7 @@ final class NatsClient
      * The read recovered the connection before it threw (#171), so the failure says why the old connection ended, not
      * that the connection is gone.
      *
-     * @internal For the pull consumer engine (#210); not part of the supported API.
+     * @internal For the pull consumer engine (#210) and fetchBatch() (#196); not part of the supported API.
      */
     public function endedTheConnection(\Throwable $failure): bool
     {

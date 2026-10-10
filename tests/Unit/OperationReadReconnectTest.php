@@ -40,7 +40,8 @@ use function Amp\async;
  * reconnect carries on without it; with waiting disabled the operation fails at once, as one whose write noticed the
  * loss does. Your own processIncoming() still runs the reconnect itself and waits for all of it, and the heartbeat's
  * read still does the same. A requestMany() or fetchBatch() whose read fails that way, or because the reconnect gave
- * up or reconnect is off, returns what it has received rather than lose it to the read's error.
+ * up or reconnect is off, returns what it has received rather than lose it to the read's error, and so does one whose
+ * read meets a fatal -ERR, also once the reconnect has reopened the connection (#196).
  *
  * Over the scripted server in tests/Support/ReconnectingTransport.php, seen through tests/Support/WatchedTransport.php,
  * which tells the test when the operation's read is on the socket, with deliveries held up by
@@ -768,6 +769,226 @@ final class OperationReadReconnectTest extends TestCase
         }
     }
 
+    /** @return iterable<string, array{string, string, string, bool, list<string>}> */
+    public static function collectionsWhoseReadMeetsAFatalError(): iterable
+    {
+        foreach (['requestMany' => 'requestMany(max 3)', 'fetchBatch' => 'JetStreamContext::fetchBatch(3)'] as $operation => $name) {
+            foreach (['Stale Connection', 'User Authentication Expired'] as $serverError) {
+                yield sprintf("%s, '%s', the reconnect reopens it, two received", $name, $serverError) => [$operation, $serverError, 'the reconnect reopens it', false, ['m-1', 'm-2']];
+            }
+
+            yield $name . ", 'Stale Connection' in the chunk of the two received, the reconnect reopens it" => [$operation, 'Stale Connection', 'the reconnect reopens it', true, ['m-1', 'm-2']];
+            foreach (['the reconnect reopens it', 'waiting disabled', 'the reconnect gives up', 'reconnect off', 'its deadline comes first'] as $recovery) {
+                if ($recovery !== 'the reconnect reopens it') {
+                    yield sprintf("%s, 'Stale Connection', %s, two received", $name, $recovery) => [$operation, 'Stale Connection', $recovery, false, ['m-1', 'm-2']];
+                }
+
+                yield sprintf("%s, 'Stale Connection', %s, nothing received", $name, $recovery) => [$operation, 'Stale Connection', $recovery, false, []];
+            }
+        }
+    }
+
+    /**
+     * A requestMany() for three replies, or a fetchBatch() of three, has received two, each in a read of its own, when a
+     * fatal -ERR, 'Stale Connection' or 'User Authentication Expired', comes in its next read, or in the chunk that
+     * brings the two. The server closes the connection after such an -ERR, and the read recovers it within the
+     * collection's wait before it throws the -ERR (#171): with a quick reconnect, the connection is Open again on a new
+     * socket by the time the collection looks at the failure. The collection returns the two then, as it does when its
+     * read fails with the connection going any other way, sends nothing on the new connection, and the connection takes
+     * the next request. It used to throw the -ERR because the connection was Open, and the two were lost (#196):
+     * replies a scatter-gather never saw, and fetched messages the server counted as delivered, which came again only
+     * after the ack wait, or never with no acks or max_deliver 1. The other ends of the recovery (waiting disabled, a
+     * reconnect that gives up, reconnect off, the collection's deadline before the held dial) already returned the
+     * two, and with nothing received every one of them still fails with the -ERR: those data sets are guards.
+     *
+     * @param list<string> $received
+     */
+    #[DataProvider('collectionsWhoseReadMeetsAFatalError')]
+    public function testACollectionWhoseReadMeetsAFatalErrorReturnsWhatItReceivedAlsoOnceTheReconnectReopenedTheConnection(
+        string $operation,
+        string $serverError,
+        string $recovery,
+        bool $inOneChunk,
+        array $received,
+    ): void {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = new NatsClient(match ($recovery) {
+            'waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, null, 5, 20, null),
+            'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, null, 5, 20, null),
+            'reconnect off' => new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 2_000, reconnectEnabled: false, pingIntervalSeconds: 0),
+            default => $this->options(true, 2_000, 1_000, 0, 2, null, 5, 20, null),
+        }, $watched);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        self::scriptAnswers($transport, '', answering: false);
+        // Sets the reply inbox up first: the collection's reads are then the only ones on the socket.
+        $client->request('svc.warm', 'x', 1_000)->await();
+
+        // Its deadline is 30 s away, or comes first: after 300 ms for requestMany(), and after 1.2 s for fetchBatch(),
+        // whose pull expires after 200 ms and which allows the server a second more.
+        $deadlineFirst = $recovery === 'its deadline comes first';
+        $result = self::startCollection($operation, $client, 3, $deadlineFirst ? ($operation === 'requestMany' ? 300 : 200) : 30_000);
+        $inbox = $this->awaitCollectionRead($transport, $watched, $operation);
+        $frames = array_map(static fn(string $payload): string => self::collectionFrame($operation, $inbox, $payload), $received);
+        if (!$inOneChunk) {
+            foreach ($frames as $frame) {
+                $this->pushToCollection($transport, $watched, $frame);
+            }
+
+            $frames = [];
+        }
+
+        if ($recovery === 'the reconnect gives up') {
+            $transport->refuseDials();
+        } elseif ($recovery === 'waiting disabled' || $deadlineFirst) {
+            $transport->holdNextDial();
+        }
+
+        $transport->pushFrame(implode('', $frames) . "-ERR '" . $serverError . "'\r\n");
+        [$payloads, $elapsed, $error] = $this->settle($result, hrtime(true));
+        $stateOnReturn = $client->state();
+
+        self::assertSame(match ($recovery) {
+            'the reconnect reopens it' => ConnectionState::Open,
+            'waiting disabled', 'its deadline comes first' => ConnectionState::Connecting,
+            default => ConnectionState::Closed,
+        }, $stateOnReturn);
+        self::assertCount(1, $transport->controlLinesStartingWith(self::collectionPublishPrefix($operation)), 'sent once, and not again on the new connection');
+        if (!$deadlineFirst) {
+            // Far from both: a collection that went on reading instead looked until its deadline, 30 s away.
+            self::assertLessThan(5.0, $elapsed, sprintf('%s returned after %.3f s, its deadline 30 s away', $operation, $elapsed));
+        }
+
+        if ($received !== []) {
+            self::assertNull($error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? ''));
+            self::assertSame($received, $payloads);
+        } else {
+            self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? 'nothing'));
+            self::assertSame("Server sent error frame: '" . $serverError . "'", $error->getMessage());
+            self::assertTrue($client->endedTheConnection($error), 'the -ERR that ended the connection');
+        }
+
+        if ($stateOnReturn === ConnectionState::Open) {
+            self::assertSame(1, $client->statistics()->reconnects);
+            if ($operation === 'fetchBatch') {
+                self::assertNull($transport->sidFor($inbox[0]), 'the fetch released its inbox');
+            }
+
+            self::assertSame('ok', $client->request('svc.warm', 'x', 1_000)->await()->payload, 'the reopened connection takes the next request');
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function collectionsOfOne(): iterable
+    {
+        yield 'requestMany(max 1)' => ['requestMany'];
+        yield 'JetStreamContext::fetchBatch(1)' => ['fetchBatch'];
+        yield 'JetStreamContext::fetchNext()' => ['fetchNext'];
+    }
+
+    /**
+     * A requestMany() for one reply, a fetchBatch() of one or a fetchNext() gets its message in the chunk that brings a
+     * fatal 'Stale Connection' right behind it: its read hands it the message, meets the -ERR, and has the connection
+     * reopened by the reconnect before the collection can see that it is complete. It returns the message, the
+     * connection Open. It used to throw the -ERR, and the complete result was lost as a partial one was (#196).
+     */
+    #[DataProvider('collectionsOfOne')]
+    public function testACompleteCollectionWhoseChunkAlsoBringsAFatalErrorReturnsItsResult(string $operation): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = $this->connectWatched($watched);
+        self::scriptAnswers($transport, '', answering: false);
+        $client->request('svc.warm', 'x', 1_000)->await();
+
+        $result = self::startCollection($operation, $client, 1, 30_000);
+        $inbox = $this->awaitCollectionRead($transport, $watched, $operation);
+        $transport->pushFrame(self::collectionFrame($operation, $inbox, 'm-1') . "-ERR 'Stale Connection'\r\n");
+        [$payloads, , $error] = $this->settle($result, hrtime(true));
+
+        self::assertNull($error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? ''));
+        self::assertSame(['m-1'], $payloads);
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame(1, $client->statistics()->reconnects);
+        self::assertCount(1, $transport->controlLinesStartingWith(self::collectionPublishPrefix($operation)), 'sent once');
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function collectionsWhoseReadFailsWithTheConnectionStayingOpen(): iterable
+    {
+        foreach (['requestMany' => 'requestMany(max 3)', 'fetchBatch' => 'JetStreamContext::fetchBatch(3)'] as $operation => $name) {
+            yield $name . ', an -ERR refusing a reply subject' => [$operation, 'reply subject refused'];
+            yield $name . ", 'Invalid Publish Subject'" => [$operation, 'invalid publish subject'];
+            yield $name . ', a handler throwing in the words of a fatal -ERR' => [$operation, 'handler in the words'];
+            yield $name . ', a handler throwing after a reconnect of its own' => [$operation, 'handler after a reconnect'];
+        }
+    }
+
+    /**
+     * Guard: a requestMany() for three replies, or a fetchBatch() of three, that has received two still fails when its
+     * next read fails with the connection staying open: on an -ERR the server keeps the connection open for, or, with
+     * NatsOptions::$handlerErrorsFailOperations, on another subscription's handler that throws, be it a
+     * ConnectionException in the words of a fatal -ERR, or one thrown once the handler's own publish lost the
+     * connection and the reconnect reopened it. The collection asks which failure ended the connection, not how the
+     * connection looks (#196): a count of reconnects would have taken the handler's for its own.
+     */
+    #[DataProvider('collectionsWhoseReadFailsWithTheConnectionStayingOpen')]
+    public function testACollectionWhoseReadFailsWithTheConnectionStayingOpenStillFails(string $operation, string $failure): void
+    {
+        $transport = new ReconnectingTransport();
+        $watched = new WatchedTransport($transport);
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 2_000,
+            maxReconnectAttempts: 1_000,
+            reconnectDelayMs: 5,
+            reconnectMaxDelayMs: 20,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+            handlerErrorsFailOperations: true,
+        ), $watched);
+        $this->opened[] = $client;
+        $client->connect()->await();
+        self::scriptAnswers($transport, '', answering: false);
+        $client->request('svc.warm', 'x', 1_000)->await();
+        $side = $client->subscribe('side', static function () use ($client, $transport, $failure): void {
+            if ($failure === 'handler after a reconnect') {
+                $transport->failNextWriteContaining('PUB side.reply ');
+                $client->publish('side.reply', 'x')->await();
+
+                throw new ConnectionException('The handler failed after its own reconnect');
+            }
+
+            throw new ConnectionException("Server sent error frame: 'Stale Connection'");
+        })->await();
+
+        $result = self::startCollection($operation, $client, 3, 30_000);
+        $inbox = $this->awaitCollectionRead($transport, $watched, $operation);
+        foreach (['m-1', 'm-2'] as $payload) {
+            $this->pushToCollection($transport, $watched, self::collectionFrame($operation, $inbox, $payload));
+        }
+
+        $transport->pushFrame(match ($failure) {
+            'reply subject refused' => "-ERR 'Permissions Violation for Publish with Reply of \"_INBOX.reserved\"'\r\n",
+            'invalid publish subject' => "-ERR 'Invalid Publish Subject'\r\n",
+            default => ReconnectingTransport::msgFrame('side', $side, 'side-1'),
+        });
+        [, , $error] = $this->settle($result, hrtime(true));
+
+        self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s threw %s', $operation, $error?->getMessage() ?? 'nothing'));
+        self::assertSame(match ($failure) {
+            'reply subject refused' => "Server sent error frame: 'Permissions Violation for Publish with Reply of \"_INBOX.reserved\"'",
+            'invalid publish subject' => "Server sent error frame: 'Invalid Publish Subject'",
+            'handler in the words' => "Server sent error frame: 'Stale Connection'",
+            default => 'The handler failed after its own reconnect',
+        }, $error->getMessage());
+        self::assertFalse($client->endedTheConnection($error), 'not a failure that ended the connection');
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame($failure === 'handler after a reconnect' ? 1 : 0, $client->statistics()->reconnects);
+        self::assertCount(1, $transport->controlLinesStartingWith(self::collectionPublishPrefix($operation)), 'sent once');
+    }
+
     /**
      * Scripts the server's answers on $transport: svc.warm gets "ok" at once; svc.echo gets reply-1, a pull gets m1, a
      * Direct Get batch gets v1 and a Key/Value replay gets one record, each behind $lead in the same chunk, while the
@@ -865,6 +1086,78 @@ final class OperationReadReconnectTest extends TestCase
             }),
             default => throw new \LogicException('Unknown operation ' . $operation),
         };
+    }
+
+    /**
+     * Starts the collection $operation for up to $max messages within $ms: a requestMany() on svc.many, or a pull of S/C
+     * by fetchBatch() or fetchNext(), whose pull expires after $ms and whose deadline is a second later.
+     *
+     * @return Future<list<string>> The payloads it returns.
+     */
+    private static function startCollection(string $operation, NatsClient $client, int $max, int $ms): Future
+    {
+        return match ($operation) {
+            'requestMany' => $client->requestMany('svc.many', 'y', null, $max, $ms)->map(self::payloads(...)),
+            'fetchBatch' => $client->jetStream()->fetchBatch('S', 'C', $max, $ms)->map(self::payloads(...)),
+            'fetchNext' => $client->jetStream()->fetchNext('S', 'C', $ms)->map(static fn(NatsMessage $message): array => [$message->payload]),
+            default => throw new \LogicException('Unknown collection ' . $operation),
+        };
+    }
+
+    /** How the control line of the request or the pull that the collection $operation sends starts. */
+    private static function collectionPublishPrefix(string $operation): string
+    {
+        return $operation === 'requestMany' ? 'PUB svc.many ' : 'PUB $JS.API.CONSUMER.MSG.NEXT.S.C ';
+    }
+
+    /**
+     * Waits until the collection $operation has sent its request or its pull and its read is on the socket, and returns
+     * where it receives what it waits for: the request's reply subject or the pull's inbox, with that subject's sid.
+     *
+     * @return array{string, int}
+     */
+    private function awaitCollectionRead(ReconnectingTransport $transport, WatchedTransport $watched, string $operation): array
+    {
+        $this->waitUntil(static fn(): bool => self::collectionInbox($transport, $operation) !== null && $watched->readsUnderWay === 1);
+        $inbox = self::collectionInbox($transport, $operation);
+        self::assertNotNull($inbox);
+
+        return $inbox;
+    }
+
+    /** @return array{string, int}|null The reply subject of the collection's request or pull, and its sid. */
+    private static function collectionInbox(ReconnectingTransport $transport, string $operation): ?array
+    {
+        foreach ($transport->controlLinesStartingWith(self::collectionPublishPrefix($operation)) as $line) {
+            $replyTo = explode(' ', $line)[2] ?? '';
+            $sid = $transport->sidFor($replyTo);
+            if ($sid !== null) {
+                return [$replyTo, $sid];
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * A message with $payload for the collection $operation, on its $inbox: a reply, or a pulled message with its ack
+     * subject.
+     *
+     * @param array{string, int} $inbox
+     */
+    private static function collectionFrame(string $operation, array $inbox, string $payload): string
+    {
+        return $operation === 'requestMany'
+            ? ReconnectingTransport::msgFrame($inbox[0], $inbox[1], $payload)
+            : ReconnectingTransport::msgFrame('evt.s', $inbox[1], $payload, self::ACK_SUBJECT);
+    }
+
+    /** Delivers $frame to the collection reading the socket, and waits until it took it and its next read is on. */
+    private function pushToCollection(ReconnectingTransport $transport, WatchedTransport $watched, string $frame): void
+    {
+        $reads = $watched->reads;
+        $transport->pushFrame($frame);
+        $this->waitUntil(static fn(): bool => $watched->reads > $reads && $watched->readsUnderWay === 1);
     }
 
     /**

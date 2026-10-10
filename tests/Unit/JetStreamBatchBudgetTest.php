@@ -227,6 +227,12 @@ final class JetStreamBatchBudgetTest extends TestCase
         try {
             $messages = $client->jetStream()->fetchBatch('S', 'C', 1, 1000, ['idle_heartbeat' => 100_000_000])->await(new TimeoutCancellation(2.5));
             self::assertSame('message', $messages[0]->payload);
+        } catch (JetStreamException $error) {
+            // The answer lands 0.22 s after the shortened send, about 50 ms before the fetch's deadline: the 100 ms
+            // response margin is all there is once the answer has to come after two heartbeats. A runner slowed down by
+            // coverage can spend those 50 ms on the reconnect, and the fetch then ends with its 408. An armed local miss
+            // timer ends it with its own error instead, as it does whenever the reconnect is quick.
+            self::assertSame(408, $error->getCode(), $error->getMessage());
         } finally {
             EventLoop::cancel($gate);
         }

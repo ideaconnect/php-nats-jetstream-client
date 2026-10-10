@@ -352,17 +352,18 @@ final class FailedControlWriteTest extends TestCase
 
     /**
      * A request whose reply inbox's SUB finds the socket dead waits for the reconnect only within its own budget (#194):
-     * requestTimeoutMs 3000, the SUB failing and the reconnect's dials refused. A request() or requestMany() with a
+     * requestTimeoutMs 10 s, the SUB failing and the reconnect's dials refused. A request() or requestMany() with a
      * budget of 300 ms ends with `Request timed out for subject svc.echo while waiting for the reply inbox to be set up`
      * within that budget, the connection still reconnecting, and a request() of five seconds that its caller cancels at
      * 0.1 s ends with CancelledException then. Each used to wait the whole requestTimeoutMs that the set-up started on its
-     * own, and end with the subscribe's timeout.
+     * own, and end with the subscribe's timeout. The outcome tells the two apart; the time bound sits far from both, half
+     * the old wait, so that a busy CI runner under coverage (once a second for a 300 ms request) cannot reach it.
      */
     #[DataProvider('requestsWhoseReplyInboxSubFindsTheSocketDead')]
     public function testARequestWhoseReplyInboxSubFindsTheSocketDeadWaitsOnlyWithinItsOwnBudget(string $variant): void
     {
         $transport = new ReconnectingTransport();
-        $connection = $this->connect($transport, requestTimeoutMs: 3_000);
+        $connection = $this->connect($transport, requestTimeoutMs: 10_000);
         $transport->refuseDials();
         $transport->failNextWriteContaining('SUB _INBOX.');
         $cancellation = new DeferredCancellation();
@@ -387,7 +388,7 @@ final class FailedControlWriteTest extends TestCase
             self::assertSame('cancelled', $variant, 'a request whose budget ran out reports its timeout');
         }
 
-        self::assertLessThan(1.0, $this->secondsSince($start), 'within its own budget, not requestTimeoutMs');
+        self::assertLessThan(5.0, $this->secondsSince($start), 'within its own budget, not requestTimeoutMs');
         self::assertSame(ConnectionState::Connecting, $connection->state());
     }
 

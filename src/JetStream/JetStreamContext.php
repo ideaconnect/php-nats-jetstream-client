@@ -2621,10 +2621,12 @@ final class JetStreamContext
                             // The read failed with the connection going: lost, or failed over from a server in lame duck
                             // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended
                             // by a reconnect that gave up or by a fatal -ERR. A partial batch is still returned, as above:
-                            // those messages are real, and the server counted them as delivered. A failure on an open
-                            // connection still fails the fetch: a full queue, a handler's own, or a fatal -ERR whose
-                            // reconnect has reopened it.
-                            if ($messages === [] || $this->client->state() === ConnectionState::Open) {
+                            // those messages are real, and the server counted them as delivered. So is it after a fatal
+                            // -ERR whose reconnect has reopened the connection by now (#196): the failure ended the
+                            // connection the messages came on, whatever the reconnect did since. A failure that leaves the
+                            // connection open still fails the fetch: a full queue, a handler's own, an -ERR the server
+                            // keeps the connection open for.
+                            if ($messages === [] || ($this->client->state() === ConnectionState::Open && !$this->client->endedTheConnection($e))) {
                                 throw $e;
                             }
 

@@ -15,6 +15,30 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.24.6] - 2026-10-10
+
+### Upgrade notes
+
+- A `requestMany()`, `fetchBatch()` or `fetchNext()` whose read meets a fatal server `-ERR` after it has received
+  something now returns what it received, also when the reconnect has reopened the connection by then (#196). It no
+  longer throws the server's error then; the connection events (`Disconnected`, `Reconnected`) announce the reconnect.
+  With nothing received it still throws the error.
+
+### Fixed
+
+- [bugfix] A `requestMany()`, `fetchBatch()` or `fetchNext()` whose read met a fatal server `-ERR` (`Stale Connection`,
+  `User Authentication Expired`, ...) threw it and lost what it had received whenever the reconnect had already reopened
+  the connection, as a quick one does (#196). The read recovers the connection within the collection's wait before it
+  throws the server's error (#171), and the collection judged whether the connection was going by its state, by then
+  the new connection's: Open. The replies a scatter-gather had collected never reached it, and the messages a fetch had
+  received, which the server counted as delivered, came again only after the consumer's `ack_wait`, or never on a
+  consumer without acks or with `max_deliver: 1`. A complete result whose chunk also brought the `-ERR` was lost the
+  same way. The collection now asks whether that failure ended the connection, as the pull consumer engine does
+  (#210), and returns what it received, as it does when its read fails with the connection going any other way. A
+  failure that leaves the connection open (an `-ERR` the server keeps the connection open for, a handler's exception
+  with `handlerErrorsFailOperations`) still fails the collection, and the collection never sends its request or pull
+  again on the new connection.
+
 ## [2.24.5] - 2026-10-10
 
 ### Upgrade notes

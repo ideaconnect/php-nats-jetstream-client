@@ -1068,7 +1068,9 @@ final class NatsConnection
      * The one classifier of such a failure: the library's operations that outlive a connection ask it, through
      * NatsClient, to tell a failure that ended the connection from one that ended only their read. The pull
      * consumer engine does, whose infinite run goes on after such a failure as it goes on after a lost connection
-     * ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #210).
+     * ({@see \IDCT\NATS\JetStream\JetStreamContext::consumePipelined()}, #210), and so does
+     * JetStreamContext::fetchBatch(), which returns what it received when its read meets such a failure, as
+     * requestMany() does, also once the reconnect has reopened the connection (#196).
      *
      * @internal Low-level mechanism for the library's own operations; not general API.
      */
@@ -5474,9 +5476,11 @@ final class NatsConnection
                     // The read failed with the connection going: lost, or failed over from a server in lame duck
                     // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended by
                     // a reconnect that gave up or by a fatal -ERR. What was collected is returned, as for a close
-                    // above; nothing collected fails with it. A failure on an open connection still fails the
-                    // collection: a full queue, a handler's own, or a fatal -ERR whose reconnect has reopened it.
-                    if ($messages === [] || $this->state === ConnectionState::Open) {
+                    // above; nothing collected fails with it. So is it after a fatal -ERR whose reconnect has reopened
+                    // the connection by now (#196): the failure ended the connection, whatever the reconnect did since,
+                    // and the replies came on it. A failure that leaves the connection open still fails the collection:
+                    // a full queue, a handler's own, an -ERR the server keeps the connection open for.
+                    if ($messages === [] || ($this->state === ConnectionState::Open && !$this->frameFailureEndsConnection($e))) {
                         throw $e;
                     }
 
