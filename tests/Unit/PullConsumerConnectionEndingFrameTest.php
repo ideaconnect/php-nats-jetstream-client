@@ -53,7 +53,9 @@ use function Amp\async;
  * the other time bounds only keep a broken run from hanging the suite. Each test fails on 2.22.0, where handle() threw
  * the frame's error, except the EOF control data sets and the declared guards, which pass on both. A drain() of the
  * client still Draining lets the hand-over deliver what the pulls held, the run issuing no pull while it drains (#207):
- * the two tests of that fail on 2.23.0 as well, where any close ended the hand-over.
+ * the two tests of that fail on 2.23.0 as well, where any close ended the hand-over. The two #189 restart data sets fail
+ * on 2.24.6, where the handle() after the stop cleared it: the first handler got the rest of the hand-over, and the
+ * first run pulled on the new connection next to the second.
  */
 final class PullConsumerConnectionEndingFrameTest extends TestCase
 {
@@ -356,6 +358,90 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
         self::assertSame(['m-1'], $handled->getArrayCopy(), 'the stop leaves m-2 and m-3 undelivered');
         self::assertSame([0, 0], $server->epochs, 'no pull on the new connection');
         self::assertSame([self::STALE_CONNECTION_ERROR], $recorder->errors);
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function restartsDuringTheHandOver(): iterable
+    {
+        yield 'the handler restarts its consumer' => [false];
+        yield 'another fiber restarts it while the handler waits' => [true];
+    }
+
+    /**
+     * The restart idiom during that hand-over leaves the rest undelivered, and the run ends as a stopped run, returning
+     * its count, with no pull on the new connection (#189): depth 2 and batch 2, the two pulls hold m-1 and m-2, and m-3,
+     * when a fatal -ERR ends the connection, the reconnect reopening it, and on m-1 the run is stopped and another
+     * started, by the handler itself, or by another fiber while the handler waits on m-1. The first handler gets m-1
+     * only, handle() returns 1, and only the second run pulls on the new connection, on an inbox of its own, until a
+     * stop() ends it. The handle() after the stop used to clear it: the first handler got m-2 and m-3 as well, and the
+     * first run went on pulling on the new connection next to the second.
+     */
+    #[DataProvider('restartsDuringTheHandOver')]
+    public function testARestartDuringTheHandOverEndsTheRunWithItsCountAndNoPullOnTheNewConnection(bool $fromAnotherFiber): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport, static fn(): array => []);
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(2)->setDepth(2)->setExpiresMs(30_000);
+        $handled = self::payloadLog();
+        $restarted = new class {
+            /** @var Future<int>|null The run started on m-1. */
+            public ?Future $run = null;
+        };
+        $restart = static function () use ($iterator, $handled, $restarted): void {
+            $iterator->stop();
+            $restarted->run = $iterator->handle(static function (NatsMessage $message) use ($handled): void {
+                $handled[] = 'second handler: ' . $message->payload;
+            });
+            // Should the test fail with the run still going, the close in tearDown ends it: nothing is to report it.
+            $restarted->run->ignore();
+        };
+        /** @var DeferredFuture<null> $holding */
+        $holding = new DeferredFuture();
+        /** @var DeferredFuture<null> $gate */
+        $gate = new DeferredFuture();
+        $run = $iterator->handle(static function (NatsMessage $message) use ($handled, $restart, $fromAnotherFiber, $holding, $gate): void {
+            $handled[] = 'first handler: ' . $message->payload;
+            if ($message->payload !== 'm-1') {
+                return;
+            }
+            if (!$fromAnotherFiber) {
+                $restart();
+
+                return;
+            }
+            $holding->complete();
+            $gate->getFuture()->await(new TimeoutCancellation(5));
+        });
+        $this->waitUntil(static fn(): bool => count($server->epochs) === 2 && $watched->readsUnderWay === 1);
+
+        $transport->pushFrame(self::messages((int) $server->sid, 'm-1', 'm-2', 'm-3') . self::STALE_CONNECTION);
+        if ($fromAnotherFiber) {
+            $holding->getFuture()->await(new TimeoutCancellation(5));
+            $restart();
+            $gate->complete();
+        }
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame(['first handler: m-1'], $handled->getArrayCopy(), 'the stop leaves m-2 and m-3 undelivered');
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(1, $processed);
+        $second = $restarted->run;
+        if ($second === null) {
+            self::fail('the consumer was never restarted');
+        }
+        // The second run's generation, on the new connection.
+        $this->waitUntil(static fn(): bool => count($server->epochs) === 4);
+        $firstInbox = (int) $server->sid;
+        self::assertSame([0, 0, 1, 1], $server->epochs);
+        self::assertSame([$firstInbox, $firstInbox], array_slice($server->sids, 0, 2), 'the first run pulled on the old connection only');
+        self::assertNotContains($firstInbox, array_slice($server->sids, 2), 'the pulls on the new connection are the second run\'s');
+        self::assertSame([self::STALE_CONNECTION_ERROR], $recorder->errors);
+
+        $iterator->stop();
+        [$secondProcessed, $secondError] = self::settle($second);
+        self::assertNull($secondError, sprintf('the second run threw %s', self::describe($secondError)));
+        self::assertSame(0, $secondProcessed);
+        self::assertCount(4, $server->epochs, 'no pull after the stop');
     }
 
     /**
@@ -1003,23 +1089,25 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
     }
 
     /**
-     * The scripted server's side of the pull consumer: records the epoch (session) and the JSON request of every pull,
-     * and the sid of the run's inbox, and answers each pull with what $onPull returns, given the pull's reply subject,
-     * the inbox's sid, the pull's number (1 for the first) and its epoch; with no frames the server holds the pull, as
-     * one with no message does until it expires.
+     * The scripted server's side of the pull consumer: records the epoch (session), the JSON request and the inbox's sid
+     * of every pull, and the sid of the first run's inbox, and answers each pull with what $onPull returns, given the
+     * pull's reply subject, the inbox's sid, the pull's number (1 for the first) and its epoch; with no frames the
+     * server holds the pull, as one with no message does until it expires.
      *
      * @param \Closure(string, int, int, int): list<string> $onPull
-     * @return object{sid: ?int, epochs: list<int>, requests: list<string>}
+     * @return object{sid: ?int, epochs: list<int>, requests: list<string>, sids: list<?int>}
      */
     private function pullServer(ReconnectingTransport $transport, \Closure $onPull): object
     {
         $server = new class {
-            /** The sid the client subscribed the run's inbox with. */
+            /** The sid the client subscribed the (first) run's inbox with. */
             public ?int $sid = null;
             /** @var list<int> The epoch each pull came on, in order. */
             public array $epochs = [];
             /** @var list<string> The JSON body of each pull request, in order. */
             public array $requests = [];
+            /** @var list<?int> The sid of the inbox each pull's reply subject belongs to, null where none was subscribed. */
+            public array $sids = [];
         };
         $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $server, $onPull): array {
             if ($replyTo === null || $subject !== self::PULL_SUBJECT) {
@@ -1029,6 +1117,7 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
             $server->epochs[] = $transport->epoch();
             $server->requests[] = $payload;
             $sid = $transport->sidFor($replyTo);
+            $server->sids[] = $sid;
             if ($sid === null) {
                 return [];
             }

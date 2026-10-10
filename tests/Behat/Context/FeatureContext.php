@@ -7,6 +7,7 @@ namespace IDCT\NATS\Tests\Behat\Context;
 use Amp\CancelledException;
 use Amp\DeferredCancellation;
 use Amp\Future;
+use Amp\TimeoutCancellation;
 use Behat\Behat\Context\Context;
 use DateTimeImmutable;
 use IDCT\NATS\Auth\CredentialsParser;
@@ -31,6 +32,7 @@ use IDCT\NATS\JetStream\Enum\DiscardPolicy;
 use IDCT\NATS\JetStream\Enum\ReplayPolicy;
 use IDCT\NATS\JetStream\Enum\RetentionPolicy;
 use IDCT\NATS\JetStream\Enum\StorageBackend;
+use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Services\BasicJsonSchemaValidator;
 use IDCT\NATS\Services\Service;
@@ -1526,6 +1528,92 @@ final class FeatureContext implements Context
     {
         if ($this->state->lastPullIteratorTotal !== $count || count($this->state->lastBatchPayloads) !== $count) {
             throw new RuntimeException(sprintf('Expected pull-consumer iteration to process %d messages.', $count));
+        }
+    }
+
+    /**
+     * The README's restart of a pull consumer (#189): stop() and handle() again in one tick, without awaiting the
+     * first run, which waits on the server for a stream still empty; then :count messages are published, each handler
+     * acking what it gets. The step records what each run returned and what each handler got.
+     *
+     * @When I restart a pull consumer waiting on an empty stream with stop and handle in one tick and publish :count JetStream messages
+     */
+    public function iRestartAPullConsumerWithStopAndHandleInOneTickAndPublishJetStreamMessages(int $count): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $consumer = $this->requireValue($this->state->consumerName, 'consumer');
+        $subject = $this->requireValue($this->state->streamSubject, 'primary stream subject');
+        $js = $this->client('primary')->jetStream();
+
+        $js->createStream($stream, [$subject])->await();
+        $this->createdStreams[] = $stream;
+        $js->createConsumer($stream, $consumer, $subject, ['ack_policy' => 'explicit'])->await();
+
+        /** @var \ArrayObject<int, string> $handled */
+        $handled = new \ArrayObject();
+        $handler = static fn(string $run): \Closure => static function (NatsMessage $message, JetStreamContext $context) use ($handled, $run): void {
+            $handled[] = $run . ': ' . $message->payload;
+            $context->ack($message)->await();
+        };
+        $iterator = $js->pullConsumer($stream, $consumer)->setBatching(1)->setDepth(1)->setExpiresMs(30_000);
+        $stopped = $iterator->handle($handler('stopped'));
+        $restarted = null;
+
+        try {
+            $this->waitFor(static fn(): bool => ($js->getConsumer($stream, $consumer)->await()->raw['num_waiting'] ?? 0) === 1);
+            $iterator->stop();
+            $restarted = $iterator->handle($handler('restarted'));
+            try {
+                $this->state->stoppedPullIteratorTotal = $stopped->await(new TimeoutCancellation(5));
+            } catch (CancelledException) {
+                throw new RuntimeException('The stopped pull-consumer run did not end at its stop: the handle() after it cleared the stop.');
+            }
+
+            for ($i = 1; $i <= $count; $i++) {
+                $js->publish($subject, 'restart-' . $i)->await();
+            }
+            $this->waitFor(static fn(): bool => $handled->count() >= $count);
+            $iterator->stop();
+            $this->state->lastPullIteratorTotal = $restarted->await(new TimeoutCancellation(5));
+            $this->state->lastBatchPayloads = array_values($handled->getArrayCopy());
+        } finally {
+            $iterator->stop();
+            $stopped->ignore();
+            $restarted?->ignore();
+        }
+    }
+
+    /**
+     * @Then the stopped pull-consumer run should have processed :count messages
+     */
+    public function theStoppedPullConsumerRunShouldHaveProcessedMessages(int $count): void
+    {
+        if ($this->state->stoppedPullIteratorTotal !== $count) {
+            throw new RuntimeException(sprintf(
+                'Expected the stopped pull-consumer run to have processed %d messages, it processed %s.',
+                $count,
+                json_encode($this->state->stoppedPullIteratorTotal),
+            ));
+        }
+    }
+
+    /**
+     * @Then only the restarted pull-consumer run should have processed :count messages
+     */
+    public function onlyTheRestartedPullConsumerRunShouldHaveProcessedMessages(int $count): void
+    {
+        $expected = [];
+        for ($i = 1; $i <= $count; $i++) {
+            $expected[] = 'restarted: restart-' . $i;
+        }
+
+        if ($this->state->lastPullIteratorTotal !== $count || $this->state->lastBatchPayloads !== $expected) {
+            throw new RuntimeException(sprintf(
+                'Expected only the restarted pull-consumer run to process %d messages, in order; it returned %d, and the handlers got %s.',
+                $count,
+                $this->state->lastPullIteratorTotal,
+                json_encode($this->state->lastBatchPayloads),
+            ));
         }
     }
 

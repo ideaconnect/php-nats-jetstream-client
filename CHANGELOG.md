@@ -15,6 +15,43 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.25.0] - 2026-10-10
+
+### Upgrade notes
+
+- `PullConsumerIterator::stop()` and `drain()` now act on every run active on the iterator when they are called, and
+  `handle()` no longer resets them for a run already going (#189). Code that called `handle()` again before the
+  previous run's future had resolved, which the README asked to avoid, no longer finds that run still going: after
+  `stop()` and `handle()` the previous run ends on its stop, its future resolving with its count, and after `drain()`
+  and `handle()` it delivers its pulls in flight to its own handler, next to the new run, and ends without pulling
+  again. The previous run's handler may still be finishing its message when the new run starts: await the previous
+  future first where two handlers must never run at once. Runs started on one iterator without a `stop()` in between
+  still all go on, and one `stop()` still ends them all, now each at once, where an older run used to see it only at
+  its pull's deadline; a `stop()` or `drain()` that an older run's handler makes once a newer run is going reaches the
+  newer run too. Code that awaits each run before starting the next sees no change.
+
+### Changed
+
+- `[feature]` A pull consumer can be restarted with `stop()` (or `drain()`) and `handle()` in one tick, without awaiting
+  the run under way, as a supervisor that changes the consumer's settings on a signal does (#189). Every run of one
+  `PullConsumerIterator` used to read the iterator's two flags: `handle()` cleared them and replaced the wake-ups of
+  #181 before the earlier run's engine resumed, so that run lost the `stop()` or `drain()` meant for it and went on
+  next to the new one, on the same consumer with its old handler and settings, one more run, inbox and set of pulls on
+  the server with each restart, until a later `stop()` reached it at its pull's deadline (its expiry plus a second),
+  or the connection closed. A restart from the handler, or from another fiber while the handler waited, also handed
+  the rest of what the run held to the old handler, against the documented "a `stop()` leaves the rest undelivered":
+  in the retire phase, and in the hand-overs of a run that fails (#197), that goes on past a frame that ended the
+  connection (#210, then also pulling on the new connection), that the client's `drain()` asks (#207), and of a
+  run's overflow and a terminal status (#187). Each run now has its own flags and wake-ups (`PullRunLifecycle`,
+  `@internal`), which live as long as the run: the iterator signals every run active when `stop()` or `drain()` is
+  called, and forgets a run once its future has resolved. Measured on nats-server 2.12.15 with a durable consumer and
+  explicit acks, a run of batch 1, depth 1 and a 30 s expiry waiting on the empty stream, then `stop()` and `handle()`
+  in one tick and four messages published: in 2.24.6 the first run's future was still pending 3 s later, the old
+  handler got m-1 and m-3 and the new one m-2 and m-4, and after a final `stop()` the first run's pull still waited on
+  the server; now the first run returns 0 at once, its request dropped with the interest in its inbox, and the new
+  handler gets all four. The 2.17.0 advice to await a run's future before calling `handle()` again is withdrawn. Found
+  by the review of #181 (2.17.0).
+
 ## [2.24.6] - 2026-10-10
 
 ### Upgrade notes

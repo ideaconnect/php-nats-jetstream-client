@@ -99,6 +99,9 @@ final class ScenarioState
 
     public int $lastPullIteratorTotal = 0;
 
+    /** What the run a restart stopped returned (#189), null while no restart has run. */
+    public ?int $stoppedPullIteratorTotal = null;
+
     public ?string $lastObservedRequestHeader = null;
 
     public ?string $lastServerName = null;
@@ -189,6 +192,7 @@ final class ScenarioState
         $this->lastAckSequence = 0;
         $this->lastPurgeCount = 0;
         $this->lastPullIteratorTotal = 0;
+        $this->stoppedPullIteratorTotal = null;
         $this->lastObservedRequestHeader = null;
         $this->lastServerName = null;
         $this->lastDirectSubject = null;

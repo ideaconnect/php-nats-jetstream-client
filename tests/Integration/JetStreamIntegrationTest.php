@@ -14,6 +14,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\JetStream\ObjectStore\ObjectData;
@@ -2409,6 +2410,76 @@ final class JetStreamIntegrationTest extends TestCase
             $run->ignore();
             $js->deleteStream($stream)->await();
             $admin->disconnect()->await();
+        }
+    }
+
+    /**
+     * A supervisor's restart of a pull consumer, stop() and handle() again in one tick without awaiting the first run
+     * (#189): the first run, its pull waiting on the server for a stream still empty, ends on its stop with nothing
+     * handled, the server dropping its request with the interest in its inbox, and from then on only the second run's
+     * handler gets what is published, acking each message: the durable consumer delivers m-1 to m-4 once, all to the
+     * second run, and holds nothing pending or waiting for an ack. The second handle() used to clear the stop before
+     * the first run saw it: the first run went on next to the second, on the same consumer, the two handlers splitting
+     * the stream between them (m-1 and m-3 to the first, m-2 and m-4 to the second), and the first run's pull still
+     * waited on the server after a final stop().
+     */
+    public function testAPullConsumerRestartedWithStopAndHandleInOneTickHandsWhatFollowsToTheNewHandler(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITRESTART' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, 'worker', $subject, ['ack_policy' => 'explicit'])->await();
+        /** @var \ArrayObject<int, string> $handled */
+        $handled = new \ArrayObject();
+        $handler = static fn(string $run): \Closure => static function (NatsMessage $message, JetStreamContext $context) use ($handled, $run): void {
+            $handled[] = $run . ': ' . $message->payload;
+            $context->ack($message)->await();
+        };
+        $iterator = $js->pullConsumer($stream, 'worker')->setBatching(1)->setDepth(1)->setExpiresMs(30_000);
+        $first = $iterator->handle($handler('first run'));
+        $second = null;
+
+        try {
+            $this->waitForWaitingPulls($client, $stream, 1);
+            $iterator->stop();
+            $second = $iterator->handle($handler('second run'));
+            try {
+                $firstProcessed = $first->await(new TimeoutCancellation(5));
+            } catch (CancelledException) {
+                self::fail('the first run did not end at its stop: the second handle() cleared the stop before the first run saw it');
+            }
+            // The second run's request; the first run's left with the interest in its inbox.
+            $this->waitForWaitingPulls($client, $stream, 1);
+
+            for ($i = 1; $i <= 4; ++$i) {
+                $js->publish($subject, 'm-' . $i)->await();
+            }
+            $this->waitFor(static fn(): bool => $handled->count() === 4, 'four messages handled');
+            $iterator->stop();
+            $secondProcessed = $second->await(new TimeoutCancellation(5));
+            $this->waitFor(
+                static fn(): bool => ($js->getConsumer($stream, 'worker')->await()->raw['num_ack_pending'] ?? null) === 0,
+                'the acks to reach the server',
+            );
+            $info = $js->getConsumer($stream, 'worker')->await()->raw;
+
+            self::assertSame(0, $firstProcessed);
+            self::assertSame(['second run: m-1', 'second run: m-2', 'second run: m-3', 'second run: m-4'], $handled->getArrayCopy());
+            self::assertSame(4, $secondProcessed);
+            self::assertIsArray($info['delivered'] ?? null);
+            self::assertSame(4, $info['delivered']['consumer_seq'] ?? null, 'each message delivered once');
+            self::assertSame(0, $info['num_pending'] ?? null);
+        } finally {
+            $iterator->stop();
+            $first->ignore();
+            $second?->ignore();
+            $js->deleteStream($stream)->await();
+            $client->disconnect()->await();
         }
     }
 

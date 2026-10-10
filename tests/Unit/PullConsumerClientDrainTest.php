@@ -45,7 +45,8 @@ use function Amp\delay;
  * must still be flushing. The time bounds keep a broken run from hanging the suite, except in the tests that show the
  * drain does not wait (for its budget, or for an idle backoff), whose bounds sit far from both outcomes (a quarter of a
  * second against the half second of a backoff, a second against the two seconds of a budget). Each test fails on
- * 2.23.0, where the drain asked no run, except the three declared guards, which pass on both.
+ * 2.23.0, where the drain asked no run, except the three declared guards, which pass on both; the #189 restart test also
+ * fails on 2.24.6, where the handle() after the stop cleared it and m-2 was handed over.
  */
 final class PullConsumerClientDrainTest extends TestCase
 {
@@ -883,6 +884,60 @@ final class PullConsumerClientDrainTest extends TestCase
         self::assertSame(['handler m-1 (Draining)', 'ack of m-1 sent'], $log->getArrayCopy(), 'the stop leaves m-2 undelivered');
         self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame(1, $processed);
+        self::assertSame(1, self::acksOnTheWire($transport));
+        self::assertSame([], $recorder->errors);
+        self::assertLessThan(1.0, $drainedIn, sprintf('the drain took %.3f s of its two-second budget', $drainedIn));
+        self::assertSame(ConnectionState::Closed, $client->state());
+    }
+
+    /**
+     * The restart idiom during that hand-over leaves the rest undelivered as well (#189): the pull (batch 3) holds m-1
+     * and m-2, and the handler acks m-1 and then stops the run and starts another. m-2 is not handed over, handle()
+     * returns 1, the new run fails at once with "Connection is not open", as any run started while the client drains,
+     * and drain() resolves without waiting out its budget, reporting nothing. The handle() after the stop used to
+     * clear it before the hand-over checked it again: m-2 was handed over too.
+     */
+    public function testARestartDuringTheHandOverLeavesTheRestUndelivered(): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport);
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000);
+        $log = self::log();
+        $acking = self::ackingHandler($log, $client);
+        $restarted = new class {
+            /** @var Future<int>|null The run the first run's handler started. */
+            public ?Future $run = null;
+        };
+        $run = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($acking, $iterator, $restarted, $log): void {
+            $acking($message, $js);
+            if ($restarted->run === null) {
+                $iterator->stop();
+                $restarted->run = $iterator->handle(static function (NatsMessage $message) use ($log): void {
+                    $log[] = 'second handler ' . $message->payload;
+                });
+                // Settled below; should the test fail first, nothing is to report the run's failure.
+                $restarted->run->ignore();
+            }
+        });
+        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server->sids['C'], 'C', ['m-1', 'm-2']);
+
+        $startedAt = hrtime(true);
+        $client->drain()->await(new TimeoutCancellation(5));
+        $drainedIn = $this->secondsSince($startedAt);
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame(['handler m-1 (Draining)', 'ack of m-1 sent'], $log->getArrayCopy(), 'the stop leaves m-2 undelivered');
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(1, $processed);
+        $second = $restarted->run;
+        if ($second === null) {
+            self::fail('the handler never restarted the consumer');
+        }
+        [$secondProcessed, $secondError] = self::settle($second);
+        self::assertNull($secondProcessed);
+        self::assertInstanceOf(ConnectionException::class, $secondError, sprintf('the new run threw %s', self::describe($secondError)));
+        self::assertSame('Connection is not open', $secondError->getMessage(), 'a run started while the client drains fails at once');
         self::assertSame(1, self::acksOnTheWire($transport));
         self::assertSame([], $recorder->errors);
         self::assertLessThan(1.0, $drainedIn, sprintf('the drain took %.3f s of its two-second budget', $drainedIn));

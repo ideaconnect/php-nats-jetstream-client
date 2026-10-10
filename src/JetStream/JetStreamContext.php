@@ -2689,9 +2689,11 @@ final class JetStreamContext
      * A stop() or drain() from another fiber ends the engine's wait at once: the pump read and the idle
      * backoff wait with the run's wake-ups from the control ({@see PullPipelineControl::stopInterruption()},
      * {@see PullPipelineControl::drainInterruption()}), each composed only while it has not fired, and the
-     * flag is seen at the top of the loop once the wait ends (#181). A wake-up a later handle() on the same
-     * iterator replaced fires without its flag; left out of the waits like any fired one, it leaves this run
-     * waiting to its deadlines as before #181, with no spin (see {@see pullWaitCancellation()}).
+     * flag is seen at the top of the loop once the wait ends (#181). The flags and the wake-ups are the run's
+     * own ({@see \IDCT\NATS\JetStream\Consumers\PullRunLifecycle}, #189): the iterator's stop() and drain()
+     * signal every run active when they are called, each through its own, and a later handle() on the same
+     * iterator starts a run with fresh ones and leaves this run's alone, where it used to clear the shared
+     * flags and replace this run's wake-ups, so that this run went on next to the new one.
      *
      * A run that ends with a failure of its own waits or writes first hands the handler what its pulls have received
      * (#197): the pump read failing with anything but the CancelledException that ends a wait (the connection lost with
@@ -3284,10 +3286,9 @@ final class JetStreamContext
                         if ($backoffWarranted) {
                             ++$consecutiveEmptyPulls;
                             // The wait holds the run's wake-ups (neither flag is set here, checked just above,
-                            // so neither has fired unless a later handle() replaced it): a stop() or drain()
-                            // from another fiber ends the backoff at once instead of at its end, and the loop
-                            // top then sees the flag (#181), and so does the client's drain() asking for the
-                            // hand-over (#207).
+                            // so neither has fired): a stop() or drain() from another fiber ends the backoff at
+                            // once instead of at its end, and the loop top then sees the flag (#181), and so
+                            // does the client's drain() asking for the hand-over (#207).
                             try {
                                 delay(
                                     PullConsumerIterator::idleBackoffMs($consecutiveEmptyPulls) / 1000,
@@ -3769,12 +3770,14 @@ final class JetStreamContext
      * fired it: composed, it would end this wait and every later one at once, a spin of reads in queued
      * callbacks that runs ahead of every timer and socket read in the process. One fired by its own stop()
      * or drain() has its flag set, and the flag is seen at the top of the loop, as is the client's drain()
-     * request, which its wake-up never fires without. One of the iterator's fired with its flag unset was
-     * replaced by a later handle() on the same iterator, which Amp fires as it is destructed: this run then
-     * waits as it did before #181, to its deadlines, until the shared flags end it. The wake-ups are read in
-     * the engine's fiber right before the wait starts, with no suspension in between, so a stop() or drain()
-     * from another fiber either fired before this check or fires a wake-up this wait holds. With one part,
-     * or none, the composite forwards that part or never fires.
+     * request, which its wake-up never fires without. The iterator's two are the run's own, like its flags
+     * ({@see \IDCT\NATS\JetStream\Consumers\PullRunLifecycle}, #189), and fire only once their flag is set
+     * while the run lasts: a later handle() on the same iterator used to replace them, Amp firing a
+     * replaced one as it destructed it with its flag unset, and still nothing spun, since a fired one is
+     * left out. The wake-ups are read in the engine's fiber right before the wait starts, with no
+     * suspension in between, so a stop() or drain() from another fiber either fired before this check or
+     * fires a wake-up this wait holds. With one part, or none, the composite forwards that part or never
+     * fires.
      */
     private static function pullWaitCancellation(
         PullPipelineControl $ctl,

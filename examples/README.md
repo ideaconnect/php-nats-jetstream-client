@@ -53,6 +53,7 @@ their own variant-server env vars (`NATS_TOKEN_URL`, `NATS_USERPASS_URL`, `NATS_
 - `fetch-batch.php` - fetch a batch of messages in one pull.
 - `pull-consumer-batching-iteration.php` - the fluent `pullConsumer()` batching iterator.
 - `pull-consumer-graceful-drain.php` - shut a pull consumer worker down with the client's `drain()`: what its pull holds is handed over and acked first.
+- `pull-consumer-restart.php` - restart a running pull consumer with new settings: `stop()` and `handle()` in one tick, the new run alone handling what follows.
 - `pull-consumer-priority-groups.php` - pull priority groups (pinned-client policy).
 
 ## JetStream - streams, messages & data

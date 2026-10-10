@@ -56,7 +56,8 @@ use PHPUnit\Framework\TestCase;
  * guards (one of them the disconnect() data set of an application close), which pass on both; the five #207 tests
  * (the drain() data set of an application close, a disconnect() from the handler or from another fiber while a
  * retired pull is handed over, and the two that keep a pull a disconnect() emptied from counting as an empty retire)
- * fail on 2.23.0.
+ * fail on 2.23.0. The #189 restart test, stop() and handle() from the handler during that delivery, fails on 2.24.6,
+ * where the second handle() cleared the stop and the first handler got the rest.
  */
 final class PullConsumerConnectionLossTest extends TestCase
 {
@@ -859,6 +860,58 @@ final class PullConsumerConnectionLossTest extends TestCase
         self::assertInstanceOf(ConnectionException::class, $error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame("Server sent error frame: 'Stale Connection'", $error->getMessage(), 'the run still ends with its failure');
         self::assertSame(['m-1'], $handled->getArrayCopy(), 'the stop leaves m-2 and m-3 undelivered');
+    }
+
+    /**
+     * The restart idiom from the handler during that delivery leaves the rest undelivered as well (#189): the pull
+     * (batch 3, depth 1) holds m-1 and m-2 when the server rejects the run's inbox, the connection staying open, and the
+     * handler stops the run and starts another on m-1. The first handler gets m-1 only, handle() still throws the
+     * rejection, and the second run, on an inbox of its own, pulls on the open connection until a stop() ends it. The
+     * handle() after the stop used to clear it before the delivery checked it again: the first handler got m-2 too.
+     */
+    public function testARestartFromTheHandlerDuringThatDeliveryLeavesTheRestUndelivered(): void
+    {
+        [$transport, $watched, $client] = $this->client('reconnect on');
+        $server = $this->pullServer($transport);
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000);
+        $handled = self::payloadLog();
+        $restarted = new class {
+            /** @var Future<int>|null The run the first run's handler started. */
+            public ?Future $run = null;
+        };
+        $run = $iterator->handle(static function (NatsMessage $message) use ($handled, $iterator, $restarted): void {
+            $handled[] = 'first handler: ' . $message->payload;
+            if ($message->payload === 'm-1') {
+                $iterator->stop();
+                $restarted->run = $iterator->handle(static function (NatsMessage $message) use ($handled): void {
+                    $handled[] = 'second handler: ' . $message->payload;
+                });
+                // Should the test fail with the run still going, the close in tearDown ends it: nothing is to report it.
+                $restarted->run->ignore();
+            }
+        });
+        $this->waitUntil(static fn(): bool => $server->sid !== null && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server, ['m-1', 'm-2']);
+
+        $transport->pushFrame(sprintf("-ERR 'Permissions Violation for Subscription to \"%s.*\" (sid \"%d\")'\r\n", $server->base, (int) $server->sid));
+        [, $error] = self::settle($run);
+
+        self::assertSame(['first handler: m-1'], $handled->getArrayCopy(), 'the stop leaves m-2 undelivered');
+        self::assertInstanceOf(JetStreamException::class, $error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertStringContainsString('was rejected by server permissions', $error->getMessage(), 'the run still ends with its failure');
+        $second = $restarted->run;
+        if ($second === null) {
+            self::fail('the handler never restarted the consumer');
+        }
+        // The second run's pull, on the connection the rejection left open.
+        $this->waitUntil(static fn(): bool => count($server->epochs) === 2);
+        self::assertSame(ConnectionState::Open, $client->state());
+
+        $iterator->stop();
+        [$processed, $secondError] = self::settle($second);
+        self::assertNull($secondError, sprintf('the second run threw %s', self::describe($secondError)));
+        self::assertSame(0, $processed);
+        self::assertSame([0, 0], $server->epochs, 'one pull per run');
     }
 
     /**
