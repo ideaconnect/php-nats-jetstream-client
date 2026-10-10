@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\Future;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -311,7 +313,9 @@ final class FailedControlWriteTest extends TestCase
     /**
      * A request that gives up on its reply inbox - the connection did not come back within its timeout -
      * leaves nothing half-established (#118): the reconnect does not subscribe the inbox given up on, and the
-     * next request subscribes it once, and is answered.
+     * next request subscribes it once, and is answered. The request times out with its own timeout, which bounds
+     * the set-up of the inbox too (#194, #213), where it used to report the subscribe's timeout, a fresh
+     * requestTimeoutMs that the set-up started on its own.
      */
     public function testRequestThatGivesUpOnItsReplyInboxLetsTheNextRequestSubscribeItAgain(): void
     {
@@ -327,7 +331,7 @@ final class FailedControlWriteTest extends TestCase
             $connection->request('svc.echo', 'x')->await();
             self::fail('expected TimeoutException');
         } catch (TimeoutException $e) {
-            self::assertStringStartsWith('Subscribe to "_INBOX.', $e->getMessage());
+            self::assertSame('Request timed out for subject svc.echo while waiting for the reply inbox to be set up', $e->getMessage());
         }
 
         $transport->acceptDials();
@@ -336,6 +340,92 @@ final class FailedControlWriteTest extends TestCase
 
         self::assertSame('hello', $reply->payload);
         self::assertCount(1, $transport->controlLinesStartingWith('SUB _INBOX.', $transport->epoch()));
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function requestsWhoseReplyInboxSubFindsTheSocketDead(): iterable
+    {
+        yield 'request() timing out' => ['request'];
+        yield 'requestMany() timing out' => ['requestMany'];
+        yield 'request() cancelled by its caller' => ['cancelled'];
+    }
+
+    /**
+     * A request whose reply inbox's SUB finds the socket dead waits for the reconnect only within its own budget (#194):
+     * requestTimeoutMs 3000, the SUB failing and the reconnect's dials refused. A request() or requestMany() with a
+     * budget of 300 ms ends with `Request timed out for subject svc.echo while waiting for the reply inbox to be set up`
+     * within that budget, the connection still reconnecting, and a request() of five seconds that its caller cancels at
+     * 0.1 s ends with CancelledException then. Each used to wait the whole requestTimeoutMs that the set-up started on its
+     * own, and end with the subscribe's timeout.
+     */
+    #[DataProvider('requestsWhoseReplyInboxSubFindsTheSocketDead')]
+    public function testARequestWhoseReplyInboxSubFindsTheSocketDeadWaitsOnlyWithinItsOwnBudget(string $variant): void
+    {
+        $transport = new ReconnectingTransport();
+        $connection = $this->connect($transport, requestTimeoutMs: 3_000);
+        $transport->refuseDials();
+        $transport->failNextWriteContaining('SUB _INBOX.');
+        $cancellation = new DeferredCancellation();
+        if ($variant === 'cancelled') {
+            EventLoop::delay(0.1, static function () use ($cancellation): void {
+                $cancellation->cancel();
+            });
+        }
+
+        $start = hrtime(true);
+        try {
+            match ($variant) {
+                'requestMany' => $connection->requestMany('svc.echo', 'x', totalTimeoutMs: 300)->await(),
+                'cancelled' => $connection->request('svc.echo', 'x', 5_000, $cancellation->getCancellation())->await(),
+                default => $connection->request('svc.echo', 'x', 300)->await(),
+            };
+            self::fail('expected the request to end before the reconnect');
+        } catch (TimeoutException $e) {
+            self::assertNotSame('cancelled', $variant, 'a cancelled request reports its cancellation');
+            self::assertSame('Request timed out for subject svc.echo while waiting for the reply inbox to be set up', $e->getMessage());
+        } catch (CancelledException) {
+            self::assertSame('cancelled', $variant, 'a request whose budget ran out reports its timeout');
+        }
+
+        self::assertLessThan(1.0, $this->secondsSince($start), 'within its own budget, not requestTimeoutMs');
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+    }
+
+    /**
+     * A request whose reply inbox's SUB found the socket dead is not sent after its deadline (#194): a budget of 300 ms,
+     * the reconnect's dials let through at 1 s. The request has failed by then, and nothing is published on the new
+     * connection; the next request subscribes the inbox there and is served. It used to be published on the new
+     * connection, after its deadline, and served, its caller getting a timeout.
+     */
+    public function testARequestWhoseReplyInboxSubFindsTheSocketDeadIsNotSentAfterItsDeadline(): void
+    {
+        /** @var \ArrayObject<int, string> $served */
+        $served = new \ArrayObject();
+        $transport = new ReconnectingTransport();
+        $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $served): array {
+            if ($subject !== 'svc.echo' || $replyTo === null) {
+                return [];
+            }
+
+            $served[] = $payload;
+
+            return $transport->replyFrame($replyTo, 'hello');
+        };
+        $connection = $this->connect($transport, requestTimeoutMs: 3_000);
+        $transport->refuseDials();
+        $transport->failNextWriteContaining('SUB _INBOX.');
+        $this->acceptDialsAfter($transport, 1.0);
+
+        try {
+            $connection->request('svc.echo', 'late', 300)->await();
+            self::fail('expected the request to time out');
+        } catch (TimeoutException $e) {
+            self::assertSame('Request timed out for subject svc.echo while waiting for the reply inbox to be set up', $e->getMessage());
+        }
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Open, 3.0);
+
+        self::assertSame('hello', $connection->request('svc.echo', 'next', 1_000)->await()->payload);
+        self::assertSame(['next'], $served->getArrayCopy(), 'the request that timed out was never published');
     }
 
     /** @return iterable<string, array{\Closure(NatsConnection): Future<mixed>}> */

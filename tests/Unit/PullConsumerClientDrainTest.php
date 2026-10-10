@@ -973,6 +973,243 @@ final class PullConsumerClientDrainTest extends TestCase
         self::assertSame(ConnectionState::Closed, $client->state());
     }
 
+    /** @return iterable<string, array{bool, bool}> */
+    public static function ackSyncHandlers(): iterable
+    {
+        yield 'the reply inbox made before the run, the failure caught' => [true, false];
+        yield 'the reply inbox made before the run, the failure thrown' => [true, true];
+        yield 'the first request of the client, the failure caught' => [false, false];
+        yield 'the first request of the client, the failure thrown' => [false, true];
+    }
+
+    /**
+     * A handler that acks with ackSync() gets its acks confirmed during the drain's hand-over (#213): the pull (batch 3,
+     * depth 1) holds m-1 and m-2 when the application drains the client, and the scripted server confirms every +ACK
+     * request whose reply subject it still holds a subscription for. The drain keeps the reply inbox subscribed while
+     * it delivers, and sets it up when the client has made no request yet, so both ackSync() calls are confirmed, the
+     * server gets two +ACK requests, handle() returns 2, the drain reports nothing, and the inbox's UNSUB follows the
+     * requests on the wire. On 2.24.3 both ackSync() calls failed at once with "Connection is not open" - the drain had
+     * unsubscribed the inbox and the connection refused requests while Draining - no +ACK reached the server, and a
+     * handler that let the failure throw ended the run with it: every message the drain handed over came again after the
+     * ack wait and was processed twice.
+     */
+    #[DataProvider('ackSyncHandlers')]
+    public function testAnAckSyncDuringTheDrainsHandOverIsConfirmed(bool $inboxBeforeTheRun, bool $failureThrown): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport);
+        $acks = $this->confirmAcks($transport);
+        if ($inboxBeforeTheRun) {
+            $client->request('warm', 'x')->await();
+        }
+        $log = self::log();
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(static function (NatsMessage $message, JetStreamContext $js) use ($log, $client, $failureThrown): void {
+                $log[] = 'handler ' . $message->payload . ' (' . $client->state()->name . ')';
+                if ($failureThrown) {
+                    $js->ackSync($message)->await();
+                    $log[] = 'ackSync of ' . $message->payload . ' confirmed';
+
+                    return;
+                }
+
+                try {
+                    $js->ackSync($message)->await();
+                    $log[] = 'ackSync of ' . $message->payload . ' confirmed';
+                } catch (\Throwable $failure) {
+                    $log[] = 'ackSync of ' . $message->payload . ' failed: ' . $failure->getMessage();
+                }
+            });
+        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server->sids['C'], 'C', ['m-1', 'm-2']);
+
+        $client->drain()->await(new TimeoutCancellation(5));
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame([
+            'handler m-1 (Draining)', 'ackSync of m-1 confirmed',
+            'handler m-2 (Draining)', 'ackSync of m-2 confirmed',
+        ], $log->getArrayCopy());
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(2, $processed);
+        self::assertSame(2, $acks->requests, 'the server got both +ACK requests');
+        self::assertSame([], $recorder->errors, 'nothing discarded, nothing reported');
+        $lines = $transport->controlLines();
+        $muxSid = self::muxSid($transport);
+        $lastAck = max([-1, ...array_keys(array_filter($lines, static fn(string $line): bool => str_starts_with($line, 'PUB $JS.ACK.S.C.')))]);
+        $muxRelease = array_search('UNSUB ' . $muxSid, $lines, true);
+        self::assertIsInt($muxRelease, 'the drain released the reply inbox');
+        self::assertGreaterThan($lastAck, $muxRelease, 'the reply inbox was released behind the acks');
+        self::assertSame(ConnectionState::Closed, $client->state());
+    }
+
+    /**
+     * Other requests of a handler during the drain's hand-over get their replies too (#213): the handler of m-1
+     * publishes a derived message to JetStream with a message id (an HPUB, answered with a PubAck), reads a Key/Value
+     * entry (a Direct Get, answered with the stored value) and makes a requestMany() of two replies, then acks with
+     * ackSync(). Each is answered while the connection is Draining, and handle() returns 1. On 2.24.3 the JetStream
+     * publish failed with "Connection is not open", and the run ended with it.
+     */
+    public function testAJetStreamPublishAKeyValueReadAndARequestManyDuringTheDrainsHandOverGetTheirReplies(): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport);
+        $acks = $this->confirmAcks($transport, static function (string $subject, string $replyTo) use ($transport): array {
+            return match ($subject) {
+                'derived.m-1' => $transport->replyFrame($replyTo, '{"stream":"D","seq":7}'),
+                '$JS.API.DIRECT.GET.KV_cfg' => self::directGetReply($transport, $replyTo, 'cfg', 'k', 'v-3', 3),
+                'svc.many' => [...$transport->replyFrame($replyTo, 'r-1'), ...$transport->replyFrame($replyTo, 'r-2')],
+                default => [],
+            };
+        });
+        $log = self::log();
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(static function (NatsMessage $message, JetStreamContext $js) use ($log, $client): void {
+                $ack = $js->publish('derived.' . $message->payload, 'x', msgId: 'id-' . $message->payload)->await();
+                $log[] = sprintf('published %s/%d', $ack->stream, $ack->seq);
+                $entry = $js->keyValue('cfg')->get('k')->await();
+                $log[] = 'read k = ' . ($entry === null ? 'nothing' : ($entry->value ?? '') . ' @' . ($entry->revision ?? 0));
+                $replies = $client->requestMany('svc.many', 'q', null, 2, 2_000)->await();
+                $log[] = 'requestMany: ' . implode(', ', array_map(static fn(NatsMessage $reply): string => $reply->payload, $replies));
+                $js->ackSync($message)->await();
+                $log[] = 'ackSync of ' . $message->payload . ' confirmed (' . $client->state()->name . ')';
+            });
+        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server->sids['C'], 'C', ['m-1']);
+
+        $client->drain()->await(new TimeoutCancellation(5));
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame([
+            'published D/7',
+            'read k = v-3 @3',
+            'requestMany: r-1, r-2',
+            'ackSync of m-1 confirmed (Draining)',
+        ], $log->getArrayCopy());
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(1, $processed);
+        self::assertSame(1, $acks->requests);
+        self::assertCount(1, $transport->controlLinesStartingWith('HPUB derived.m-1 '), 'the JetStream publish carried its message id');
+        self::assertSame([], $recorder->errors);
+    }
+
+    /**
+     * A request still waiting when the drain's budget runs out ends with the delivery phase (#213): a budget of half a
+     * second, the pull holding m-1 and m-2, and a server that never confirms an +ACK request, the handler's ackSync()
+     * waiting with a timeout of five seconds. At the deadline the drain seals its delivery phase - m-2 counted as not
+     * delivered - and the ackSync() fails with "Connection is not open", not with its own timeout; the handler, which
+     * catches it, gets nothing more, handle() returns 1, and the drain reports m-2 once and closes within its budget. A
+     * drain that let the request run to its own timeout took five seconds; one that counted what the run held only after
+     * the handler returned, the run having ended by then, reported nothing.
+     */
+    public function testARequestOutlastingTheDrainsBudgetEndsWithTheDeliveryPhase(): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client(requestTimeoutMs: 500);
+        $server = $this->pullServer($transport);
+        $log = self::log();
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(static function (NatsMessage $message, JetStreamContext $js) use ($log, $client): void {
+                $log[] = 'handler ' . $message->payload . ' (' . $client->state()->name . ')';
+                $startedAt = hrtime(true);
+                try {
+                    $js->ackSync($message, 5_000)->await();
+                    $log[] = 'ackSync of ' . $message->payload . ' confirmed';
+                } catch (\Throwable $failure) {
+                    $log[] = sprintf('ackSync of %s failed: %s: %s', $message->payload, $failure::class, $failure->getMessage());
+                    $log[] = (hrtime(true) - $startedAt) / 1e9 < 2.0 ? 'within the drain\'s budget' : 'at its own timeout';
+                }
+            });
+        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server->sids['C'], 'C', ['m-1', 'm-2']);
+
+        $startedAt = hrtime(true);
+        $client->drain()->await(new TimeoutCancellation(8));
+        $drainedIn = $this->secondsSince($startedAt);
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame([
+            'handler m-1 (Draining)',
+            'ackSync of m-1 failed: IDCT\NATS\Exception\ConnectionException: Connection is not open',
+            'within the drain\'s budget',
+        ], $log->getArrayCopy());
+        self::assertSame([self::DEADLINE_REPORT], $recorder->errorsContaining('drain deadline exceeded'), 'm-2 is reported once');
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(1, $processed);
+        self::assertLessThan(2.0, $drainedIn, sprintf('the drain took %.3f s of its half-second budget', $drainedIn));
+        self::assertCount(1, $transport->controlLinesStartingWith('PUB $JS.ACK.S.C.'), 'only m-1\'s +ACK request went out');
+        self::assertSame(ConnectionState::Closed, $client->state());
+    }
+
+    /**
+     * What the drain's deadline report names is counted when the deadline seals the delivery phase (#213), not once the
+     * drain looks again: a budget of half a second, the pull (batch 4) holding m-1, m-2 and m-3, and the handler of m-1
+     * waiting on an ackSync() the server never confirms. At the deadline the seal counts m-2 and m-3 - not m-1, which the
+     * handler has - and only then ends the request: the handler, which catches the failure, returns at once, the run hands
+     * nothing more over, ends, and leaves the drain, all before the drain looks again. The report still names the two,
+     * once. Counted when the drain looked again, the run gone by then, the report named nothing, or was skipped as if
+     * every hand-over had completed.
+     */
+    public function testTheDeadlineReportCountsWhatTheRunHeldWhenTheDeliveryPhaseWasSealed(): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client(requestTimeoutMs: 500);
+        $server = $this->pullServer($transport);
+        $log = self::log();
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(4)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(static function (NatsMessage $message, JetStreamContext $js) use ($log): void {
+                $log[] = 'handler ' . $message->payload;
+                try {
+                    $js->ackSync($message, 5_000)->await();
+                } catch (\Throwable $failure) {
+                    $log[] = 'ackSync of ' . $message->payload . ' failed: ' . $failure->getMessage();
+                }
+            });
+        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server->sids['C'], 'C', ['m-1', 'm-2', 'm-3']);
+
+        $client->drain()->await(new TimeoutCancellation(5));
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame(['handler m-1', 'ackSync of m-1 failed: Connection is not open'], $log->getArrayCopy(), 'nothing was handed over after the seal');
+        self::assertSame(
+            ['drain deadline exceeded: 2 buffered message(s) were not delivered before close'],
+            $recorder->errorsContaining('drain deadline exceeded'),
+        );
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(1, $processed);
+    }
+
+    /**
+     * Guard, passes on both: a drain whose deadline comes during its flush counts what the runs hold although it has not
+     * asked them yet (#213): the pull (batch 3) holds m-1 and m-2, the server never answers the drain's PING, and the
+     * budget is a third of a second. The seal counts both, the report names them once, and the run, asked once the flush
+     * has ended, hands nothing over and returns 0, rather than fail at the close. On 2.24.3 the drain asked the run after
+     * its flush and counted it at its deadline, to the same effect. A seal that counted only the runs already asked
+     * reported nothing; a drain that asked no run once its delivery phase was sealed left the run to fail with
+     * "Connection is not open".
+     */
+    public function testADeadlineDuringTheFlushCountsWhatTheRunsHoldBeforeTheyAreAsked(): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client(requestTimeoutMs: 300);
+        $server = $this->pullServer($transport);
+        $log = self::log();
+        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
+            ->handle(self::ackingHandler($log, $client));
+        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $watched->readsUnderWay === 1);
+        $this->sendEachInAReadOfItsOwn($transport, $watched, $server->sids['C'], 'C', ['m-1', 'm-2']);
+
+        $transport->answerPings = false;
+        $client->drain()->await(new TimeoutCancellation(5));
+        [$processed, $error] = self::settle($run);
+
+        self::assertSame(
+            ['drain deadline exceeded: 2 buffered message(s) were not delivered before close'],
+            $recorder->errorsContaining('drain deadline exceeded'),
+        );
+        self::assertSame([], $log->getArrayCopy(), 'nothing was handed over after the seal');
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame(0, $processed);
+    }
+
     /**
      * A connected client over a watched ReconnectingTransport, closed in tearDown, with no heartbeat, so that only the
      * runs, the drain and the test read: reconnect on with waiting for it enabled, and the drain's budget
@@ -1047,6 +1284,73 @@ final class PullConsumerClientDrainTest extends TestCase
         };
 
         return $server;
+    }
+
+    /**
+     * Has the scripted server confirm every +ACK request whose reply subject it still holds a subscription for, as
+     * nats-server does, answer the request "warm" with "ok", and any other request with what $other returns, on top of
+     * the pull consumer's side that {@see pullServer()} set up.
+     *
+     * @param (\Closure(string, string): list<string>)|null $other Called with the subject and the reply subject.
+     * @return object{requests: int} Counts the +ACK requests the server got.
+     */
+    private function confirmAcks(ReconnectingTransport $transport, ?\Closure $other = null): object
+    {
+        $acks = new class {
+            /** How many +ACK requests the server got. */
+            public int $requests = 0;
+        };
+        $pulls = $transport->responder;
+        $transport->responder = static function (string $subject, ?string $replyTo, string $payload) use ($transport, $pulls, $acks, $other): array {
+            if ($replyTo !== null && str_starts_with($subject, '$JS.ACK.')) {
+                ++$acks->requests;
+
+                return $transport->replyFrame($replyTo, '');
+            }
+
+            if ($replyTo !== null && $subject === 'warm') {
+                return $transport->replyFrame($replyTo, 'ok');
+            }
+
+            if ($replyTo !== null && $other !== null && !str_starts_with($subject, self::PULL_PREFIX)) {
+                return $other($subject, $replyTo);
+            }
+
+            return $pulls === null ? [] : $pulls($subject, $replyTo, $payload);
+        };
+
+        return $acks;
+    }
+
+    /** The sid the client subscribed its reply inbox with, "_INBOX.<base>.*". */
+    private static function muxSid(ReconnectingTransport $transport): int
+    {
+        foreach ($transport->controlLinesStartingWith('SUB _INBOX.') as $line) {
+            if (!str_starts_with($line, 'SUB _INBOX.JS.') && preg_match('/^SUB _INBOX\.\S+\.\* (\d+)$/', $line, $match) === 1) {
+                return (int) $match[1];
+            }
+        }
+
+        self::fail('the client subscribed no reply inbox');
+    }
+
+    /**
+     * The server's answer to a Key/Value Direct Get of $key in $bucket: the stored value with its Nats-* headers, on the
+     * reply subject's subscription, or nothing when the client holds none for it.
+     *
+     * @return list<string>
+     */
+    private static function directGetReply(ReconnectingTransport $transport, string $replyTo, string $bucket, string $key, string $value, int $revision): array
+    {
+        $sid = $transport->sidFor($replyTo);
+        if ($sid === null) {
+            return [];
+        }
+
+        $headers = "NATS/1.0\r\nNats-Stream: KV_" . $bucket . "\r\nNats-Subject: \$KV." . $bucket . '.' . $key
+            . "\r\nNats-Sequence: " . $revision . "\r\n\r\n";
+
+        return [ReconnectingTransport::hmsgFrame($replyTo, $sid, $headers, $value)];
     }
 
     /**

@@ -15,6 +15,63 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.24.4] - 2026-10-10
+
+### Upgrade notes
+
+- Requests now work while the client's `drain()` delivers (#213), which withdraws the 2.24.0 advice to ack with `ack()`
+  in a handler that may run during a drain: `ackSync()`, a JetStream publish, a Key/Value read or write, `request()`
+  and `requestMany()` made by a handler the drain runs - a pull consumer run's in its hand-over, or a core
+  subscription's with a message the drain delivers - now get their replies, also when the client has made no request
+  before. The drain keeps the shared reply inbox subscribed until its delivery phase is over, subscribes it for a
+  first request, and unsubscribes it at the end, so its `UNSUB` now follows the requests on the wire instead of
+  coming first. The round trips count against the drain's one budget (`requestTimeoutMs`).
+- The delivery phase ends once everything is delivered, or at the drain's deadline, and every request still waiting
+  then fails with `Connection is not open`, whichever fiber made it: a request of another fiber is taken while the
+  drain delivers, but the drain does not wait for its reply, which can come too late although the server has acted on
+  it; give a JetStream publish made there a `msgId`. A request made after that phase, after a `disconnect()` that
+  interrupts the drain, or from the listener of the drain's deadline report is still refused, unsent. Subscriptions,
+  and what needs one of its own (`fetchBatch()`, `fetchNext()`, a pull consumer's new pulls, batched Direct Get,
+  Key/Value `keys()` and `history()`, an Object Store download of more than one chunk), stay refused while Draining.
+- A drain with a connection now hands nothing more over once its deadline has passed: no handler gets another message,
+  also not the first of a new delivery pass, which a final backlog pass used to hand over past the deadline to a
+  handler whose request-based ack would then have been refused; the "drain deadline exceeded" report counts that
+  message as well. A drain that found no connection to drain keeps its final backlog pass as before.
+- `disconnect()` now ends the requests in flight as it begins, wherever they wait, with `Connection is not open`,
+  rather than once the close of the transport fails their reads; a request made while the close is under way is not
+  sent.
+- The request that subscribes the reply inbox does so within its own timeout and cancellation (#194): a request whose
+  inbox's `SUB` meets a dead socket and a reconnect that outlasts its timeout now fails with `Request timed out for
+  subject <subject> while waiting for the reply inbox to be set up`, where it used to wait up to another
+  `requestTimeoutMs` and fail with `Subscribe to "_INBOX.<inbox>.*" timed out waiting for the connection to be
+  re-established`.
+
+### Fixed
+
+- [bugfix] A request made while the client's `drain()` delivered failed at once with `Connection is not open`, so a
+  pull consumer handler that acked with `ackSync()` processed every message the drain handed over twice (#213). Since
+  2.24.0 the drain hands the messages a pull consumer run holds to its handler, but it unsubscribed the shared reply
+  inbox before delivering anything, and the connection refused every request while Draining: the handler processed
+  the message, its `ackSync()` failed, nothing reached the server, and the server delivered the message again after
+  `ack_wait`, to be processed a second time. Measured on nats-server 2.12.15 with the iterator's defaults, a producer at
+  20 messages a second and the worker drained 4.5 s in: 29 of 87 messages were processed twice. A handler that made a
+  request as part of its work (a JetStream publish, a Key/Value write) failed on its first message instead, and a core
+  subscription's handler whose message the drain's flush delivered could not make a request either. The drain now
+  keeps the reply inbox through its delivery phase and releases it afterwards, lets a request subscribe it when the
+  client has none, and takes requests through the bounded request writers while it delivers. One request lifetime per
+  connection, ended by the application's close, bounds every wait of every request: the end of the delivery phase -
+  everything delivered, or the deadline, which a timer enforces wherever the drain is - seals delivery, counts what is
+  left for the deadline report, and only then ends the requests still waiting, so that a run whose handler a woken
+  request lets go on cannot hide what it held, and the drain still closes within its budget. A write that fails while
+  the drain holds the connection is neither retried nor followed by a reconnect.
+- [bugfix] The request that subscribed the shared reply inbox did so without a budget, so a `SUB` held up by
+  backpressure, or the reconnect its failed write started, could keep the request waiting past its own timeout and
+  its caller's cancellation (#194). The set-up now runs within the request's budget, through the bounded writer of the
+  guarded inboxes; a request that joined the set-up is no longer failed with the other request's timeout when that
+  request stops waiting: the abandoned `SUB` is followed by an `UNSUB` once it is out, and the joiner subscribes the
+  inbox itself within its own budget. The `UNSUB`s owed for muxes dropped before are taken in the step that writes
+  them, so a set-up that never writes leaves them owed for the next one.
+
 ## [2.24.3] - 2026-10-10
 
 ### Upgrade notes

@@ -201,8 +201,12 @@ final class NatsConnection
     /**
      * Serializes concurrent first-request mux establishment so exactly one "<base>.*" SUB is written
      * even when several requests race before any completes (subscribe()->await() suspends) (#118).
+     * Completes once the inbox is set up, and also when the request that set it up stopped waiting for it - its
+     * own timeout or cancellation, or the end of a drain's delivery phase - having released what it registered: a
+     * request that joined it then finds no inbox, and sets it up itself (#213). It errors for what fails every
+     * request alike: a rejection, a closed connection.
      *
-     * @var Future<void>|null
+     * @var Future<null>|null
      */
     private ?Future $muxInboxSetup = null;
     /**
@@ -428,13 +432,43 @@ final class NatsConnection
     private int $lastDrainParticipantId = 0;
     /**
      * Whether the {@see drain()} under way still hands over what the connection's participants hold
-     * ({@see isDiscardingUndelivered()}, #207): set as the drain enters Draining, and cleared once its delivery phase is
-     * over (every hand-over done, or its budget run out, before its deadline report) and by a disconnect() that
-     * interrupts it. The state alone cannot say it: the drain's teardown and a disconnect() both await the transport's
-     * close with the state still Draining, and a handler that went on meanwhile got what the drain had just reported as
-     * discarded, or what the disconnect() was discarding.
+     * ({@see isDiscardingUndelivered()}, #207), and still takes requests ({@see drainStillDelivers()}, #213): set as the
+     * drain enters Draining, and cleared once its delivery phase is over (every hand-over done, or its budget run out,
+     * before its deadline report: {@see sealDrainDelivery()}) and by a disconnect() that interrupts it. The state alone
+     * cannot say it: the drain's teardown and a disconnect() both await the transport's close with the state still
+     * Draining, and a handler that went on meanwhile got what the drain had just reported as discarded, or what the
+     * disconnect() was discarding.
      */
     private bool $drainDelivers = false;
+    /**
+     * Whether the delivery phase of the {@see drain()} under way is over ({@see sealDrainDelivery()}, #213): from then on
+     * no message is handed to a handler, the first of a new delivery pass included, so that what the drain reports as
+     * discarded is what it discards. Only a drain that had a connection to drain seals its delivery: one without a
+     * connection keeps its final backlog pass, whose first message a pass hands over whatever the deadline. Cleared as
+     * a drain begins.
+     */
+    private bool $drainDeliverySealed = false;
+    /**
+     * What the drain's deadline left undelivered, counted where it was when the deadline sealed the delivery phase
+     * ({@see sealDrainDelivery()}, #213), for the drain's "drain deadline exceeded" report: null while nothing was
+     * counted. Counted at the seal, before the requests waiting are woken, rather than once the drain looks again: a
+     * pull consumer run whose handler a woken request lets go on hands over, or discards, what it holds and ends, and
+     * the count made then missed it.
+     */
+    private ?int $drainDiscarded = null;
+    /** The timer that seals the delivery phase at the drain's deadline ({@see armDrainSeal()}, #213), while it waits. */
+    private ?string $drainSealTimer = null;
+    /**
+     * The lifetime of the requests made on the connection the application opened last (#213): every request() and
+     * requestMany() waits with its cancellation besides its own timeout and its caller's cancellation, from its first
+     * wait to its last - the wait for a reconnect, the reply inbox's set-up, its PUB and its reply - so that the
+     * application's close ends the request wherever it waits, rather than once the transport's close fails its read.
+     * Made by a connect() that dials afresh, and kept across reconnects. Ended by the application's close: a
+     * disconnect(), and a drain() once its delivery phase is over ({@see sealDrainDelivery()}), or as it begins when it
+     * has no connection to drain. A close the connection comes to on its own, a reconnect that gave up, ends its
+     * requests as it always did, with the close count ({@see $terminalCloses}).
+     */
+    private DeferredCancellation $requestLifetime;
     /**
      * Whether the current close has been announced with a Closed event, or is about to be: by the
      * disconnect() that set it, or by the connect or reconnect that gave up on the connection
@@ -597,6 +631,7 @@ final class NatsConnection
         $this->connectionEndingFailures = new \WeakMap();
         $this->readSlotReleased = new DeferredFuture();
         $this->readSlotReleased->getFuture()->ignore();
+        $this->requestLifetime = new DeferredCancellation();
 
         $servers = $this->options->servers;
         if ($this->options->randomizeServers && count($servers) > 1) {
@@ -822,6 +857,9 @@ final class NatsConnection
             // disarm a concurrent disconnect() (#145).
             $this->closing = false;
             $this->closedAnnounced = false;
+            // The requests of the connection this dials live until the application closes it (#213); those of the
+            // connection before keep the lifetime they had, which that connection's close ended, or its close count.
+            $this->requestLifetime = new DeferredCancellation();
 
             try {
                 $this->performConnect();
@@ -891,13 +929,16 @@ final class NatsConnection
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the operation, captured
      *        before the operation's own async() fiber was spawned (null for {main}).
      * @param bool $acceptDraining Whether a Draining connection is usable (the read path's rule).
+     * @param bool $duringDrainDelivery Whether a Draining connection is usable while the drain still delivers (a
+     *        request's rule, #213): checked as the wait ends, so that what follows it without suspending - the
+     *        registration of a SUB, the write of a PUB - is admitted by the drain as it is then, never as it was.
      *
      * @throws ConnectionException When the connection is not open and there is nothing to wait for.
      * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
      */
-    private function awaitOpenConnection(?Cancellation $cancellation, ?\Fiber $caller, bool $acceptDraining = false): void
+    private function awaitOpenConnection(?Cancellation $cancellation, ?\Fiber $caller, bool $acceptDraining = false, bool $duringDrainDelivery = false): void
     {
-        while (!$this->isUsableForOperations($acceptDraining)) {
+        while (!$this->isUsableForOperations($acceptDraining, $duringDrainDelivery)) {
             $recovery = $this->reconnecting;
             if (
                 $recovery === null
@@ -913,12 +954,17 @@ final class NatsConnection
     }
 
     /**
-     * Whether the connection currently accepts operations: Open, or also Draining for the read path.
+     * Whether the connection currently accepts operations: Open, or also Draining for the read path, and for a request
+     * while the drain still delivers ({@see drainStillDelivers()}, #213).
      */
-    private function isUsableForOperations(bool $acceptDraining): bool
+    private function isUsableForOperations(bool $acceptDraining, bool $duringDrainDelivery = false): bool
     {
-        return $this->state === ConnectionState::Open
-            || ($acceptDraining && $this->state === ConnectionState::Draining);
+        if ($this->state === ConnectionState::Open) {
+            return true;
+        }
+
+        return $this->state === ConnectionState::Draining
+            && ($acceptDraining || ($duringDrainDelivery && $this->drainStillDelivers()));
     }
 
     /**
@@ -951,11 +997,15 @@ final class NatsConnection
      *
      * @param int $generation The {@see $connectionGeneration} the failed write ran on.
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the operation.
+     * @param bool $duringDrainDelivery Whether the operation, a request's, may go on on a connection a drain() took
+     *        over meanwhile, while that drain still delivers (#213): a drain that waited for this recovery, which
+     *        kept the reply inbox, replayed with the rest. Only for a write made while the connection was Open: one
+     *        made while it was Draining is not retried ({@see publishFrameWithin()}).
      *
      * @throws ConnectionException When the connection does not come back, or at once when waiting is disabled.
      * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
      */
-    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation, ?\Fiber $caller): void
+    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation, ?\Fiber $caller, bool $duringDrainDelivery = false): void
     {
         $recovery = async(function () use ($generation, $writeError): void {
             $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
@@ -969,12 +1019,19 @@ final class NatsConnection
 
         $recovery->await($cancellation);
 
-        if ($this->state !== ConnectionState::Open) {
+        // A drain() holds the connection whose write failed - the write was made while it was Draining, or the drain
+        // took it over before the recovery could replace it - and close-intent kept the recovery from reconnecting: the
+        // drain closes that connection, and a request does not go on, or write again, on it (#213).
+        if ($this->state === ConnectionState::Draining && $this->connectionGeneration === $generation) {
+            throw new ConnectionException('Connection is not open', 0, $writeError);
+        }
+
+        if (!$this->isUsableForOperations(false, $duringDrainDelivery)) {
             try {
                 // The recovery announced the new connection before it ended, and the listener, or what it
                 // called, may have started another reconnect since: waited for within the same budget, like
                 // any reconnect in flight.
-                $this->awaitOpenConnection($cancellation, $caller);
+                $this->awaitOpenConnection($cancellation, $caller, duringDrainDelivery: $duringDrainDelivery);
             } catch (ConnectionException) {
                 // Nothing to wait for, or it did not reopen the connection: the user is closing it, a connect()
                 // owns the dial, or the connection was closed for good.
@@ -1282,8 +1339,11 @@ final class NatsConnection
             // cannot race to re-open the connection after the user asked to close it (#84).
             $this->setCloseIntent();
             // A drain() this interrupts hands nothing more over, also while the close below is awaited with the
-            // state still Draining (#207).
+            // state still Draining (#207), and takes no request more (#213).
             $this->drainDelivers = false;
+            // The requests in flight end now, wherever they wait, rather than once the close below fails their reads,
+            // which a close that takes a while holds up (#213).
+            $this->requestLifetime->cancel();
             $stopped = $this->stoppedDials();
             // This disconnect announces the close below: a drain() it interrupts must not announce it
             // again when it ends, even if it ends first.
@@ -1559,16 +1619,31 @@ final class NatsConnection
      * What a JetStream pull consumer run's pulls hold is delivered too (#207): the run is a drain participant
      * ({@see DrainParticipant}), and once the flush is done, while the connection is Draining, the drain asks it to
      * hand its pulls over to its handler and waits for that within the same budget, as it waits for its own backlog,
-     * the handler's acks going out meanwhile, though not its requests, which the connection refuses while it is
-     * Draining; the run then ends, and its handle() resolves with its count. A run used to lose them: they had left
-     * the connection's queues long before, and the drain closed the connection under them. A drain whose budget runs
-     * out first closes the connection all the same, and what the run still holds is discarded from the "drain deadline
-     * exceeded" report on, which counts it, as a disconnect() discards it, also while the transport's close is under
-     * way ({@see $drainDelivers}). A drain without a connection (the budget ran out before the reconnect it waited for
-     * was done, or that reconnect gave up) asks no run: nothing was flushed, and a run whose read then fails discards
-     * what it holds; nor does a drain whose flush a disconnect() cut short. A drain awaited from code the run calls
-     * (its handler, its onError, the error listener while the run reports to it) waits for the very run that waits for
-     * it, to the end of its budget, as one awaited from a subscription's handler waits for that handler.
+     * the handler's acks going out meanwhile; the run then ends, and its handle() resolves with its count. A run used
+     * to lose them: they had left the connection's queues long before, and the drain closed the connection under them.
+     * A drain whose budget runs out first closes the connection all the same, and what the run still holds is
+     * discarded from the "drain deadline exceeded" report on, which counts it, as a disconnect() discards it, also
+     * while the transport's close is under way ({@see $drainDelivers}). A drain without a connection (the budget ran
+     * out before the reconnect it waited for was done, or that reconnect gave up) asks no run: nothing was flushed, and
+     * a run whose read then fails discards what it holds; nor does a drain whose flush a disconnect() cut short. A
+     * drain awaited from code the run calls (its handler, its onError, the error listener while the run reports to it)
+     * waits for the very run that waits for it, to the end of its budget, as one awaited from a subscription's handler
+     * waits for that handler.
+     *
+     * Requests work while the drain delivers (#213), so that a handler it runs - a subscription's, or a pull consumer
+     * run's in its hand-over - can ack with ackSync(), publish to JetStream or read and write Key/Value: the drain
+     * keeps the reply inbox subscribed through its delivery phase ({@see unsubscribeAndFlushForDrain()}), lets a
+     * request set it up when the connection has none, takes requests through the bounded request writers while it
+     * delivers ({@see drainStillDelivers()}), and unsubscribes it once that phase is over
+     * ({@see releaseMuxAfterDrainDelivery()}). The delivery phase ends once everything is delivered and every
+     * hand-over done, or at the drain's deadline, wherever the drain is then ({@see sealDrainDelivery()}): no handler
+     * gets another message from there, the first of a new pass included; at the deadline what is left is counted,
+     * where it is, for the "drain deadline exceeded" report; and every request still waiting ends with "Connection is
+     * not open", whichever fiber made it, so that the drain closes within its budget. A request of another fiber is
+     * taken while the drain delivers but does not extend it: its reply can come too late although the server acted on
+     * it. Subscriptions, and the operations that need one of their own, stay refused while Draining. A drain without a
+     * connection has no delivery phase: its final backlog pass may still hand over its first message past the
+     * deadline, and requests are refused.
      *
      * @return Future<void>
      */
@@ -1593,6 +1668,10 @@ final class NatsConnection
                 $this->drainConnection($caller);
             } finally {
                 $this->drainInProgress = false;
+                // The drain is over, however it ended: its timer seals nothing more, and the delivery of the next
+                // connection, which a Closed listener may open at once, is not sealed (#213).
+                $this->disarmDrainSeal();
+                $this->drainDeliverySealed = false;
                 // A reconnect the drain stopped, when its budget ran out before the reconnect was done.
                 $stopped = $this->stoppedDials();
                 // Announced once the drain is over, so a Closed listener may connect() again at once - and
@@ -1636,6 +1715,17 @@ final class NatsConnection
         // Recorded on the instance so mid-drain handler publishes (writePublishFrame's Draining branch)
         // and the per-sid delivery loop (drainPendingForSid) share this same budget.
         $this->drainDeadline = $drainDeadline;
+        $this->drainDeliverySealed = false;
+        $this->drainDiscarded = null;
+        if ($connected) {
+            // The delivery phase ends at the deadline at the latest, wherever the drain is then: in its flush, in a
+            // handler it runs, or waiting for a participant's hand-over (#213). A request a handler waits on ends with
+            // it, so that the handler returns and the drain closes within its budget.
+            $this->armDrainSeal($drainDeadline);
+        } else {
+            // Without a connection there is no delivery phase: the requests in flight end now (#213).
+            $this->requestLifetime->cancel();
+        }
 
         // Without a connection there is nothing to unsubscribe or flush: only the backlog pass and the
         // teardown below apply.
@@ -1651,8 +1741,10 @@ final class NatsConnection
         // left out: the drain closed the connection under them, and a run whose read then failed discarded them. Not
         // without a connection: nothing was flushed, and such a run discards what it holds, as a disconnect() does. Nor
         // once a disconnect() has interrupted the flush: the connection is closed, and a run asked then returned a
-        // count, having discarded what it held, where a disconnect() fails it with "Connection is not open".
-        $handOvers = $this->drainDelivers ? $this->askDrainParticipants() : [];
+        // count, having discarded what it held, where a disconnect() fails it with "Connection is not open". A drain
+        // whose deadline sealed its delivery phase during the flush still asks (#213): the seal counted what each run
+        // holds, and a run asked then hands nothing over and ends with its count, rather than fail at the close.
+        $handOvers = $this->drainDelivers || $this->drainDeliverySealed ? $this->askDrainParticipants() : [];
 
         // Deliver the remaining buffered backlog before closing. A handler may await mid-delivery
         // (suspending on ANOTHER fiber, its sid guarded by dispatchingSids with messages still queued)
@@ -1667,6 +1759,14 @@ final class NatsConnection
             // A handler that throws, or a full SubscriptionQueue, is reported without cutting the pass short.
             $this->deliverReportingFailures();
 
+            // The deadline sealed the delivery phase meanwhile ({@see sealDrainDelivery()}, #213): what it left
+            // undelivered is counted already, and nothing more is handed over. Checked ahead of the completion below:
+            // a pull consumer run whose handler the seal let go on, its request ended, completes its hand-over having
+            // handed nothing more over, and the count made at the seal is what it discarded.
+            if ($this->drainDeliverySealed) {
+                break;
+            }
+
             if (!$this->hasUndeliveredDrainBacklog() && !self::anyHandOverPending($handOvers)) {
                 break;
             }
@@ -1679,13 +1779,12 @@ final class NatsConnection
                 // mirrors the #123/#134 observable-drop principle). What a participant still holds is
                 // discarded the same way from here, before the report counts it, so that a handler that
                 // goes on while the report is made or the close below is awaited gets none of it (#207).
-                $this->drainDelivers = false;
-                $undelivered = $this->countUndeliveredDrainBacklog() + self::countHeldByParticipants($handOvers);
-                if ($undelivered > 0) {
-                    $this->emitErrorSafely(new ConnectionException(
-                        'drain deadline exceeded: ' . $undelivered
-                        . ' buffered message(s) were not delivered before close',
-                    ));
+                // A drain with a connection seals its delivery phase, as its timer would have (#213); one without
+                // a connection, or one a disconnect() interrupted, has no delivery phase left to seal.
+                if ($this->drainDelivers) {
+                    $this->sealDrainDelivery(expired: true);
+                } else {
+                    $this->drainDiscarded = $this->countUndeliveredDrainBacklog() + self::countHeldByParticipants($handOvers);
                 }
 
                 break;
@@ -1695,11 +1794,27 @@ final class NatsConnection
             // without this the loop would spin while that fiber is never scheduled.
             delay(0.001);
         }
-        // The delivery phases are over: from here the close discards what a participant still holds (#207).
-        $this->drainDelivers = false;
+        // The delivery phases are over: from here the close discards what a participant still holds (#207), no
+        // request is taken, and the requests still waiting end (#213), an unrelated fiber's included, whose reply
+        // would come too late.
+        $this->disarmDrainSeal();
+        $this->sealDrainDelivery(expired: false);
 
-        // The drain budget ends with the delivery phases above; writePublishFrame()'s Draining branch
-        // falls back to its fixed per-publish bound once cleared.
+        // Made by the drain's own fiber, once delivery is sealed: an error listener that awaits, or makes a request,
+        // runs with nothing more handed over and nothing taken (#213).
+        if ($this->drainDiscarded !== null && $this->drainDiscarded > 0) {
+            $this->emitErrorSafely(new ConnectionException(
+                'drain deadline exceeded: ' . $this->drainDiscarded
+                . ' buffered message(s) were not delivered before close',
+            ));
+        }
+
+        if ($connected) {
+            $this->releaseMuxAfterDrainDelivery($drainDeadline);
+        }
+
+        // The drain budget ends with the delivery phases and the release of the reply inbox above;
+        // writePublishFrame()'s Draining branch falls back to its fixed per-publish bound once cleared.
         $this->drainDeadline = null;
 
         if (!$connected && !$this->closedAnnounced) {
@@ -1724,12 +1839,19 @@ final class NatsConnection
     }
 
     /**
-     * The connection phase of {@see drain()}: UNSUB every subscription, then flush (PING/PONG) so the
-     * deliveries the server already emitted are read - all within the remaining drain budget. Failures
+     * The connection phase of {@see drain()}: UNSUB every subscription but the reply inbox, then flush (PING/PONG) so
+     * the deliveries the server already emitted are read - all within the remaining drain budget. Failures
      * are contained so drain() still reaches Closed: a wedged write skips the rest of the phase, and
      * anything else goes to the error listener (#149/#150). A full subscription queue
      * (SlowConsumerPolicy::Error), a handler that throws and an -ERR the server keeps the connection open
      * for are reported without ending the flush: the deliveries still in flight are behind them.
+     *
+     * The reply inbox stays subscribed through the delivery phase that follows, for the requests a handler makes
+     * meanwhile - a pull consumer handler's ackSync(), a JetStream publish, a Key/Value read or write - whose replies
+     * would otherwise never come (#213); the drain releases it once that phase is over
+     * ({@see releaseMuxAfterDrainDelivery()}). nats.go keeps its response mux out of the first phase of its drain the
+     * same way. A set-up a request began just before is recognised too: the inbox is recorded before its SUB is
+     * written.
      */
     private function unsubscribeAndFlushForDrain(float $drainDeadline): void
     {
@@ -1741,6 +1863,10 @@ final class NatsConnection
             // that could otherwise break such a wedge - so an unbounded write here hung drain()
             // forever in violation of its documented ~requestTimeoutMs bound (#149).
             foreach (array_keys($this->subscriptionMeta) as $sid) {
+                if ($sid === $this->muxSid) {
+                    continue;
+                }
+
                 $this->writeBounded(
                     $this->codec->encodeUnsubscribe($sid),
                     $this->remainingBudgetCancellation($drainDeadline),
@@ -1900,12 +2026,16 @@ final class NatsConnection
      * if its deadline is reached before delivery completes. A sid guarded by a suspended dispatch
      * keeps its not-yet-delivered messages in its queue, so summing all queue sizes counts them too.
      * Used to name the count in the loud deadline-exceeded error so the drop is never silent (#149).
+     * Not the replies queued on the reply inbox, which the drain keeps through its delivery phase (#213):
+     * they are for requests, which end with that phase, not messages a handler would have got.
      */
     private function countUndeliveredDrainBacklog(): int
     {
         $count = 0;
-        foreach ($this->pendingMessages as $queue) {
-            $count += $queue->count();
+        foreach ($this->pendingMessages as $sid => $queue) {
+            if ($sid !== $this->muxSid) {
+                $count += $queue->count();
+            }
         }
 
         return $count;
@@ -1961,6 +2091,136 @@ final class NatsConnection
         }
 
         return $held;
+    }
+
+    /**
+     * Arms the timer that seals the delivery phase of a drain with a connection at its deadline (#213): the drain may be
+     * anywhere then, in its flush, in a handler it runs, or waiting for a participant's hand-over, and a handler waiting
+     * on a request holds it until that request ends. Referenced, unlike a TimeoutCancellation's: what the drain waits
+     * for may hold no watcher that keeps the event loop running, and the deadline must still come. A stale timer cannot
+     * seal the delivery of a connection opened since: it checks the request lifetime it was armed with.
+     */
+    private function armDrainSeal(float $drainDeadline): void
+    {
+        $lifetime = $this->requestLifetime;
+        $this->drainSealTimer = EventLoop::delay(max(0.0, $drainDeadline - $this->monotonicSeconds()), function () use ($lifetime): void {
+            $this->drainSealTimer = null;
+            if ($this->requestLifetime === $lifetime) {
+                $this->sealDrainDelivery(expired: true);
+            }
+        });
+    }
+
+    /** Cancels the timer {@see armDrainSeal()} armed, if it has not fired. */
+    private function disarmDrainSeal(): void
+    {
+        if ($this->drainSealTimer !== null) {
+            EventLoop::cancel($this->drainSealTimer);
+            $this->drainSealTimer = null;
+        }
+    }
+
+    /**
+     * Ends the delivery phase of the drain under way, once every hand-over is done or at its deadline (#213); does
+     * nothing when the drain does not deliver: it has no connection, it sealed already, or a disconnect() interrupted
+     * it. In this order, with nothing suspending: no handler gets another message from here
+     * ({@see $drainDeliverySealed}), and a pull consumer run hands nothing more over ({@see isDiscardingUndelivered()});
+     * at the deadline, what is still undelivered is counted for the drain's report ({@see $drainDiscarded}), the queued
+     * messages of the connection's subscriptions and what every participant holds, asked yet or not, each where it is;
+     * and only then do the requests still waiting end ({@see $requestLifetime}), since a handler whose request ends goes
+     * on and a run that ends then takes what it held with it. The message a handler has already is not counted, nor the
+     * replies queued on the reply inbox, which go to requests that end. Never calls an application listener: the drain's
+     * own fiber reports the count.
+     */
+    private function sealDrainDelivery(bool $expired): void
+    {
+        if (!$this->drainDelivers) {
+            return;
+        }
+
+        $this->drainDelivers = false;
+        $this->drainDeliverySealed = true;
+        if ($expired) {
+            $held = 0;
+            foreach ($this->drainParticipants as $participant) {
+                $held += $participant->undelivered();
+            }
+
+            $this->drainDiscarded = $this->countUndeliveredDrainBacklog() + $held;
+        }
+
+        $this->requestLifetime->cancel();
+    }
+
+    /**
+     * Whether the drain under way still takes requests ({@see $drainDelivers}, #213): its delivery phase is not over and
+     * its deadline has not passed. A deadline that passed before the timer could seal the delivery phase seals it here,
+     * as the timer would have.
+     */
+    private function drainStillDelivers(): bool
+    {
+        if (!$this->drainDelivers) {
+            return false;
+        }
+
+        if ($this->drainDeadline !== null && $this->monotonicSeconds() >= $this->drainDeadline) {
+            $this->sealDrainDelivery(expired: true);
+
+            return false;
+        }
+
+        return true;
+    }
+
+    /**
+     * Releases the reply inbox once the drain's delivery phase is over (#213): the drain kept it subscribed for the
+     * requests of that phase ({@see unsubscribeAndFlushForDrain()}), and the UNSUB goes out now, with those of muxes
+     * dropped before, in one write whose wait the rest of the drain's budget bounds; the drain's teardown releases its
+     * local state right after. A SUB still being written, of a set-up a request began, is not unsubscribed here: an
+     * UNSUB written now could reach the server ahead of it, and its writer, or the close, releases it
+     * ({@see subscribeWithin()}). Nothing is written once the budget is spent, nor on a connection that is not this
+     * drain's any more: the close releases what the server holds. A write that fails is reported, and the drain still
+     * closes.
+     */
+    private function releaseMuxAfterDrainDelivery(float $drainDeadline): void
+    {
+        if (!$this->drainDeliverySealed) {
+            // A disconnect() interrupted the drain: its close releases the reply inbox.
+            return;
+        }
+
+        $sids = $this->muxSidsToRelease;
+        $this->muxSidsToRelease = [];
+        if ($this->muxSid !== null) {
+            $sids[] = $this->muxSid;
+        }
+
+        $generation = $this->connectionGeneration;
+        $bytes = '';
+        foreach ($sids as $sid) {
+            if (($this->subscriptionWrites[$sid] ?? null) !== $generation) {
+                $bytes .= $this->codec->encodeUnsubscribe($sid);
+            }
+        }
+
+        if ($bytes === '' || $this->state !== ConnectionState::Draining || $this->monotonicSeconds() >= $drainDeadline) {
+            return;
+        }
+
+        $write = async(function () use ($bytes, $generation): void {
+            // Checked as the write starts, which may be after the drain stopped waiting for it: never on a connection
+            // a Closed listener has opened since.
+            if ($this->connectionGeneration === $generation && $this->state === ConnectionState::Draining) {
+                $this->transport->write($bytes)->await();
+            }
+        });
+        try {
+            $write->await($this->remainingBudgetCancellation($drainDeadline));
+        } catch (CancelledException) {
+            // A wedged write: the close below releases what the server holds.
+        } catch (\Throwable $releaseError) {
+            $this->emitErrorSafely($releaseError);
+        }
     }
 
     /**
@@ -2420,14 +2680,16 @@ final class NatsConnection
     }
 
     /**
-     * Body of {@see subscribe()}, also used for the mux reply inbox and the guarded inboxes ({@see subscribeGuarded()}).
+     * Body of {@see subscribe()}, also used for the guarded inboxes ({@see subscribeGuarded()}); the reply inbox subscribes
+     * through {@see subscribeWithin()}, within the budget of the request that sets it up.
      *
      * @param callable(NatsMessage):void $handler
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the subscribe.
      * @param (\Closure(int): void)|null $registered Called with the sid once the subscription is registered, before
      *        its SUB is written, so that whichever fiber reads the server's answer to the SUB finds what it records.
-     * @param string $before Frames written ahead of the SUB, in the same write.
      * @param string $after Frames written right behind the SUB, in the same write.
+     * @param Cancellation|null $budget The operation's budget, which bounds the whole subscribe; its running out is a
+     *        TimeoutException naming the subject.
      */
     private function subscribeInternal(
         string $subject,
@@ -2435,12 +2697,15 @@ final class NatsConnection
         ?string $queue,
         ?\Fiber $caller,
         ?\Closure $registered = null,
-        string $before = '',
         string $after = '',
         ?Cancellation $budget = null,
     ): int {
         if ($budget !== null) {
-            return $this->subscribeWithin($subject, $handler, $queue, $caller, $registered, $before, $after, $budget);
+            try {
+                return $this->subscribeWithin($subject, $handler, $queue, $caller, $registered, null, $after, $budget);
+            } catch (CancelledException $error) {
+                throw new TimeoutException(sprintf('Subscribe to "%s" timed out within the operation budget', $subject), previous: $error);
+            }
         }
 
         if ($this->state !== ConnectionState::Open) {
@@ -2467,7 +2732,7 @@ final class NatsConnection
 
         $generation = $this->connectionGeneration;
         try {
-            $this->transport->write($before . $this->codec->encodeSubscribe($subject, $sid, $queue) . $after)->await();
+            $this->transport->write($this->codec->encodeSubscribe($subject, $sid, $queue) . $after)->await();
         } catch (\Throwable $writeError) {
             // The socket is dead. The subscription stays registered while the connection recovers, so the
             // reconnect subscribes it on the new connection; it is rolled back only when the connection does
@@ -2497,12 +2762,24 @@ final class NatsConnection
     }
 
     /**
-     * Budgeted guarded SUB, including inline transport backpressure. Recovery replays its registration;
-     * this writer never retries SUB itself. Abandoned registrations cannot be replayed or resurrected.
+     * Budgeted SUB, including inline transport backpressure: a guarded inbox's ({@see subscribeGuarded()}) and the
+     * reply inbox's ({@see ensureMuxInbox()}). Recovery replays its registration; this writer never retries SUB itself.
+     * Abandoned registrations cannot be replayed or resurrected. The writer registers the subscription and writes the
+     * SUB in one step, with no suspension between the last check of the budget and the connection and the write: a
+     * writer that first runs after its caller stopped waiting writes nothing, and queues no pong slot.
      *
      * @param callable(NatsMessage):void $handler
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
      * @param (\Closure(int):void)|null $registered
+     * @param (\Closure():string)|null $before Frames written ahead of the SUB, in the same write, taken in that step: the
+     *        UNSUBs the reply inbox's set-up owes for the muxes dropped before ({@see $muxSidsToRelease}), which a writer
+     *        that never writes leaves owed.
+     * @param bool $duringDrainDelivery Whether the SUB may go out on a connection a drain() holds while that drain still
+     *        delivers (the reply inbox's, #213), and an UNSUB that follows a SUB abandoned meanwhile. A SUB whose write
+     *        fails on such a connection fails without a reconnect ({@see recoverAfterFailedWrite()}): the drain closes
+     *        the connection.
+     *
+     * @throws CancelledException When $budget fires first, the registration released.
      */
     private function subscribeWithin(
         string $subject,
@@ -2510,9 +2787,10 @@ final class NatsConnection
         ?string $queue,
         ?\Fiber $caller,
         ?\Closure $registered,
-        string $before,
+        ?\Closure $before,
         string $after,
         Cancellation $budget,
+        bool $duringDrainDelivery = false,
     ): int {
         $this->validateSubject($subject, allowWildcards: true);
         if ($queue !== null) {
@@ -2520,13 +2798,13 @@ final class NatsConnection
         }
         $sid = $this->nextSid++;
         $closes = $this->terminalCloses;
-        $bytes = $before . $this->codec->encodeSubscribe($subject, $sid, $queue) . $after;
+        $subscribe = $this->codec->encodeSubscribe($subject, $sid, $queue) . $after;
 
         try {
             $budget->throwIfRequested();
-            $write = async(function () use ($subject, $handler, $queue, $caller, $registered, $budget, $sid, $closes, $bytes): ?array {
+            $write = async(function () use ($subject, $handler, $queue, $caller, $registered, $budget, $sid, $closes, $before, $subscribe, $duringDrainDelivery): ?array {
                 $budget->throwIfRequested();
-                $this->awaitOpenConnection($budget, $caller);
+                $this->awaitOpenConnection($budget, $caller, duringDrainDelivery: $duringDrainDelivery);
                 $budget->throwIfRequested();
                 if ($this->terminalCloses !== $closes) {
                     throw new ConnectionException('Connection was closed while the reply inbox was being set up');
@@ -2536,6 +2814,7 @@ final class NatsConnection
                 $this->subscriptionMeta[$sid] = ['subject' => $subject, 'queue' => $queue];
                 $this->pendingMessages[$sid] = new SplQueue();
                 $registered?->__invoke($sid);
+                $bytes = ($before === null ? '' : $before()) . $subscribe;
                 $generation = $this->connectionGeneration;
                 $this->subscriptionWrites[$sid] = $generation;
                 try {
@@ -2552,7 +2831,7 @@ final class NatsConnection
 
                 if (!$this->isSubscriptionActive($sid)) {
                     // The caller abandoned a pending SUB. Its UNSUB must follow that SUB, on that session.
-                    $this->sendSubscriptionRelease($sid, $generation);
+                    $this->sendSubscriptionRelease($sid, $generation, $duringDrainDelivery);
                 }
 
                 return null;
@@ -2561,7 +2840,7 @@ final class NatsConnection
             $failure = $write->await($budget);
             if ($failure !== null) {
                 [$generation, $error] = $failure;
-                $this->recoverAfterFailedWrite($generation, $error, $budget, $caller);
+                $this->recoverAfterFailedWrite($generation, $error, $budget, $caller, $duringDrainDelivery);
             }
             $budget->throwIfRequested();
             if (!isset($this->subscriptionMeta[$sid])) {
@@ -2569,12 +2848,8 @@ final class NatsConnection
             }
 
             return $sid;
-        } catch (CancelledException $error) {
-            $this->releaseTemporarySubscription($sid);
-
-            throw new TimeoutException(sprintf('Subscribe to "%s" timed out within the operation budget', $subject), 0, $error);
         } catch (\Throwable $error) {
-            $this->releaseTemporarySubscription($sid);
+            $this->releaseTemporarySubscription($sid, $duringDrainDelivery);
 
             throw $error;
         }
@@ -2822,13 +3097,17 @@ final class NatsConnection
         });
     }
 
-    /** @return Future<null>|null */
-    private function releaseTemporarySubscription(int $sid): ?Future
+    /**
+     * @param bool $duringDrainDelivery Whether the UNSUB goes out on a connection a drain() holds as well: for the reply
+     *        inbox, which the drain did not unsubscribe (#213). A drain unsubscribes every other subscription itself.
+     * @return Future<null>|null
+     */
+    private function releaseTemporarySubscription(int $sid, bool $duringDrainDelivery = false): ?Future
     {
         $held = isset($this->subscriptionMeta[$sid]);
         $owed = $this->takeOwedRelease($sid);
         $this->dropSubscriptionState($sid);
-        if ((!$held && !$owed) || $this->state !== ConnectionState::Open) {
+        if ((!$held && !$owed) || !$this->isUsableForOperations($duringDrainDelivery)) {
             // A reconnect's finishReplayWindow releases anything already replayed while Connecting.
             return null;
         }
@@ -2837,19 +3116,24 @@ final class NatsConnection
             return null;
         }
 
-        return $this->sendSubscriptionRelease($sid, $this->connectionGeneration);
+        return $this->sendSubscriptionRelease($sid, $this->connectionGeneration, $duringDrainDelivery);
     }
 
-    /** @return Future<null> */
-    private function sendSubscriptionRelease(int $sid, int $generation): Future
+    /**
+     * @param bool $duringDrainDelivery Whether the UNSUB goes out on a connection a drain() holds as well (the reply
+     *        inbox's, {@see releaseTemporarySubscription()}): also once the drain's delivery phase is over, since it
+     *        releases what the server holds rather than starts anything.
+     * @return Future<null>
+     */
+    private function sendSubscriptionRelease(int $sid, int $generation, bool $duringDrainDelivery = false): Future
     {
         $existing = $this->subscriptionReleases[$sid] ?? null;
         if ($existing !== null && $existing['generation'] === $generation) {
             return $existing['future'];
         }
-        $write = async(function () use ($sid, $generation): null {
+        $write = async(function () use ($sid, $generation, $duringDrainDelivery): null {
             try {
-                if ($this->connectionGeneration === $generation && $this->state === ConnectionState::Open) {
+                if ($this->connectionGeneration === $generation && $this->isUsableForOperations($duringDrainDelivery)) {
                     $this->transport->write($this->codec->encodeUnsubscribe($sid))->await();
                 }
             } catch (\Throwable) {
@@ -4125,48 +4409,63 @@ final class NatsConnection
      * the client dropped before, and carries a PING right behind the SUB, whose PONG confirms the mux.
      * Nothing waits for that PONG here.
      *
-     * Precondition: the caller has checked state === Open (the subscribe re-checks it). A request that
-     * joins another fiber's establishment waits for it only within $budget - its own deadline.
+     * The request that sets the inbox up does so within its own budget, $budget - its timeout, its caller's
+     * cancellation and the connection's request lifetime - which bounds a SUB held up by backpressure and the
+     * wait for a reconnect its failed write starts, as the budget of a guarded inbox does ({@see subscribeWithin()},
+     * #194), and it may do so on a connection a drain() holds while that drain still delivers, for the first request
+     * of a pull consumer handler that acks with ackSync() (#213). A request that joins another fiber's set-up waits
+     * for it within its own budget too. When the request that sets it up stops waiting for it, its budget spent,
+     * what its set-up registered is released, its SUB, if already written, followed by an UNSUB, and a request
+     * that joined it sets the inbox up itself, within its own budget, rather than fail with that request's timeout;
+     * a failure that fails every request alike, a rejection or a closed connection, fails them all, as before.
      *
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the request.
+     *
+     * @throws CancelledException When $budget fires first.
      */
     private function ensureMuxInbox(Cancellation $budget, ?\Fiber $caller): void
     {
-        if ($this->muxInboxSetup !== null) {
-            // Another fiber is mid-establishment; join it instead of writing a second SUB. Checked before
-            // muxSid, which is set from just before that SUB is written, while the write may still be under way.
-            $this->muxInboxSetup->await($budget);
-
-            return;
+        // Another fiber is mid-establishment; join it instead of writing a second SUB. Checked before muxSid, which is
+        // set from just before that SUB is written, while the write may still be under way. Its end is looked at as
+        // it is: an inbox in place, or none when its owner stopped waiting for it and released what it had registered,
+        // when this request sets the inbox up itself - or joins the set-up another request that joined it began.
+        while (($setup = $this->muxInboxSetup) !== null) {
+            $setup->await($budget);
         }
 
-        if ($this->muxSid !== null) {
-            return;
+        if ($this->muxSid === null) {
+            $this->setUpMuxInbox($budget, $caller);
         }
+    }
 
+    /**
+     * The set-up {@see ensureMuxInbox()} makes when no other fiber is making one: subscribes "<base>.*" within the
+     * request's budget, $budget, and completes the shared set-up others join ({@see $muxInboxSetup}).
+     *
+     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the request.
+     *
+     * @throws CancelledException When $budget fires first.
+     */
+    private function setUpMuxInbox(Cancellation $budget, ?\Fiber $caller): void
+    {
         $base = Inbox::generate($this->options->inboxPrefix);
         $generation = $this->muxGeneration;
+        /** @var DeferredFuture<null> $deferred */
         $deferred = new DeferredFuture();
         $setup = $deferred->getFuture();
         $setup->ignore();
         $this->muxInboxSetup = $setup;
 
         try {
-            $release = '';
-            foreach ($this->muxSidsToRelease as $droppedSid) {
-                $release .= $this->codec->encodeUnsubscribe($droppedSid);
-            }
-            $this->muxSidsToRelease = [];
-
             // dispatchMuxReply is non-suspending, so it is safe to invoke inside drainPendingForSid()'s
             // dequeue loop. The handler lives in subscriptions[$muxSid] and persists across reconnect
             // (resubscribeAll replays only the SUB bytes; only releaseRuntimeState clears the handler).
-            $this->subscribeInternal(
+            $this->subscribeWithin(
                 $base . '.*',
                 $this->dispatchMuxReply(...),
                 null,
                 $caller,
-                registered: function (int $sid) use ($base): void {
+                function (int $sid) use ($base): void {
                     $this->muxBase = $base;
                     $this->muxSid = $sid;
                     $this->muxConfirmed = false;
@@ -4176,10 +4475,33 @@ final class NatsConnection
                     // whatever PINGs other fibers write, this slot completes on the PONG answering that PING.
                     $this->muxFence = $this->enqueuePongSlot();
                 },
-                before: $release,
-                after: $this->codec->encodePing(),
+                // The UNSUBs owed for the muxes dropped before, taken in the step that writes them: a set-up that never
+                // writes leaves them owed, for the next set-up or the drain's release of the inbox.
+                function (): string {
+                    $release = '';
+                    foreach ($this->muxSidsToRelease as $droppedSid) {
+                        $release .= $this->codec->encodeUnsubscribe($droppedSid);
+                    }
+                    $this->muxSidsToRelease = [];
+
+                    return $release;
+                },
+                $this->codec->encodePing(),
+                $budget,
+                duringDrainDelivery: true,
             );
             $deferred->complete();
+        } catch (CancelledException $e) {
+            // This request's own budget ran out, its caller cancelled it, or the application's close ended it: what the
+            // set-up registered is released, its SUB, if already out, followed by an UNSUB ({@see subscribeWithin()}),
+            // and a request that joined it sets the inbox up itself (#213).
+            if ($this->muxBase === $base) {
+                $this->forgetMux();
+            }
+
+            $deferred->complete();
+
+            throw $e;
         } catch (\Throwable $e) {
             if ($this->muxBase === $base) {
                 // The subscribe rolled its registration back: the connection did not come back in time.
@@ -4483,15 +4805,22 @@ final class NatsConnection
     /**
      * Throws when the mux subscription a request is about to be sent on is gone: released by a terminal close
      * while it was being set up, latched as rejected by permissions (#167), or dropped because the server may
-     * have rejected it ({@see dropUnconfirmedMux()}).
+     * have rejected it ({@see dropUnconfirmedMux()}). Or when the request's lifetime is over: the application
+     * closed the connection, or the drain's delivery phase ended (#213); the request then fails as one made then
+     * does, whether or not the close has released the connection's state yet.
      *
      * @param int $closes The {@see $terminalCloses} when the request began setting the mux up.
      * @param int $generation The {@see $muxGeneration} then.
+     * @param DeferredCancellation $lifetime The request lifetime the request was made with ({@see $requestLifetime}).
      *
      * @phpstan-impure Reads state that reads in other fibers change while the request is suspended.
      */
-    private function throwUnlessMuxInstalled(int $closes, int $generation): void
+    private function throwUnlessMuxInstalled(int $closes, int $generation, DeferredCancellation $lifetime): void
     {
+        if ($lifetime->isCancelled()) {
+            throw new ConnectionException('Connection is not open');
+        }
+
         if ($this->terminalCloses !== $closes) {
             throw new ConnectionException('Connection was closed while the reply inbox was being set up');
         }
@@ -4515,7 +4844,7 @@ final class NatsConnection
      *
      * @throws CancelledException When $budget fires first.
      */
-    private function awaitMuxConfirmation(Cancellation $budget, int $closes, int $generation): void
+    private function awaitMuxConfirmation(Cancellation $budget, int $closes, int $generation, DeferredCancellation $lifetime): void
     {
         while (!$this->muxConfirmed) {
             try {
@@ -4536,7 +4865,7 @@ final class NatsConnection
                 throw $readError;
             }
 
-            $this->throwUnlessMuxInstalled($closes, $generation);
+            $this->throwUnlessMuxInstalled($closes, $generation, $lifetime);
 
             if (!$read->consumedBytes) {
                 delay(0.001, cancellation: $budget);
@@ -4546,13 +4875,19 @@ final class NatsConnection
 
     /**
      * The error a request reports when its budget ran out before the request could be sent: the
-     * caller's own cancellation surfaces as CancelledException (as in the reply wait), anything else as
-     * a timeout naming the subject and what the request was still $waitingFor.
+     * caller's own cancellation surfaces as CancelledException (as in the reply wait), the end of the request's
+     * lifetime - the application closed the connection, or the drain's delivery phase is over (#213) - as the
+     * connection's "Connection is not open", and anything else as a timeout naming the subject and what the request
+     * was still $waitingFor.
      */
-    private function requestNotSentFailure(string $subject, ?Cancellation $cancellation, string $waitingFor): \Throwable
+    private function requestNotSentFailure(string $subject, ?Cancellation $cancellation, DeferredCancellation $lifetime, string $waitingFor): \Throwable
     {
         if ($cancellation !== null && $cancellation->isRequested()) {
             return new CancelledException();
+        }
+
+        if ($lifetime->isCancelled()) {
+            return new ConnectionException('Connection is not open');
         }
 
         return new TimeoutException('Request timed out for subject ' . $subject . ' while waiting for ' . $waitingFor);
@@ -4562,19 +4897,26 @@ final class NatsConnection
      * The part of {@see requestInternal()}/{@see requestManyInternal()} before the publish: wait for an
      * in-flight reconnect, then make sure the mux reply inbox exists - both within the request's budget.
      * After the client dropped a mux the server may have rejected, it also waits for the new one to be
-     * confirmed, so that a request whose inbox the server rejects again is not sent. Nor is a request whose
-     * set-up a drain() overtook, since the drain has unsubscribed the inbox.
+     * confirmed, so that a request whose inbox the server rejects again is not sent.
      *
+     * A drain() takes requests while it delivers (#213): a handler it runs may ack with ackSync(), publish to
+     * JetStream or read Key/Value, the reply inbox kept subscribed for them and set up if the connection has none
+     * yet. A request whose set-up a drain() overtook goes on while that drain still delivers, and fails without
+     * being sent once its delivery phase is over, since the drain then releases the inbox.
+     *
+     * @param Cancellation $budget What the request waits with: its timeout, its caller's cancellation and $lifetime.
+     * @param DeferredCancellation $lifetime The request lifetime of the connection the request was made on
+     *        ({@see $requestLifetime}).
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
      * @return int The {@see $muxGeneration} the request is sent on: when it changes, the mux was dropped.
      */
-    private function prepareRequest(string $subject, Cancellation $budget, ?Cancellation $cancellation, ?\Fiber $caller): int
+    private function prepareRequest(string $subject, Cancellation $budget, ?Cancellation $cancellation, DeferredCancellation $lifetime, ?\Fiber $caller): int
     {
-        if ($this->state !== ConnectionState::Open) {
+        if (!$this->isUsableForOperations(false, duringDrainDelivery: true)) {
             try {
-                $this->awaitOpenConnection($budget, $caller);
+                $this->awaitOpenConnection($budget, $caller, duringDrainDelivery: true);
             } catch (CancelledException) {
-                throw $this->requestNotSentFailure($subject, $cancellation, 'the connection to be re-established');
+                throw $this->requestNotSentFailure($subject, $cancellation, $lifetime, 'the connection to be re-established');
             }
         }
 
@@ -4588,18 +4930,19 @@ final class NatsConnection
             $this->ensureMuxInbox($budget, $caller);
             // The server can answer the SUB before this request resumes from writing it, or from joining the
             // fiber that writes it.
-            $this->throwUnlessMuxInstalled($closes, $generation);
+            $this->throwUnlessMuxInstalled($closes, $generation, $lifetime);
 
             if ($this->awaitMuxFence) {
-                $this->awaitMuxConfirmation($budget, $closes, $generation);
+                $this->awaitMuxConfirmation($budget, $closes, $generation, $lifetime);
             }
         } catch (CancelledException) {
-            throw $this->requestNotSentFailure($subject, $cancellation, 'the reply inbox to be set up');
+            throw $this->requestNotSentFailure($subject, $cancellation, $lifetime, 'the reply inbox to be set up');
         }
 
-        // A drain() that began while the request set the inbox up, or waited for the server to take it, has unsubscribed
-        // it: no reply can come. The request fails as one issued during the drain does, without being sent.
-        if ($this->state === ConnectionState::Draining) {
+        // A drain() that began while the request set the inbox up, or waited for the server to take it, has ended its
+        // delivery phase meanwhile: it releases the inbox, and no reply can come. The request fails as one issued then
+        // does, without being sent.
+        if ($this->state === ConnectionState::Draining && !$this->drainStillDelivers()) {
             throw new ConnectionException('Connection is not open');
         }
 
@@ -4616,6 +4959,10 @@ final class NatsConnection
      * uncancellable and may finish after expiry; no new write starts after expiry. A late failure can
      * still repair the connection independently, but cannot retry the abandoned request.
      *
+     * A request goes out on a connection a drain() holds while that drain still delivers, checked in the step that
+     * writes it, as the deadline and the reply inbox are (#213): a writer that first runs once the delivery phase is
+     * over writes nothing.
+     *
      * @param array<string,string>|null $headers
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
      */
@@ -4626,6 +4973,7 @@ final class NatsConnection
         string $replyTo,
         Cancellation $budget,
         ?Cancellation $cancellation,
+        DeferredCancellation $lifetime,
         ?\Fiber $caller,
         int $closes,
         int $muxGeneration,
@@ -4636,10 +4984,11 @@ final class NatsConnection
                 static fn(): array => [$frame, $payload],
                 $budget,
                 $caller,
-                fn() => $this->throwUnlessMuxInstalled($closes, $muxGeneration),
+                fn() => $this->throwUnlessMuxInstalled($closes, $muxGeneration, $lifetime),
+                duringDrainDelivery: true,
             );
         } catch (CancelledException) {
-            throw $this->requestNotSentFailure($subject, $cancellation, 'the request to be sent');
+            throw $this->requestNotSentFailure($subject, $cancellation, $lifetime, 'the request to be sent');
         }
     }
 
@@ -4680,14 +5029,17 @@ final class NatsConnection
      * @param \Closure():?array{string,string} $makeFrame
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
      * @param \Closure():void $guard
+     * @param bool $duringDrainDelivery Whether the frame may go out on a connection a drain() holds while that drain
+     *        still delivers (a request's, #213). A write that fails on such a connection is not retried: close-intent
+     *        forbids the reconnect, and {@see recoverAfterFailedWrite()} fails it, the drain closing the connection.
      */
-    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, ?\Fiber $caller, \Closure $guard): void
+    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, ?\Fiber $caller, \Closure $guard, bool $duringDrainDelivery = false): void
     {
         for ($attempt = 0; ; $attempt++) {
             $budget->throwIfRequested();
-            $write = async(function () use ($makeFrame, $budget, $caller, $guard): ?array {
+            $write = async(function () use ($makeFrame, $budget, $caller, $guard, $duringDrainDelivery): ?array {
                 $budget->throwIfRequested();
-                $this->awaitOpenConnection($budget, $caller);
+                $this->awaitOpenConnection($budget, $caller, duringDrainDelivery: $duringDrainDelivery);
                 $budget->throwIfRequested();
                 $guard();
                 $encoded = $makeFrame();
@@ -4725,7 +5077,7 @@ final class NatsConnection
                 throw $writeError;
             }
 
-            $this->recoverAfterFailedWrite($generation, $writeError, $budget, $caller);
+            $this->recoverAfterFailedWrite($generation, $writeError, $budget, $caller, $duringDrainDelivery);
         }
     }
 
@@ -4736,6 +5088,9 @@ final class NatsConnection
      * ({@see NatsOptions::$waitForReconnect}), the mux inbox set-up, the publish and the wait for the
      * reply all draw on the deadline started here. The publish wait includes inline transport
      * backpressure and recovery from its own failed write; no retry starts after the budget expires.
+     * Every one of those waits also ends with the request lifetime of the connection ({@see $requestLifetime},
+     * #213): a disconnect(), or the end of a drain()'s delivery phase, ends the request with "Connection is not
+     * open" wherever it waits, unless its reply is in already.
      *
      * @param array<string,string>|null $headers
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called request()/requestWithHeaders().
@@ -4753,12 +5108,14 @@ final class NatsConnection
             throw new TimeoutException('Request timeout must be greater than zero');
         }
 
+        // Taken before the request's first wait, so that the close it belongs to ends every one of them.
+        $lifetime = $this->requestLifetime;
         $timeoutCancellation = new TimeoutCancellation($deadlineMs / 1000);
         $waitCancellation = $cancellation === null
-            ? $timeoutCancellation
-            : new CompositeCancellation($cancellation, $timeoutCancellation);
+            ? new CompositeCancellation($timeoutCancellation, $lifetime->getCancellation())
+            : new CompositeCancellation($cancellation, $timeoutCancellation, $lifetime->getCancellation());
 
-        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
+        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $lifetime, $caller);
         // The connection the request is sent on: a terminal close while the reply is awaited ends the request at its
         // next look ({@see $terminalCloses}).
         $closes = $this->terminalCloses;
@@ -4793,7 +5150,7 @@ final class NatsConnection
         }, $replyArrived);
 
         try {
-            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $caller, $closes, $muxGeneration);
+            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $caller, $closes, $muxGeneration);
 
             while (true) {
                 // Completion is checked BEFORE the deadline so a reply delivered in the same tick the
@@ -4807,8 +5164,11 @@ final class NatsConnection
                 // error listener as well, or a recovery that gave up: nothing more comes on it. A read still waiting
                 // fails the same way on its own; this is the exit of a request whose wake-up fired, since the close
                 // also reset the rejection latch below: woken by a rejection the close followed at once, it would
-                // otherwise look every millisecond until its deadline (#180).
-                if ($this->terminalCloses !== $closes) {
+                // otherwise look every millisecond until its deadline (#180). The application's close ends the request
+                // as it begins, wherever it waits ({@see $requestLifetime}, #213): a disconnect() under way, or a
+                // drain() whose delivery phase is over, its deadline report and the close of the transport still to
+                // come, whose reply would come too late.
+                if ($this->terminalCloses !== $closes || $lifetime->isCancelled()) {
                     throw new ConnectionException('Connection is not open');
                 }
 
@@ -4931,7 +5291,9 @@ final class NatsConnection
      * Executes the scatter-gather collection loop.
      *
      * The total timeout is one budget started here, shared by the wait for an in-flight reconnect, the
-     * mux inbox set-up, the publish and the collection.
+     * mux inbox set-up, the publish and the collection. Every one of those waits also ends with the request lifetime
+     * of the connection ({@see $requestLifetime}, #213), as a terminal close ends the collection: what was collected
+     * is returned, and nothing collected fails with "Connection is not open".
      *
      * @param array<string,string>|null $headers
      * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called requestMany().
@@ -4953,12 +5315,14 @@ final class NatsConnection
         }
 
         $deadline = $this->monotonicSeconds() + $totalMs / 1000;
+        // As in requestInternal(): taken before the first wait.
+        $lifetime = $this->requestLifetime;
         $totalCancellation = new TimeoutCancellation($totalMs / 1000);
         $waitCancellation = $cancellation === null
-            ? $totalCancellation
-            : new CompositeCancellation($cancellation, $totalCancellation);
+            ? new CompositeCancellation($totalCancellation, $lifetime->getCancellation())
+            : new CompositeCancellation($cancellation, $totalCancellation, $lifetime->getCancellation());
 
-        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $caller);
+        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $lifetime, $caller);
         // As in requestInternal(): a terminal close while replies are awaited ends the collection at its next look.
         $closes = $this->terminalCloses;
         $token = $this->newMuxToken();
@@ -5007,14 +5371,14 @@ final class NatsConnection
         }, $replyWake);
 
         try {
-            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $caller, $closes, $muxGeneration);
+            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $caller, $closes, $muxGeneration);
 
             while (true) {
                 // The connection closed for good while replies were awaited (see requestInternal()): what was
                 // collected is returned, as below for a rejection, and nothing collected fails with the closed
                 // connection. The exit of a collection whose wake-up fired right before a close that reset the
-                // rejection latch (#180).
-                if ($this->terminalCloses !== $closes) {
+                // rejection latch (#180). So does the application's close as it begins (#213).
+                if ($this->terminalCloses !== $closes || $lifetime->isCancelled()) {
                     if ($messages !== []) {
                         break;
                     }
@@ -7717,11 +8081,7 @@ final class NatsConnection
 
         try {
             while (!$queue->isEmpty()) {
-                if (
-                    $deliveredThisPass > 0
-                    && $this->drainDeadline !== null
-                    && $this->monotonicSeconds() >= $this->drainDeadline
-                ) {
+                if ($this->drainDeadline !== null && $this->monotonicSeconds() >= $this->drainDeadline) {
                     // The drain budget ran out mid-pass: stop before the NEXT delivery, so a handler
                     // that consumes budget per message (e.g. a bounded ack publish timing out per
                     // delivery) cannot serially extend drain() a whole pass (~K x the per-publish
@@ -7729,7 +8089,19 @@ final class NatsConnection
                     // the finally below) and drain()'s own deadline check then reports the discard
                     // loudly, exactly as it does for a backlog that never got a pass (#149). Keyed on
                     // the deadline alone, not the Draining state: a drain that winds down without a
-                    // connection (the reconnect outlasted its budget) is bounded the same way.
+                    // connection (the reconnect outlasted its budget) is bounded the same way. A drain
+                    // with a connection seals its delivery phase here, if its timer has yet to (#213),
+                    // and the check below then stops the pass before its first delivery as well.
+                    $this->sealDrainDelivery(expired: true);
+                    if ($deliveredThisPass > 0) {
+                        break;
+                    }
+                }
+
+                // The delivery phase of the drain is over (#213): no handler gets another message, the first
+                // of a new pass included, since its request-based ack would be refused, and what is still
+                // queued is what the drain counted as discarded.
+                if ($this->drainDeliverySealed) {
                     break;
                 }
 

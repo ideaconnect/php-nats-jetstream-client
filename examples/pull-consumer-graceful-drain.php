@@ -7,9 +7,10 @@
  * them, so that the pull holds the stream's three messages without completing (the engine hands a pull over only
  * when its batch is full, a status comes, or it expires), as a worker's pull does on a stream that trickles. Once the
  * server shows the three as delivered and unacknowledged, the worker shuts down the way a SIGTERM handler would: with
- * the client's drain(). The drain hands what the pull holds to the handler while the connection is Draining, so that
- * the acks still go out, waits for that, and then closes; handle() resolves with the count. A fresh client then sees
- * nothing pending and an ack floor of 3.
+ * the client's drain(). The drain hands what the pull holds to the handler while the connection is Draining, and the
+ * handler's requests still work then: it acks with ackSync(), which waits for the server to confirm each ack (#213).
+ * The drain waits for that, and then closes; handle() resolves with the count. A fresh client then sees nothing
+ * pending and an ack floor of 3.
  *
  * Mirrors the README "Graceful Drain" note on pull consumer runs and the "Pull Consumer Batching/Iteration" section.
  * Run: php examples/pull-consumer-graceful-drain.php
@@ -70,7 +71,8 @@ try {
         ->setExpiresMs(30_000)
         ->handle(function (NatsMessage $msg, JetStreamContext $js) use (&$handled): void {
             $handled[] = $msg->payload;
-            $js->ack($msg)->await();
+            // A request, confirmed by the server, also while the client's drain() hands the pull over.
+            $js->ackSync($msg)->await();
         });
 
     // The server has delivered the three to the run's pull, and nobody has acked them yet.
@@ -100,7 +102,7 @@ try {
         throw new RuntimeException(sprintf('expected handle() to return 3 with all three handled, got %d and [%s]', $processed, implode(', ', $handled)));
     }
 
-    // A fresh client: the drained one is closed. The acks went out during the drain.
+    // A fresh client: the drained one is closed. The acks were confirmed during the drain.
     $checker = new NatsClient(new NatsOptions(servers: [$url], name: 'example-pull-consumer-graceful-drain-check'));
     $checker->connect()->await();
     try {
@@ -118,7 +120,7 @@ try {
         ));
     }
 
-    echo "OK pull-consumer-graceful-drain: drain() handed the {$processed} message(s) the pull held to the handler and waited for their acks (ack floor {$ackFloor})\n";
+    echo "OK pull-consumer-graceful-drain: drain() handed the {$processed} message(s) the pull held to the handler and waited for their confirmed acks (ack floor {$ackFloor})\n";
 } finally {
     // drain() closes the connection; on a failure before it, close it here, the run ending with it.
     $run?->ignore();

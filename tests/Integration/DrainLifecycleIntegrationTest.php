@@ -11,6 +11,8 @@ use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
+use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use PHPUnit\Framework\TestCase;
 
@@ -247,6 +249,81 @@ final class DrainLifecycleIntegrationTest extends TestCase
             $publisher->disconnect()->await();
             $other->disconnect()->await();
             $draining->disconnect()->await();
+        }
+    }
+
+    /**
+     * A pull consumer handler that acks with ackSync() gets its acks confirmed during the client's drain (#213), on a
+     * worker that has made no request before: a consumer with explicit acks and an ack wait of two seconds, m-1 and m-2
+     * stored, and the worker's run (batch 3, depth 1, a 20 s expiry) holding both in its pull, which their count of two
+     * leaves open. The worker drains its client: the drain sets the reply inbox up for the first ackSync(), keeps it
+     * while the run hands both over, and both acks are confirmed while the connection is Draining. The server then
+     * counts nothing as waiting for an ack, and nothing comes again after the ack wait. On 2.24.3 both ackSync() calls
+     * failed with "Connection is not open", num_ack_pending stayed 2, and both messages came again with num_delivered 2.
+     * The admin connection does the set-up and the checks, so that the worker's own reply inbox does not exist before
+     * the drain.
+     */
+    public function testAnAckSyncDuringTheDrainsHandOverIsConfirmedAgainstALiveServer(): void
+    {
+        $this->requireIntegrationEnabled();
+        $stream = 'ITDRAINACK' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $js = $admin->jetStream();
+        $js->createStream($stream, [$subject])->await();
+        $js->createConsumer($stream, 'worker', $subject, ['ack_policy' => 'explicit', 'ack_wait' => 2_000_000_000])->await();
+        $js->publish($subject, 'm-1')->await();
+        $js->publish($subject, 'm-2')->await();
+        $worker = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()], pingIntervalSeconds: 0));
+        $worker->connect()->await();
+        /** @var \ArrayObject<int, string> $log */
+        $log = new \ArrayObject();
+        $run = $worker->jetStream()->pullConsumer($stream, 'worker')->setBatching(3)->setDepth(1)->setExpiresMs(20_000)
+            ->handle(static function (NatsMessage $message, JetStreamContext $workerJs) use ($log, $worker): void {
+                $log[] = $message->payload . ' (' . $worker->state()->name . ')';
+                try {
+                    $workerJs->ackSync($message)->await();
+                    $log[] = 'ackSync of ' . $message->payload . ' confirmed';
+                } catch (\Throwable $failure) {
+                    $log[] = 'ackSync of ' . $message->payload . ' failed: ' . $failure->getMessage();
+                }
+            });
+
+        try {
+            // The server has delivered both to the run's pull, which stays open for its third.
+            $deadline = $this->monotonic() + 5.0;
+            while (($js->getConsumer($stream, 'worker')->await()->raw['num_ack_pending'] ?? 0) < 2 && $this->monotonic() < $deadline) {
+                delay(0.05);
+            }
+            $before = $js->getConsumer($stream, 'worker')->await()->raw;
+            self::assertSame(2, $before['num_ack_pending'] ?? null);
+            self::assertSame([], $log->getArrayCopy(), 'the run holds both');
+
+            $worker->drain()->await();
+            $processed = $run->await(new TimeoutCancellation(5));
+
+            self::assertSame(['m-1 (Draining)', 'ackSync of m-1 confirmed', 'm-2 (Draining)', 'ackSync of m-2 confirmed'], $log->getArrayCopy());
+            self::assertSame(2, $processed);
+            self::assertSame(ConnectionState::Closed, $worker->state());
+            $after = $js->getConsumer($stream, 'worker')->await()->raw;
+            self::assertSame(0, $after['num_ack_pending'] ?? null, 'both acks were recorded');
+
+            // Past the ack wait nothing comes again.
+            delay(2.5);
+            try {
+                $again = $js->fetchBatch($stream, 'worker', 2, 500)->await();
+                self::assertSame([], array_map(static fn(NatsMessage $message): string => $message->payload, $again), 'nothing was delivered again');
+            } catch (JetStreamException $e) {
+                self::assertMatchesRegularExpression('/status (404|408)|No messages received within timeout/i', $e->getMessage());
+            }
+        } finally {
+            $run->ignore();
+            if ($worker->state() !== ConnectionState::Closed) {
+                $worker->disconnect()->await();
+            }
+            $js->deleteStream($stream)->await();
+            $admin->disconnect()->await();
         }
     }
 

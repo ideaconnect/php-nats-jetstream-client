@@ -254,6 +254,11 @@ final class DrainFlushBoundedWriteTest extends TestCase
      * ~K x 2 x requestTimeoutMs (here ~36 s). Now the first ack consumes the remaining budget, the
      * second is clamped to the ~expired remainder, the delivery pass stops at the next inter-message
      * boundary, and the dropped remainder is reported loudly - drain() completes in ~one budget.
+     *
+     * Since #213 the deadline seals the drain's delivery phase: no handler gets another message, the first
+     * of a new pass included. The dedicated backlog pass used to hand m2 over after the deadline, to a
+     * handler whose request-based ack the connection would then refuse, and report four; it now reports
+     * the five that m1's handler left queued.
      */
     public function testDrainBudgetBoundsSerialHandlerPublishesAcrossBacklog(): void
     {
@@ -314,12 +319,12 @@ final class DrainFlushBoundedWriteTest extends TestCase
         // single extra fresh full bound (3 + 3 = 6 s), which timers cannot undercut.
         self::assertLessThan(4.5, $elapsedSeconds, 'mid-drain handler publishes must share the single drain budget');
         // Delivery stops at the first inter-message boundary past the deadline: m1's acks consume
-        // the budget (flush-phase pass), the dedicated backlog pass delivers its head message m2,
-        // and the remaining four are dropped - loudly.
-        self::assertSame(['m1', 'm2'], $received, 'deliveries must stop once the drain budget is exhausted');
-        self::assertNotSame(
-            [],
-            array_filter($errors, static fn(string $m): bool => str_contains($m, 'drain deadline exceeded: 4 buffered message(s)')),
+        // the budget (flush-phase pass), the deadline seals the delivery phase, so the dedicated backlog
+        // pass delivers nothing, and the remaining five are dropped - loudly, once.
+        self::assertSame(['m1'], $received, 'deliveries must stop once the drain budget is exhausted');
+        self::assertSame(
+            ['drain deadline exceeded: 5 buffered message(s) were not delivered before close'],
+            array_values(array_filter($errors, static fn(string $m): bool => str_contains($m, 'drain deadline exceeded'))),
             'the dropped remainder must be reported loudly with its count',
         );
         self::assertNotSame([], $ackFailures, 'the wedged acks must fail into the handler, not hang');

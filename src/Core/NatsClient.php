@@ -90,10 +90,15 @@ final class NatsClient
      * A JetStream pull consumer run's pulls are drained too (#207): once the drain's flush is done, each
      * run hands its handler what its pulls hold, in order, while the connection is Draining, so that the
      * acks the handler publishes (ack(), nak(), term(), inProgress()) still go out, and the drain waits
-     * for that, the handler included, within the same budget. The connection refuses requests while it
-     * is Draining, so a request the handler makes then, an ackSync(), a JetStream publish or a Key/Value
-     * write, fails with "Connection is not open". The run then ends, and its handle() resolves with its
-     * count, as after the iterator's
+     * for that, the handler included, within the same budget. The handler's requests work too (#213): the
+     * drain keeps the shared reply inbox subscribed while it delivers, sets it up for the client's first
+     * request, and releases it once its delivery phase is over, so an ackSync() is confirmed and a
+     * JetStream publish or a Key/Value read or write gets its reply. A request still waiting when that phase
+     * ends - everything delivered, or the budget run out - fails with "Connection is not open"; another
+     * fiber's request is taken as well, but does not extend the phase. Subscriptions, and the operations that
+     * need one of their own (fetchBatch(), batched Direct Get, Key/Value keys() and history()), stay refused.
+     * From the deadline on no handler gets another message. The run then ends, and its handle() resolves
+     * with its count, as after the iterator's
      * {@see \IDCT\NATS\JetStream\Consumers\PullConsumerIterator::drain()}. When the budget runs out
      * first, the drain closes the connection, and what the run still holds is discarded from the "drain
      * deadline exceeded" report on, which counts it, as a disconnect() discards it. A drain without a

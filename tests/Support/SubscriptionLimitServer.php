@@ -76,6 +76,14 @@ final class SubscriptionLimitServer implements TransportInterface
     /** @var list<array{epoch: int, bytes: string}> Every write a live session took, with its session. */
     public array $writes = [];
 
+    /**
+     * Called with the bytes of each write the live session took, once it has answered them - for a test that has to
+     * act right after a write went out, such as one that writes a SUB the server rejects behind the mux SUB.
+     *
+     * @var (\Closure(string): void)|null
+     */
+    public ?\Closure $afterWrite = null;
+
     private int $epoch = -1;
     private int $idleReads = 0;
     private bool $sessionLive = false;
@@ -176,6 +184,10 @@ final class SubscriptionLimitServer implements TransportInterface
             } elseif ($answers !== []) {
                 array_push($this->reads, ...$answers);
                 $this->wakeReaders();
+            }
+
+            if ($this->afterWrite !== null) {
+                ($this->afterWrite)($bytes);
             }
 
             foreach ($this->lateCompletions as $needle => $seconds) {
@@ -293,6 +305,12 @@ final class SubscriptionLimitServer implements TransportInterface
     public function completeNextWriteContainingLate(string $needle, float $seconds): void
     {
         $this->lateCompletions[$needle] = $seconds;
+    }
+
+    /** How many writes are stalled right now (see {@see stallNextWriteContaining()}). */
+    public function writesStalled(): int
+    {
+        return count($this->runningStalls);
     }
 
     /**
