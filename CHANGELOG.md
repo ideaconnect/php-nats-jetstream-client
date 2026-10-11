@@ -15,6 +15,18 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` `RetirePullInboxTest::testADrainThatNeverAsksForTheHandOverEndsItReleasedAtTheRequestTimeout` no longer
+  fails when the drain is slow to ask its participant. The release ends at the request timeout, at whichever comes
+  first of two deadlines: its own budget, or the seal of the drain's delivery, which ends the requests in flight at the
+  drain's budget. The drain's deadline starts first, but the test measured its 0.15 s lower bound from the release's
+  call. In the coverage run Infection starts with, the drain took about 55 ms to ask, and the release ended 0.145 s
+  after the call. That failed the post-merge mutation jobs of 2.25.5 before any mutant ran. The bound is now measured
+  from the drain's start. The test still fails when the release does not wait for the drain (0.002 s).
+
 ## [2.25.5] - 2026-10-11
 
 ### Testing & CI
