@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Support;
 
 use Amp\Cancellation;
 use Amp\CancelledException;
+use Amp\DeferredCancellation;
 use Amp\DeferredFuture;
 use Amp\Future;
 use IDCT\NATS\Transport\CancellableDialTransportInterface;
@@ -34,16 +35,29 @@ use function Amp\delay;
  *     CONNECT that follows, as a server that requires authentication does;
  *   - {@see $rejectAuthentication}: the next handshakes are refused with an authorization -ERR;
  *   - {@see $closeDelay}: close() takes a while, like a TLS or WebSocket close handshake;
- *   - stallNextWriteContaining(): the next write containing a needle is held up, like a socket under
- *     backpressure, until its time is up or the test calls releaseStalledWrites();
+ *   - stallNextWriteContaining(): the next write containing a needle is held up before the session accepts
+ *     its bytes, like a socket under backpressure, until its time is up or the test calls
+ *     releaseStalledWrites(); the writes made after it wait behind it (see below);
+ *   - holdCompletionOfNextWriteContaining(): the next write containing a needle is accepted and answered at
+ *     once, and the writes after it go on, but its writer learns it is done only once its time is up or the test
+ *     calls releaseHeldCompletions() - a writer that has put its bytes on the wire and is not resumed yet;
  *   - failNextWriteContaining(): the next write containing a needle finds the socket dead - failing with
  *     a TransportClosedException, or with the error the test gives, such as the raw stream error a
  *     built-in transport's socket throws.
  *
+ * Writes reach the session in the order they were made, as bytes reach a server over a socket (#192): each
+ * waits until the write before it has been accepted, and only then looks for its own stall or failure. A
+ * write held up before acceptance - a stall - holds every later write of its session behind it, so a PING
+ * written meanwhile cannot overtake a stalled SUB + PING and have its PONG taken for the stalled one's.
+ * Acceptance is not completion: {@see $afterWrite} and a held completion come once the write's bytes are
+ * accepted and answered, after the next write has been let through, so they delay only that write's caller.
+ *
  * Reads and writes belong to the session they started on, like a real socket's: one still pending
  * when that session ends fails, even if a new session is live by then - at once, like a real socket's,
- * unless the test asks for a write whose failure surfaces only later. Responses and PONGs held back by
- * {@see $responseDelay} and {@see $pongDelay} end with their session too.
+ * unless the test asks for a write whose failure surfaces only later. That includes a write waiting
+ * behind an earlier one, and a write made just before the session ended whose turn came after it: the
+ * write order belongs to its session too, and a new session's writes never wait for an old one's.
+ * Responses and PONGs held back by {@see $responseDelay} and {@see $pongDelay} end with their session too.
  *
  * Reads block like an idle socket until a frame arrives, the session ends or the caller's cancellation
  * fires. A {@see $responder} answers published messages with raw frames; {@see replyFrame()} builds a
@@ -107,8 +121,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     public float $closeDelay = 0.0;
 
     /**
-     * Called with the bytes of each write a live session accepted, once it is recorded - for a test
-     * that has to act at the exact moment a write went out.
+     * Called with the bytes of each write a live session accepted, once it is recorded and answered - for a
+     * test that has to act at the exact moment a write went out. It runs after the next write has been let
+     * through: suspending in it holds only this write's completion, not the bytes written after it.
      *
      * @var (\Closure(string): void)|null
      */
@@ -151,8 +166,30 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
      */
     private array $runningStalls = [];
 
+    /** @var array<string, float> One-shot completion holds by needle (see {@see holdCompletionOfNextWriteContaining()}). */
+    private array $completionHolds = [];
+
+    /**
+     * Completions held right now, keyed by their timer: what {@see completionsHeld()} counts and
+     * {@see releaseHeldCompletions()} and the end of their session end.
+     *
+     * @var array<string, DeferredFuture<null>>
+     */
+    private array $heldCompletions = [];
+
     /** @var array<string, true> Timers of the live session's delayed responses: cancelled when it ends. */
     private array $delayedDeliveries = [];
+
+    /**
+     * When the live session's latest write has been accepted (or has failed): what the next write waits
+     * for. Null on a fresh session.
+     *
+     * @var ?Future<null>
+     */
+    private ?Future $acceptedSoFar = null;
+
+    /** Cancelled when the live session ends: wakes the writes still waiting their turn on it. */
+    private DeferredCancellation $sessionEnd;
 
     private int $epoch = -1;
     /** @var list<string> */
@@ -179,6 +216,7 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     public function __construct()
     {
         $this->wake = new DeferredFuture();
+        $this->sessionEnd = new DeferredCancellation();
     }
 
     public function connect(string $dsn, int $timeoutMs, ?Cancellation $cancellation = null): Future
@@ -208,6 +246,13 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
                 $this->refuseDialIfRefusing();
             }
 
+            // A dial that succeeds replaces the live session, if there is one: its pending writes, those
+            // waiting their turn included, fail now rather than at the end of their stalls, and the new
+            // session's writes start a write order of their own (#192). A refused or cancelled dial has
+            // thrown above and leaves the live session alone.
+            $this->endSession();
+            $this->sessionEnd = new DeferredCancellation();
+            $this->acceptedSoFar = null;
             $this->epoch++;
             $this->reads = [self::INFO];
             $this->sessionLive = true;
@@ -235,53 +280,28 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
         }
 
         $epoch = $this->epoch;
+        // The write order is fixed here, in the caller's fiber, as a socket fixes it: two writes made in the
+        // same tick take their turns in the order they were made (#192).
+        $before = $this->acceptedSoFar;
+        /** @var DeferredFuture<null> $accepted */
+        $accepted = new DeferredFuture();
+        $this->acceptedSoFar = $accepted->getFuture();
+        $sessionEnd = $this->sessionEnd->getCancellation();
 
-        return async(function () use ($bytes, $epoch): void {
-            foreach ($this->writeStalls as $needle => $stall) {
-                if (str_contains($bytes, $needle)) {
-                    unset($this->writeStalls[$needle]);
-                    $this->stall($stall['seconds'], $stall['outlivesSession']);
-                    // The session may have ended - or been replaced - while the write was stalled.
-                    $this->assertSessionLive($epoch);
-                }
+        return async(function () use ($bytes, $epoch, $before, $accepted, $sessionEnd): void {
+            try {
+                $holdFor = $this->accept($bytes, $epoch, $before, $sessionEnd);
+            } finally {
+                // Let the next write through - on a failure too: it checks its own session and fails on its own.
+                $accepted->complete();
             }
-
-            if ($this->failingWriteNeedle !== null && str_contains($bytes, $this->failingWriteNeedle)) {
-                $this->failingWriteNeedle = null;
-                $this->endSession();
-
-                throw $this->failingWriteError ?? new TransportClosedException('The connection is gone');
-            }
-
-            $frames = self::parseClientFrames($bytes);
-
-            $this->writes[] = ['epoch' => $epoch, 'bytes' => $bytes];
-
-            if (!$this->clientFrameSeen && $frames !== []) {
-                $this->clientFrameSeen = true;
-                $this->connectNotFirst = $frames[0]['op'] !== 'CONNECT';
-            }
-
-            $pongs = [];
-            $laterPongs = [];
-            $responses = [];
-            foreach ($frames as $frame) {
-                if ($frame['op'] === 'PUB' || $frame['op'] === 'HPUB') {
-                    $responses = [...$responses, ...$this->answer($frame)];
-                } elseif ($frame['op'] === 'PING' && !$this->handshakePending) {
-                    $laterPongs = [...$laterPongs, ...$this->answer($frame)];
-                } else {
-                    $pongs = [...$pongs, ...$this->answer($frame)];
-                }
-            }
-
-            // Only the responder and later PONGs can be slow: the handshake's PONG goes out at once.
-            $this->deliver($epoch, $pongs, 0.0);
-            $this->deliver($epoch, $laterPongs, $this->pongDelay);
-            $this->deliver($epoch, $responses, $this->responseDelay);
 
             if ($this->afterWrite !== null) {
                 ($this->afterWrite)($bytes);
+            }
+
+            if ($holdFor !== null) {
+                $this->holdCompletion($holdFor);
             }
         });
     }
@@ -387,6 +407,34 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
             }
         }
         $this->stalledWrites = [];
+    }
+
+    /**
+     * Makes the next write containing $needle complete for its writer only $seconds after the session accepted and
+     * answered it, or when the test calls releaseHeldCompletions(), or when its session ends - whichever comes first.
+     * One-shot. Unlike a stall, it holds no other write: the bytes are on the wire, and the writes made after it go
+     * out behind them, while its writer is not resumed yet.
+     */
+    public function holdCompletionOfNextWriteContaining(string $needle, float $seconds): void
+    {
+        $this->completionHolds[$needle] = $seconds;
+    }
+
+    /** How many writes' completions are held right now (see {@see holdCompletionOfNextWriteContaining()}). */
+    public function completionsHeld(): int
+    {
+        return count($this->heldCompletions);
+    }
+
+    /** Lets every held completion go now: their writers learn their writes are done. */
+    public function releaseHeldCompletions(): void
+    {
+        foreach ($this->heldCompletions as $timer => $released) {
+            EventLoop::cancel($timer);
+            if (!$released->isComplete()) {
+                $released->complete();
+            }
+        }
     }
 
     /**
@@ -640,6 +688,106 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
     }
 
     /**
+     * Takes one write's bytes on its session, in its turn: once the write before it has been accepted (or has
+     * failed), it meets its stall or failure, if one is set up for it, and then the session records and answers
+     * its frames. Returns how long the write's completion is to be held, if a hold is set up for it - taken in its
+     * turn too, before the session answers it, so a hold the answer sets up is for a later write.
+     *
+     * @param ?Future<null> $before
+     */
+    private function accept(string $bytes, int $epoch, ?Future $before, Cancellation $sessionEnd): ?float
+    {
+        if ($before !== null) {
+            try {
+                $before->await($sessionEnd);
+            } catch (CancelledException) {
+                // Its session ended while the write waited its turn: it fails just below.
+            }
+        }
+
+        // Also when it had no write to wait for: a session may have ended between the call and this turn.
+        $this->assertSessionLive($epoch);
+
+        foreach ($this->writeStalls as $needle => $stall) {
+            if (str_contains($bytes, $needle)) {
+                unset($this->writeStalls[$needle]);
+                $this->stall($stall['seconds'], $stall['outlivesSession']);
+                // The session may have ended - or been replaced - while the write was stalled.
+                $this->assertSessionLive($epoch);
+            }
+        }
+
+        if ($this->failingWriteNeedle !== null && str_contains($bytes, $this->failingWriteNeedle)) {
+            $this->failingWriteNeedle = null;
+            $this->endSession();
+
+            throw $this->failingWriteError ?? new TransportClosedException('The connection is gone');
+        }
+
+        $holdFor = null;
+        foreach ($this->completionHolds as $needle => $seconds) {
+            if (str_contains($bytes, $needle)) {
+                unset($this->completionHolds[$needle]);
+                $holdFor = $seconds;
+
+                break;
+            }
+        }
+
+        $frames = self::parseClientFrames($bytes);
+
+        $this->writes[] = ['epoch' => $epoch, 'bytes' => $bytes];
+
+        if (!$this->clientFrameSeen && $frames !== []) {
+            $this->clientFrameSeen = true;
+            $this->connectNotFirst = $frames[0]['op'] !== 'CONNECT';
+        }
+
+        $pongs = [];
+        $laterPongs = [];
+        $responses = [];
+        foreach ($frames as $frame) {
+            if ($frame['op'] === 'PUB' || $frame['op'] === 'HPUB') {
+                $responses = [...$responses, ...$this->answer($frame)];
+            } elseif ($frame['op'] === 'PING' && !$this->handshakePending) {
+                $laterPongs = [...$laterPongs, ...$this->answer($frame)];
+            } else {
+                $pongs = [...$pongs, ...$this->answer($frame)];
+            }
+        }
+
+        // Only the responder and later PONGs can be slow: the handshake's PONG goes out at once.
+        $this->deliver($epoch, $pongs, 0.0);
+        $this->deliver($epoch, $laterPongs, $this->pongDelay);
+        $this->deliver($epoch, $responses, $this->responseDelay);
+
+        return $holdFor;
+    }
+
+    /**
+     * Holds the calling writer's completion for $seconds, or until {@see releaseHeldCompletions()} or the end of its
+     * session; the write then completes. The timer is referenced, as for a stall.
+     */
+    private function holdCompletion(float $seconds): void
+    {
+        /** @var DeferredFuture<null> $released */
+        $released = new DeferredFuture();
+        $timer = EventLoop::delay($seconds, static function () use ($released): void {
+            if (!$released->isComplete()) {
+                $released->complete();
+            }
+        });
+        $this->heldCompletions[$timer] = $released;
+
+        try {
+            $released->getFuture()->await();
+        } finally {
+            EventLoop::cancel($timer);
+            unset($this->heldCompletions[$timer]);
+        }
+    }
+
+    /**
      * Holds the calling write for $seconds or until {@see releaseStalledWrites()}, and, unless it outlives its
      * session, no longer than the session lasts. The timer is referenced, like the writable watcher of a real
      * socket's pending write.
@@ -686,6 +834,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
         $this->sessionLive = false;
         $this->reads = [];
         $this->wakeReaders();
+        // The writes waiting their turn behind a pending one fail now; the pending one itself ends below, or,
+        // when it outlives its session, at the end of its stall.
+        $this->sessionEnd->cancel();
 
         foreach ($this->stalledWrites as $timer => $released) {
             EventLoop::cancel($timer);
@@ -699,6 +850,9 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
             EventLoop::cancel($timer);
         }
         $this->delayedDeliveries = [];
+
+        // The writes whose completions are held were accepted: their writers learn they are done.
+        $this->releaseHeldCompletions();
     }
 
     private function wakeReaders(): void

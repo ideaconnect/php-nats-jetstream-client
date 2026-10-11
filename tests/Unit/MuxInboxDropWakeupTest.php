@@ -186,8 +186,10 @@ final class MuxInboxDropWakeupTest extends TestCase
      * The request waits at its own wait for the read slot, not in a read: another operation's read - a
      * SubscriptionQueue poll's, a flush's - holds the socket when the request looks, so it parks on its reply or on the
      * slot's release, with its budget, without reading. The application's loop read the chunk with the PING and the
-     * -ERR before that read took the socket, and its dispatch is held up at the PONG's write while the request is
-     * issued. The write is released, the -ERR drops the inbox, and the request fails at once with the dropped-inbox
+     * -ERR before that read took the socket, and its dispatch is held at the PONG's write while the request is issued:
+     * the server has the PONG, and the other operation's write and the request's PUB go out behind it, but the dispatch
+     * is not resumed yet (#192: a write held up before it reaches the server would hold those writes too, as on a
+     * socket). The dispatch is let go, the -ERR drops the inbox, and the request fails at once with the dropped-inbox
      * error, within 0.5 s of its 3 s timeout, having never read the socket. It used to notice only once the other
      * operation's read ended, here at that operation's 2 s timeout: the drop ended a request's read, not this wait.
      */
@@ -200,12 +202,13 @@ final class MuxInboxDropWakeupTest extends TestCase
         $this->awaitRead($watched);
 
         try {
-            // The application's read brings the PING and the -ERR, and its dispatch is held up at the PONG's write,
-            // with the read slot free.
+            // The application's read brings the PING and the -ERR, and its dispatch is held at the PONG's write, the
+            // PONG on the wire, with the read slot free.
             $readsBefore = $watched->reads;
-            $transport->stallNextWriteContaining('PONG', 5.0);
+            $transport->holdCompletionOfNextWriteContaining('PONG', 5.0);
             $transport->pushFrame("PING\r\n-ERR 'maximum subscriptions exceeded'\r\n");
-            $this->waitUntil(static fn(): bool => $transport->writesStalled() > 0 && $watched->readsUnderWay === 0);
+            $this->waitUntil(static fn(): bool => $transport->completionsHeld() > 0 && $watched->readsUnderWay === 0);
+            self::assertSame(['PONG'], $transport->controlLinesStartingWith('PONG'), 'the PONG reached the server');
 
             // The other operation's read takes the socket meanwhile: the flush's for the PONG of its own PING, which
             // the server, answering no PINGs here, does not send.
@@ -224,7 +227,7 @@ final class MuxInboxDropWakeupTest extends TestCase
             self::assertCount(1, self::muxWakes($connection), 'the request registered its wake-up');
             self::assertSame($readsBefore + 1, $watched->reads, "the request's read did not reach the socket: the other operation's read holds it");
 
-            $transport->releaseStalledWrites();
+            $transport->releaseHeldCompletions();
             [, $error] = self::settle($result);
             $elapsed = $this->secondsSince($start);
 
@@ -245,6 +248,7 @@ final class MuxInboxDropWakeupTest extends TestCase
                 $holding->await(new TimeoutCancellation(2));
             }
         } finally {
+            $transport->releaseHeldCompletions();
             $stop->cancel();
             $loop->await();
         }

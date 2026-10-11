@@ -158,19 +158,22 @@ final class PullConsumerClientDrainTest extends TestCase
 
     /**
      * The hand-over the drain asks for goes through the pulls in flight in issue order: depth 2 and batch 2, the second
-     * pull's write held up (a socket under backpressure) while the application drains the client, so that the engine
-     * waits in its issue phase, not on the socket. The drain's flush reads m-1, m-2 and m-3 with its PONG: m-1 and m-2
-     * fill the first pull and m-3 goes into the second, and the drain asks the run. Once the write is let through, the
-     * run goes back to the top of its loop and hands both pulls over, the first one first: the handler gets m-1, m-2
-     * and m-3, in that order, while the connection is Draining, and handle() returns 3. Handed over in reverse issue
-     * order, m-3 came first. On 2.23.0 the drain asked no run, and the handler got nothing.
+     * pull reaches the server but the engine is not resumed from its write while the application drains the client, so
+     * that the engine waits in its issue phase, not on the socket. The drain's UNSUB and PING go out behind the pull, as
+     * on a socket (#192: a pull held up before it reached the server would hold them too). The drain's flush reads m-1,
+     * m-2 and m-3 with its PONG: m-1 and m-2 fill the first pull and m-3 goes into the second, and the drain asks the
+     * run. Once the engine is let go, the run goes back to the top of its loop and hands both pulls over, the first one
+     * first: the handler gets m-1, m-2 and m-3, in that order, while the connection is Draining, and handle() returns 3;
+     * the server got exactly the two pulls, none after the inbox's UNSUB. Handed over in reverse issue order, m-3 came
+     * first. On 2.23.0 the drain asked no run, and the handler got nothing.
      */
     public function testTheDrainsHandOverGoesThroughThePullsInIssueOrder(): void
     {
         [$transport, $watched, $client, $recorder] = $this->client();
         $server = $this->pullServer($transport, static function (string $consumer, string $replyTo, int $sid, int $pull) use ($transport): array {
             if ($pull === 1) {
-                $transport->stallNextWriteContaining('PUB ' . self::PULL_SUBJECT . ' ', 10.0);
+                // The second pull reaches the server; the engine learns that its write is done only once let go.
+                $transport->holdCompletionOfNextWriteContaining('PUB ' . self::PULL_SUBJECT . ' ', 10.0);
             }
 
             return [];
@@ -179,17 +182,27 @@ final class PullConsumerClientDrainTest extends TestCase
         $log = self::log();
         $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(2)->setDepth(2)->setExpiresMs(30_000)
             ->handle(self::ackingHandler($log, $client));
-        $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $transport->writesStalled() === 1);
-        $sid = $server->sids['C'];
 
-        $transport->answerPings = false;
-        $drain = $client->drain();
-        $this->waitUntil(static fn(): bool => $flush->pingWritten());
-        $transport->pushFrame(self::messages($sid, 'C', 'm-1', 'm-2', 'm-3') . "PONG\r\n");
-        $this->waitUntil(static fn(): bool => $flush->flushDone());
-        $transport->releaseStalledWrites();
-        $drain->await(new TimeoutCancellation(5));
-        [$processed, $error] = self::settle($run);
+        try {
+            $this->waitUntil(static fn(): bool => isset($server->sids['C']) && $transport->completionsHeld() === 1);
+            $sid = $server->sids['C'];
+
+            $transport->answerPings = false;
+            $drain = $client->drain();
+            $this->waitUntil(static fn(): bool => $flush->pingWritten());
+            $transport->pushFrame(self::messages($sid, 'C', 'm-1', 'm-2', 'm-3') . "PONG\r\n");
+            $this->waitUntil(static fn(): bool => $flush->flushDone());
+            self::assertSame(1, $transport->completionsHeld(), 'the engine is still in its issue phase');
+            $transport->releaseHeldCompletions();
+            $drain->await(new TimeoutCancellation(5));
+            [$processed, $error] = self::settle($run);
+        } finally {
+            $transport->releaseHeldCompletions();
+        }
+
+        $lines = $transport->controlLines();
+        $pulls = array_keys(array_filter($lines, static fn(string $line): bool => str_starts_with($line, 'PUB ' . self::PULL_SUBJECT . ' ')));
+        $unsubs = array_keys(array_filter($lines, static fn(string $line): bool => $line === 'UNSUB ' . $sid || str_starts_with($line, 'UNSUB ' . $sid . ' ')));
 
         self::assertSame([
             'handler m-1 (Draining)', 'ack of m-1 sent',
@@ -198,6 +211,9 @@ final class PullConsumerClientDrainTest extends TestCase
         ], $log->getArrayCopy());
         self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
         self::assertSame(3, $processed);
+        self::assertCount(2, $pulls, 'the server got exactly the two pulls');
+        self::assertNotSame([], $unsubs, "the inbox's UNSUB went out");
+        self::assertLessThan($unsubs[0], $pulls[count($pulls) - 1], "no pull followed the inbox's UNSUB");
         self::assertSame([], $recorder->errors);
         self::assertSame(ConnectionState::Closed, $client->state());
     }
