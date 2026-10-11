@@ -15,6 +15,30 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` The no-spin tests see a timer loop inside the connection's read again (#184).
+  `ReadWakeupLifecycleTest::testTwoPollsOfOneQueueWithOneMessage` and
+  `OperationReadReconnectLifecycleTest::testAnOperationParkedOnTheReconnectItStartedDoesNotSpin` counted what returns to
+  the operation (its looks at its result) and what reaches the socket (its reads). A wait that polls on a timer inside
+  the connection does neither: polling the read slot while the application's read holds it, or polling the recovery
+  while a reconnect backs off. It registers hundreds of timers and was invisible to both counts. The process-wide count
+  of event-loop registrations that used to catch it was dropped in 2.18.0, because clients earlier tests left
+  reconnecting landed their handshake bursts in the wait.
+
+  Both tests now run each data case in a process of its own (`#[RunInSeparateProcess]`,
+  `#[PreserveGlobalState(false)]`). Each installs `tests/Support/LoopRegistrationCounter.php` first: a transparent
+  driver around the loop's, `tests/Support/RegistrationCountingDriver.php`, which counts every registration. Each test
+  bounds the registrations over its wait to fewer than 50, next to the existing counts: six and four on the current
+  code. A 1 ms loop in place of either wait registers some 900 to 1,800, and tens of thousands with no delay, also when
+  it runs in a detached fiber. All six such loops pass the old assertions and fail the new bound.
+
+  `LoopRegistrationCounterTest` (10 cases) covers the driver's forwarding and counting, the windows, and the isolation:
+  a fresh process and loop per case, and install() refusing a loop that has callbacks or has run. No production code
+  changed.
+
 ## [2.25.6] - 2026-10-11
 
 ### Testing & CI
