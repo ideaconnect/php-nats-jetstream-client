@@ -27,7 +27,7 @@ final class PullPipelineConfig
      * @param int $depth Max concurrent in-flight pulls in infinite, ungrouped, non-idle steady state.
      * @param int|null $iterations Finite pull count (null = infinite). A finite run is strictly serial.
      * @param bool $noWait Whether pulls carry no_wait (immediate empties need idle-backoff pacing, #153).
-     * @param bool $grouped Whether an ADR-42 priority group is set (gates pin capture + serial-until-pinned).
+     * @param bool $grouped Whether an ADR-42 priority group is set (gates pin capture on receipt + serial pin acquisition, #208).
      * @param array<string,mixed> $pullFields Snapshot of the iterator's buildPull() output; the engine
      *        overrides the dynamic `id` (pin) field per issue from the live {@see PullPipelineControl}.
      * @param int|null $idleHeartbeatNs Requested ADR-13 idle heartbeat (ns), or null. A route-wide miss

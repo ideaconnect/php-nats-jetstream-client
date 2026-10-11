@@ -844,6 +844,119 @@ final class JetStreamIntegrationTest extends TestCase
         $client->disconnect()->await();
     }
 
+    /** @return iterable<string, array{string}> */
+    public static function pinnedRunEndings(): iterable
+    {
+        yield 'stop' => ['stop'];
+        yield 'another subscription\'s handler fails the run' => ['handler failure'];
+    }
+
+    /**
+     * A pinned_client group's pin survives a run that ends before its first pull retires (#208). Run 1 pulls a batch of
+     * 10 with two messages stored, so its first pull holds both and stays open; the server pins the group and the
+     * worker reads the messages (the consumer reports them pending ack, and a flush's PONG behind them proves the
+     * client routed them). The run then ends: by stop(), which leaves them undelivered, or by another subscription's
+     * handler failing with handlerErrorsFailOperations, which hands them to the handler first (acked there). A third
+     * message is stored and run 2 starts on the same iterator: its pull carries the pin, so the server serves it at
+     * once under that pin, the consumer still pinned to it. Up to 2.25.8 the restart pulled without the pin and the
+     * server held the pull until the pin's priority_timeout (here 30 s, two minutes by default) had passed.
+     */
+    #[DataProvider('pinnedRunEndings')]
+    public function testJetStreamPinnedGroupKeepsItsPinWhenARunEndsBeforeItsFirstPullRetires(string $ending): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.pull.pinned';
+        $other = 'it.' . strtolower($stream) . '.other';
+        $consumer = 'C_' . strtoupper(bin2hex(random_bytes(2)));
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()], handlerErrorsFailOperations: true));
+        $client->connect()->await();
+        $publisher = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $publisher->connect()->await();
+        $js = $client->jetStream();
+        $iterator = null;
+
+        try {
+            $js->createStream($stream, [$subject])->await();
+            $js->createConsumer($stream, $consumer, $subject, [
+                'ack_policy' => 'explicit',
+                'priority_policy' => 'pinned_client',
+                'priority_groups' => ['g'],
+                'priority_timeout' => 30_000_000_000,
+            ])->await();
+            $client->subscribe($other, static function (): void {
+                throw new \RuntimeException('the other subscription\'s handler failed');
+            })->await();
+            $js->publish($subject, 'm-1')->await();
+            $js->publish($subject, 'm-2')->await();
+
+            $iterator = $js->pullConsumer($stream, $consumer)->setGroup('g')->setBatching(10)->setDepth(2)->setExpiresMs(30_000);
+            $handled = [];
+            $run1 = $iterator->handle(static function (NatsMessage $message, JetStreamContext $context) use (&$handled): void {
+                $handled[] = $message->payload;
+                $context->ack($message)->await();
+            });
+
+            $deadline = $this->monotonic() + 5.0;
+            do {
+                $info = $js->getConsumer($stream, $consumer)->await()->raw;
+                $pin = $info['priority_groups'][0]['pinned_client_id'] ?? null;
+                if (is_string($pin) && $pin !== '' && ($info['num_ack_pending'] ?? 0) === 2) {
+                    break;
+                }
+                self::assertLessThan($deadline, $this->monotonic(), 'the server pinned the group and sent run 1 both messages');
+                delay(0.02);
+            } while (true);
+            // Its PONG comes behind the two messages: once it is read, the worker has routed them.
+            $client->flush()->await(new TimeoutCancellation(5));
+            self::assertFalse($run1->isComplete(), 'run 1\'s first pull is still open');
+
+            if ($ending === 'stop') {
+                $iterator->stop();
+                self::assertSame(0, $run1->await(new TimeoutCancellation(5)));
+                self::assertSame([], $handled, 'stop() leaves the batch undelivered');
+            } else {
+                $publisher->publish($other, 'x')->await();
+                $publisher->flush()->await(new TimeoutCancellation(5));
+                try {
+                    $run1->await(new TimeoutCancellation(5));
+                    self::fail('run 1 ends with the other handler\'s failure');
+                } catch (\RuntimeException $failure) {
+                    self::assertSame('the other subscription\'s handler failed', $failure->getMessage());
+                }
+                self::assertSame(['m-1', 'm-2'], $handled, 'the failing run handed its batch over first');
+            }
+
+            $js->publish($subject, 'm-3')->await();
+            $iterator->setBatching(1)->setIterations(1);
+            $received = [];
+            $run2 = $iterator->handle(static function (NatsMessage $message, JetStreamContext $context) use (&$received): void {
+                $received[] = [$message->payload, $context->pinIdOf($message)];
+                $context->ack($message)->await();
+            });
+            // Bounded well inside the pin's 30 s priority_timeout: a pull without the pin waits that out.
+            try {
+                self::assertSame(1, $run2->await(new TimeoutCancellation(10)));
+            } catch (CancelledException) {
+                self::fail('run 2 was not served within 10 s: its pull did not carry the pin, and the server holds it until the pin\'s priority_timeout');
+            }
+            self::assertSame([['m-3', $pin]], $received, 'the restart is served at once, under the original pin');
+            $after = $js->getConsumer($stream, $consumer)->await()->raw;
+            self::assertSame($pin, $after['priority_groups'][0]['pinned_client_id'] ?? null, 'the group is still pinned to the original pin');
+        } finally {
+            $iterator?->stop();
+            try {
+                $js->deleteConsumer($stream, $consumer)->await();
+                $js->deleteStream($stream)->await();
+            } finally {
+                $publisher->disconnect()->await();
+                $client->disconnect()->await();
+            }
+        }
+    }
+
     /**
      * Verifies durable push helper delivers live payloads to subscribed handlers.
      */

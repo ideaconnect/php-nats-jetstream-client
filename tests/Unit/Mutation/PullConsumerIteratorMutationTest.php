@@ -202,9 +202,9 @@ final class PullConsumerIteratorMutationTest extends TestCase
     }
 
     /**
-     * Pins the first AND at line 314: the pin id is captured ONLY when a group is configured. With no
-     * group set, even if a delivered message carries a Nats-Pin-Id header, the iterator must NOT
-     * capture it, so the next pull must NOT include an "id" field.
+     * The pin id is captured ONLY when a group is configured (originally pinned the first AND at line 314; the
+     * capture is the router's since #208). With no group set, even if a delivered message carries a Nats-Pin-Id
+     * header, the iterator must NOT capture it, so the next pull must NOT include an "id" field.
      *
      * Mutant: ($group !== null && $pinId === null) -> ($group !== null || $pinId === null). With no
      * group + null pinId + a non-empty batch the mutated condition becomes true and captures the pin,
@@ -240,26 +240,21 @@ final class PullConsumerIteratorMutationTest extends TestCase
     }
 
     /**
-     * Pins the second AND at line 314: once a pin id is captured for a group, a later message in a
-     * subsequent batch must NOT overwrite it (the guard $pinId === null prevents re-capture). The real
-     * code retains the original pin id across iterations.
-     *
-     * Mutant: ($group !== null && $pinId === null && $messages !== []) ->
-     *         ($group !== null && $pinId === null || $messages !== []). With a non-empty batch the
-     * mutated condition is always true, so it re-captures the pin from each batch's first message and
-     * would switch the sent id from "pin-1" to "pin-2".
-     *
-     * Kills: LogicalAnd @ 314 (second conjunction).
+     * A later data message's pin replaces the retained one, and a message without a pin leaves it alone (#208). The
+     * server assigns the pin as it delivers, so the last pin a client receives on its connection is the server's current
+     * one for it: the router now remembers each non-empty Nats-Pin-Id as the message arrives. Up to 2.25.8 the pin was
+     * captured from a retired batch only while none was held, so this test asserted that "pin-2" was ignored and pull 3
+     * still carried "pin-1"; the receipt-time capture of #208 makes the newer pin the one sent.
      */
-    public function testCapturedPinIdIsRetainedAcrossIterations(): void
+    public function testALaterDataPinReplacesTheRetainedOne(): void
     {
         $transport = new FakeTransport($this->infoAndPong());
         $this->pullServer($transport, 'S', 'C', [
             // pull 1: first delivery pins the group with "pin-1".
             [['msg' => 'm1', 'pin' => 'pin-1']],
-            // pull 2: a message advertising a DIFFERENT pin "pin-2"; real code must ignore it.
+            // pull 2: a message carrying a newer pin "pin-2".
             [['msg' => 'm2', 'pin' => 'pin-2']],
-            // pull 3: a plain message; its pull must still carry the ORIGINAL "pin-1".
+            // pull 3: a plain message, which leaves "pin-2" alone.
             [['msg' => 'm3']],
             [['status' => 404, 'desc' => 'No Messages']],
         ]);
@@ -274,12 +269,11 @@ final class PullConsumerIteratorMutationTest extends TestCase
             ->handle(static function (): void {})->await();
 
         $pulls = $this->pullWrites($transport);
-        self::assertGreaterThanOrEqual(3, count($pulls));
+        self::assertCount(4, $pulls);
 
-        // pull 2 carries the pin captured in pull 1.
+        self::assertStringNotContainsString('"id"', $pulls[0], 'the first pull has no pin yet');
         self::assertStringContainsString('"id":"pin-1"', $pulls[1]);
-        // kills LogicalAnd@314 (second conjunction): pin must NOT be re-captured to "pin-2".
-        self::assertStringContainsString('"id":"pin-1"', $pulls[2], 'captured pin id must be retained, not overwritten');
-        self::assertStringNotContainsString('"id":"pin-2"', $pulls[2]);
+        self::assertStringContainsString('"id":"pin-2"', $pulls[2], 'the newer pin replaces the retained one');
+        self::assertStringContainsString('"id":"pin-2"', $pulls[3], 'a message without a pin leaves it alone');
     }
 }

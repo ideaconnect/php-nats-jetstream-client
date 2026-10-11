@@ -55,7 +55,11 @@ final class PullConsumerIterator
     private ?int $maxBytes = null;
     private bool $noWait = false;
 
-    /** Runtime pin id captured from the first delivered message of a pinned group. */
+    /**
+     * Runtime pin id of a pinned_client group, remembered as each message carrying one arrives, before the handler
+     * gets it (#208), and kept across handle() runs on this iterator however a run ends; cleared only by a 423 that
+     * rejected the pin the iterator's own pull sent. A new iterator starts without one.
+     */
     private ?string $pinId = null;
 
     /**
@@ -104,7 +108,8 @@ final class PullConsumerIterator
      * once in infinite, ungrouped, non-idle steady state, so a fresh pull's network round-trip
      * overlaps handler processing of the previous pull (#120). depth=1 forces the classic serial
      * one-pull-at-a-time behavior. Ignored in finite ({@see setIterations()}) mode, which is always
-     * strictly serial, and clamped to 1 until a pinned group's pin id is resolved and while idle.
+     * strictly serial, and clamped to 1 while a grouped run acquires its pin (until the first batch under
+     * it is delivered, #208) and while idle.
      *
      * @return $this
      */

@@ -15,6 +15,43 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- A `pinned_client` pull consumer's iterator now remembers the group's pin as soon as a message carrying it arrives
+  (#208), so a later `handle()` on the same iterator resends it however the earlier run ended. A 423 clears only the
+  pin its own pull sent. A grouped run still pulls one request at a time until the first batch under its pin has
+  been delivered, also after receiving the pin.
+
+### Fixed
+
+- [bugfix] A `pinned_client` pull consumer run that ended while its first pull (or the first after a 423) still held
+  messages left the iterator without the pin, so `handle()` again on the same iterator pulled without it, and the
+  server held that pull, and every other client of the group, until the pin's `priority_timeout` (two minutes by
+  default) had passed (#208). The pin was taken only from a batch the run retired or handed over to the handler, never
+  when the run ended first: a failure (a fatal `-ERR`, the connection lost with `waitForReconnect: false`, another
+  subscription's handler under `handlerErrorsFailOperations`, a rejected inbox), `stop()`, `disconnect()` or the
+  client's `drain()`. The pull-inbox router now remembers a grouped run's pin as each data message arrives, before it
+  routes the message, so every way a run ends keeps it, also a `stop()` followed by `handle()` while the old pull's
+  write is still completing. Delivery no longer takes a pin from what a pull buffered, so an old message cannot
+  restore a pin a 423 rejected after it arrived. A run still pulls serially until the first batch under its pin
+  retires (a pin received on the first message no longer lets it fan out early), and pipelines at once with a pin
+  inherited from an earlier run. Each pull records the pin it sent, and a 423 clears the live pin only when it is
+  that one, restarting serial acquisition: a 423 delayed past a newer pin, received by the same run or another run of
+  the iterator, leaves the newer pin alone. Against nats-server 2.12 the report measured the restart's message 7.5 s
+  late with `priority_timeout` 8 s; the new live test (`priority_timeout` 30 s) gets it at once, where the unchanged
+  code was still waiting at the test's 10 s bound. Found by the review of #197 (2.22.0).
+
+### Testing & CI
+
+- [docs] New `PullConsumerPinRetentionTest` (20 cases, #208): the restart's first pull keeps the pin of an unretired
+  first pull across seven endings, with the old pull's write still completing, after a 423, against a delayed 423 of
+  an older run and when another run loses an inherited pin; serial re-acquisition after a 423; an old buffer not
+  restoring a rejected pin; frames that must not change the pin; a pinless group fanning out; an ungrouped run taking
+  no pin. New live `JetStreamIntegrationTest::testJetStreamPinnedGroupKeepsItsPinWhenARunEndsBeforeItsFirstPullRetires`
+  (stop, and another handler failing the run) against a `pinned_client` consumer.
+
 ## [2.25.9] - 2026-10-11
 
 ### Upgrade notes
