@@ -281,8 +281,13 @@ final class RetirePullInboxTest extends TestCase
     }
 
     /**
-     * A drain that never asks for the hand-over within the request timeout (200 ms): the operation stops waiting at its
-     * budget and ends Released, not DrainFlushed, the inbox gone all the same.
+     * A drain that never asks for the hand-over within the request timeout (200 ms): the operation stops waiting at the
+     * request timeout and ends Released, not DrainFlushed, the inbox gone all the same.
+     *
+     * Two deadlines of that length can end the wait, whichever comes first: the operation's own budget, and the seal of
+     * the drain's delivery at the drain's budget, which ends the requests in flight. The drain's started first, so the
+     * lower bound is measured from the drain's start. Measured from the operation's call, it failed whenever the drain
+     * took over 50 ms to ask its participant, as in the coverage run Infection starts with on a CI runner (0.145 s).
      */
     public function testADrainThatNeverAsksForTheHandOverEndsItReleasedAtTheRequestTimeout(): void
     {
@@ -290,6 +295,7 @@ final class RetirePullInboxTest extends TestCase
         [$sid] = $this->inbox($client);
         $participant = new HeldDrainParticipant();
         $client->addDrainParticipant($participant);
+        $drainStarted = hrtime(true);
         $drain = $client->drain();
         $this->waitUntil(static fn(): bool => $participant->asked === 1);
         $never = new DeferredCancellation();
@@ -297,6 +303,7 @@ final class RetirePullInboxTest extends TestCase
         $started = hrtime(true);
         $outcome = $client->retirePullInbox($sid, new NullCancellation(), $never->getCancellation())->await(new TimeoutCancellation(2));
         $elapsed = $this->secondsSince($started);
+        $sinceTheDrainStarted = $this->secondsSince($drainStarted);
         $participant->release();
         try {
             $drain->await(new TimeoutCancellation(5));
@@ -305,7 +312,7 @@ final class RetirePullInboxTest extends TestCase
         }
 
         self::assertSame(InboxRetirement::Released, $outcome);
-        self::assertGreaterThanOrEqual(0.15, $elapsed);
+        self::assertGreaterThanOrEqual(0.15, $sinceTheDrainStarted, 'the wait ended at the request timeout, not at once');
         self::assertLessThan(1.5, $elapsed);
         self::assertFalse($client->isSubscriptionActive($sid));
     }
