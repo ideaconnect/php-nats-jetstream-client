@@ -48,7 +48,8 @@ use function Amp\delay;
  * it, which can only be the operation's, and the hop sweeps count event-loop hops. Timers only end a hold-up that no
  * read ends, and time the outage of the reconnect tests, whose operation starts waiting within a hop or two, tens of
  * milliseconds before the reconnect. The old reads returned at their deadline in every case: 3 s, or 1.5 s in the hop
- * sweeps, where the fixed ones return within milliseconds.
+ * sweeps, where the fixed ones return within milliseconds. The PING form decides by a race, not a bound on the
+ * elapsed time: the result must come before a timer of the operation's deadline, armed before it starts (#185).
  */
 final class OperationReadWakeupTest extends TestCase
 {
@@ -162,17 +163,35 @@ final class OperationReadWakeupTest extends TestCase
 
     /**
      * A dispatch still under way: the chunk the application's read takes holds a server PING ahead of the operation's
-     * message. The
-     * dispatch answers the PING inline and awaits the PONG's write, which a socket under backpressure takes only after a
-     * while; the operation's message is not even queued yet. The test transport holds that write up until a read takes
-     * the socket meanwhile, which only the operation's can, or for half a second when none does.
+     * message. The dispatch answers the PING inline and awaits the PONG's write, which a socket under backpressure takes
+     * only after a while; the operation's message is not even queued yet. The test transport holds that write up until a
+     * read takes the socket meanwhile, which only the operation's can, or for half a second when none does.
+     *
+     * The operation gets its message, with no error, before its deadline: its result and a referenced timer of the
+     * operation's TIMEOUT, armed before the operation starts, race, and the result must come first (#185). The broken
+     * reads this was written against returned only at that deadline - the operation's own timeout let it look at what the
+     * dispatch had queued by then, so a correct payload alone does not show the wake-up. Either end of the hold-up is
+     * fine: the operation's read taking the socket, or the dispatch going on after the half-second fallback. The test
+     * used to require the result within 1.5 s, which a slow runner under coverage exceeded (2.58 s) with the hold-up
+     * ended as designed, by the operation's read.
      */
     #[DataProvider('operationsBehindAPing')]
     public function testOperationGetsWhatADispatchWaitingOnAPongWriteBrings(string $operation): void
     {
-        [$payloads, $elapsed, $error, $endedBy] = $this->runBehindAHeldUpDelivery($operation, 'ping');
+        [$payloads, $elapsed, $error, $endedBy, , $beforeDeadline] = $this->runBehindAHeldUpDelivery($operation, 'ping');
+        $summary = sprintf(
+            '%s returned %s after %.3f s%s (the PONG write was let go by %s)',
+            $operation,
+            json_encode($payloads),
+            $elapsed,
+            $error === null ? '' : ', throwing ' . $error,
+            $endedBy,
+        );
+        self::report($summary);
 
-        $this->assertPrompt($operation, $payloads, $elapsed, $error, self::PROMPT, 'the PONG write was let go by ' . $endedBy);
+        self::assertNull($error, $summary);
+        self::assertSame([self::RESULTS[$operation]], $payloads, $summary);
+        self::assertTrue($beforeDeadline, 'the result came before the operation\'s deadline: ' . $summary);
     }
 
     /** @return iterable<string, array{string, string}> */
@@ -336,8 +355,10 @@ final class OperationReadWakeupTest extends TestCase
      * message is not delivered yet. A queue poll starts once the hold-up began; the other operations start first, and the
      * server answers what they write with that chunk.
      *
-     * @return array{list<string>, float, ?string, string, bool} The operation's payloads, the seconds it took, what it
-     *         threw, what ended the hold-up, and whether the handler ahead of it was still held when the result was in.
+     * @return array{list<string>, float, ?string, string, bool, bool} The operation's payloads, the seconds it took,
+     *         what it threw, what ended the hold-up, whether the handler ahead of it was still held when the result was
+     *         in, and - for the 'ping' lead, which races the operation against its deadline - whether its result came
+     *         before the deadline (true for the other leads).
      */
     private function runBehindAHeldUpDelivery(string $operation, string $lead): array
     {
@@ -508,8 +529,14 @@ final class OperationReadWakeupTest extends TestCase
         }
 
         $heldWhenDone = false;
+        $beforeDeadline = true;
         try {
-            $outcome = $this->runOperation($operation, $client, $queue);
+            if ($lead === 'ping') {
+                [$payloads, $elapsed, $error, $beforeDeadline] = $this->runOperationAgainstDeadline($operation, $client, $queue);
+                $outcome = [$payloads, $elapsed, $error];
+            } else {
+                $outcome = $this->runOperation($operation, $client, $queue);
+            }
             // Captured before the hold is let go below: with the message queued behind the handler, the operation takes
             // it at once and the handler is still held when its result is in (#179). The 'ping' and 'request' leads let
             // the hold go as part of getting the result, so this only holds for the plain 'handler' lead.
@@ -537,7 +564,7 @@ final class OperationReadWakeupTest extends TestCase
             self::report(sprintf("  the handler's own request got %s after %.3f s", $hold->innerReply, $hold->innerSeconds));
         }
 
-        return [...$outcome, $hold->endedBy, $heldWhenDone];
+        return [...$outcome, $hold->endedBy, $heldWhenDone, $beforeDeadline];
     }
 
     /**
@@ -662,6 +689,43 @@ final class OperationReadWakeupTest extends TestCase
         }
 
         return [$payloads, (hrtime(true) - $start) / 1e9, $error];
+    }
+
+    /**
+     * Runs $operation to its end, racing its result against a referenced timer of its {@see TIMEOUT}, armed before it
+     * starts: an operation that returns only when its own timeout fires cannot win (#185). The operation is joined
+     * whichever comes first, within a generous watchdog, so a failure still shows what it returned; it is owned by the
+     * test's resource scope, which ends it with the client if the join gives up.
+     *
+     * @return array{list<string>, float, ?string, bool} The payloads it got, the seconds it took, what it threw, and
+     *         whether its result came before the deadline.
+     */
+    private function runOperationAgainstDeadline(string $operation, NatsClient $client, ?SubscriptionQueue $queue): array
+    {
+        $start = hrtime(true);
+        /** @var DeferredFuture<string> $deadline */
+        $deadline = new DeferredFuture();
+        $timer = EventLoop::delay(self::TIMEOUT, static function () use ($deadline): void {
+            $deadline->complete('deadline');
+        });
+        $error = null;
+        $beforeDeadline = false;
+        try {
+            $running = $this->resources()->ownOperation($this->startOperation($operation, $client, $queue, self::TIMEOUT), label: $operation);
+            $first = Future\awaitFirst([
+                $running->map(static fn(array $payloads): string => 'result'),
+                $deadline->getFuture(),
+            ], new TimeoutCancellation(self::TIMEOUT + 8));
+            $beforeDeadline = $first === 'result';
+            $payloads = $running->await(new TimeoutCancellation(self::TIMEOUT + 8));
+        } catch (\Throwable $e) {
+            $payloads = [];
+            $error = $e::class . ': ' . $e->getMessage();
+        } finally {
+            EventLoop::cancel($timer);
+        }
+
+        return [$payloads, (hrtime(true) - $start) / 1e9, $error, $beforeDeadline];
     }
 
     /**
