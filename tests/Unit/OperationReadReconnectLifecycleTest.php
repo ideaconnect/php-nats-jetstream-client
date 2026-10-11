@@ -19,10 +19,13 @@ use IDCT\NATS\Tests\Support\CountingBuffer;
 use IDCT\NATS\Tests\Support\CountingCancellation;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
+use IDCT\NATS\Tests\Support\LoopRegistrationCounter;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Tests\Support\WatchedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
+use PHPUnit\Framework\Attributes\PreserveGlobalState;
+use PHPUnit\Framework\Attributes\RunInSeparateProcess;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -925,18 +928,26 @@ final class OperationReadReconnectLifecycleTest extends TestCase
      * the poll does not check its buffer, the request does not check its cancellation - until the reconnect is over.
      * The looks are the guard against a spin of the operation: a wait for the recovery that returned at once would
      * have it look again every millisecond, about a thousand times in the second, with the socket still unread and
-     * the dials unchanged, so neither of the other two counts would notice. A wait that polled the recovery on a
-     * timer inside the connection, without returning to the operation, would escape the look count; no path of a
-     * parked operation has such a loop, and a count of the event loop's registrations that would have caught it was
-     * tried and dropped: it is process-wide, and a reconnect attempt of a client an earlier test left behind registers
-     * its 500 handshake polls in a burst. The test used to bound the CPU time of the second instead, which depended on
-     * the environment: under Xdebug on a busy CI runner the second's own cost - three refused dials with their
-     * exceptions and listener calls, GC - reached the bound, while either spin cost less than the bound on a fast
-     * machine.
+     * the dials unchanged, so neither of the other two counts would notice.
+     *
+     * A wait that polled the recovery on a timer inside the connection, without returning to the operation, would
+     * escape the look count, so the callbacks the event loop registers over the second are counted too (#184,
+     * {@see LoopRegistrationCounter}): fewer than 50, four on the current code, where such a loop registers one per
+     * tick - hundreds at 1 ms, many thousands with no delay - also when it runs in a fiber of its own. The count is of
+     * the whole process, so each data case runs in a process of its own and installs the counter first: no client an
+     * earlier test left behind is counted (a reconnect attempt registers its 500 handshake polls in a burst, which is
+     * why the count was dropped from a shared process once). The test used to bound the CPU time of the second instead,
+     * which depended on the environment: under Xdebug on a busy CI runner the second's own cost - three refused dials
+     * with their exceptions and listener calls, GC - reached the bound, while either spin cost less than the bound on a
+     * fast machine.
      */
     #[DataProvider('parkedOperations')]
+    #[RunInSeparateProcess]
+    #[PreserveGlobalState(false)]
     public function testAnOperationParkedOnTheReconnectItStartedDoesNotSpin(string $operation): void
     {
+        // First, before anything runs on the loop: the counter refuses a loop that has been started.
+        $counter = LoopRegistrationCounter::install();
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
@@ -954,7 +965,12 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         $readsBefore = $watched->reads;
         $dialsBefore = count($transport->connectCalls);
         $looksBefore = $looksSoFar();
-        delay(1.0);
+        $window = $counter->begin();
+        try {
+            delay(1.0);
+        } finally {
+            $counter->end();
+        }
         $looks = $looksSoFar() - $looksBefore;
         $reads = $watched->reads - $readsBefore;
         $dials = count($transport->connectCalls) - $dialsBefore;
@@ -963,6 +979,8 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open, 4.0);
 
         self::assertGreaterThan(0, $looksBefore, sprintf('%s looked as it started: the count sees its looks', $operation));
+        self::assertGreaterThan(0, $window->registrations, 'the count sees the second: its own delay at least');
+        self::assertLessThan(50, $window->registrations, sprintf('%s parked a second on the reconnect, which registered %d event-loop callbacks %s: a timer loop, four when it parks', $operation, $window->registrations, json_encode($window->kinds)));
         self::assertSame(0, $reads, 'nothing reads the dead socket while the reconnect backs off');
         self::assertLessThanOrEqual(6, $dials, sprintf('%d dials in a second of 300 ms backoffs', $dials));
         self::assertLessThan(10, $looks, sprintf('%s looked again %d times in a second parked: it polled through the reconnect', $operation, $looks));
