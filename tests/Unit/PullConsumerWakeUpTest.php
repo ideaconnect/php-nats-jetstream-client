@@ -566,9 +566,10 @@ final class PullConsumerWakeUpTest extends TestCase
 
     /**
      * The restart idiom before the first run's engine has started (#189): handle(), stop() and handle() again in one
-     * tick. The stop is the first run's: once its inbox is subscribed, the run sees the stop at the top of its loop and
-     * ends with nothing pulled, its inbox released, and only the second run pulls. The second handle() used to clear the
-     * stop before the first run's engine had even started: the first run pulled next to the second and went on.
+     * tick. The stop is the first run's: the run sees it latched before it subscribes its inbox (#198) and ends with
+     * nothing subscribed and nothing pulled, while the second run starts normally and is the only one to subscribe and
+     * pull. The second handle() used to clear the stop before the first run's engine had even started: the first run
+     * pulled next to the second and went on. Until #198 the first run still subscribed an inbox, only to release it.
      */
     public function testAStopThenHandleAgainBeforeTheFirstRunStartedEndsItBeforeItPulls(): void
     {
@@ -592,10 +593,8 @@ final class PullConsumerWakeUpTest extends TestCase
         $this->waitUntil(static fn(): bool => count($server->pulls) === 1 && $watched->readsUnderWay === 1);
 
         self::assertSame(0, $firstProcessed);
-        self::assertCount(2, $transport->controlLinesStartingWith('SUB _INBOX.JS.PULL.'), 'each run subscribed an inbox of its own');
-        $released = $transport->controlLinesStartingWith('UNSUB ');
-        self::assertCount(1, $released, 'the first run released its inbox');
-        self::assertNotSame('UNSUB ' . $server->pulls[0]['sid'], $released[0], 'the one pull is the second run\'s: the first run never pulled');
+        self::assertCount(1, $transport->controlLinesStartingWith('SUB _INBOX.JS.PULL.'), 'only the second run subscribed: the first was already stopped');
+        self::assertSame([], $transport->controlLinesStartingWith('UNSUB '), 'the first run had no inbox to release');
 
         $iterator->stop();
         self::assertSame(0, $second->await(new TimeoutCancellation(5)));

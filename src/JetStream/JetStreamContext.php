@@ -2690,7 +2690,14 @@ final class JetStreamContext
      * A stop() or drain() from another fiber ends the engine's wait at once: the pump read and the idle
      * backoff wait with the run's wake-ups from the control ({@see PullPipelineControl::stopInterruption()},
      * {@see PullPipelineControl::drainInterruption()}), each composed only while it has not fired, and the
-     * flag is seen at the top of the loop once the wait ends (#181). The flags and the wake-ups are the run's
+     * flag is seen at the top of the loop once the wait ends (#181). So does the run's first wait, the
+     * subscribe of its inbox (#198): a run told to stop or drain before it subscribes returns 0 without a
+     * SUB, and one told while the subscribe waits for a reconnect, the SUB's write or the recovery a failed
+     * write runs returns 0 at once, with no pull issued and so nothing to deliver; the cancelled subscribe
+     * releases what it registered. That set-up has one requestTimeoutMs for all of it, the SUB's write
+     * included; without a signal it still waits for the reconnect within it, and its running out fails the
+     * run with a TimeoutException ('timed out within the operation budget'), or with the inbox's rejection
+     * when the server rejected the inbox meanwhile. The flags and the wake-ups are the run's
      * own ({@see \IDCT\NATS\JetStream\Consumers\PullRunLifecycle}, #189): the iterator's stop() and drain()
      * signal every run active when they are called, each through its own, and a later handle() on the same
      * iterator starts a run with fresh ones and leaves this run's alone, where it used to clear the shared
@@ -2975,12 +2982,39 @@ final class JetStreamContext
             // would spin forever with zero signal on any channel. The rejection fires a wake-up of the run's own,
             // which ends the engine's waits (#206), and the engine looks at it again after every wait that can let
             // another fiber run and before every pull it writes ({@see PullInboxRejection}).
+            //
+            // The subscribe is the run's first wait, and the run's stop() and drain() end it as they end the reads and
+            // the idle backoff (#198): a run told to stop or drain before it subscribed returns 0 without a SUB, and one
+            // told while its subscribe waits (for a reconnect, the SUB's write, or the recovery a failed write runs)
+            // returns 0 as soon as it is told. No pull has gone out yet, so there is nothing to deliver or abandon. The
+            // check and the budget below are taken with no suspension between them: a signal is either latched before
+            // the check or fires a token the budget holds. The subscribe has one requestTimeoutMs for the whole set-up,
+            // the SUB's write included; a cancelled subscribe releases what it registered itself (the engine holds no
+            // SID to release), so an abandoned SUB is neither replayed on a later connection nor left subscribed.
             $inboxRejection = new PullInboxRejection();
+            if ($ctl->isStopRequested() || $ctl->isDrainRequested()) {
+                return 0;
+            }
+            $subscribeBudget = new CompositeCancellation(
+                new TimeoutCancellation($this->client->options()->requestTimeoutMs / 1000),
+                $ctl->stopInterruption(),
+                $ctl->drainInterruption(),
+            );
             try {
-                $sid = $this->client->subscribeGuarded($base . '.*', $router, $inboxRejection->reject(...))->await();
-            } catch (ConnectionException $e) {
-                // The SUB write failed, and the new server rejected the reconnect's replay of the SUB (#175): the
-                // replay recorded the rejection, and the subscribe reports it. The run fails as it does below.
+                $sid = $this->client->subscribeGuarded($base . '.*', $router, $inboxRejection->reject(...), $subscribeBudget)->await();
+                // The budget bounds the set-up only: the run's reads and backoff have cancellations of their own.
+                unset($subscribeBudget);
+            } catch (ConnectionException|TimeoutException $e) {
+                // The budget ran out, and the run was told to stop or drain: that is what ended the subscribe (#198),
+                // or the run would end at its next look at the flags anyway. Only a TimeoutException: a latched signal
+                // does not turn a failed connection into a normal end.
+                if ($e instanceof TimeoutException && ($ctl->isStopRequested() || $ctl->isDrainRequested())) {
+                    return 0;
+                }
+
+                // The server rejected the inbox while the set-up waited: the SUB's own -ERR, read by another fiber while
+                // the write waited for its completion, or the new server's rejection of the reconnect's replay of the SUB
+                // (#175). The run fails with the rejection, as it does below, the budget's timeout as its cause.
                 $rejection = $inboxRejection->error();
                 if ($rejection !== null) {
                     throw $this->pullInboxRejectedException($base, $rejection, $e);

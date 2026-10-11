@@ -277,7 +277,8 @@ final class PullConsumerIterator
      * abandons any messages remaining in its in-flight batch (already-fetched but not yet handled). Safe to call from
      * inside the handler or from another fiber: a call from another fiber - a signal handler's timer, a supervisor -
      * also ends each engine's wait on the socket, or in its idle backoff, at once, instead of at the earliest in-flight
-     * pull's deadline (#181). It acts on the runs active when it is called (#189): a run a later handle() starts, in
+     * pull's deadline (#181), and a run's set-up of its inbox while it waits for a reconnect or the SUB's write, which
+     * then returns 0 with no pull issued, instead of when the reconnect is done or with a subscribe timeout (#198). It acts on the runs active when it is called (#189): a run a later handle() starts, in
      * the same tick or not, starts clean and is not stopped, so stop() followed by handle() restarts the consumer, the
      * earlier run ending on its stop. A handler already running when it is called finishes its message. Idempotent; a
      * call outside a run has no effect on a later run. Mirrors nats.go `ConsumeContext.Stop()`.
@@ -294,7 +295,9 @@ final class PullConsumerIterator
      * (so no fetched message is dropped, across a reconnect too, #187) and then stops without issuing another pull.
      * From another fiber the call wakes each engine once, so it stops issuing pulls at once and, with nothing in
      * flight, returns at once; the in-flight pulls still complete or reach their deadline first, as from inside the
-     * handler (#181). Like {@see stop()} it acts on the runs active when it is called (#189): a run a later handle()
+     * handler (#181). A run still setting up its inbox (waiting for a reconnect or the SUB's write) has no pull in
+     * flight: it returns 0 at once (#198). This is the iterator's drain(), not the client's (see
+     * {@see \IDCT\NATS\Core\NatsClient::drain()}). Like {@see stop()} it acts on the runs active when it is called (#189): a run a later handle()
      * starts pulls as usual, and the drained run goes on delivering its in-flight pulls to its own handler next to it,
      * without pulling again. Mirrors nats.go `ConsumeContext.Drain()`.
      */
@@ -312,7 +315,9 @@ final class PullConsumerIterator
      * {@see PullPipelineConfig}, and binds a live {@see PullPipelineControl} so the engine still sees a
      * stop()/drain() the handler makes mid-run and writes any captured pin back onto this iterator. The
      * control also carries the run's two one-shot wake-ups, which stop() and drain() fire, so a call from
-     * another fiber ends the engine's wait on the socket or in its idle backoff at once (#181); each run
+     * another fiber ends the engine's wait on the socket or in its idle backoff at once (#181), and the subscribe of
+     * the run's inbox before its first pull (#198), which has one requestTimeoutMs for its reconnect wait and SUB
+     * write together; a stop()/drain() latched before the engine starts skips that subscribe; each run
      * has its own, so a wake-up fired in an earlier run cannot end a wait of this one. The engine
      * overlaps up to {@see setDepth()} concurrent pulls while preserving order; behavior is otherwise
      * identical to the classic serial loop (finite count, 404/408/409/423 handling, #153 idle backoff,

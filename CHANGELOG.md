@@ -15,6 +15,51 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.25.9] - 2026-10-11
+
+### Upgrade notes
+
+- A pull consumer run's set-up of its inbox (`_INBOX.JS.PULL.<nuid>.*`, before its first pull) now has one
+  `requestTimeoutMs` for the whole set-up: the wait for a reconnect in flight, the `SUB` write and the recovery of a
+  failed write together (#198). It used to have up to two fresh `requestTimeoutMs` waits for a reconnect, and a `SUB`
+  write without a bound. When that budget runs out without a `stop()` or `drain()`, `handle()` still fails with a
+  `TimeoutException`, now worded `Subscribe to "_INBOX.JS.PULL.<nuid>.*" timed out within the operation budget` (it
+  was `... timed out waiting for the connection to be re-established`), or with the detailed `JetStreamException` of
+  an inbox rejection the server sent meanwhile. Public `subscribe()` is unchanged.
+- A run whose `stop()` or `drain()` came before its engine started no longer subscribes an inbox only to release it at
+  once: it returns 0 without a `SUB`.
+
+### Fixed
+
+- [bugfix] A pull consumer's `stop()` or `drain()` during its inbox set-up was seen only once the set-up ended (#198).
+  The case: a worker whose `handle()` starts while the connection reconnects (a run restarted during an outage, or
+  `handle()` with `setIterations()` in a loop) and is told to shut down meanwhile, a SIGTERM during a rolling restart of
+  the NATS cluster, say. #181 (2.17.0) made the iterator's `stop()` and `drain()` from another fiber end the engine's
+  pump read and idle backoff at once, but not the run's first wait, the subscribe of its pull inbox, which can wait for
+  a reconnect, the `SUB` write, and the recovery of a failed write. The run went on waiting: when the reconnect came
+  back, it subscribed the inbox on the new connection only to release it at once, and when it did not within
+  `requestTimeoutMs` (10 s by default), `handle()` failed with the subscribe's `TimeoutException` although the run had
+  been told to stop; a `SUB` write that met a dead socket after the reconnect could add a second `requestTimeoutMs`.
+  The set-up now waits with the run's stop and drain wake-ups next to its budget: either signal ends it at once, and
+  the run returns 0 with no pull issued, so nothing is delivered or lost. A cancelled subscribe releases what it
+  registered: a `SUB` not written yet is never written, one waiting for the recovery is not replayed on the new
+  connection, and one already written or replayed is followed by its `UNSUB`, on that session. The shared reconnect
+  goes on for the other operations. A signal latched before the engine starts skips the subscribe. Without a signal
+  the set-up still waits for the reconnect within its budget and then pulls. A rejection of the inbox the server sent
+  while the set-up waited (permissions, or the connection's subscription limit) still fails the run with its detailed
+  `JetStreamException` when the budget runs out, the timeout as its cause, rather than a bare timeout; with a signal
+  the run returns 0. A connection failure stays a failure even when a signal lands after it. This is the iterator's
+  `drain()`; draining the client is unchanged. Found by the implementation brief of #188 (2.19.0).
+
+### Testing & CI
+
+- [docs] New `PullConsumerSubscribeWakeUpTest` (28 cases, #198): a signal while the set-up joins a recovery or recovers
+  a failed `SUB`, latched before the engine starts, outside a run, during a held `Reconnected` listener and during a
+  `SUB` write held before or after acceptance; recovery and a genuine timeout without a signal; a restart during the
+  set-up; a recorded rejection with a timeout, stop or drain; and a signal after the connection failed.
+  `PullConsumerWakeUpTest::testAStopThenHandleAgainBeforeTheFirstRunStartedEndsItBeforeItPulls` now expects one `SUB`
+  (the second run's) and no `UNSUB`.
+
 ## [2.25.8] - 2026-10-11
 
 ### Testing & CI
