@@ -15,6 +15,25 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` Two wall-clock tests no longer flake on slow runners (#185). Both now decide by the order of events.
+  - `OperationReadReconnectLifecycleTest::testAClosedListenerThatSuspendsWhileTheReconnectGivesUp` suspended its
+    Closed listener 0.3 s or 0.8 s against poll deadlines of 3 s and 0.3 s. It checked Closed the moment the timed-out
+    poll returned, but on a slow runner the three refused reconnect attempts were not over by then (Connecting). The
+    listener is now held on a gate the test opens. In the exhaustion case, with a 30 s deadline, the poll must still
+    wait once the listener has been entered and the queued work has run; let go, the poll gets the exhaustion error.
+    In the timeout case the listener stays held until the 0.3 s poll has returned nothing, and Connecting is allowed
+    at that point. Both still end Closed with the same events and dials.
+  - `OperationReadWakeupTest::testOperationGetsWhatADispatchWaitingOnAPongWriteBrings` required its result within
+    1.5 s. A runner under coverage took 2.58 s, with the hold-up ended as designed. The result now has to win a race
+    against a referenced timer of the operation's 3 s deadline, armed before the operation starts, which the broken
+    reads could not win.
+
+  Both still fail on the regressions they guard against. No production code changed.
+
 ## [2.25.7] - 2026-10-11
 
 ### Testing & CI

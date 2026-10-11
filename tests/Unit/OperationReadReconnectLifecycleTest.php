@@ -570,49 +570,99 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         }
     }
 
-    /** @return iterable<string, array{float, float, string}> */
-    public static function closedListenerDelays(): iterable
+    /** @return iterable<string, array{float, string}> */
+    public static function closedListenerOutcomes(): iterable
     {
-        yield 'the listener suspends 0.3 s, the deadline is 3 s: the exhaustion error' => [0.3, 3.0, 'exhausted'];
-        yield 'the listener suspends 0.8 s, the deadline is 0.3 s: the poll times out' => [0.8, 0.3, 'timeout'];
+        yield 'the Closed listener let go while the poll waits: the exhaustion error' => [30.0, 'exhausted'];
+        yield 'the Closed listener held until the poll has timed out: nothing' => [0.3, 'timeout'];
     }
 
     /**
-     * The reconnect a poll's read started gives up (three attempts, dials refused) and its Closed listener suspends.
-     * A poll whose deadline outlasts the listener gets "Reconnect attempts exhausted" with its cause (#172), after
-     * the listener returned; one whose deadline comes first times out with nothing instead, the connection Closed by
-     * then: the exhaustion error reaches only an operation that still waits for the reconnect.
+     * The reconnect a poll's read started gives up (three attempts, dials refused), and its Closed listener suspends,
+     * held on a gate the test opens. The order of events decides, not two sleeps that must stay apart (#185):
+     *   - exhausted: the poll's deadline is far off (30 s). Once the listener has been entered, and the work already
+     *     queued has run (a deferred checkpoint), the poll still waits while the listener is held; let go, the listener
+     *     returns and then the poll gets "Reconnect attempts exhausted" with its cause (#172).
+     *   - timeout: the listener is held until the poll, with its 0.3 s deadline, has returned - nothing, and no error -
+     *     however long the reconnect takes to reach the listener: the exhaustion error reaches only an operation that
+     *     still waits for the reconnect. The connection may still be Connecting when the poll returns.
+     * Both end Closed, with Connected, Disconnected and Closed reported, after the first dial and three attempts.
+     * The test used to suspend the listener 0.3 s or 0.8 s against deadlines of 3 s and 0.3 s, and checked Closed the
+     * moment the timed-out poll returned: on a slow runner the three attempts were not over by then (Connecting).
      */
-    #[DataProvider('closedListenerDelays')]
-    public function testAClosedListenerThatSuspendsWhileTheReconnectGivesUp(float $listenerDelay, float $deadline, string $expected): void
+    #[DataProvider('closedListenerOutcomes')]
+    public function testAClosedListenerThatSuspendsWhileTheReconnectGivesUp(float $deadline, string $expected): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
         $record = $recorder->connectionListener();
         $listenerReturned = false;
-        $listener = static function (ConnectionEvent $event, ?\Throwable $error = null) use ($record, $listenerDelay, &$listenerReturned): void {
+        /** @var DeferredFuture<null> $entered */
+        $entered = new DeferredFuture();
+        /** @var DeferredFuture<null> $release */
+        $release = new DeferredFuture();
+        /** @var DeferredFuture<null> $done */
+        $done = new DeferredFuture();
+        $letGo = static function () use ($release): void {
+            if (!$release->isComplete()) {
+                $release->complete();
+            }
+        };
+        $this->resources()->onRelease($letGo, 'the held Closed listener');
+        // What the held listener waits for keeps the loop running, as real suspended I/O would: the poll's
+        // TimeoutCancellation timer is unreferenced, and the socket is gone once the reconnect gives up.
+        $keepAlive = $this->resources()->ownCallback(EventLoop::delay(30.0, static function (): void {}), 'the held listener\'s keep-alive');
+        $listener = static function (ConnectionEvent $event, ?\Throwable $error = null) use ($record, $entered, $release, $done, &$listenerReturned): void {
             $record($event, $error);
             if ($event === ConnectionEvent::Closed) {
-                delay($listenerDelay);
+                $entered->complete();
+                $release->getFuture()->await();
                 $listenerReturned = true;
+                $done->complete();
             }
         };
         $client = $this->lifecycleClient($watched, $recorder, connectionListener: $listener, maxReconnectAttempts: 3);
         $queue = $client->subscribeQueue('jobs')->await();
 
-        $poll = async(static fn(): ?NatsMessage => $queue->setTimeout($deadline)->next());
+        $poll = $this->resources()->ownOperation(async(static fn(): ?NatsMessage => $queue->setTimeout($deadline)->next()), label: 'the poll');
         $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
         $transport->refuseDials();
         $transport->dropConnection();
         $error = null;
         $message = null;
+        $returnedAfterListener = null;
         try {
-            $message = $poll->await(new TimeoutCancellation(8));
-        } catch (\Throwable $e) {
-            $error = $e;
+            if ($expected === 'exhausted') {
+                $entered->getFuture()->await(new TimeoutCancellation(8));
+                // What is already queued runs first - a recovery that wrongly completed would reach the poll by then.
+                /** @var DeferredFuture<null> $checkpoint */
+                $checkpoint = new DeferredFuture();
+                $this->resources()->ownCallback(EventLoop::defer(static function () use ($checkpoint): void {
+                    $checkpoint->complete();
+                }), 'the checkpoint');
+                $checkpoint->getFuture()->await(new TimeoutCancellation(8));
+                self::assertFalse($poll->isComplete(), 'the poll still waits while the Closed listener is held');
+                $letGo();
+            }
+
+            try {
+                $message = $poll->await(new TimeoutCancellation(8));
+            } catch (\Throwable $e) {
+                $error = $e;
+            }
+            $returnedAfterListener = $listenerReturned;
+
+            // A slow runner may not have given up on its dials yet when the poll times out.
+            $entered->getFuture()->await(new TimeoutCancellation(8));
+            if ($expected === 'timeout') {
+                self::assertFalse($listenerReturned, 'the Closed listener is still held after the poll ended');
+            }
+        } finally {
+            $letGo();
+            EventLoop::cancel($keepAlive);
         }
-        $returnedAfterListener = $listenerReturned;
+        $done->getFuture()->await(new TimeoutCancellation(8));
 
         self::assertSame(ConnectionState::Closed, $client->state());
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Closed], $recorder->events);
@@ -626,9 +676,6 @@ final class OperationReadReconnectLifecycleTest extends TestCase
             self::assertNull($message);
             self::assertFalse($returnedAfterListener, 'the poll timed out before the Closed listener returned');
         }
-        $this->waitUntil(static function () use (&$listenerReturned): bool {
-            return $listenerReturned;
-        }, 3.0);
         self::assertCount(4, $transport->connectCalls, 'the first dial and three reconnect attempts');
     }
 
