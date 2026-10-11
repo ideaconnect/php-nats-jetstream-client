@@ -15,6 +15,29 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.25.5] - 2026-10-11
+
+### Testing & CI
+
+- `[docs]` The scripted reconnect server keeps the order of writes (#192). `tests/Support/ReconnectingTransport.php`
+  ran each write on its own and held up only the one matching a stall, so a write made during a stall reached the
+  session before the stalled one, which no socket does: bytes reach a server in the order they were written, and the
+  built-in transports hand them over in the caller's fiber. Since the connection ties PONGs to PINGs by order (2.19.0),
+  a heartbeat PING overtaking a held-up SUB + PING had its PONG taken for the held-up one's and confirmed a guarded
+  inbox whose SUB the server had not received. Each write now waits until the one before it on its session has been
+  accepted, and only then meets its stall or failure: a stalled write holds the later ones, and they fail when their
+  session ends - also one made just before the end with nothing ahead of it, which used to be recorded on the dead
+  session - without waiting for a head that outlives its session; a dial that succeeds ends the session it replaces, so
+  a new session's writes never wait for an old one's. `afterWrite` runs once the next write has been let through, and
+  the new `holdCompletionOfNextWriteContaining()` holds a writer whose bytes the session already has, without holding
+  any other write: a delay after acceptance, distinct from backpressure. The three tests that relied on a write
+  overtaking a stalled one are restaged on that distinction, with their assertions kept: the heartbeat-shape inbox
+  rejection test of #175 now runs with PINGs answered over `SubscriptionLimitServer`, which rejects the SUB in wire
+  order, holding the fetch's writer through the new `tests/Support/CompletionHoldingTransport.php`; the mux wait test
+  of #180 (four data sets) and the drain hand-over order test of #207 hold a writer's completion instead of its bytes.
+  New `ReconnectingTransportWriteOrderTest` (15 cases) covers the order, sessions ending and being replaced, and the
+  connection-level consequence with the heartbeat answered. No production code changed.
+
 ## [2.25.4] - 2026-10-10
 
 ### Testing & CI

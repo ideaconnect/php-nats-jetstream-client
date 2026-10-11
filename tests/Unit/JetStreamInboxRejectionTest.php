@@ -17,10 +17,10 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\JetStreamContext;
+use IDCT\NATS\Tests\Support\CompletionHoldingTransport;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
-use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\SubscriptionLimitServer;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -44,8 +44,8 @@ use function Amp\delay;
  * reports the rejection.
  *
  * Over `tests/Support/SubscriptionLimitServer.php`, which enforces the limit and answers in wire order, with an
- * application loop as the other reader, and over `tests/Support/ReconnectingTransport.php` with the heartbeat as the
- * other reader and the SUB write held up. The order of events decides; the time bounds (1 s) sit far from both the
+ * application loop as the other reader, or with the heartbeat as the other reader while the fetch's writer is held
+ * after its SUB reached the server (`tests/Support/CompletionHoldingTransport.php`). The order of events decides; the time bounds (1 s) sit far from both the
  * expected behaviour (milliseconds) and the broken one (the deadline: 3 s with the 2 s expiry used here). Each
  * regression test fails on the code before the fix with the operation's routine result after its deadline; the guards
  * pass on both unless said otherwise.
@@ -100,82 +100,77 @@ final class JetStreamInboxRejectionTest extends TestCase
     }
 
     /**
-     * The issue's shape. The heartbeat reads the socket every 50 ms. The fetch's SUB write is held up, like a write
-     * under backpressure, so the fetch is suspended in its subscribe when the server's -ERR arrives, and the heartbeat's
-     * read brings it: the heartbeat reports it to the error listener, the only reader there is. Once the write goes on
-     * the fetch fails at once, within 1 s, with the error naming its inbox and the limit, where it used to report an
-     * empty pull (JetStreamException 408, 'No messages received within timeout') after the 2 s expiry plus 1 s of slack;
-     * no pull is sent for the dead inbox, the inbox is unsubscribed, the connection is Open, nothing is recorded for the
-     * dead sid by the marks the fetch applies once its write completes, and a retry once the limit has room subscribes
-     * a new inbox, which the server confirms, and gets its message.
+     * The issue's shape. The heartbeat reads the socket every 50 ms, and is the only reader there is: the server, with
+     * no room for a subscription, receives the fetch's SUB and its PING and answers them in wire order, the -ERR first,
+     * while the fetch is suspended in its subscribe, its writer not yet resumed after the write - the completion is
+     * held, the bytes are on the wire. The heartbeat's PING goes out behind the SUB, its read brings the -ERR, and the
+     * heartbeat reports it to the error listener. Once the fetch's writer is let go, the fetch fails at once, within
+     * 1 s, with the error naming its inbox and the limit, where it used to report an empty pull (JetStreamException
+     * 408, 'No messages received within timeout') after the 2 s expiry plus 1 s of slack; no pull is sent for the dead
+     * inbox, the inbox is unsubscribed, the connection is Open, nothing is recorded for the dead sid by the marks the
+     * fetch applies once its write completes, and a retry once the limit has room subscribes a new inbox, which the
+     * server confirms, and gets its message.
      *
-     * The server leaves PINGs unanswered while the SUB is held up, and the heartbeat ticks at least once meanwhile, as
-     * it does on a loaded machine. A socket keeps the order of its writes, and the production transports hand their
-     * bytes over synchronously, but this double lets a write made during a stall overtake the stalled one: a heartbeat
-     * PING written past the held-up SUB+PING would be answered first, and its PONG, completing the oldest pong slot,
-     * would confirm the inbox before its SUB reached the server. With no PONG the inbox stays unconfirmed, whenever the
-     * heartbeat ticks, and the heartbeat's reads still bring the -ERR.
+     * The server answers every PING, with the heartbeat's usual limit: the PONG behind the rejected SUB comes after
+     * the -ERR, as on a socket (#192). The test used to hold the SUB + PING write itself up and push the -ERR, over a
+     * double that let a later write overtake a held-up one; a heartbeat PONG would then have confirmed the inbox before
+     * its SUB reached the server, so PINGs went unanswered there.
      */
     #[DataProvider('fetches')]
     public function testAFetchWhoseInboxSubIsRejectedWhileTheHeartbeatReadsTheErrFailsAtOnce(string $fetch): void
     {
-        $transport = new ReconnectingTransport();
+        $server = $this->pullServer(limit: 0);
+        $transport = new CompletionHoldingTransport($server);
         $recorder = new LifecycleRecorder();
         $client = $this->own(new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             reconnectEnabled: false,
             pingIntervalSeconds: 0.05,
-            // The heartbeat's PINGs go unanswered until the retry: far more ticks than the test takes.
-            maxPingsOut: 100,
             errorListener: $recorder->errorListener(),
         ), $transport));
-        $this->opened[] = $client;
         $client->connect()->await();
-        $transport->answerPings = false;
-        $this->answerPulls = false;
-        $transport->responder = function (string $subject, ?string $replyTo) use ($transport): array {
-            if (!$this->answerPulls || $replyTo === null || $subject !== self::PULL_SUBJECT) {
-                return [];
-            }
-
-            return [ReconnectingTransport::msgFrame('evt.s', (int) $transport->sidFor($replyTo), 'm1', '$JS.ACK.S.C.1.1.1.0.0')];
-        };
         $js = $client->jetStream();
 
-        $transport->stallNextWriteContaining('SUB _INBOX.JS.FETCH', 5.0);
-        $fetching = self::startOperation($fetch, $js);
-        $this->waitUntil(static fn(): bool => $transport->writesStalled() > 0);
-        // The heartbeat ticks while the write is held up: its PING overtakes the SUB in this double, unanswered.
-        delay(0.06);
-        self::assertGreaterThan(1, count($transport->controlLinesStartingWith('PING')), 'the heartbeat wrote a PING past the held-up SUB');
-        // The server rejects the SUB. With the write still held up, the heartbeat's reads are the only ones.
-        $transport->pushFrame("-ERR 'maximum subscriptions exceeded'\r\n");
-        $this->waitUntil(static fn(): bool => $recorder->errorsContaining('maximum subscriptions exceeded') !== []);
-        self::assertFalse($fetching->isComplete(), 'the fetch is still in its subscribe, its SUB write held up');
+        try {
+            $transport->holdCompletionOfNextWriteContaining('SUB _INBOX.JS.FETCH', 5.0);
+            $fetching = self::startOperation($fetch, $js);
+            $this->waitUntil(static fn(): bool => $transport->completionsHeld() === 1);
+            self::assertCount(1, $server->controlLines('SUB _INBOX.JS.FETCH'), 'the server received the SUB');
+            self::assertSame([], $server->heldSubscriptions(), 'and rejected it');
+            // The heartbeat's read is the only one, and brings the -ERR.
+            $this->waitUntil(static fn(): bool => $recorder->errorsContaining('maximum subscriptions exceeded') !== []);
+            $lines = $server->controlLines();
+            $subAt = array_search(self::lastLineStartingWith($lines, 'SUB _INBOX.JS.FETCH'), $lines, true);
+            self::assertIsInt($subAt);
+            self::assertContains('PING', array_slice($lines, $subAt + 2), "the heartbeat's PING went out behind the SUB and its own PING");
+            self::assertFalse($fetching->isComplete(), 'the fetch is still in its subscribe, its writer not resumed yet');
 
-        $start = hrtime(true);
-        $transport->releaseStalledWrites();
-        [, $error] = self::settle($fetching);
-        $elapsed = self::secondsSince($start);
+            $start = hrtime(true);
+            $transport->releaseHeldCompletions();
+            [, $error] = self::settle($fetching);
+            $elapsed = self::secondsSince($start);
 
-        self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s ended after %.3f s with %s', $fetch, $elapsed, self::describe($error)));
-        self::assertStringContainsString(self::LIMIT, $error->getMessage());
-        self::assertStringContainsString('"_INBOX.JS.FETCH.', $error->getMessage(), 'the error names the inbox');
-        self::assertLessThan(1.0, $elapsed, sprintf('%s failed after %.3f s, with a 2 s expiry and 1 s of slack', $fetch, $elapsed));
-        self::assertSame([], $transport->controlLinesStartingWith('PUB ' . self::PULL_SUBJECT), 'no pull was sent for the dead inbox');
-        $sid = self::lastSidOf($transport->controlLinesStartingWith('SUB _INBOX.JS.FETCH'));
-        self::assertContains('UNSUB ' . $sid, $transport->controlLines(), 'the inbox was unsubscribed');
-        self::assertSame(ConnectionState::Open, $client->state());
-        // The slow-consumer exemption the fetch applies once its SUB write completes ran after the drop.
-        self::assertGuardStateEmpty(self::connectionOf($client), 'after the rejected fetch');
+            self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s ended after %.3f s with %s', $fetch, $elapsed, self::describe($error)));
+            self::assertStringContainsString(self::LIMIT, $error->getMessage());
+            self::assertStringContainsString('"_INBOX.JS.FETCH.', $error->getMessage(), 'the error names the inbox');
+            self::assertLessThan(1.0, $elapsed, sprintf('%s failed after %.3f s, with a 2 s expiry and 1 s of slack', $fetch, $elapsed));
+            self::assertSame([], $this->pulls->getArrayCopy(), 'no pull was sent for the dead inbox');
+            $sid = self::lastSidOf($server->controlLines('SUB _INBOX.JS.FETCH'));
+            self::assertContains('UNSUB ' . $sid, $server->controlLines('UNSUB'), 'the inbox was unsubscribed');
+            self::assertSame(ConnectionState::Open, $client->state());
+            // The slow-consumer exemption the fetch applies once its SUB write completes ran after the drop.
+            self::assertGuardStateEmpty(self::connectionOf($client), 'after the rejected fetch');
 
-        // The retry's inbox is confirmed by the PONG behind its SUB, as usual.
-        $transport->answerPings = true;
-        $this->answerPulls = true;
-        [$payloads, $error] = self::settle(self::startOperation($fetch, $js));
-        self::assertNull($error, 'the retry got its message: ' . self::describe($error));
-        self::assertSame(['m1'], $payloads);
-        self::assertCount(2, $transport->controlLinesStartingWith('SUB _INBOX.JS.FETCH'), 'the retry subscribed a new inbox');
+            // The retry's inbox is confirmed by the PONG behind its SUB, as usual.
+            $server->limit = 1;
+            [$payloads, $error] = self::settle(self::startOperation($fetch, $js));
+            self::assertNull($error, 'the retry got its message: ' . self::describe($error));
+            self::assertSame(['m1'], $payloads);
+            self::assertCount(2, $server->controlLines('SUB _INBOX.JS.FETCH'), 'the retry subscribed a new inbox');
+            self::assertSame([], $server->heldSubscriptions(), 'the retry released its inbox');
+        } finally {
+            $transport->releaseHeldCompletions();
+        }
     }
 
     /**
@@ -1029,6 +1024,15 @@ final class JetStreamInboxRejectionTest extends TestCase
         $parts = explode(' ', $lines[count($lines) - 1]);
 
         return (int) $parts[count($parts) - 1];
+    }
+
+    /** @param list<string> $lines */
+    private static function lastLineStartingWith(array $lines, string $prefix): string
+    {
+        $matching = array_values(array_filter($lines, static fn(string $line): bool => str_starts_with($line, $prefix)));
+        self::assertNotSame([], $matching, sprintf('no line starts with "%s"', $prefix));
+
+        return $matching[count($matching) - 1];
     }
 
     /** @param \Closure(): bool $condition */
