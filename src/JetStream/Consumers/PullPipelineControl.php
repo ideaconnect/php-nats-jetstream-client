@@ -21,7 +21,9 @@ use Amp\NullCancellation;
  * Besides the flags, the run has two one-shot wake-ups, {@see stopInterruption()} and
  * {@see drainInterruption()}: cancellations that stop() and drain() fire right after setting their flag,
  * so that a call from another fiber ends the engine's wait on the socket, or in its idle backoff, at
- * once instead of at the earliest pull's deadline (#181). The engine composes a wake-up into a wait only
+ * once instead of at the earliest pull's deadline (#181), and the subscribe of the run's inbox before
+ * its first pull, at once instead of when the reconnect it waits for is done or its requestTimeoutMs
+ * runs out (#198). The engine composes a wake-up into a wait only
  * while it has not fired: once stop() or drain() fired it, their flag is seen at the top of the loop, and
  * a fired wake-up left out of the later waits cannot end them at once. The wake-ups are the run's own,
  * like its flags, and live as long as the run (#189): a later handle() on the iterator no longer replaces
