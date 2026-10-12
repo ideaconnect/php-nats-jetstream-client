@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3449 unit tests, 159 integration tests, 49 Behat scenarios.
+Indicative totals: 3458 unit tests, 159 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -138,6 +138,15 @@ The application's own read - processIncoming() or readIncoming() - finding the s
 - `testServerPingWhosePongWriteFailsClosesTheConnectionWithReconnectOff` - A server PING whose PONG write finds the socket dead fails processIncoming() with the socket's error, as before, and the connection no longer stays Open on that socket.
 - `testFullSubscriptionQueueDoesNotEndTheConnection` - Guard: a full subscription queue under the Error policy still fails the read with SlowConsumerException, and the connection stays Open with its socket.
 - `testFatalErrDuringDrainDoesNotReconnect` - Guard: a fatal -ERR answering drain()'s flush PING does not reconnect (no second dial); drain() reports it and closes.
+
+### tests/Unit/CorruptChunkOperationReadTest.php
+The read of one of the library's operations that gets a chunk which fails to parse recovers the connection as a read that met a lost socket does (#195): in a fiber of its own, waited for only within the operation's wait, or not at all with waiting disabled. Over `ReconnectingTransport`, heartbeat off; the recovery's first dial is held until the operation has returned, so each operation ends with the connection still Connecting; a 3 s watchdog bounds a broken case.
+- `testARequestWhoseReadGetsACorruptChunkTimesOutAtItsDeadline` - With the reply inbox set up, `svc.echo` is answered with `BOGUS`: the request (300 ms) ends with `TimeoutException: Request timed out for subject svc.echo`, the state Connecting with the dial held, the error listener having got `Unsupported control frame: BOGUS`; once the dial is let through, one reconnect.
+- `testWithWaitingDisabledTheRequestFailsAtOnce` - The same with `waitForReconnect: false` and a 30 s request: `ConnectionException: Connection is not open`, the `ProtocolException` (`Unsupported control frame: BOGUS`) its previous, the state Connecting.
+- `testAReplyAheadOfTheBadBytesIsReturnedAtOnce` (waiting enabled / disabled) - The reply and `BOGUS` in one chunk: the 30 s request returns `reply-1` while the dial is held.
+- `testAPollWhoseReadGetsACorruptChunkKeepsToItsWait` (a corrupt chunk / its message ahead of the bad bytes) - A `SubscriptionQueue` poll returns nothing at its 0.3 s deadline, or returns `job` at once from a 30 s poll, the state Connecting.
+- `testALameDuckInfoAheadOfTheBadBytesFailsOverInAFiberOfItsOwn` - A lame-duck `INFO` naming port 4223 and `BOGUS` in one chunk: the 0.3 s poll returns nothing at its deadline while the failover's dial (to 4223) is held, the only dial after the first connect, the parse error's recovery having joined the failover; then one reconnect.
+- `testAnApplicationReadStillWaitsForTheWholeRecovery` (waiting enabled / disabled) - Guard: your own `processIncoming()` that gets `BOGUS` is still pending past a checkpoint while the dial is held, and returns once the connection is Open, one reconnect.
 
 ### tests/Unit/CredentialsParserTest.php
 - `testParseExtractsJwtAndNkeySeed` - Asserts `parse()` extracts the JWT and NKey seed from a standard five-dash BEGIN/END `.creds` block.
@@ -3025,7 +3034,7 @@ SlowConsumerPolicy::Error where a subscriber that cannot keep up meets the clien
 - `testReconnectReportsAPollingBufferOverflowAndDeliversTheRestAtOnce` - Messages for the full queue and for another subscription arrive while a reconnect re-subscribes: once the reconnect is done the overflow is reported and the other message is already delivered, not left for the next read.
 - `testReconnectHandshakeReportsAPollingBufferOverflowInsteadOfFailingTheAttempt` - A message for the full queue still queued from before, behind a handler that awaits in the application's read (`tests/Support/HeldUpDelivery.php`), and an async INFO right behind the reconnect's handshake PONG: the overflow is reported, the first reconnect attempt succeeds (it used to fail the attempt), and the held-up read ends with its 2 frames once its handler returns. (Built on a throwing handler before #177.)
 - `testDrainFlushReadsOnPastAPollingBufferOverflow` - (drain() / drainSubscription()) The flush's first read overflows the full queue, the next brings a message still in flight for another subscription and the PONG: the overflow is reported once and the in-flight message delivered (the flush used to end at the overflow).
-- `testRequestReadEndingInACorruptFrameStillGetsItsReplyPastAnOverflow` - (subscription queue / polling buffer) A request's read brings an overflow, the reply and a corrupt control line: the request returns the reply, the overflow is reported once, and the corrupt stream is recovered with a reconnect (the request used to fail with the overflow).
+- `testRequestReadEndingInACorruptFrameStillGetsItsReplyPastAnOverflow` - (subscription queue / polling buffer) A request's read brings an overflow, the reply and a corrupt control line: the request returns the reply, the overflow is reported once, and the corrupt stream is recovered with a reconnect, which since #195 runs in a fiber of its own, so the test waits for it before counting it (the request used to fail with the overflow).
 - `testSubscriptionQueueStillFailsOnItsOwnOverflow` - (fetch() / next() / next() with a timeout / fetchAll()) Three messages for a SubscriptionQueue's own subscription in one read (limit 2): the poll fails with a SlowConsumerException naming that subscription, and the messages that fit are still delivered by the next call.
 - `testSubscriptionQueueStillFailsWhenItsOwnPollingBufferOverflows` - A SubscriptionQueue built with a smaller buffer (2) than the connection's (4) polls three of its own messages in one read, with a later subscription's message behind them: next() fails with a SlowConsumerException naming its subscription once that later message is delivered, and the next call returns j1.
 - `testServiceReportsAnotherSubscriptionsOverflowAndKeepsServing` - While Service::run() reads, a request to its endpoint arrives in the same read as another subscription's overflow: the request is answered and the overflow reported (Service::run() used to swallow it without a trace).

@@ -4108,9 +4108,12 @@ final class NatsConnection
      *        waits for that failover only within the operation's wait, unless the PONG it is for came in the chunk,
      *        as it waits for a reconnect its failed read starts (#178, #191): the deadline ends that wait with the
      *        caller's timeout, and the wake-up with the read returning what it read ({@see handleServerInfoUpdate()},
-     *        {@see awaitLameDuckFailoverFrom()}). Not for a chunk that fails to parse: the frames ahead of the bad
-     *        bytes are dispatched as a read without a wake-up dispatches them, a failover among them inline, and the
-     *        read then recovers the corrupt stream.
+     *        {@see awaitLameDuckFailoverFrom()}). So does one whose chunk fails to parse (#195): the frames ahead of
+     *        the bad bytes are dispatched the same way, a failover among them started in a fiber of its own, and the
+     *        corrupt stream is then recovered as a lost socket is ({@see recoverAfterFailedOperationRead()}): in a
+     *        fiber of its own, waited for only within the operation's wait, or not at all with waiting disabled, the
+     *        recovery joining a failover those frames started. It used to recover it inline, past the operation's
+     *        deadline and wake-up, also with waiting disabled. A read without a wake-up recovers it inline.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -4363,7 +4366,9 @@ final class NatsConnection
                 // rethrow-after-containment) and a later one is reported rather than hiding it.
                 $dispatchError = null;
                 try {
-                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid);
+                    // As on the clean path, a read with a wake-up starts a lame-duck failover an INFO among them brings
+                    // in a fiber of its own (#191, #195): the recovery below joins it within the read's wait.
+                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null);
                 } catch (\Throwable $e) {
                     $dispatchError = $e;
                 }
@@ -4394,9 +4399,18 @@ final class NatsConnection
                 // the recovery run regardless.
                 $this->emitErrorSafely($parseError);
                 try {
-                    // A recovery another fiber already runs is joined only until this read's own cancellation
-                    // fires, as on the read-failure path above.
-                    $this->recoverConnection(joinCancellation: self::waitWith($cancellation, $wake), failedGeneration: $generation, cause: $parseError);
+                    // As on the read-failure path above: a recovery another fiber already runs is joined only until
+                    // this read's own cancellation fires, and a read with a wake-up - an operation's, or a flush's for
+                    // its PONG - waits only that long for a recovery it starts itself, which runs in a fiber of its
+                    // own, and with waiting disabled fails at once with "Connection is not open", the parse error its
+                    // previous (#195). A read without one - your own, a serving loop's - runs it here and waits for
+                    // all of it. It used to run it here for every read: an operation waited for the whole reconnect,
+                    // past its deadline and its wake-up, also with waiting disabled.
+                    if ($wake !== null) {
+                        $this->recoverAfterFailedOperationRead($generation, $parseError, self::waitWith($cancellation, $wake));
+                    } else {
+                        $this->recoverConnection(joinCancellation: self::waitWith($cancellation, $wake), failedGeneration: $generation, cause: $parseError);
+                    }
                 } catch (CancelledException $cancelled) {
                     // The read's deadline ended the wait, unless the read's wake-up did: then the recovered frames are
                     // delivered and the operation looks again. A failure already on its way still wins.
@@ -4561,9 +4575,8 @@ final class NatsConnection
      * @param bool $failOverInItsOwnFiber Start a lame-duck failover that an INFO of the chunk brings in a fiber of
      *        its own rather than run it inline ({@see handleServerInfoUpdate()}): for a read with a wake-up, an
      *        operation's or a flush's, which waits for it only within the operation's own wait ({@see readChunk()},
-     *        #191). Your own read, a serving loop's, the heartbeat's and those of a connect or a reconnect run it
-     *        inline, and so does any read for the frames it parsed ahead of bytes that fail to parse, whose corrupt
-     *        stream it recovers from inline right after.
+     *        #191), also for the frames it parsed ahead of bytes that fail to parse (#195). Your own read, a serving
+     *        loop's, the heartbeat's and those of a connect or a reconnect run it inline.
      */
     private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false): void
     {

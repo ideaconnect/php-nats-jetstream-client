@@ -1178,7 +1178,9 @@ final class SlowConsumerErrorPolicyTest extends TestCase
 
     /**
      * An operation's read that ends in a corrupt frame still delivers past another subscription's overflow:
-     * the request gets the reply that read brought, and the corrupt stream is recovered as usual.
+     * the request gets the reply that read brought, and the corrupt stream is recovered as usual. Since #195 the
+     * recovery runs in a fiber of its own and the request returns its reply at once, so the test waits for the
+     * reconnect before it counts it.
      */
     #[DataProvider('overflowKinds')]
     public function testRequestReadEndingInACorruptFrameStillGetsItsReplyPastAnOverflow(string $kind): void
@@ -1193,6 +1195,7 @@ final class SlowConsumerErrorPolicyTest extends TestCase
 
         self::assertSame('pong', $client->request('svc', 'ping')->await()->payload);
         self::assertSame(['Subscription queue overflow for sid ' . $sid], $recorder->errorsContaining('overflow'));
+        $this->waitUntil(static fn(): bool => $client->statistics()->reconnects >= 1 && $client->state() === ConnectionState::Open);
         self::assertSame(1, $client->statistics()->reconnects, 'the corrupt stream was recovered');
     }
 
