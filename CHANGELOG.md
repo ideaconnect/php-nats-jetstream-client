@@ -15,6 +15,31 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A request or `requestMany()` waiting for a replacement reply inbox to be confirmed now checks the inbox
+  before each confirmation read, not only after one (#204). After a read that returned without reading, the wait
+  pauses for 1 ms; when another fiber's read dropped the inbox in that pause (the server's renewed `maximum
+  subscriptions exceeded`, or a permissions violation naming it), the next read was made with the forgotten
+  confirmation fence: no wake-up, so on an idle connection the request waited out its timeout (`Request timed out
+  for subject ... while waiting for the reply inbox to be set up`) instead of failing with the dropped-inbox error
+  at once, and a lame-duck `INFO` that read took was failed over inline, past the request's timeout. Now the request
+  fails at once with the dropped-inbox or the permissions error, without another read and without being sent, as
+  README Request/Reply describes; a later request still installs a fresh inbox. Needs a connection at its
+  subscription limit and another fiber's read meeting the rejection in a 1 ms window, hence rare. Found by the
+  review of #191 (2.21.0).
+
+### Testing & CI
+
+- `[docs]` New `MuxConfirmationPauseTest` (16 cases, #204): `request()` and `requestMany()` whose replacement inbox is
+  rejected during the confirmation pause (limit, limit then a queued lame-duck `INFO`, permissions) fail before
+  another socket read and are not sent; a replacement inbox installed by another request during the pause, left
+  unconfirmed or confirmed, does not adopt the original request; guards for a rejection in the read the request
+  waits behind (failing without another pause), a confirmation during the pause and a terminal close. The tests hold
+  the real 1 ms pause timer instead of relying on timing.
+
 ## [2.26.1] - 2026-10-12
 
 ### Fixed
