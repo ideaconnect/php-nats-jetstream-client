@@ -491,12 +491,21 @@ final class ServerErrorKeepingConnectionTest extends TestCase
         self::assertSame([], $recorder->errors);
     }
 
+    /** @return iterable<string, array{bool}> */
+    public static function operationReads(): iterable
+    {
+        yield 'an operation\'s read' => [false];
+        yield 'a pull consumer\'s read, reporting server errors (#209)' => [true];
+    }
+
     /**
      * An operation's read does not continue that remainder (#186): it reports the other subscriptions' handler
      * failures, and its own subscription has a take of its own (#179). An operation's read that finds the socket empty
-     * leaves a's second message queued, and your next read delivers it.
+     * leaves a's second message queued, and your next read delivers it. So does the pull consumer's read, which reports
+     * the server's -ERRs that keep the connection open (#209) but is no serving loop's read.
      */
-    public function testAnOperationsReadLeavesTheRemainderToYourNextRead(): void
+    #[DataProvider('operationReads')]
+    public function testAnOperationsReadLeavesTheRemainderToYourNextRead(bool $reportServerErrors): void
     {
         $recorder = new LifecycleRecorder();
         $seen = [];
@@ -508,7 +517,7 @@ final class ServerErrorKeepingConnectionTest extends TestCase
             self::assertSame('handler a', $e->getMessage());
         }
 
-        $operationRead = $connection->readIncomingForOperation()->await();
+        $operationRead = $connection->readIncomingForOperation(reportServerErrors: $reportServerErrors)->await();
 
         self::assertFalse($operationRead->consumedBytes);
         self::assertSame(['a:x', 'b:z'], $seen, "the operation's read left a's remainder queued");

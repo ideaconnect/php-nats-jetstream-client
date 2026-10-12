@@ -3933,15 +3933,17 @@ final class NatsConnection
      *        the application's read - unless a disconnect() is closing the connection, which discards it. A read
      *        that receives anything during the close still delivers it with what it received, as any read does. A
      *        failure that ends the connection is still thrown, once the connection has recovered.
+     * @param bool $reportServerErrors Report only nonfatal server -ERR failures, preserving handler/overflow
+     *        policies and the operation's delivery/recovery rules: for a pull consumer pump.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
      */
-    public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
+    public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false, bool $reportServerErrors = false): Future
     {
         // Taken here, in the operation's fiber, before the read's own fiber starts a few event-loop hops later: a
         // delivery made during those hops ends the read as well.
-        return $this->operationRead($cancellation, $ownSid, $alwaysReport, $ownSid === null ? null : $this->nextDeliveryTo($ownSid));
+        return $this->operationRead($cancellation, $ownSid, $alwaysReport, $ownSid === null ? null : $this->nextDeliveryTo($ownSid), $reportServerErrors);
     }
 
     /**
@@ -3954,7 +3956,7 @@ final class NatsConnection
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
      */
-    private function operationRead(?Cancellation $cancellation, ?int $ownSid, bool $alwaysReport, ?Cancellation $wake): Future
+    private function operationRead(?Cancellation $cancellation, ?int $ownSid, bool $alwaysReport, ?Cancellation $wake, bool $reportServerErrors = false): Future
     {
         return $this->readChunk(
             $cancellation,
@@ -3965,6 +3967,7 @@ final class NatsConnection
             reportFailuresKeepingTheConnection: $alwaysReport,
             deliverLeftovers: $alwaysReport,
             wake: $wake,
+            reportServerErrors: $reportServerErrors,
         );
     }
 
@@ -4064,6 +4067,8 @@ final class NatsConnection
      *        such as an -ERR the server keeps it open for, instead of throwing it: for a read whose caller would
      *        only swallow it ({@see readIncomingForOperation()}), and for the flushes of drain() and
      *        drainSubscription(), which read on to their PONG.
+     * @param bool $reportServerErrors Report nonfatal server -ERR failures during frame dispatch, before
+     *        selecting a failure to throw; preserve independently configured overflow/handler failures.
      * @param bool $deliverLeftovers Deliver what an earlier or a concurrent read has queued and not reached,
      *        before reading and after waiting for another fiber's read: for a serving loop's read
      *        ({@see readIncomingForOperation()}), since nothing else would deliver all of it until the server
@@ -4129,6 +4134,7 @@ final class NatsConnection
         ?DeferredFuture $pongSlot = null,
         ?Cancellation $wake = null,
         bool $continueStoppedSubscriptions = false,
+        bool $reportServerErrors = false,
     ): Future {
         if ($wake === null && $pongSlot !== null && !$pongSlot->isComplete()) {
             // A slot still pending is the read's wake-up. One already complete is not: that read returns at the slot
@@ -4138,7 +4144,7 @@ final class NatsConnection
             $wake = $this->wakeOnPong($pongSlot);
         }
 
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake, $continueStoppedSubscriptions): IncomingChunkResult {
+        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake, $continueStoppedSubscriptions, $reportServerErrors): IncomingChunkResult {
             // What the read waits with: the caller's cancellation, and the operation's wake-up. Every wait below
             // subscribes to it before it suspends, and the checks before each wait run with no suspension between
             // them and the wait, so a wake-up that fires at any point either ends the wait or is seen by a check.
@@ -4368,7 +4374,7 @@ final class NatsConnection
                 try {
                     // As on the clean path, a read with a wake-up starts a lame-duck failover an INFO among them brings
                     // in a fiber of its own (#191, #195): the recovery below joins it within the read's wait.
-                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null);
+                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors);
                 } catch (\Throwable $e) {
                     $dispatchError = $e;
                 }
@@ -4442,7 +4448,7 @@ final class NatsConnection
             $dispatchError = null;
             try {
                 // A read with a wake-up starts a lame-duck failover in a fiber of its own, waited for below (#191).
-                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null);
+                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors);
             } catch (\Throwable $e) {
                 // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
                 // delivery, #128) before this frame error reaches the caller below, recovering the
@@ -4572,13 +4578,15 @@ final class NatsConnection
      *        waits for a result of its own - so only the failures that matter to that caller, such as a
      *        fatal -ERR, are rethrown.
      * @param int|null $ownSid The caller's own subscription, whose overflow is rethrown all the same.
+     * @param bool $reportServerErrors Report nonfatal server -ERR failures at their classification site,
+     *        before selecting the chunk's thrown failure. Other callers keep the existing failure selection.
      * @param bool $failOverInItsOwnFiber Start a lame-duck failover that an INFO of the chunk brings in a fiber of
      *        its own rather than run it inline ({@see handleServerInfoUpdate()}): for a read with a wake-up, an
      *        operation's or a flush's, which waits for it only within the operation's own wait ({@see readChunk()},
      *        #191), also for the frames it parsed ahead of bytes that fail to parse (#195). Your own read, a serving
      *        loop's, the heartbeat's and those of a connect or a reconnect run it inline.
      */
-    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false): void
+    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false): void
     {
         $firstError = null;
         /** @var list<array{\Throwable, string}> $reports What to report, with its log level. */
@@ -4598,7 +4606,7 @@ final class NatsConnection
             }
 
             try {
-                $this->handleFrame($frame, $reports, $stale, $failOverInItsOwnFiber);
+                $this->handleFrame($frame, $reports, $stale, $failOverInItsOwnFiber, $reportServerErrors);
             } catch (\Throwable $e) {
                 $reportable = $reportOverflows && $e instanceof SlowConsumerException && $e->sid !== $ownSid;
                 if (!$reportable && ($firstError === null || $this->dispatchFailureRank($e) > $this->dispatchFailureRank($firstError))) {
@@ -7089,9 +7097,11 @@ final class NatsConnection
      *        the replayed inbox.
      * @param bool $failOverInItsOwnFiber For an INFO: whether a lame-duck failover it brings starts in a fiber of its
      *        own ({@see handleServerInfoUpdate()}, {@see dispatchFrames()}).
+     * @param bool $reportServerErrors Queue nonfatal server -ERR exceptions for reporting, after recording
+     *        any inbox rejection. Other frame failures and fatal server errors still throw.
      * @param-out list<array{\Throwable, string}> $reports
      */
-    private function handleFrame(ProtocolFrame $frame, array &$reports, bool $stale = false, bool $failOverInItsOwnFiber = false): void
+    private function handleFrame(ProtocolFrame $frame, array &$reports, bool $stale = false, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false): void
     {
         if ($frame->type === ProtocolFrameType::Ping) {
             $drainDeadline = $this->drainDeadline;
@@ -7237,10 +7247,15 @@ final class NatsConnection
             }
 
             $serverError = new ConnectionException('Server sent error frame: ' . $error);
-            // The read fails with it either way, as it always did; only an -ERR the server closes the
-            // connection after ends the connection here (#171).
+            // Classify before dispatch chooses a failure to throw (#209). Nonfatal server errors reported
+            // here cannot hide a configured overflow or handler failure from the same chunk. Reports are
+            // emitted after dispatch queues the whole chunk, as for recoverable errors above.
             if (!$this->isServerErrorKeepingTheConnectionOpen($error)) {
                 $this->connectionEndingFailures[$serverError] = true;
+            } elseif ($reportServerErrors) {
+                $reports[] = [$serverError, 'error'];
+
+                return;
             }
 
             throw $serverError;

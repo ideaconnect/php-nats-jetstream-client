@@ -500,11 +500,13 @@ final class NatsClient
      *        the application's read - unless a disconnect() is closing the connection, which discards it. A read
      *        that receives anything during the close still delivers it with what it received, as any read does. A
      *        failure that ends the connection is still thrown, once the connection has recovered.
+     * @param bool $reportServerErrors Report only nonfatal server -ERR failures, preserving handler/overflow
+     *        policies and the operation's delivery/recovery rules: for a pull consumer pump.
      * @return Future<IncomingChunkResult>
      */
-    public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false): Future
+    public function readIncomingForOperation(?Cancellation $cancellation = null, ?int $ownSid = null, bool $alwaysReport = false, bool $reportServerErrors = false): Future
     {
-        return $this->connection->readIncomingForOperation($cancellation, $ownSid, $alwaysReport);
+        return $this->connection->readIncomingForOperation($cancellation, $ownSid, $alwaysReport, $reportServerErrors);
     }
 
     /**

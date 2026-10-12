@@ -2731,6 +2731,11 @@ final class JetStreamContext
      * deadline (setExpiresMs() plus a second); on a server with leaf nodes or gateways, nats-server serves a pull younger
      * than 2 s whose reply subject has no local interest, so such a pull could take a batch nobody received.
      *
+     * The pump reports nonfatal server -ERR failures to the error listener and logger without ending a
+     * finite or infinite run or retiring its partial batch (#209). The run's own inbox rejection still
+     * ends it through its rejection latch, while fatal frames and configured overflow/handler failures
+     * keep the rules below, including when they share a chunk with a nonfatal server error.
+     *
      * A run that ends with a failure of its own waits or writes first hands the handler what its pulls have received
      * (#197): the pump read failing with anything but the CancelledException that ends a wait (the connection lost with
      * waiting for a reconnect disabled, a reconnect that gave up, reconnect off, a fatal -ERR or a PONG the socket
@@ -3649,7 +3654,7 @@ final class JetStreamContext
                         $inboxRejection->wakeUp(),
                     );
                     try {
-                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid)->await();
+                        $read = $this->client->readIncomingForOperation($waitCancellation, $sid, reportServerErrors: true)->await();
                         if (!$read->consumedBytes) {
                             // A genuinely idle read yields 1 ms; a read that consumed bytes but completed no
                             // frame yet (a chunked payload) loops immediately to drain the rest (#119).
@@ -3962,8 +3967,9 @@ final class JetStreamContext
      * as after an EOF, at its next read or pull), nor while the application closes it (a disconnect() or a drain() of
      * the connection), nor with reconnect off, where the frame closed the connection for good, nor with waiting
      * disabled, where the read failed with the frame's error at once: the run ends then, as it does after an EOF. Every
-     * other failure of the read still ends the run: an -ERR the server keeps the connection open for, an overflow,
-     * another subscription's handler under the options. A finite run ends at any failure, which the caller checks
+     * other failure of the read still ends the run: an overflow or another subscription's handler under
+     * the options. Nonfatal server errors are reported by the pump's read and do not reach this classifier
+     * (#209). A finite run ends at any thrown failure, which the caller checks
      * first.
      */
     private function goesOnAfterItsReadFailed(\Throwable $failure): bool
