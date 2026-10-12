@@ -50,6 +50,9 @@ final class PullInFlight extends PullMessageBuffer
     /** Terminal status description, when a terminal status frame arrived (empty otherwise). */
     public string $terminalDescription = '';
 
+    /** Pin sent as id on this request; a delayed 423 must not clear a newer pin (#208). */
+    public ?string $requestedPinId = null;
+
     /**
      * @param string $token Reply-subject suffix token uniquely identifying this pull within the run.
      * @param int $batch Batch size requested (the received >= batch retire threshold).

@@ -2674,9 +2674,20 @@ final class JetStreamContext
      * raw), and each message, which carries no token, into the oldest pull still open (received>=batch
      * retires), or an infinite run's {@see PullOverflow} when none has room (#187). The engine fiber -
      * which owns every await - retires completed head pulls in issue order (draining each buffer to the
-     * handler FIRST, even on a terminal/deadline retire, and capturing a group pin from the first
-     * message), hands the overflow over behind them, issues fresh pulls up to the effective depth, then
-     * pumps {@see \IDCT\NATS\Core\NatsClient::readIncoming()} bounded by the earliest per-pull deadline.
+     * handler FIRST, even on a terminal/deadline retire), hands the overflow over behind them, issues
+     * fresh pulls up to the effective depth, then pumps {@see \IDCT\NATS\Core\NatsClient::readIncoming()}
+     * bounded by the earliest per-pull deadline.
+     *
+     * A grouped run's pin is remembered by the router as each data message arrives (#208): a non-empty
+     * Nats-Pin-Id becomes the iterator's live pin at once, before anything can end the run, so the
+     * iterator's next run asks with it however this one ends (a failure, stop(), a lost connection, the
+     * client's drain()) - it used to be taken only from a batch the run retired or handed over, and a run
+     * that ended before its first pull retired left the next one pulling without it, held by the server
+     * until the pin's priority_timeout. Delivery takes no pin from a buffer, so an old message cannot
+     * restore a pin a 423 rejected after it arrived. A grouped run pulls serially until the first batch
+     * under its pin retires, or from the start with an inherited pin; a 423 clears only the pin its own
+     * request sent ({@see PullInFlight::$requestedPinId}), restarting that serial acquisition, and leaves a
+     * newer pin, received by this run or another run of the iterator, alone.
      *
      * Semantics preserved from the serial loop: finite ({@see PullPipelineConfig::$iterations}) runs
      * strictly serial with an exact issued-pull count and stop-on-any-error (404/408 terminal without
@@ -2729,7 +2740,7 @@ final class JetStreamContext
      * the ack wait, or never on a consumer without acks or with max_deliver 1; fetchBatch() returns its partial batch
      * for the same reason. The pulls in flight are handed over in issue order through the retire phase's delivery, an
      * infinite run's overflow behind them (#187), stop() checked before each message, though unlike the retire phase it
-     * captures no group pin from them; the failure is then rethrown unchanged, so that the caller still learns why the
+     * takes no group pin from them, the router having remembered it on receipt (#208); the failure is then rethrown unchanged, so that the caller still learns why the
      * run ended, and a handler that throws during that delivery ends it and is reported through the error listener and
      * the logger ({@see deliverReceivedBeforeFailing()}). A close that discards what the connection has received and
      * not delivered, a disconnect() or a drain() of the connection once its budget has run out, made before or during
@@ -2760,7 +2771,7 @@ final class JetStreamContext
      * right before the idle backoff and the issue phase, and right before the pump read, since it can come while the
      * handler runs and its wake-up has then fired already. At the top of the loop the run hands every pull in flight
      * over, in issue order, each marked done right before its buffer goes out, and then its overflow (#187), stop() and
-     * the discard checked before each message and no group pin captured, counts what it handed over in its total, and
+     * the discard checked before each message (a group's pin was remembered on receipt, #208), counts what it handed over in its total, and
      * returns that count, as after the iterator's drain(), while the drain waits for it within its budget. The drain's
      * deadline report counts what the overflow holds too. A drain whose budget runs out first
      * discards the rest from its deadline report on, which counts it, also while it closes the connection, the state
@@ -2786,8 +2797,8 @@ final class JetStreamContext
      * wait and then threw the frame's error (#171), and the run used to end with it although the connection was open
      * again. The error now goes to the error listener and the logger, since nothing else says why the server closed the
      * connection. What the pulls in flight hold goes to the handler as a delivery of the run: in issue order, counted
-     * in its total, stop() checked before each message and a close that discards ending it, as above, and a group pin
-     * captured from it as in the retire phase; a handler that throws there ends the run with its own exception. The
+     * in its total, stop() checked before each message and a close that discards ending it, as above, its group pin
+     * already remembered on receipt (#208); a handler that throws there ends the run with its own exception. The
      * pulls then leave the run, which counts them as lost with the old connection, as after an EOF (#120), and it pulls
      * again on the new connection once the reconnect is done. The server may still hold one of them: nats-server serves
      * a waiting pull on the new connection when the reconnect subscribes the run's inbox again before it next checks
@@ -2828,8 +2839,8 @@ final class JetStreamContext
      * the reconnect's own delivery gave a pull, or the answer to a pull issued on the new connection before the run saw
      * the reconnect, never reached the handler, and the server delivered it again only after the ack wait, or never on
      * a consumer without acks or with max_deliver 1. The overflow goes to the handler right behind the pulls the retire
-     * phase retires, before the run issues another pull or reads on, its messages counted in the run's total and a
-     * group pin captured from the first; while it holds a message, every newer one joins it, so that none overtakes it
+     * phase retires, before the run issues another pull or reads on, its messages counted in the run's total (a group's
+     * pin remembered as they arrived, #208); while it holds a message, every newer one joins it, so that none overtakes it
      * through a pull, and the run issues nothing. Wherever the run ends it is handed over behind the pulls, as their
      * buffers are: on the client's drain() asking for it, before a failure, and on a terminal status, which now also
      * hands over what the pulls behind the one it ended hold, where they used to be left undelivered, after the run has
@@ -2885,10 +2896,22 @@ final class JetStreamContext
             // order (#187). A finite run never fills it.
             $overflow = new PullOverflow();
 
+            // Whether a grouped run may pipeline past one pull (#170, #208): true once a delivery has retired the
+            // group's first batch, or from the start when the run inherits the iterator's pin from an earlier run.
+            // Receiving a pin does not set it: a pinned_client group keeps pulling serially until the first batch
+            // under its pin retires. Reset only when a 423 rejects the pin this run's own request sent, which restarts
+            // that serial acquisition. It survives a reconnect: the pin belongs to the consumer, not the connection.
+            $groupReadyForPipeline = $ctl->getPinId() !== null;
+            // Whether the run's group is known to pin (pinned_client): an inherited pin, or a pin the router has
+            // received. It tells a pinned group that lost its pin (a 423 cleared it), which must re-acquire serially,
+            // from an overflow/prioritized group whose messages never carry one, which pipelines freely (#170).
+            $everPinned = $cfg->grouped && $groupReadyForPipeline;
+
             // Non-suspending router (mirrors the muxed request inbox, #118): it only buffers into the
             // owning PullInFlight, or the overflow, so it is safe to run inside the connection's same-sid
-            // dispatch loop. The engine fiber does every await and every handler call.
-            $router = function (NatsMessage $msg) use (&$inflight, &$issueOrder, &$lastActivityNs, $prefix, $finite, $overflow): void {
+            // dispatch loop. The engine fiber does every await and every handler call. It also remembers a grouped
+            // run's pin as each data message arrives (#208), before anything can end the run.
+            $router = function (NatsMessage $msg) use (&$inflight, &$issueOrder, &$lastActivityNs, $prefix, $finite, $overflow, $cfg, $ctl, &$everPinned): void {
                 // Any frame (data, status, heartbeat) on this run's inbox proves it is alive.
                 $lastActivityNs = hrtime(true);
 
@@ -2932,6 +2955,24 @@ final class JetStreamContext
                 // notwithstanding, until the engine has handed it all over (#187): no message can then reach
                 // the handler through a pull ahead of an older one the overflow holds, in whichever order a
                 // hand-over takes the pulls and the overflow. Only an infinite run's overflow is ever filled.
+                //
+                // First, a grouped run remembers the pin the message carries (#208), on receipt, before the message
+                // is routed to a pull, to the overflow or dropped as a finite run's straggler: the server assigned the
+                // pin when it delivered the message, whatever becomes of the run. A run that fails, is stopped, or
+                // loses its pulls with the connection before it delivers the batch keeps it, so the iterator's next
+                // run asks with it, where it used to pull without it and wait out the server's priority_timeout. Each
+                // non-empty pin becomes the iterator's live pin, a newly assigned one included; a message without
+                // one, or with an empty one, leaves it alone. Delivery takes no pin from what a pull buffered: an old
+                // message must not restore a pin a 423 rejected after it arrived. Status frames never carry the
+                // run's pin, and an ungrouped run never takes one.
+                if ($cfg->grouped) {
+                    $receivedPin = $this->pinIdOf($msg);
+                    if ($receivedPin !== null) {
+                        $ctl->setPinId($receivedPin);
+                        $everPinned = true;
+                    }
+                }
+
                 if ($overflow->buffer !== []) {
                     $overflow->buffer[] = $msg;
 
@@ -3053,15 +3094,6 @@ final class JetStreamContext
             $idleDraining = false;
             // Whether the generation's empties were immediate (no_wait, or a 409) and so need pacing.
             $backoffWarranted = false;
-            // Whole-run bootstrap latch: a grouped run pulls serially only until its FIRST delivery, so a
-            // pinned_client group captures its pin before any fan-out; once delivered, a still-unpinned
-            // group (overflow/prioritized never emit Nats-Pin-Id) fans out to the full depth (review).
-            $anyDelivered = false;
-            // Set once a pin is ever captured, i.e. this IS a pinned_client group. Distinguishes a
-            // pinned group that has LOST its pin (a 423 cleared it) from an overflow/prioritized group
-            // that never pins: the former must re-serialize to re-capture cleanly, the latter pipelines
-            // freely. Persists across a pin loss and reconnect (#170).
-            $everPinned = false;
             $terminated = false;
             // FIX2 reconnect epoch: the reconnect count the run's pulls in flight were issued under. Replayed interest
             // restores the SUB; once the count moves, the infinite run ends its pulls in flight and issues fresh ones
@@ -3103,8 +3135,8 @@ final class JetStreamContext
                     // deliverReceivedBeforeFailing(), each pull is marked done right before its buffer goes out, so
                     // that a message read while the handler suspends goes to a pull still to come, or to the overflow,
                     // and stop(), or a close that discards (the drain's budget ran out, or a disconnect() came), ends
-                    // the delivery; a handler that throws ends the run with its own exception, as anywhere else. No
-                    // group pin is captured: the run ends.
+                    // the delivery; a handler that throws ends the run with its own exception, as anywhere else. The
+                    // group's pin was remembered as the messages arrived (#208), for the iterator's next run.
                     if ($drainParticipant->isHandOverRequested()) {
                         $totalProcessed += $this->deliverWhatTheRunHolds($inflight, $issueOrder, $overflow, $handler, $ctl);
 
@@ -3163,7 +3195,7 @@ final class JetStreamContext
                         $emptyRetireStreak = 0;
                         $idleDraining = false;
                         $backoffWarranted = false;
-                        // $anyDelivered persists across reconnect (a group already bootstrapped its
+                        // $groupReadyForPipeline persists across reconnect (a group already bootstrapped its
                         // pin / fan-out), so depth is not needlessly re-clamped (review).
                     }
 
@@ -3174,8 +3206,7 @@ final class JetStreamContext
                     // issues another pull or reads on, so that it neither waits behind a pull still open nor adds
                     // requests while it is held. A pull still open then holds nothing older: while the overflow
                     // holds a message, the router gives every newer one to the overflow too. The overflow's
-                    // delivery is one of the retire phase's: a group pin is captured from its first message, the
-                    // delivery ends the idle streak and a group's bootstrap, and it takes what the overflow receives
+                    // delivery is one of the retire phase's: the delivery ends the idle streak and a group's bootstrap, and it takes what the overflow receives
                     // while the handler runs, until it is empty. A message a frame that ended the connection left
                     // there comes this way too (#210), behind what the pulls held.
                     $nowNs = hrtime(true);
@@ -3220,13 +3251,8 @@ final class JetStreamContext
                             break;
                         }
 
-                        // Capture a pinned-group pin from the first message of the batch (before delivery),
-                        // so once resolved the effective depth can fan out past 1. A non-null capture marks
-                        // this a pinned_client group for the rest of the run (#170), so a later pin loss
-                        // re-serializes rather than racing pin-less pulls.
-                        if ($this->capturePin($messages, $cfg, $ctl)) {
-                            $everPinned = true;
-                        }
+                        // No pin is taken from the batch here: the router remembered it as the messages arrived
+                        // (#208), and an old buffered message must not restore a pin a 423 has rejected since.
 
                         // Drain the buffer to the handler FIRST (so a deadline/terminal retire of a
                         // partially received pull does not drop already-received messages; mirrors
@@ -3252,7 +3278,8 @@ final class JetStreamContext
                             $emptyRetireStreak = 0;
                             $idleDraining = false;
                             $backoffWarranted = false;
-                            $anyDelivered = true;
+                            // The group's first batch under its pin has retired: it may pipeline (#208).
+                            $groupReadyForPipeline = true;
                             // JetStream answered with data again: re-arm the one-shot no-responders
                             // signal so a LATER outage is reported once more.
                             $noRespondersSignaled = false;
@@ -3273,9 +3300,15 @@ final class JetStreamContext
                         $description = $pull->terminalDescription;
 
                         if ($code === 423) {
-                            // Stale pin (both modes): drop it and re-pull without it. The pull already
-                            // consumed a finite iteration slot (counted at issue time).
-                            $ctl->setPinId(null);
+                            // Stale pin (both modes): drop it and re-pull without it, serially until the first batch
+                            // under the new pin retires. The pull already consumed a finite iteration slot (counted at
+                            // issue time). Only the pin this request sent is dropped (#208): a 423 delayed past a newer
+                            // pin, received by this run or by another run of the iterator, leaves that pin, and the
+                            // run's readiness, alone.
+                            if ($ctl->getPinId() === $pull->requestedPinId) {
+                                $ctl->setPinId(null);
+                                $groupReadyForPipeline = false;
+                            }
 
                             continue;
                         }
@@ -3463,7 +3496,7 @@ final class JetStreamContext
                     // guard of each pull's publication checks it in the step that writes, before a retry after a
                     // failed write's recovery too, and refuses the write, the issue phase then ending with the
                     // rejection as with a failed write, so that no reply-less pull goes out.
-                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $anyDelivered, $everPinned);
+                    $effectiveDepth = $this->effectivePullDepth($cfg, $ctl, $consecutiveEmptyPulls, $groupReadyForPipeline, $everPinned);
                     while (
                         count($inflight) < $effectiveDepth
                         && $overflow->buffer === []
@@ -3486,9 +3519,11 @@ final class JetStreamContext
                         ++$issued;
 
                         // Inject the LIVE pin id onto the frozen pull fields: it changes across the run
-                        // (captured on first delivery, dropped on 423), unlike the rest of buildPull().
+                        // (remembered as data arrives, dropped on 423), unlike the rest of buildPull(). The
+                        // request remembers the pin it sends, so that its 423 clears that pin only (#208).
                         $fields = $cfg->pullFields;
                         $pin = $ctl->getPinId();
+                        $pull->requestedPinId = $pin;
                         if ($pin !== null) {
                             $fields['id'] = $pin;
                         } else {
@@ -3657,8 +3692,8 @@ final class JetStreamContext
                         // stopped run, or where its next pull's write fails on the closed connection. A drain() of the
                         // client within its budget lets it go on (#207): the run then hands the rest over at the top of
                         // the loop once the drain asks for it, or ends there with its count, issuing no pull onto the
-                        // inbox the drain has unsubscribed. As in the retire phase, a pin is captured from the first
-                        // message, since a pin belongs to the consumer, not the connection, the messages count towards
+                        // inbox the drain has unsubscribed. The group's pin was remembered as the messages arrived (#208),
+                        // and it stays: a pin belongs to the consumer, not the connection. The messages count towards
                         // the run's total, a delivery resets the idle state, and a handler that throws ends the run
                         // with its own exception. The pulls are counted as lost with the old connection, as after an
                         // EOF (#120), though a server can still serve one whose inbox the reconnect subscribed again
@@ -3671,9 +3706,6 @@ final class JetStreamContext
                         foreach ($issueOrder as $token) {
                             $lostPull = $inflight[$token];
                             $lostPull->done = true;
-                            if ($this->capturePin($lostPull, $cfg, $ctl)) {
-                                $everPinned = true;
-                            }
                             $handedOver += $this->deliverPullBuffer($lostPull, $handler, $ctl);
                         }
                         $totalProcessed += $handedOver;
@@ -3684,7 +3716,7 @@ final class JetStreamContext
                             $emptyRetireStreak = 0;
                             $idleDraining = false;
                             $backoffWarranted = false;
-                            $anyDelivered = true;
+                            $groupReadyForPipeline = true;
                             $noRespondersSignaled = false;
                         }
                         if (
@@ -3791,7 +3823,7 @@ final class JetStreamContext
      * left open (a finite run, which has none, drops it as a straggler), instead of being added to the buffer being
      * delivered; before a failure nothing more is read for the run by then, its inbox released first (#212). Every
      * delivery goes through {@see deliverPullBuffer()}, with its checks of stop() and of a close
-     * before each message; no group pin is captured, since the run ends. For the hand-over the client's drain() asks
+     * before each message; a group's pin was remembered as the messages arrived (#208), for the iterator's next run. For the hand-over the client's drain() asks
      * for (#207), the end of a run on a terminal status (#187), and the hand-over before a run fails ({@see
      * deliverReceivedBeforeFailing()}, #197). A handler that throws ends the delivery, its exception thrown.
      *
@@ -3819,7 +3851,7 @@ final class JetStreamContext
      * lost with the run, they came again only after the ack wait, or never on a consumer without acks or with
      * max_deliver 1. They go to the handler as the run's other hand-overs give them ({@see deliverWhatTheRunHolds()}):
      * each pull in issue order, then the overflow, with the checks of stop() and of a close before each message, though
-     * no group pin is captured from them as the retire phase does, and the caller then throws its failure unchanged.
+     * the group's pin already remembered on receipt (#208), and the caller then throws its failure unchanged.
      *
      * The run's inbox is closed to new deliveries first (#212), through
      * {@see \IDCT\NATS\Core\NatsClient::retirePullInbox()}: on an open connection UNSUB and a PING go out in one write,
@@ -3946,28 +3978,6 @@ final class JetStreamContext
     }
 
     /**
-     * Captures a pinned group's pin from the first message $messages holds, before {@see consumePipelined()} hands them
-     * to the handler, when the run pulls under a group and holds no pin yet. Whatever that message carries is set on
-     * the control, null for a message without a Nats-Pin-Id header, which an overflow or prioritized group's messages
-     * never carry. For the retire phase, for the run's overflow, which can bring a group's first messages (#187), and
-     * for the hand-over of the pulls that a frame which ended the connection took with it (#210): a pin belongs to the
-     * consumer, not the connection, so the pulls the run issues on the new connection carry it.
-     *
-     * @return bool Whether a pin was captured, which marks the run as a pinned_client group's (#170).
-     */
-    private function capturePin(PullMessageBuffer $messages, PullPipelineConfig $cfg, PullPipelineControl $ctl): bool
-    {
-        if (!$cfg->grouped || $ctl->getPinId() !== null || $messages->buffer === []) {
-            return false;
-        }
-
-        $capturedPin = $this->pinIdOf($messages->buffer[0]);
-        $ctl->setPinId($capturedPin);
-
-        return $capturedPin !== null;
-    }
-
-    /**
      * What a wait of {@see consumePipelined()} waits with (#181): $deadline, when the wait has one (the pump
      * read's earliest pull deadline or heartbeat miss; the idle backoff has none), plus each of the run's
      * four wake-ups, stop()'s and drain()'s of the iterator, the client's drain() asking for the run's
@@ -4004,24 +4014,37 @@ final class JetStreamContext
 
     /**
      * The number of pull requests {@see consumePipelined()} may keep in flight at once for this turn.
-     * Serial (1) when finite (exact count, stop on any error), when a pinned group has not resolved
-     * its pin yet (a parallel un-pinned fan-out would race the server's pin assignment), or while an
-     * idle streak is active (one pull per backoff window keeps the idle rate at ~2/s, #153); otherwise
-     * the configured depth.
+     * Serial (1) when finite (exact count, stop on any error), while a grouped run acquires its pin (a
+     * parallel un-pinned fan-out would race the server's pin assignment), or while an idle streak is
+     * active (one pull per backoff window keeps the idle rate at ~2/s, #153); otherwise the configured
+     * depth.
+     *
+     * @param bool $groupReadyForPipeline Whether the group's first batch under its pin has retired, or the run
+     *        inherited a pin; reset by a 423 that rejected the pin the run's own request sent (#208).
+     * @param bool $everPinned Whether the run's group is known to pin: an inherited or received pin (#170).
      */
-    private function effectivePullDepth(PullPipelineConfig $cfg, PullPipelineControl $ctl, int $consecutiveEmptyPulls, bool $anyDelivered, bool $everPinned): int
-    {
+    private function effectivePullDepth(
+        PullPipelineConfig $cfg,
+        PullPipelineControl $ctl,
+        int $consecutiveEmptyPulls,
+        bool $groupReadyForPipeline,
+        bool $everPinned,
+    ): int {
         if ($cfg->iterations !== null) {
             return 1;
         }
 
-        // A grouped run pulls serially while it is unpinned AND either (a) it has not yet delivered - the
-        // bootstrap window, where a `pinned_client` group must capture its pin (from the first batch's
-        // Nats-Pin-Id) before any parallel fan-out could race the server's pin assignment - or (b) it has
-        // pinned before and since LOST the pin (a 423 cleared it), where it must likewise re-capture
-        // serially (#170). A group that delivered but never pinned is `overflow`/`prioritized` (those
-        // policies never emit Nats-Pin-Id); it pipelines safely and fans out to the configured depth.
-        if ($cfg->grouped && $ctl->getPinId() === null && (!$anyDelivered || $everPinned)) {
+        // A grouped run pulls serially (a) until its first batch retires - the bootstrap window, where a
+        // `pinned_client` group acquires its pin before any parallel fan-out could race the server's pin
+        // assignment; receiving the pin on the first message does not end that window, nor does it after a
+        // 423 (#208) - or (b) while a group known to pin holds no pin, a 423 having cleared it (#170). A
+        // group that delivered but never pinned is `overflow`/`prioritized` (those policies never emit
+        // Nats-Pin-Id); it pipelines safely and fans out to the configured depth, and so does a run that
+        // inherits a pin from an earlier run on the same iterator.
+        if ($cfg->grouped && (
+            !$groupReadyForPipeline
+            || ($ctl->getPinId() === null && $everPinned)
+        )) {
             return 1;
         }
 

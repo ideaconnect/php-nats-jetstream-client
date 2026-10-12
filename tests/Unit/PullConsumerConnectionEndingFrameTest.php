@@ -1009,7 +1009,8 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
      * both with 423, the pin lost; the run then pulls once without a pin, and the server answers that pull with m-2
      * (carrying pin-2), m-3 and m-4, the handler stopping the run on m-2. Only one pull went out without a pin. Captured
      * without marking the run as a pinned group's, the pin's loss made the run fan out pulls without a pin again. On
-     * 2.22.0 handle() threw the -ERR's error once the handler had m-1.
+     * 2.22.0 handle() threw the -ERR's error once the handler had m-1. Since #208 the router remembers pin-1 as m-1
+     * arrives, before the hand-over, with the same effect.
      */
     public function testAPinCapturedInTheHandOverMakesALaterPinLossPullOneAtATime(): void
     {

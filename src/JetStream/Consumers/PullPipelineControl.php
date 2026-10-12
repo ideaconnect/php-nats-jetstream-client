@@ -14,9 +14,10 @@ use Amp\NullCancellation;
  *
  * Every accessor reads/writes live state through the closures the iterator supplies: the stop/drain
  * flags of this run's own {@see PullRunLifecycle} (#189), so a handler, or another fiber, that calls
- * stop()/drain() mid-run is observed on the very next check, and the iterator's pin, so a pin captured
- * mid-run is written straight back to the iterator. Each handle() run has its own flags, which no later
- * run touches, while the pin is the iterator's, so a captured pin survives into the next run (#120).
+ * stop()/drain() mid-run is observed on the very next check, and the iterator's pin, so a pin received
+ * mid-run is written straight back to the iterator, as the message carrying it arrives (#208). Each
+ * handle() run has its own flags, which no later run touches, while the pin is the iterator's, so a
+ * received pin survives into the next run however this one ends (#120, #208).
  *
  * Besides the flags, the run has two one-shot wake-ups, {@see stopInterruption()} and
  * {@see drainInterruption()}: cancellations that stop() and drain() fire right after setting their flag,
@@ -94,7 +95,7 @@ final class PullPipelineControl
     }
 
     /**
-     * The pin id currently held by the iterator (null until captured / after a 423 drop).
+     * The pin id currently held by the iterator (null until one is received / after a 423 drop).
      */
     public function getPinId(): ?string
     {
@@ -102,7 +103,7 @@ final class PullPipelineControl
     }
 
     /**
-     * Writes a captured pin id back onto the iterator (or null to drop it after a stale-pin 423).
+     * Writes a received pin id back onto the iterator (or null to drop it after a stale-pin 423).
      */
     public function setPinId(?string $pinId): void
     {
