@@ -15,6 +15,34 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` An operation whose read got a chunk that fails to parse ran the reconnect inline and waited for all of it
+  (#195): past its own deadline, past its wake-up (a reply delivered from the frames ahead of the bad bytes came back
+  only once the reconnect was over), and also with `waitForReconnect: false`. Since #178 (2.14.0) and #191 (2.21.0)
+  such an operation - a `request()`, `requestMany()`, a `SubscriptionQueue` poll, a fetch, a pull consumer, Key/Value
+  `keys()` and `history()`, a flush waiting for its `PONG` - recovers a lost socket and a lame-duck failover in a fiber
+  of its own and waits only within its own wait, but the parse-error path still called the recovery inline, so a
+  `request()` with a 300 ms timeout came back only after the outage. A chunk fails to parse on an unknown control
+  line, a malformed `MSG`/`HMSG` line, a frame over the bound derived from the server's `max_payload`, or a payload
+  not ended by CRLF: a server or proxy bug, hence rare. The read still delivers the frames ahead of the bad bytes and
+  reports the `ProtocolException` first, then recovers through the same helper as a failed read: the operation times
+  out at its deadline with the recovery carrying on, returns at once what those frames brought it, or with waiting
+  disabled fails at once with `Connection is not open`, the `ProtocolException` its previous. A lame-duck `INFO`
+  among those frames now fails over in a fiber of its own too, as from a chunk that parses, and the recovery joins
+  it, which removes the exception README item 9 documented. Your own `processIncoming()`/`readIncoming()`, a serving
+  loop's read and the heartbeat still recover inline and wait for all of it. Found by the review of #191 (2.21.0).
+
+### Testing & CI
+
+- `[docs]` New `CorruptChunkOperationReadTest` (9 cases, #195): a request whose reply is a corrupt chunk times out at
+  its deadline, or fails at once with waiting disabled; a reply, or a poll's message, ahead of the bad bytes returned
+  at once; a poll with nothing for it returning at its deadline; a lame-duck `INFO` ahead of the bad bytes failing over
+  in a fiber of its own; your own read still waiting for the whole recovery. Each holds the recovery's dial until the
+  operation has returned.
+
 ## [2.26.0] - 2026-10-12
 
 ### Upgrade notes
