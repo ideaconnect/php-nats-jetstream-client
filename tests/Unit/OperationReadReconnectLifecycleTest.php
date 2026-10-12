@@ -45,7 +45,7 @@ use function Amp\delay;
  *  - a stall of the event loop around the drop, or in a listener, changes none of it;
  *  - a reconnect nobody waits for any more gives up on its own terms, its Closed event saying why; an operation that
  *    still waits gets the exhaustion error with its cause, after a Closed listener that suspends;
- *  - a poll that waits for all of the reconnect returns after the Reconnected listener (README reconnect item 8);
+ *  - a poll whose read started recovery can return while the Reconnected listener still awaits (#202);
  *  - the application's read parked behind the operation's still waits for the whole reconnect, a listener's poll whose
  *    read finds the new connection gone reconnects it again, a poller rides out three outages in a row, the pull
  *    consumer re-issues its pull right after the reconnect, and an operation parked on the reconnect costs nothing.
@@ -680,46 +680,58 @@ final class OperationReadReconnectLifecycleTest extends TestCase
     }
 
     /**
-     * README reconnect item 8: an operation whose own read started the reconnect, and which waits for it to its end,
-     * returns after the Reconnected listener. The listener pushes the poll's message and then suspends; the poll
-     * returns the message once the listener returned.
+     * The listener puts the poll's message on the new socket, then waits on a gate. The initiating poll reads
+     * its message and returns before the test releases the listener (#202). The operation has a long budget;
+     * the assertion depends on event order, with a watchdog bounding a broken test.
      */
-    public function testAPollThatWaitsForAllOfTheReconnectReturnsAfterTheReconnectedListener(): void
+    public function testAPollReturnsWhileTheReconnectedListenerStillWaits(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $recorder = new LifecycleRecorder();
         $record = $recorder->connectionListener();
         $listenerReturned = false;
+        $entered = new \Amp\DeferredFuture();
+        $release = new \Amp\DeferredFuture();
+        $this->resources()->onRelease(static function () use ($release): void {
+            if (!$release->isComplete()) {
+                $release->complete();
+            }
+        }, 'the held Reconnected listener');
+        $this->resources()->ownCallback(EventLoop::delay(30.0, static function (): void {}), 'the listener keep-alive');
         $sidHolder = new class {
             public int $sid = 0;
         };
-        $listener = static function (ConnectionEvent $event, ?\Throwable $error = null) use ($record, $transport, $sidHolder, &$listenerReturned): void {
+        $listener = static function (ConnectionEvent $event, ?\Throwable $error = null) use ($record, $transport, $sidHolder, &$listenerReturned, $entered, $release): void {
             $record($event, $error);
             if ($event !== ConnectionEvent::Reconnected) {
                 return;
             }
 
             $transport->pushFrame(ReconnectingTransport::msgFrame('jobs', $sidHolder->sid, 'job-1'));
-            delay(0.2);
+            $entered->complete();
+            $release->getFuture()->await();
             $listenerReturned = true;
         };
         $client = $this->lifecycleClient($watched, $recorder, connectionListener: $listener);
         $queue = $client->subscribeQueue('jobs')->await();
         $sidHolder->sid = $queue->sid;
 
-        $poll = async(static fn(): ?NatsMessage => $queue->setTimeout(3.0)->next());
+        $poll = $this->resources()->ownOperation(async(static fn(): ?NatsMessage => $queue->setTimeout(30.0)->next()), label: 'the poll');
         $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
-        $transport->refuseDials();
         $transport->dropConnection();
-        $this->acceptDialsAfter($transport, 0.2);
+        $entered->getFuture()->await(new TimeoutCancellation(5));
         $message = $poll->await(new TimeoutCancellation(5));
         $returnedAfterListener = $listenerReturned;
 
         self::assertSame('job-1', $message?->payload);
-        self::assertTrue($returnedAfterListener, 'the poll returned after the Reconnected listener');
+        self::assertFalse($returnedAfterListener, 'the poll returned while the Reconnected listener still waited');
         self::assertSame(ConnectionState::Open, $client->state());
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected], $recorder->events);
+        $release->complete();
+        $this->waitUntil(static function () use (&$listenerReturned): bool {
+            return $listenerReturned;
+        });
     }
 
     /**
@@ -807,7 +819,8 @@ final class OperationReadReconnectLifecycleTest extends TestCase
     }
 
     /**
-     * A Reconnected listener polls, and the new connection drops as soon as the poll's read is on the socket: that
+     * An application read initiates recovery and waits for its Reconnected listener, which polls. The new
+     * connection drops as soon as that poll's read is on the socket: that
      * read is the first to notice, starts a second reconnect in a fiber of its own and waits within the poll's
      * timeout. The second open is announced from the event loop, since the listener call is still under way, and
      * the poll gets the message the third connection brings; the listener hears Disconnected and Reconnected again
@@ -858,18 +871,16 @@ final class OperationReadReconnectLifecycleTest extends TestCase
         $queue = $client->subscribeQueue('jobs')->await();
         $holder->queue = $queue;
 
-        $poll = self::startOperation('next', $client, $queue, 1.0);
+        $read = $this->resources()->ownOperation($client->processIncoming(), label: 'the initiating application read');
         $this->waitUntil(static fn(): bool => $watched->readsUnderWay === 1);
         $transport->dropConnection();
-        [$pollPayloads, , $pollError] = $this->settle($poll, hrtime(true));
+        $read->await(new TimeoutCancellation(8));
         $this->waitUntil(static fn(): bool => $outcome->calls >= 1 && ($outcome->payload !== null || $outcome->error !== null), 6.0);
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open && $client->statistics()->reconnects === 2, 4.0);
         delay(0.05);
 
         self::assertNull($outcome->error, sprintf('the listener\'s poll threw %s', $outcome->error?->getMessage() ?? ''));
         self::assertSame('job-from-listener', $outcome->payload);
-        self::assertNull($pollError, sprintf('the poll threw %s', $pollError?->getMessage() ?? ''));
-        self::assertSame([], $pollPayloads, 'the poll that met the first drop timed out, with nothing delivered to it');
         self::assertSame(2, $client->statistics()->reconnects);
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected], $recorder->events);
     }

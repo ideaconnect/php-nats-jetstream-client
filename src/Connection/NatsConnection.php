@@ -565,7 +565,7 @@ final class NatsConnection
      * for it only within the operation's own wait ({@see awaitLameDuckFailoverFrom()}), and the rest of any chunk
      * read on that connection is the leaving server's ({@see dispatchFrames()}). Cleared when the failover returns.
      *
-     * @var array{generation: int, failover: Future<void>}|null
+     * @var array{generation: int, failover: Future<void>, ready: Future<void>}|null
      */
     private ?array $lameDuckFailover = null;
     /**
@@ -1151,7 +1151,8 @@ final class NatsConnection
      * connection once it is over, and fails on its own terms when it gives up. A recovery that ends while the
      * read waits ends the wait as well, with its outcome: the read returns and the operation looks again before
      * it reads the new connection, as after a reconnect it joined, or gets the recovery's error. A recovery
-     * another fiber already runs is joined within the same wait, as before.
+     * another fiber already runs is joined within the same wait, as before. Successful recovery releases this
+     * read alongside joiners, before the Reconnected listener and replay delivery finish (#202).
      *
      * The recovery fiber is then the one started here, not the read's: a listener called during the recovery
      * runs inside it, and an operation issued from there is refused a join, as for a failed write
@@ -1175,8 +1176,22 @@ final class NatsConnection
             return;
         }
 
-        $recovery = async(function () use ($generation, $readError): void {
-            $this->recoverConnection(failedGeneration: $generation, cause: $readError);
+        $ready = new DeferredFuture();
+        $ready->getFuture()->ignore();
+        $recovery = async(function () use ($generation, $readError, $ready): void {
+            try {
+                $this->recoverConnection(failedGeneration: $generation, cause: $readError, operationReady: $ready);
+                // A guard or a joined recovery may have returned without running our own recovery.
+                if (!$ready->isComplete()) {
+                    $ready->complete();
+                }
+            } catch (\Throwable $error) {
+                if (!$ready->isComplete()) {
+                    $ready->error($error);
+                }
+
+                throw $error;
+            }
         });
         // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
         $recovery->ignore();
@@ -1193,7 +1208,7 @@ final class NatsConnection
             throw new ConnectionException('Connection is not open', 0, $readError);
         }
 
-        $recovery->await($waitCancellation);
+        $ready->getFuture()->await($waitCancellation);
     }
 
     /**
@@ -3900,7 +3915,8 @@ final class NatsConnection
      *
      * A read with $ownSid, whose subscription still exists, that is the first to notice a lost connection starts the
      * reconnect and waits for it only within $cancellation and that wake-up, as it waits for a reconnect another
-     * fiber runs, or with waiting disabled fails at once with "Connection is not open" (#178); a read without a
+     * fiber runs, and only until the reconnect is over, not for the Reconnected listener or the delivery of what the
+     * reconnect read (#202), or with waiting disabled fails at once with "Connection is not open" (#178); a read without a
      * wake-up - {@see readIncoming()}, a serving loop's read, one for a sid since removed - runs the reconnect itself
      * and waits for all of it.
      *
@@ -6139,12 +6155,15 @@ final class NatsConnection
      * @param \Throwable|null $cause The error that ended the connection. With reconnect off it is chained to
      *                             the "Reconnect is disabled" error, so that the caller, and any operation
      *                             that joins the recovery, learns why the connection ended (#172).
+     * @param DeferredFuture<void>|null $operationReady Completes with owned recovery before announcement/delivery.
+     *                             The spawning wrapper settles guard/join/failure exits with their existing outcome.
      */
     private function recoverConnection(
         bool $ownedByConnect = false,
         ?Cancellation $joinCancellation = null,
         ?int $failedGeneration = null,
         ?\Throwable $cause = null,
+        ?DeferredFuture $operationReady = null,
     ): void {
         // The user asked to close (disconnect/drain): never start or join a reconnect that would
         // re-open the connection (#84).
@@ -6201,6 +6220,7 @@ final class NatsConnection
         try {
             $opened = $this->performRecovery($cause);
             $deferred->complete();
+            $operationReady?->complete();
         } catch (\Throwable $e) {
             $deferred->error($e);
 
@@ -8200,31 +8220,38 @@ final class NatsConnection
      * server's. It is the recovery fiber, as for a reconnect an operation's failed read starts
      * ({@see recoverAfterFailedOperationRead()}): a listener called during the failover runs inside it, and an
      * operation issued from there is refused a join ({@see awaitOpenConnection()}). The new connection is announced
-     * from it as well, once the failover is over, and the read that waits for it waits for that listener too while
-     * its own wait lasts.
+     * from it as well, once recovery is over. The bounded read waits for recovery completion, so it can resume
+     * while the Reconnected listener or replay delivery still runs (#202); the fiber continues both.
      *
      * @param int $generation The {@see $connectionGeneration} of the connection the INFO came on.
      */
     private function startLameDuckFailover(int $generation): void
     {
-        $failover = async(function () use ($generation): void {
+        $ready = new DeferredFuture();
+        $failover = async(function () use ($generation, $ready): void {
             try {
-                $this->recoverConnection(failedGeneration: $generation);
+                $this->recoverConnection(failedGeneration: $generation, operationReady: $ready);
             } catch (\Throwable $e) {
                 $this->emitError($e);
             } finally {
+                // Lame-duck failure is reported asynchronously; its read looks again at connection state.
+                if (!$ready->isComplete()) {
+                    $ready->complete();
+                }
                 if ($this->lameDuckFailover !== null && $this->lameDuckFailover['generation'] === $generation) {
                     $this->lameDuckFailover = null;
                 }
             }
         });
-        $this->lameDuckFailover = ['generation' => $generation, 'failover' => $failover];
+        $failover->ignore();
+        $this->lameDuckFailover = ['generation' => $generation, 'failover' => $failover, 'ready' => $ready->getFuture()];
     }
 
     /**
      * Waits for a lame-duck failover started in a fiber of its own ({@see startLameDuckFailover()}, #191) away from
      * the connection of $generation, for a read with a wake-up that read on that connection ({@see readChunk()}),
-     * once it has delivered its chunk: whether its own dispatch started the failover or another fiber's read of the
+     * once it has delivered its chunk. Waits for recovery completion rather than announcement/delivery completion
+     * (#202): whether its own dispatch started the failover or another fiber's read of the
      * same connection did, that connection is being left. Returns at once when no such failover is under way.
      *
      * Only within the operation's own wait, as the read waits for a reconnect its failed read starts
@@ -8275,7 +8302,7 @@ final class NatsConnection
                 return;
             }
 
-            $started['failover']->await($waitCancellation);
+            $started['ready']->await($waitCancellation);
         } catch (CancelledException $cancelled) {
             if (!self::wokenUp($wake, $cancellation)) {
                 // The caller's own exception when both fired: the wake-up's may have won inside the composite.

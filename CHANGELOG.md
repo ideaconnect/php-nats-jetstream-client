@@ -15,6 +15,46 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- One of the library's operations whose read started a reconnect, or brought a lame-duck `INFO` that started a
+  failover, is now let go when the reconnect is over, as an operation that joined it is, instead of when the
+  `Reconnected` listener and the delivery of what the reconnect read have finished (#202). That listener and that
+  delivery go on in the reconnect's fiber, so the operation can return while they still run; a listener must not
+  count on such an operation having waited for it. Your own `processIncoming()` and `readIncoming()`, a serving
+  loop's read, the heartbeat and an operation whose write started the reconnect still wait for all of it.
+
+### Changed
+
+- `[feature]` An operation whose read starts the recovery no longer loses its result to a slow `Reconnected` listener
+  or a slow handler in the delivery after the reconnect (#202). When the read of a `request()`, `requestMany()`, a
+  `SubscriptionQueue` poll, a fetch, a pull consumer or a `flush()` meets a lost connection (#178), or brings a
+  lame-duck `INFO` (#191), it starts the recovery in a fiber of its own and waits for it within its own timeout. It
+  used to wait for that fiber to end: past the reconnect itself, through the announcement of the new connection,
+  which runs the `Reconnected` listener, and the delivery of what the reconnect read, which runs the handlers in sid
+  order. A listener, or a handler of a lower sid, that took longer than what was left of the operation's timeout
+  made it time out although its message was queued or its reply was on the new socket; a `request()`'s reply was
+  then lost, and a fetch's messages came back only after `ack_wait`. Operations that joined the reconnect were
+  already let go when it was over. The read now waits for a completion of its own, settled at the same point as the
+  joiners' (after the handshake, the subscription replay, the reply inbox's confirmation and the flush of buffered
+  publishes), or when its recovery returns having done nothing (a close, a recovery already done by another fiber),
+  or with the recovery's error. It then looks again: a poll takes what the reconnect read for its subscription, and
+  a request reads its reply on the new socket. Failed recoveries keep their errors, a deadline or a wake-up still ends
+  only the wait, and the recovery carries on. A request's reply already queued on the shared request inbox behind a
+  slow handler of a lower sid still waits for that handler. Found by the review of #191 (2.21.0).
+
+### Testing & CI
+
+- `[docs]` New `OperationRecoveryCompletionTest` (13 cases, #202): a poll or a request whose read started the recovery
+  or the failover returns while the tail is held, joiners as guards, an application read that still waits, a listener
+  that recovers again after the initiating poll returned, and a skipped recovery of a replaced connection.
+  `OperationReadReconnectLifecycleTest::testAPollThatWaitsForAllOfTheReconnectReturnsAfterTheReconnectedListener` is
+  replaced by `testAPollReturnsWhileTheReconnectedListenerStillWaits`, and
+  `testAPollFromAReconnectedListenerWhoseOwnReadFindsTheNewConnectionGoneReconnectsItAgain` starts the first reconnect
+  with an application read, since an outer poll of the same queue could now take the one message itself.
+
 ## [2.25.10] - 2026-10-12
 
 ### Upgrade notes
