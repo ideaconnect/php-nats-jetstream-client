@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3607 unit tests, 159 integration tests, 49 Behat scenarios.
+Indicative totals: 3642 unit tests, 159 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -849,6 +849,18 @@ The rest of the chunk a lame-duck INFO came in (#182). The INFO's dispatch fails
 - `testWhenTheLameDuckListenerClosesTheConnectionAPingBehindTheInfoIsNotAnsweredOnTheClosedTransport` - The LameDuck listener awaits disconnect(), so no failover runs and only the close count moves: [INFO ldm | PING | MSG on a user subscription] returns 3 without error, the state is Closed (one dial in all; the events Connected, DiscoveredServers, LameDuck, Closed), no PONG was written, and the message went with the closed connection, as what a disconnect() discards does. Before: the read failed with the PONG write's TransportClosedException ("The connection is gone"). The one staging that exercises the close-count half of the dispatch's check, since every failover, a refused one included, moves the connection generation as well.
 - `testAPingBehindTheLameDuckInfoReadByARequestIsNotAnsweredOnTheNewConnection` - The same chunk read by a request's own read, which starts the failover in a fiber of its own (#191), the PING the leaving server's from then (its reply comes on neither server, so it times out at its 500 ms): the connection is on the second server and no PONG was written. Before: a PONG on the second connection.
 - `testAPingBehindTheLameDuckInfoReadByTheHeartbeatIsNotAnsweredOnTheNewConnection` - The same chunk read by the heartbeat tick's read of its PONG (ping interval 0.05 s, nothing else reading): the heartbeat pinged the first server, the connection is on the second, and no PONG was written. Before: a PONG on the second connection.
+
+### tests/Unit/LateTransportReadTest.php
+A chunk a custom transport hands over late is parsed and dispatched as the connection's its read started on (#205). `LateReadHoldingTransport` wraps `ReconnectingTransport` and, when armed, holds the chunk a read took until the test releases it; meanwhile a `flush()` whose `PING` write fails makes the recovery reconnect (two dials). Paths: `public` (your `readIncoming()`), `operation` (`readIncomingForOperation()` with its own subscription's wake-up), `heartbeat` (`consumeHeartbeatResponse()` with its tick's generation) and `heartbeat without generation`. Up to 2.26.5 the late bytes went into the new connection's parser and were dispatched as its own.
+- `testLatePingAndPartialFrameLeaveReplacementParserClean` (4 paths) - [PING | half MSG] handed over once the second connection is open: no PONG on it for the old PING; the new server's PING is then parsed (1 frame) and answered once.
+- `testLateChunkFinishesTheOldParsersPartialMessage` (4 paths) - The late chunk finishes an MSG the old parser had buffered: "hello" delivered, then "new" read on the new connection.
+- `testLatePongOrReplyDoesNotConfirmTheReplacementInbox` (4 paths x PONG / reply) - The new server's maximum-subscriptions `-ERR` still drops the unconfirmed inbox, and the next request subscribes it again (2 inbox SUBs on the new connection).
+- `testLateInfoAndErrorAreClassifiedAsTheOldServers` (4 paths) - serverInfo() stays the new server's; the `-ERR` is reported once as "The server the connection left sent an error frame"; the connection stays Open.
+- `testLateCorruptChunkPreservesHeaderMessagesAndIgnoresOldControls` (4 paths) - [HMSG | PING | PONG | INFO | -ERR 'Stale Connection' | corrupt]: the HMSG delivered with its headers; the old server's error and the parse failure reported once each; Open after two dials; the new server's PING answered once.
+- `testTerminalCloseAloneKeepsLateBytesOffTheResetParser` (4 paths) - disconnect() resets the parser without moving the generation; the late half MSG leaves the reset parser empty.
+- `testSameConnectionStillHandlesControlsAndSplitHeaderMessages` (4 paths) - Guard: with no reconnect, the late chunk finishes a split HMSG (3 frames) and its PING is answered on that connection.
+- `testCorruptOldChunkDoesNotJoinAnUnrelatedReplacementRecovery` (public / operation) - The new connection's own recovery holds its dial; the corrupt late chunk's read completes meanwhile, its message delivered, without joining it.
+- `testAnObsoleteHeartbeatGenerationDoesNotStartReadingTheReplacement` - A heartbeat tick for the replaced connection starts no read on the new socket; the new server's PING is answered by your next read.
 
 ### tests/Unit/ListenerOperationFailoverTest.php
 What a `DiscoveredServers` or `LameDuck` listener starts and does not await waits for the failover and runs on the new server, whichever read brought the lame-duck `INFO` (#203). Over the two-server `ReconnectingTransport`, the `INFO` naming port 4223, brought by your own `processIncoming()` (an inline failover in the listener's fiber) or by a `request()`'s read (a failover in a fiber of its own); the failover's dial is held until the case releases it; every connection, operation and held dial is owned by the test.

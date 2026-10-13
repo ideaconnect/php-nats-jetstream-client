@@ -4333,6 +4333,8 @@ final class NatsConnection
 
             $this->readInProgress = true;
             $generation = $this->connectionGeneration;
+            $closes = $this->terminalCloses;
+            $parser = $this->parser;
 
             $readError = null;
             try {
@@ -4413,7 +4415,7 @@ final class NatsConnection
             }
 
             try {
-                $frames = $this->parser->push($chunk);
+                $frames = $parser->push($chunk);
             } catch (ProtocolException $parseError) {
                 // An unparseable/corrupt stream is a transport-level failure: reconnect rather than
                 // letting the exception escape the caller's processing loop. The parser has already
@@ -4421,7 +4423,7 @@ final class NatsConnection
                 // Frames that parsed before the failure are dispatched first - their bytes are
                 // consumed, so recovery would lose them permanently (#147, parse-layer twin of #128)
                 // - and the failure surfaces via the error listener before recovery runs.
-                $recovered = $this->parser->takeParsedFrames();
+                $recovered = $parser->takeParsedFrames();
 
                 // Whatever a frame or a handler throws meanwhile, the recovered frames are delivered and the
                 // corrupt stream is reported and recovered; then the first failure reaches the caller (#128
@@ -4430,7 +4432,7 @@ final class NatsConnection
                 try {
                     // As on the clean path, a read with a wake-up starts a lame-duck failover an INFO among them brings
                     // in a fiber of its own (#191, #195): the recovery below joins it within the read's wait.
-                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors);
+                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
                 } catch (\Throwable $e) {
                     $dispatchError = $e;
                 }
@@ -4468,10 +4470,14 @@ final class NatsConnection
                     // previous (#195). A read without one - your own, a serving loop's - runs it here and waits for
                     // all of it. It used to run it here for every read: an operation waited for the whole reconnect,
                     // past its deadline and its wake-up, also with waiting disabled.
-                    if ($wake !== null) {
-                        $this->recoverAfterFailedOperationRead($generation, $parseError, self::waitWith($cancellation, $wake));
-                    } else {
-                        $this->recoverConnection(joinCancellation: self::waitWith($cancellation, $wake), failedGeneration: $generation, cause: $parseError);
+                    // A corrupt late chunk belongs to the old stream. Do not join a recovery of
+                    // the replacement connection: recoverConnection() checks joiners before generations.
+                    if ($this->connectionGeneration === $generation && $this->terminalCloses === $closes) {
+                        if ($wake !== null) {
+                            $this->recoverAfterFailedOperationRead($generation, $parseError, self::waitWith($cancellation, $wake));
+                        } else {
+                            $this->recoverConnection(joinCancellation: self::waitWith($cancellation, $wake), failedGeneration: $generation, cause: $parseError);
+                        }
                     }
                 } catch (CancelledException $cancelled) {
                     // The read's deadline ended the wait, unless the read's wake-up did: then the recovered frames are
@@ -4504,7 +4510,7 @@ final class NatsConnection
             $dispatchError = null;
             try {
                 // A read with a wake-up starts a lame-duck failover in a fiber of its own, waited for below (#191).
-                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors);
+                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
             } catch (\Throwable $e) {
                 // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
                 // delivery, #128) before this frame error reaches the caller below, recovering the
@@ -4628,6 +4634,8 @@ final class NatsConnection
      * since the connection goes while one of them is handled; here, so that every caller gets the rule.
      *
      * @param list<ProtocolFrame> $frames
+     * @param int|null $generation Connection generation captured before the read; null for the current one.
+     * @param int|null $closes Terminal-close count captured before the read; null for the current one.
      * @param bool $reportOverflows Report a full subscription queue ({@see SlowConsumerException})
      *        through the error listener instead of rethrowing it - for a caller that must not fail on
      *        it: a reconnect has nobody to throw it to, a drain needs the messages behind it, an operation
@@ -4642,14 +4650,14 @@ final class NatsConnection
      *        #191), also for the frames it parsed ahead of bytes that fail to parse (#195). Your own read, a serving
      *        loop's, the heartbeat's and those of a connect or a reconnect run it inline.
      */
-    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false): void
+    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false, ?int $generation = null, ?int $closes = null): void
     {
         $firstError = null;
         /** @var list<array{\Throwable, string}> $reports What to report, with its log level. */
         $reports = [];
-        // The connection the chunk was read on (#182).
-        $generation = $this->connectionGeneration;
-        $closes = $this->terminalCloses;
+        // Runtime reads provide the origin captured before I/O (#205). Other callers own their socket.
+        $generation ??= $this->connectionGeneration;
+        $closes ??= $this->terminalCloses;
 
         foreach ($frames as $frame) {
             // The chunk's connection is gone once a frame handled before this one has replaced or ended it.
@@ -7941,6 +7949,15 @@ final class NatsConnection
             return;
         }
 
+        // The tick's PING can finish after another fiber replaced its connection. Its read is obsolete.
+        if ($generation !== null && $generation !== $this->connectionGeneration) {
+            return;
+        }
+
+        $generation ??= $this->connectionGeneration;
+        $closes = $this->terminalCloses;
+        $parser = $this->parser;
+
         $timeoutSeconds = min(2.0, max(0.05, (float) $this->options->pingIntervalSeconds));
 
         $this->readInProgress = true;
@@ -8003,10 +8020,10 @@ final class NatsConnection
 
         $dispatchError = null;
         try {
-            $frames = $this->parser->push($chunk);
+            $frames = $parser->push($chunk);
 
             try {
-                $this->dispatchFrames($frames);
+                $this->dispatchFrames($frames, generation: $generation, closes: $closes);
             } catch (\Throwable $e) {
                 // Contained per frame (#128): the sibling MSG frames are already enqueued below.
                 $dispatchError = $e;
@@ -8028,7 +8045,7 @@ final class NatsConnection
             // Contained like the clean-path dispatch above: surfaced below, never thrown out of the timer -
             // and a delivery failure does not hide a dispatch failure, nor the other way round.
             try {
-                $this->dispatchFrames($this->parser->takeParsedFrames());
+                $this->dispatchFrames($parser->takeParsedFrames(), generation: $generation, closes: $closes);
             } catch (\Throwable $e) {
                 $dispatchError = $e;
             }
