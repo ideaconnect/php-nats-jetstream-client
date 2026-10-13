@@ -241,9 +241,11 @@ final class NatsConnection
      */
     private bool $awaitMuxFence = false;
     /**
-     * Sids of dropped mux subscriptions, unsubscribed in the write that subscribes the next one: when the
-     * -ERR was another SUB's after all, the server still holds the dropped one, and the UNSUB frees its slot
-     * before the new SUB is counted. The server ignores an UNSUB for a sid it does not hold.
+     * Sids of dropped mux subscriptions whose UNSUB is still owed on the connection they were dropped on:
+     * when the -ERR was another SUB's after all, the server still holds the dropped one. The next mux install
+     * releases it before its SUB is counted, or the drain releases it when delivery ends. A replayed mux dropped
+     * by the replay's drain is released by finishReplayWindow(). connectOnce() forgets releases from the replaced
+     * connection, whose subscriptions died with it. The server ignores an UNSUB for a sid it does not hold.
      *
      * @var list<int>
      */
@@ -6087,10 +6089,11 @@ final class NatsConnection
         // epoch's PING must never be completed by a PONG from this new connection, and its own
         // PONG died with the old socket - error the waiters (flush/rtt) out instead (#117).
         $this->failPongWaiters(new ConnectionException('Connection lost before the server answered the PING'));
-        // The UNSUBs owed by guarded inboxes treated as rejected on the connection this one replaces (#175) are
-        // moot: the server dropped whatever it held with that connection, and a replayed inbox the new server
-        // rejects is released by the replay itself ({@see finishReplayWindow()}).
+        // The UNSUBs owed by mux and guarded inboxes treated as rejected on the connection this one replaces
+        // (#193, #175) are moot: the server dropped whatever it held with that connection, and a replayed inbox
+        // the new server rejects is released by the replay itself ({@see finishReplayWindow()}).
         $this->guardedSidsToRelease = [];
+        $this->muxSidsToRelease = [];
 
         $server = $this->nextServer();
         $this->connectedServer = $server;
@@ -6705,9 +6708,13 @@ final class NatsConnection
                 if (!isset($this->subscriptionMeta[$sid])) {
                     $frames .= $this->codec->encodeUnsubscribe($sid);
                     unset($replayed[$sid]);
-                    // This UNSUB is the one a guarded inbox the replay's drain treated as rejected owes (#175): its
-                    // operation's unsubscribe() then has nothing left to write.
+                    // This UNSUB settles what a mux or guarded inbox rejected by the replay's drain owes
+                    // (#193, #175): its next install or its operation's unsubscribe() has nothing left to write.
                     $this->takeOwedRelease($sid);
+                    $this->muxSidsToRelease = array_values(array_filter(
+                        $this->muxSidsToRelease,
+                        static fn(int $queued): bool => $queued !== $sid,
+                    ));
 
                     continue;
                 }
