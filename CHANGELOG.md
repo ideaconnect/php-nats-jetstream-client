@@ -15,6 +15,25 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.26.6] - 2026-10-13
+
+### Fixed
+
+- `[bugfix]` A lame-duck failover whose reconnect is refused authentication reports the refusal once through the
+  error listener and the asynchronous error log, also when it joins another fiber's recovery (#201). `performRecovery()`
+  reports a refusal before it rethrows it, and both failover catches - inline for your own read, and in the failover's
+  own fiber for an operation's read (#191, 2.21.0) - reported it again, so metrics or alerting built on the listener
+  counted it twice. They now go through one helper that leaves an `AuthenticationException` alone and reports
+  everything else, so "Reconnect attempts exhausted", which recovery does not report itself, is still reported once.
+  The `Closed` event, its error and the fail-fast stop after a refusal are unchanged. Found by the review of #191.
+
+### Testing & CI
+
+- `[docs]` New `LameDuckAuthenticationReportingTest` (16 cases, #201): the inline and own-fiber failover refused,
+  with normal, throwing-listener and throwing-logger reporting; both paths joining a heartbeat recovery whose dial is
+  held; exhaustion still reported once; a refusal outside lame duck still reported once and thrown; two separate
+  refusals with identical messages each reported. 12 fail on 2.26.5.
+
 ## [2.26.5] - 2026-10-13
 
 ### Fixed

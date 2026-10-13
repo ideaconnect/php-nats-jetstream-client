@@ -8290,10 +8290,25 @@ final class NatsConnection
                 try {
                     $this->recoverConnection(failedGeneration: $generation);
                 } catch (\Throwable $e) {
-                    $this->emitError($e);
+                    $this->reportLameDuckFailoverFailure($e);
                 }
             }
         }
+    }
+
+    /**
+     * Reports a failover failure not already reported by recovery. An authentication refusal is
+     * reported by performRecovery() before it is rethrown, also to a recovery's joiners (#201).
+     * On exhaustion, recovery emits Closed with the last attempt's error; the failover reports
+     * the separate "Reconnect attempts exhausted" exception here.
+     */
+    private function reportLameDuckFailoverFailure(\Throwable $error): void
+    {
+        if ($error instanceof AuthenticationException) {
+            return;
+        }
+
+        $this->emitError($error);
     }
 
     /**
@@ -8322,7 +8337,7 @@ final class NatsConnection
             try {
                 $this->recoverConnection(failedGeneration: $generation, operationReady: $ready);
             } catch (\Throwable $e) {
-                $this->emitError($e);
+                $this->reportLameDuckFailoverFailure($e);
             } finally {
                 // Lame-duck failure is reported asynchronously; its read looks again at connection state.
                 if (!$ready->isComplete()) {
