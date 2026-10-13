@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3642 unit tests, 159 integration tests, 49 Behat scenarios.
+Indicative totals: 3653 unit tests, 159 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -1753,6 +1753,16 @@ The set-up of the shared reply inbox within the budget of the request that sets 
 - `testARequestThatStopsWaitingForItsSetUpLeavesTheInboxToTheRequestsThatJoinedIt` - Data provider (its own 150 ms timeout / its caller's cancellation): the first SUB held up, the request that wrote it fails with its own outcome (`Request timed out for subject svc.echo while waiting for the reply inbox to be set up`, or CancelledException) within half a second, the request that joined it waits on, and once the SUB is let through the joiner subscribes the inbox again and is answered; the abandoned SUB is followed by an UNSUB, the server holds one inbox, and only the joiner's request is published. On 2.24.3 the first request waited for its SUB.
 - `testACancelledRequestThatJoinedASetUpLeavesItToTheRequestThatMakesIt` - Guard, passes on both: a joiner cancelled while the SUB is held up fails with CancelledException; the request that makes the set-up is answered once the SUB is let through, one inbox subscribed.
 - `testASetUpCancelledBeforeItsWriterRunsWritesNothingAndLeavesItsOwedReleaseToTheNextSetUp` - After the server rejected the first inbox at its limit of one subscription and the slot was freed, a request cancelled one event-loop hop after it was made writes no SUB and no PING; the next request subscribes the inbox in a write that starts with the UNSUB owed for the dropped one, and is answered. On 2.24.3 the cancelled request wrote its SUB at once.
+
+### tests/Unit/MuxReleaseAcrossReconnectTest.php
+The `UNSUB` a dropped shared reply inbox (mux) owes belongs to the connection it was dropped on (#193). Over `SubscriptionLimitServer`, which counts the subscriptions it holds per connection (epoch) and answers a `SUB` past its limit with `-ERR 'maximum subscriptions exceeded'`; the request cases run through `request()` and `requestMany()`. Up to 2.26.5 the release queue outlived a reconnect.
+- `testADroppedMuxIsNotReleasedOnTheConnectionThatReplacesItsOwn` (request / requestMany) - Limit 1 with an application subscription: the mux is dropped at the limit, then the connection lost; on the new connection the dropped mux is not replayed and the next install is `SUB _INBOX.* 3` + `PING` only; the only `UNSUB` there is the application subscription's.
+- `testARejectedReplayedMuxIsReleasedExactlyOnce` (request / requestMany) - A working mux, then the limit lowered and the connection lost: the replay writes `UNSUB 2` for the rejected mux; the next install carries no second one.
+- `testARejectedMuxReplayedAfterItsFailedWriteIsReleasedExactlyOnce` (request / requestMany) - The first mux `SUB`'s write fails with the connection; the replay's rejection fails the request; `UNSUB 2` from the replay only, also after the failed set-up's cleanup.
+- `testTheNextInstallOnTheSameConnectionStillFreesADroppedMuxThatTheServerHolds` (request / requestMany) - Guard: another `SUB`'s ambiguous `-ERR` drops a mux the server holds; the next install writes `UNSUB 4` ahead of its `SUB`, freeing the slot, and gets its reply.
+- `testADrainDoesNotReleaseAMuxDroppedOnThePreviousConnection` - A drain after the reconnect writes only the application subscription's `UNSUB`.
+- `testADrainDoesNotRepeatTheReleaseOfARejectedReplayedMux` - A drain after the replay's `UNSUB 2` writes `UNSUB 1` only.
+- `testADrainStillReleasesADroppedMuxHeldOnTheSameConnection` - Guard: a drain on the same connection writes `UNSUB 4` for the held dropped mux, once.
 
 ### tests/Unit/MuxRequestInboxInternalsTest.php
 - `testDispatchMuxReplyRoutesReplyToItsTokenWaiter` - A mux reply is delivered to the waiter registered for its token.

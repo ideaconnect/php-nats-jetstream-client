@@ -15,6 +15,27 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` The `UNSUB` a dropped shared reply inbox owes is written only on the connection it was dropped on (#193).
+  A mux dropped for a `maximum subscriptions exceeded` `-ERR` is queued for release, since the `-ERR` may have been
+  another subscription's and the server may still hold it, and the next request's install (or a drain, #213) writes
+  its `UNSUB` ahead of the new `SUB`. The queue outlived a reconnect: a mux dropped on a connection then lost was
+  released again on the new one, which never held it, and a replayed mux the new server rejected got a second `UNSUB`
+  after the one the replay writes. `connectOnce()` now forgets the old connection's mux releases, as it does the
+  guarded inboxes' (#175), and `finishReplayWindow()` takes the sid whose `UNSUB` it writes off the mux list. The
+  release on the same connection is unchanged. The server ignores an `UNSUB` for a sid it does not hold, so this only
+  removes wasted bytes. Found by the review of #175 (2.19.0).
+
+### Testing & CI
+
+- `[docs]` New `MuxReleaseAcrossReconnectTest` (11 cases, #193) over `SubscriptionLimitServer`: a mux dropped and its
+  connection lost, a replayed mux the new server rejects, the same after the first `SUB`'s write fails (each through
+  `request()` and `requestMany()`), a drain after each, and the same-connection release kept for the next install and
+  for a drain (guards). 8 fail on 2.26.5.
+
 ## [2.26.7] - 2026-10-13
 
 ### Fixed
