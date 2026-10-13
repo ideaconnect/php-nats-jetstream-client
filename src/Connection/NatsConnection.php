@@ -5225,13 +5225,19 @@ final class NatsConnection
      * way the request reads for its reply, except that its read returns without reading once the PONG that confirms
      * the mux is in, whichever fiber's read took it. When the server rejects the SUB again, the mux is dropped and the
      * request fails without being sent; when this read brought that -ERR, it is the previous exception instead
-     * of being thrown, so it fails the request once and is not reported on top.
+     * of being thrown, so it fails the request once and is not reported on top. The mux is checked before each read
+     * as well as after it: another fiber's read can drop it during the pause after a read that returned without
+     * reading, and a read started then would hold no fence, so no wake-up, and could fail over a lame-duck INFO inline
+     * past the budget (#204).
      *
      * @throws CancelledException When $budget fires first.
      */
     private function awaitMuxConfirmation(Cancellation $budget, int $closes, int $generation, DeferredCancellation $lifetime): void
     {
         while (!$this->muxConfirmed) {
+            // Another fiber may have dropped the inbox during the idle-read pause (#204).
+            $this->throwUnlessMuxInstalled($closes, $generation, $lifetime);
+
             try {
                 $read = $this->readChunk(
                     $budget,
