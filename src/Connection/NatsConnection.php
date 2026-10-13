@@ -723,14 +723,14 @@ final class NatsConnection
      */
     public function rtt(): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($caller): float {
+        return async(function () use ($issuedDuringRecovery): float {
             $deadline = $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000);
 
             if ($this->state !== ConnectionState::Open) {
                 try {
-                    $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $caller);
+                    $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $issuedDuringRecovery);
                 } catch (CancelledException) {
                     throw new TimeoutException('RTT measurement timed out waiting for the connection to be re-established');
                 }
@@ -739,13 +739,21 @@ final class NatsConnection
             $start = $this->monotonicSeconds();
             $this->flushWithin(
                 $deadline,
-                $caller,
+                $issuedDuringRecovery,
                 reportOverflows: !$this->options->slowConsumerErrorsFailOperations,
                 reportHandlerFailures: !$this->options->handlerErrorsFailOperations,
             );
 
             return $this->monotonicSeconds() - $start;
         });
+    }
+
+    /** Captured synchronously before an operation queues its own fiber (#145, #203). */
+    private function operationIsIssuedDuringRecovery(): bool
+    {
+        $caller = \Fiber::getCurrent();
+
+        return $caller !== null && $caller === $this->recoveryFiber;
     }
 
     /**
@@ -782,8 +790,9 @@ final class NatsConnection
         // connect() issued from a listener inside the recovery fiber is only recognizable by the
         // fiber connect() was called from.
         $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($caller): void {
+        return async(function () use ($caller, $issuedDuringRecovery): void {
             // Checked first: a drain waiting for a reconnect, or winding down after its budget ran out,
             // is not in the Draining state, and its teardown would destroy a connection opened now.
             if ($this->drainInProgress) {
@@ -805,7 +814,7 @@ final class NatsConnection
                 // A connection/error listener runs synchronously inside the recovery fiber - the
                 // only fiber that can complete the recovery deferred. Joining from there would
                 // await that deferred forever: refuse loudly instead of deadlocking (#145).
-                if ($caller !== null && $caller === $this->recoveryFiber) {
+                if ($issuedDuringRecovery) {
                     throw new ConnectionException(
                         'connect() cannot join the in-flight recovery from a connection/error listener: '
                         . 'the listener runs inside the recovery fiber, and awaiting the join there '
@@ -927,7 +936,7 @@ final class NatsConnection
      * Loops, because a finished recovery can be followed by another one before the caller resumes.
      * Refuses - the fail-fast behaviour - when waiting is disabled, when the user is closing the
      * connection, when no recovery is in flight (Idle, or terminally Closed: nothing will reopen the
-     * connection), and when the caller IS the recovery fiber: a listener called during the recovery (a
+     * connection), and when the operation was issued inside the active recovery fiber: a listener called during recovery (a
      * Disconnected or error listener) runs inside it, and waiting there would await a deferred only that
      * suspended fiber can complete (#145). A recovery that a failed initial connect() hands off to runs in
      * the connect fiber, which is then the recovery fiber; any other caller - a Connected or Reconnected
@@ -938,8 +947,7 @@ final class NatsConnection
      * The wait is bounded only by $cancellation. Callers derive it from their own single budget, so the
      * reconnect wait and the operation itself share one timeout.
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the operation, captured
-     *        before the operation's own async() fiber was spawned (null for {main}).
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param bool $acceptDraining Whether a Draining connection is usable (the read path's rule).
      * @param bool $duringDrainDelivery Whether a Draining connection is usable while the drain still delivers (a
      *        request's rule, #213): checked as the wait ends, so that what follows it without suspending - the
@@ -948,7 +956,7 @@ final class NatsConnection
      * @throws ConnectionException When the connection is not open and there is nothing to wait for.
      * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
      */
-    private function awaitOpenConnection(?Cancellation $cancellation, ?\Fiber $caller, bool $acceptDraining = false, bool $duringDrainDelivery = false): void
+    private function awaitOpenConnection(?Cancellation $cancellation, bool $issuedDuringRecovery, bool $acceptDraining = false, bool $duringDrainDelivery = false): void
     {
         while (!$this->isUsableForOperations($acceptDraining, $duringDrainDelivery)) {
             $recovery = $this->reconnecting;
@@ -956,7 +964,7 @@ final class NatsConnection
                 $recovery === null
                 || !$this->options->waitForReconnect
                 || $this->closing
-                || ($caller !== null && $caller === $this->recoveryFiber)
+                || $issuedDuringRecovery
             ) {
                 throw new ConnectionException('Connection is not open');
             }
@@ -1008,7 +1016,7 @@ final class NatsConnection
      * the connection for good, and the caller gets its "Reconnect is disabled".
      *
      * @param int $generation The {@see $connectionGeneration} the failed write ran on.
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the operation.
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param bool $duringDrainDelivery Whether the operation, a request's, may go on on a connection a drain() took
      *        over meanwhile, while that drain still delivers (#213): a drain that waited for this recovery, which
      *        kept the reply inbox, replayed with the rest. Only for a write made while the connection was Open: one
@@ -1017,7 +1025,7 @@ final class NatsConnection
      * @throws ConnectionException When the connection does not come back, or at once when waiting is disabled.
      * @throws CancelledException When $cancellation fires first; callers map it to their timeout error.
      */
-    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation, ?\Fiber $caller, bool $duringDrainDelivery = false): void
+    private function recoverAfterFailedWrite(int $generation, \Throwable $writeError, Cancellation $cancellation, bool $issuedDuringRecovery, bool $duringDrainDelivery = false): void
     {
         $recovery = async(function () use ($generation, $writeError): void {
             $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
@@ -1043,7 +1051,7 @@ final class NatsConnection
                 // The recovery announced the new connection before it ended, and the listener, or what it
                 // called, may have started another reconnect since: waited for within the same budget, like
                 // any reconnect in flight.
-                $this->awaitOpenConnection($cancellation, $caller, duringDrainDelivery: $duringDrainDelivery);
+                $this->awaitOpenConnection($cancellation, $issuedDuringRecovery, duringDrainDelivery: $duringDrainDelivery);
             } catch (ConnectionException) {
                 // Nothing to wait for, or it did not reopen the connection: the user is closing it, a connect()
                 // owns the dial, or the connection was closed for good.
@@ -1685,8 +1693,9 @@ final class NatsConnection
     public function drain(): Future
     {
         $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($caller): void {
+        return async(function () use ($caller, $issuedDuringRecovery): void {
             // Nothing to drain, and no side effects: a drain is already running, or the connection is not
             // open and no live reconnect will reopen it - Idle, Closed (even while the reconnect that just
             // gave up is still reporting it through a listener), or closing.
@@ -1700,7 +1709,7 @@ final class NatsConnection
 
             $this->drainInProgress = true;
             try {
-                $this->drainConnection($caller);
+                $this->drainConnection($issuedDuringRecovery);
             } finally {
                 $this->drainInProgress = false;
                 // The drain is over, however it ended: its timer seals nothing more, and the delivery of the next
@@ -1724,9 +1733,9 @@ final class NatsConnection
     /**
      * The body of {@see drain()}, once it is known there is something to drain.
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called drain().
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      */
-    private function drainConnection(?\Fiber $caller): void
+    private function drainConnection(bool $issuedDuringRecovery): void
     {
         // One overall drain budget (monotonic), computed once at entry, bounds every phase - the wait
         // for an in-flight reconnect, the flush-wait and the backlog-wait: total drain time cannot
@@ -1738,7 +1747,7 @@ final class NatsConnection
         // Not connected: the budget ran out before the reconnect finished, the reconnect gave up (it
         // reported what it discarded and closed the connection), or the user disconnect()ed meanwhile.
         // The drain then winds down without a connection - for the last two there is nothing left.
-        $connected = $this->state === ConnectionState::Open || $this->awaitReconnectForDrain($drainDeadline, $caller);
+        $connected = $this->state === ConnectionState::Open || $this->awaitReconnectForDrain($drainDeadline, $issuedDuringRecovery);
 
         if ($connected) {
             $this->state = ConnectionState::Draining;
@@ -1938,7 +1947,7 @@ final class NatsConnection
                     // lost without a trace. A failure that ends the connection still ends the flush.
                     $read = $this->readChunk(
                         $flushCancellation,
-                        \Fiber::getCurrent(),
+                        $this->operationIsIssuedDuringRecovery(),
                         reportOverflows: true,
                         reportHandlerFailures: true,
                         reportFailuresKeepingTheConnection: true,
@@ -1981,18 +1990,18 @@ final class NatsConnection
      * and throws, like nats.go's Drain() while reconnecting: otherwise the reconnect would reopen a
      * connection the application is shutting down.
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called drain().
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      */
-    private function awaitReconnectForDrain(float $drainDeadline, ?\Fiber $caller): bool
+    private function awaitReconnectForDrain(float $drainDeadline, bool $issuedDuringRecovery): bool
     {
-        if (!$this->options->waitForReconnect || ($caller !== null && $caller === $this->recoveryFiber)) {
+        if (!$this->options->waitForReconnect || $issuedDuringRecovery) {
             $this->closeInsteadOfDrain();
 
             throw new ConnectionException('Cannot drain while reconnecting: the connection was closed instead');
         }
 
         try {
-            $this->awaitOpenConnection($this->remainingBudgetCancellation($drainDeadline), $caller);
+            $this->awaitOpenConnection($this->remainingBudgetCancellation($drainDeadline), $issuedDuringRecovery);
         } catch (\Throwable) {
             // The budget ran out, or the reconnect ended without reopening the connection - however it
             // ended: the drain still winds down and closes.
@@ -2750,9 +2759,9 @@ final class NatsConnection
      */
     public function subscribe(string $subject, callable $handler, ?string $queue = null): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(fn(): int => $this->subscribeInternal($subject, $handler, $queue, $caller));
+        return async(fn(): int => $this->subscribeInternal($subject, $handler, $queue, $issuedDuringRecovery));
     }
 
     /**
@@ -2760,7 +2769,7 @@ final class NatsConnection
      * through {@see subscribeWithin()}, within the budget of the request that sets it up.
      *
      * @param callable(NatsMessage):void $handler
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the subscribe.
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param (\Closure(int): void)|null $registered Called with the sid once the subscription is registered, before
      *        its SUB is written, so that whichever fiber reads the server's answer to the SUB finds what it records.
      * @param string $after Frames written right behind the SUB, in the same write.
@@ -2771,14 +2780,14 @@ final class NatsConnection
         string $subject,
         callable $handler,
         ?string $queue,
-        ?\Fiber $caller,
+        bool $issuedDuringRecovery,
         ?\Closure $registered = null,
         string $after = '',
         ?Cancellation $budget = null,
     ): int {
         if ($budget !== null) {
             try {
-                return $this->subscribeWithin($subject, $handler, $queue, $caller, $registered, null, $after, $budget);
+                return $this->subscribeWithin($subject, $handler, $queue, $issuedDuringRecovery, $registered, null, $after, $budget);
             } catch (CancelledException $error) {
                 throw new TimeoutException(sprintf('Subscribe to "%s" timed out within the operation budget', $subject), previous: $error);
             }
@@ -2786,7 +2795,7 @@ final class NatsConnection
 
         if ($this->state !== ConnectionState::Open) {
             try {
-                $this->awaitOpenConnection(new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $caller);
+                $this->awaitOpenConnection(new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $issuedDuringRecovery);
             } catch (CancelledException) {
                 throw new TimeoutException(sprintf('Subscribe to "%s" timed out waiting for the connection to be re-established', $subject));
             }
@@ -2815,7 +2824,7 @@ final class NatsConnection
             // not come back in time, so that the registry does not keep an entry whose sid the caller never
             // learns (#116).
             try {
-                $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $caller);
+                $this->recoverAfterFailedWrite($generation, $writeError, new TimeoutCancellation($this->options->requestTimeoutMs / 1000), $issuedDuringRecovery);
             } catch (CancelledException) {
                 $this->releaseTemporarySubscription($sid);
 
@@ -2845,7 +2854,7 @@ final class NatsConnection
      * writer that first runs after its caller stopped waiting writes nothing, and queues no pong slot.
      *
      * @param callable(NatsMessage):void $handler
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param (\Closure(int):void)|null $registered
      * @param (\Closure():string)|null $before Frames written ahead of the SUB, in the same write, taken in that step: the
      *        UNSUBs the reply inbox's set-up owes for the muxes dropped before ({@see $muxSidsToRelease}), which a writer
@@ -2861,7 +2870,7 @@ final class NatsConnection
         string $subject,
         callable $handler,
         ?string $queue,
-        ?\Fiber $caller,
+        bool $issuedDuringRecovery,
         ?\Closure $registered,
         ?\Closure $before,
         string $after,
@@ -2878,9 +2887,9 @@ final class NatsConnection
 
         try {
             $budget->throwIfRequested();
-            $write = async(function () use ($subject, $handler, $queue, $caller, $registered, $budget, $sid, $closes, $before, $subscribe, $duringDrainDelivery): ?array {
+            $write = async(function () use ($subject, $handler, $queue, $issuedDuringRecovery, $registered, $budget, $sid, $closes, $before, $subscribe, $duringDrainDelivery): ?array {
                 $budget->throwIfRequested();
-                $this->awaitOpenConnection($budget, $caller, duringDrainDelivery: $duringDrainDelivery);
+                $this->awaitOpenConnection($budget, $issuedDuringRecovery, duringDrainDelivery: $duringDrainDelivery);
                 $budget->throwIfRequested();
                 if ($this->terminalCloses !== $closes) {
                     throw new ConnectionException('Connection was closed while the reply inbox was being set up');
@@ -2916,7 +2925,7 @@ final class NatsConnection
             $failure = $write->await($budget);
             if ($failure !== null) {
                 [$generation, $error] = $failure;
-                $this->recoverAfterFailedWrite($generation, $error, $budget, $caller, $duringDrainDelivery);
+                $this->recoverAfterFailedWrite($generation, $error, $budget, $issuedDuringRecovery, $duringDrainDelivery);
             }
             $budget->throwIfRequested();
             if (!isset($this->subscriptionMeta[$sid])) {
@@ -2971,9 +2980,9 @@ final class NatsConnection
      */
     public function subscribeGuarded(string $subject, callable $handler, \Closure $onRejected, ?Cancellation $budget = null): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($subject, $handler, $onRejected, $caller, $budget): int {
+        return async(function () use ($subject, $handler, $onRejected, $issuedDuringRecovery, $budget): int {
             // Recorded here as well, so that a rejection read while this fiber waits in its subscribe - by the
             // drain of the reconnect a failed write started - is told from a connection that closed.
             /** @var string|null $rejection */
@@ -2988,7 +2997,7 @@ final class NatsConnection
                     $subject,
                     $handler,
                     null,
-                    $caller,
+                    $issuedDuringRecovery,
                     registered: function (int $sid) use ($recordingRejection): void {
                         $this->guardedSids[$sid] = true;
                         $this->subscriptionRejectionHandlers[$sid] = $recordingRejection;
@@ -3268,9 +3277,9 @@ final class NatsConnection
      */
     public function drainSubscription(int $sid): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($sid, $caller): void {
+        return async(function () use ($sid, $issuedDuringRecovery): void {
             if (!isset($this->subscriptionMeta[$sid])) {
                 return;
             }
@@ -3288,7 +3297,7 @@ final class NatsConnection
                     // A reconnect that already re-subscribed the sid unsubscribes it only just before it
                     // goes live, and the server can deliver on it until then: draining on the new
                     // connection delivers those messages too.
-                    $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $caller);
+                    $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $issuedDuringRecovery);
                 } catch (\Throwable) {
                     // Nothing to wait for, waiting disabled or impossible, the budget ran out, or the
                     // reconnect gave up: what already arrived is delivered below.
@@ -3311,7 +3320,7 @@ final class NatsConnection
                     // after it is removed, and be dropped.
                     $this->flushWithin(
                         $deadline,
-                        $caller,
+                        $issuedDuringRecovery,
                         reportOverflows: true,
                         reportHandlerFailures: true,
                         reportFailuresKeepingTheConnection: true,
@@ -3540,7 +3549,7 @@ final class NatsConnection
                         // connection open for are reported, as in drainSubscription()'s flush: the run already fails.
                         $read = $this->readChunk(
                             $readCancellation,
-                            \Fiber::getCurrent(),
+                            $this->operationIsIssuedDuringRecovery(),
                             reportOverflows: true,
                             ownSid: $sid,
                             reportHandlerFailures: true,
@@ -3673,12 +3682,12 @@ final class NatsConnection
      */
     public function flush(): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($caller): void {
+        return async(function () use ($issuedDuringRecovery): void {
             $this->flushWithin(
                 $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000),
-                $caller,
+                $issuedDuringRecovery,
                 reportOverflows: !$this->options->slowConsumerErrorsFailOperations,
                 reportHandlerFailures: !$this->options->handlerErrorsFailOperations,
             );
@@ -3697,12 +3706,12 @@ final class NatsConnection
      */
     public function flushReportingFailures(): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($caller): void {
+        return async(function () use ($issuedDuringRecovery): void {
             $this->flushWithin(
                 $this->monotonicSeconds() + max(0.1, $this->options->requestTimeoutMs / 1000),
-                $caller,
+                $issuedDuringRecovery,
                 reportOverflows: true,
                 reportHandlerFailures: true,
                 reportFailuresKeepingTheConnection: true,
@@ -3716,7 +3725,7 @@ final class NatsConnection
      * reconnect, the PING write and the PONG wait - so the flush honours the single request-timeout bound it
      * documents (the write and read phases used to get a full budget each).
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called flush()/rtt().
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param bool $reportOverflows Report a full queue of a subscription that one of the flush's reads runs
      *        into ({@see SlowConsumerException}) and read on, instead of ending the flush with it: for
      *        flush() and rtt(), which wait for a PONG of their own ({@see readIncomingForOperation()}), and
@@ -3733,14 +3742,14 @@ final class NatsConnection
      */
     private function flushWithin(
         float $deadline,
-        ?\Fiber $caller,
+        bool $issuedDuringRecovery,
         bool $reportOverflows,
         bool $reportHandlerFailures = false,
         bool $reportFailuresKeepingTheConnection = false,
     ): void {
         if ($this->state !== ConnectionState::Open) {
             try {
-                $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $caller);
+                $this->awaitOpenConnection($this->remainingBudgetCancellation($deadline), $issuedDuringRecovery);
             } catch (CancelledException) {
                 throw new TimeoutException('Flush timed out waiting for the connection to be re-established');
             }
@@ -3771,7 +3780,7 @@ final class NatsConnection
             // The socket is dead. The connection recovers within this flush's budget, and the flush fails
             // anyway, as when its PONG dies with the socket: what it was to confirm went to the dead one.
             try {
-                $this->recoverAfterFailedWrite($generation, $writeError, $this->remainingBudgetCancellation($deadline), $caller);
+                $this->recoverAfterFailedWrite($generation, $writeError, $this->remainingBudgetCancellation($deadline), $issuedDuringRecovery);
             } catch (CancelledException) {
                 throw new TimeoutException('Flush timed out waiting for the connection to be re-established');
             }
@@ -3784,7 +3793,7 @@ final class NatsConnection
             while (!$slot->isComplete()) {
                 $read = $this->readChunk(
                     $cancellation,
-                    \Fiber::getCurrent(),
+                    $this->operationIsIssuedDuringRecovery(),
                     $reportOverflows,
                     reportHandlerFailures: $reportHandlerFailures,
                     reportFailuresKeepingTheConnection: $reportFailuresKeepingTheConnection,
@@ -3878,7 +3887,7 @@ final class NatsConnection
      */
     public function readIncoming(?Cancellation $cancellation = null): Future
     {
-        return $this->readChunk($cancellation, \Fiber::getCurrent(), reportOverflows: false, continueStoppedSubscriptions: true);
+        return $this->readChunk($cancellation, $this->operationIsIssuedDuringRecovery(), reportOverflows: false, continueStoppedSubscriptions: true);
     }
 
     /**
@@ -3960,7 +3969,7 @@ final class NatsConnection
     {
         return $this->readChunk(
             $cancellation,
-            \Fiber::getCurrent(),
+            $this->operationIsIssuedDuringRecovery(),
             reportOverflows: $alwaysReport || !$this->options->slowConsumerErrorsFailOperations,
             ownSid: $ownSid,
             reportHandlerFailures: $alwaysReport || !$this->options->handlerErrorsFailOperations,
@@ -4048,7 +4057,7 @@ final class NatsConnection
     /**
      * The read behind {@see readIncoming()} and {@see readIncomingForOperation()}.
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that asked for the read.
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param bool $reportOverflows Report a full subscription queue the read runs into instead of throwing
      *        it, except one of $ownSid ({@see dispatchFrames()}).
      * @param int|null $ownSid The operation's own subscription ({@see readIncomingForOperation()}). What an earlier
@@ -4125,7 +4134,7 @@ final class NatsConnection
      */
     private function readChunk(
         ?Cancellation $cancellation,
-        ?\Fiber $caller,
+        bool $issuedDuringRecovery,
         bool $reportOverflows,
         ?int $ownSid = null,
         bool $reportHandlerFailures = false,
@@ -4144,7 +4153,7 @@ final class NatsConnection
             $wake = $this->wakeOnPong($pongSlot);
         }
 
-        return async(function () use ($cancellation, $caller, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake, $continueStoppedSubscriptions, $reportServerErrors): IncomingChunkResult {
+        return async(function () use ($cancellation, $issuedDuringRecovery, $reportOverflows, $ownSid, $reportHandlerFailures, $reportFailuresKeepingTheConnection, $deliverLeftovers, $pongSlot, $wake, $continueStoppedSubscriptions, $reportServerErrors): IncomingChunkResult {
             // What the read waits with: the caller's cancellation, and the operation's wake-up. Every wait below
             // subscribes to it before it suspends, and the checks before each wait run with no suspension between
             // them and the wait, so a wake-up that fires at any point either ends the wait or is seen by a check.
@@ -4160,7 +4169,7 @@ final class NatsConnection
                 // reader waiting here still never touches the new socket during the subscription
                 // replay window (#148).
                 try {
-                    $this->awaitOpenConnection($waitCancellation, $caller, acceptDraining: true);
+                    $this->awaitOpenConnection($waitCancellation, $issuedDuringRecovery, acceptDraining: true);
                 } catch (CancelledException $cancelled) {
                     // Delivered while the connection was down: by the reconnect's delivery of what it read, or by
                     // a delivery still under way when the connection dropped.
@@ -4199,7 +4208,7 @@ final class NatsConnection
                     break;
                 }
 
-                $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
+                $this->awaitOpenConnection($cancellation, $issuedDuringRecovery, acceptDraining: true);
             }
 
             // Your own read first continues the subscriptions whose delivery an earlier pass stopped at a handler
@@ -4219,7 +4228,7 @@ final class NatsConnection
                     break;
                 }
 
-                $this->awaitOpenConnection($cancellation, $caller, acceptDraining: true);
+                $this->awaitOpenConnection($cancellation, $issuedDuringRecovery, acceptDraining: true);
             }
 
             // An operation's read first takes what an earlier read has queued for the operation's own subscription
@@ -4241,6 +4250,18 @@ final class NatsConnection
 
             // Delivered by the reconnect waited for above, or by another fiber's read meanwhile.
             if (self::wokenUp($wake, $cancellation)) {
+                return new IncomingChunkResult(0, false);
+            }
+
+            // A listener can queue this read before the failover's fiber. Do not take the leaving socket.
+            // A close takes over that socket: drain reads still flush it under close-intent (#191/#213).
+            if (
+                !$this->closing
+                && $this->lameDuckFailover !== null
+                && $this->lameDuckFailover['generation'] === $this->connectionGeneration
+            ) {
+                $this->awaitLameDuckFailoverFrom($this->connectionGeneration, $cancellation, $wake);
+
                 return new IncomingChunkResult(0, false);
             }
 
@@ -4753,14 +4774,14 @@ final class NatsConnection
         ?int $timeoutMs = null,
         ?Cancellation $cancellation = null,
     ): Future {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($subject, $payload, $timeoutMs, $cancellation, $caller): NatsMessage {
+        return async(function () use ($subject, $payload, $timeoutMs, $cancellation, $issuedDuringRecovery): NatsMessage {
             // Cached: request targets repeat (unlike the per-request inbox, which is validated
             // uncached as publish()'s replyTo).
             $this->validateSubjectCached($subject);
 
-            return $this->requestInternal($subject, $payload, null, $timeoutMs, $cancellation, $caller);
+            return $this->requestInternal($subject, $payload, null, $timeoutMs, $cancellation, $issuedDuringRecovery);
         });
     }
 
@@ -4779,14 +4800,14 @@ final class NatsConnection
         ?int $timeoutMs = null,
         ?Cancellation $cancellation = null,
     ): Future {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($subject, $payload, $headers, $timeoutMs, $cancellation, $caller): NatsMessage {
+        return async(function () use ($subject, $payload, $headers, $timeoutMs, $cancellation, $issuedDuringRecovery): NatsMessage {
             // Cached: request targets repeat (unlike the per-request inbox, which is validated
             // uncached as publish()'s replyTo).
             $this->validateSubjectCached($subject);
 
-            return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation, $caller);
+            return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation, $issuedDuringRecovery);
         });
     }
 
@@ -4812,11 +4833,11 @@ final class NatsConnection
      * that joined it sets the inbox up itself, within its own budget, rather than fail with that request's timeout;
      * a failure that fails every request alike, a rejection or a closed connection, fails them all, as before.
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the request.
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      *
      * @throws CancelledException When $budget fires first.
      */
-    private function ensureMuxInbox(Cancellation $budget, ?\Fiber $caller): void
+    private function ensureMuxInbox(Cancellation $budget, bool $issuedDuringRecovery): void
     {
         // Another fiber is mid-establishment; join it instead of writing a second SUB. Checked before muxSid, which is
         // set from just before that SUB is written, while the write may still be under way. Its end is looked at as
@@ -4827,7 +4848,7 @@ final class NatsConnection
         }
 
         if ($this->muxSid === null) {
-            $this->setUpMuxInbox($budget, $caller);
+            $this->setUpMuxInbox($budget, $issuedDuringRecovery);
         }
     }
 
@@ -4835,11 +4856,11 @@ final class NatsConnection
      * The set-up {@see ensureMuxInbox()} makes when no other fiber is making one: subscribes "<base>.*" within the
      * request's budget, $budget, and completes the shared set-up others join ({@see $muxInboxSetup}).
      *
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that issued the request.
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      *
      * @throws CancelledException When $budget fires first.
      */
-    private function setUpMuxInbox(Cancellation $budget, ?\Fiber $caller): void
+    private function setUpMuxInbox(Cancellation $budget, bool $issuedDuringRecovery): void
     {
         $base = Inbox::generate($this->options->inboxPrefix);
         $generation = $this->muxGeneration;
@@ -4857,7 +4878,7 @@ final class NatsConnection
                 $base . '.*',
                 $this->dispatchMuxReply(...),
                 null,
-                $caller,
+                $issuedDuringRecovery,
                 function (int $sid) use ($base): void {
                     $this->muxBase = $base;
                     $this->muxSid = $sid;
@@ -5249,7 +5270,7 @@ final class NatsConnection
             try {
                 $read = $this->readChunk(
                     $budget,
-                    \Fiber::getCurrent(),
+                    $this->operationIsIssuedDuringRecovery(),
                     reportOverflows: !$this->options->slowConsumerErrorsFailOperations,
                     reportHandlerFailures: !$this->options->handlerErrorsFailOperations,
                     pongSlot: $this->muxFence,
@@ -5306,14 +5327,14 @@ final class NatsConnection
      * @param Cancellation $budget What the request waits with: its timeout, its caller's cancellation and $lifetime.
      * @param DeferredCancellation $lifetime The request lifetime of the connection the request was made on
      *        ({@see $requestLifetime}).
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @return int The {@see $muxGeneration} the request is sent on: when it changes, the mux was dropped.
      */
-    private function prepareRequest(string $subject, Cancellation $budget, ?Cancellation $cancellation, DeferredCancellation $lifetime, ?\Fiber $caller): int
+    private function prepareRequest(string $subject, Cancellation $budget, ?Cancellation $cancellation, DeferredCancellation $lifetime, bool $issuedDuringRecovery): int
     {
         if (!$this->isUsableForOperations(false, duringDrainDelivery: true)) {
             try {
-                $this->awaitOpenConnection($budget, $caller, duringDrainDelivery: true);
+                $this->awaitOpenConnection($budget, $issuedDuringRecovery, duringDrainDelivery: true);
             } catch (CancelledException) {
                 throw $this->requestNotSentFailure($subject, $cancellation, $lifetime, 'the connection to be re-established');
             }
@@ -5326,7 +5347,7 @@ final class NatsConnection
         $closes = $this->terminalCloses;
         $generation = $this->muxGeneration;
         try {
-            $this->ensureMuxInbox($budget, $caller);
+            $this->ensureMuxInbox($budget, $issuedDuringRecovery);
             // The server can answer the SUB before this request resumes from writing it, or from joining the
             // fiber that writes it.
             $this->throwUnlessMuxInstalled($closes, $generation, $lifetime);
@@ -5363,7 +5384,7 @@ final class NatsConnection
      * over writes nothing.
      *
      * @param array<string,string>|null $headers
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      */
     private function publishRequestWithin(
         string $subject,
@@ -5373,7 +5394,7 @@ final class NatsConnection
         Cancellation $budget,
         ?Cancellation $cancellation,
         DeferredCancellation $lifetime,
-        ?\Fiber $caller,
+        bool $issuedDuringRecovery,
         int $closes,
         int $muxGeneration,
     ): void {
@@ -5382,7 +5403,7 @@ final class NatsConnection
             $this->publishFrameWithin(
                 static fn(): array => [$frame, $payload],
                 $budget,
-                $caller,
+                $issuedDuringRecovery,
                 fn() => $this->throwUnlessMuxInstalled($closes, $muxGeneration, $lifetime),
                 duringDrainDelivery: true,
             );
@@ -5399,9 +5420,9 @@ final class NatsConnection
      */
     public function publishWithin(string $subject, \Closure $payload, string $replyTo, int $replySid, Cancellation $budget, \Closure $beforeWrite): Future
     {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($subject, $payload, $replyTo, $replySid, $budget, $beforeWrite, $caller): void {
+        return async(function () use ($subject, $payload, $replyTo, $replySid, $budget, $beforeWrite, $issuedDuringRecovery): void {
             try {
                 $this->publishFrameWithin(
                     function () use ($subject, $payload, $replyTo): ?array {
@@ -5410,7 +5431,7 @@ final class NatsConnection
                         return $body === null ? null : [$this->encodePublishFrame($subject, $body, null, $replyTo), $body];
                     },
                     $budget,
-                    $caller,
+                    $issuedDuringRecovery,
                     function () use ($replySid, $beforeWrite): void {
                         $beforeWrite();
                         if (!isset($this->subscriptionMeta[$replySid])) {
@@ -5426,19 +5447,19 @@ final class NatsConnection
 
     /**
      * @param \Closure():?array{string,string} $makeFrame
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @param \Closure():void $guard
      * @param bool $duringDrainDelivery Whether the frame may go out on a connection a drain() holds while that drain
      *        still delivers (a request's, #213). A write that fails on such a connection is not retried: close-intent
      *        forbids the reconnect, and {@see recoverAfterFailedWrite()} fails it, the drain closing the connection.
      */
-    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, ?\Fiber $caller, \Closure $guard, bool $duringDrainDelivery = false): void
+    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, bool $issuedDuringRecovery, \Closure $guard, bool $duringDrainDelivery = false): void
     {
         for ($attempt = 0; ; $attempt++) {
             $budget->throwIfRequested();
-            $write = async(function () use ($makeFrame, $budget, $caller, $guard, $duringDrainDelivery): ?array {
+            $write = async(function () use ($makeFrame, $budget, $issuedDuringRecovery, $guard, $duringDrainDelivery): ?array {
                 $budget->throwIfRequested();
-                $this->awaitOpenConnection($budget, $caller, duringDrainDelivery: $duringDrainDelivery);
+                $this->awaitOpenConnection($budget, $issuedDuringRecovery, duringDrainDelivery: $duringDrainDelivery);
                 $budget->throwIfRequested();
                 $guard();
                 $encoded = $makeFrame();
@@ -5476,7 +5497,7 @@ final class NatsConnection
                 throw $writeError;
             }
 
-            $this->recoverAfterFailedWrite($generation, $writeError, $budget, $caller, $duringDrainDelivery);
+            $this->recoverAfterFailedWrite($generation, $writeError, $budget, $issuedDuringRecovery, $duringDrainDelivery);
         }
     }
 
@@ -5492,7 +5513,7 @@ final class NatsConnection
      * open" wherever it waits, unless its reply is in already.
      *
      * @param array<string,string>|null $headers
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called request()/requestWithHeaders().
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      */
     private function requestInternal(
         string $subject,
@@ -5500,7 +5521,7 @@ final class NatsConnection
         ?array $headers,
         ?int $timeoutMs,
         ?Cancellation $cancellation,
-        ?\Fiber $caller = null,
+        bool $issuedDuringRecovery = false,
     ): NatsMessage {
         $deadlineMs = $timeoutMs ?? $this->options->requestTimeoutMs;
         if ($deadlineMs <= 0) {
@@ -5514,7 +5535,7 @@ final class NatsConnection
             ? new CompositeCancellation($timeoutCancellation, $lifetime->getCancellation())
             : new CompositeCancellation($cancellation, $timeoutCancellation, $lifetime->getCancellation());
 
-        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $lifetime, $caller);
+        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery);
         // The connection the request is sent on: a terminal close while the reply is awaited ends the request at its
         // next look ({@see $terminalCloses}).
         $closes = $this->terminalCloses;
@@ -5549,7 +5570,7 @@ final class NatsConnection
         }, $replyArrived);
 
         try {
-            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $caller, $closes, $muxGeneration);
+            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
 
             while (true) {
                 // Completion is checked BEFORE the deadline so a reply delivered in the same tick the
@@ -5668,9 +5689,9 @@ final class NatsConnection
         ?int $stallMs = null,
         ?Cancellation $cancellation = null,
     ): Future {
-        $caller = \Fiber::getCurrent();
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
 
-        return async(function () use ($subject, $payload, $headers, $maxResponses, $totalTimeoutMs, $stallMs, $cancellation, $caller): array {
+        return async(function () use ($subject, $payload, $headers, $maxResponses, $totalTimeoutMs, $stallMs, $cancellation, $issuedDuringRecovery): array {
             // Cached: request targets repeat (unlike the per-request inbox, which is validated
             // uncached as publish()'s replyTo).
             $this->validateSubjectCached($subject);
@@ -5682,7 +5703,7 @@ final class NatsConnection
                 throw new \InvalidArgumentException('stallMs must be greater than zero when provided');
             }
 
-            return $this->requestManyInternal($subject, $payload, $headers, $maxResponses, $totalTimeoutMs, $stallMs, $cancellation, $caller);
+            return $this->requestManyInternal($subject, $payload, $headers, $maxResponses, $totalTimeoutMs, $stallMs, $cancellation, $issuedDuringRecovery);
         });
     }
 
@@ -5695,7 +5716,7 @@ final class NatsConnection
      * is returned, and nothing collected fails with "Connection is not open".
      *
      * @param array<string,string>|null $headers
-     * @param ?\Fiber<mixed, mixed, mixed, mixed> $caller The fiber that called requestMany().
+     * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
      * @return list<NatsMessage>
      */
     private function requestManyInternal(
@@ -5706,7 +5727,7 @@ final class NatsConnection
         ?int $totalTimeoutMs,
         ?int $stallMs,
         ?Cancellation $cancellation,
-        ?\Fiber $caller = null,
+        bool $issuedDuringRecovery = false,
     ): array {
         $totalMs = $totalTimeoutMs ?? $this->options->requestTimeoutMs;
         if ($totalMs <= 0) {
@@ -5721,7 +5742,7 @@ final class NatsConnection
             ? new CompositeCancellation($totalCancellation, $lifetime->getCancellation())
             : new CompositeCancellation($cancellation, $totalCancellation, $lifetime->getCancellation());
 
-        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $lifetime, $caller);
+        $muxGeneration = $this->prepareRequest($subject, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery);
         // As in requestInternal(): a terminal close while replies are awaited ends the collection at its next look.
         $closes = $this->terminalCloses;
         $token = $this->newMuxToken();
@@ -5770,7 +5791,7 @@ final class NatsConnection
         }, $replyWake);
 
         try {
-            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $caller, $closes, $muxGeneration);
+            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
 
             while (true) {
                 // The connection closed for good while replies were awaited (see requestInternal()): what was
@@ -8286,7 +8307,9 @@ final class NatsConnection
      * the connection of $generation, for a read with a wake-up that read on that connection ({@see readChunk()}),
      * once it has delivered its chunk. Waits for recovery completion rather than announcement/delivery completion
      * (#202): whether its own dispatch started the failover or another fiber's read of the
-     * same connection did, that connection is being left. Returns at once when no such failover is under way.
+     * same connection did, that connection is being left. Also used before a queued read takes the read slot (#203),
+     * with an optional wake-up: a listener can queue that read ahead of the failover's fiber, while the connection
+     * is still Open. Returns at once when no such failover is under way.
      *
      * Only within the operation's own wait, as the read waits for a reconnect its failed read starts
      * ({@see recoverAfterFailedOperationRead()}, #178): the deadline ends the wait with the caller's cancellation,
@@ -8305,13 +8328,13 @@ final class NatsConnection
      *
      * @param int $generation The {@see $connectionGeneration} the read read on.
      * @param Cancellation|null $cancellation The caller's cancellation: the operation's deadline.
-     * @param Cancellation $wake The read's wake-up.
+     * @param Cancellation|null $wake The read's optional wake-up.
      *
      * @throws CancelledException When the deadline ends the wait: the caller's own exception.
      * @throws ConnectionException At once when waiting for a reconnect is disabled, unless the wait has already ended
      *         or the connection has been replaced.
      */
-    private function awaitLameDuckFailoverFrom(int $generation, ?Cancellation $cancellation, Cancellation $wake): void
+    private function awaitLameDuckFailoverFrom(int $generation, ?Cancellation $cancellation, ?Cancellation $wake): void
     {
         $started = $this->lameDuckFailover;
         if ($started === null || $started['generation'] !== $generation) {

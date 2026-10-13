@@ -524,7 +524,7 @@ final class NatsConnectionInternalsTest extends TestCase
         $this->setPrivate($connection, 'reconnecting', $first);
 
         $waiter = async(function () use ($connection): void {
-            $this->invokePrivate($connection, 'awaitOpenConnection', null, null);
+            $this->invokePrivate($connection, 'awaitOpenConnection', null, false);
         });
         delay(0.01);
 
