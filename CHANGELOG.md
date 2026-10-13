@@ -15,6 +15,38 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` An operation a `DiscoveredServers` or `LameDuck` listener started and did not await failed at once or read
+  the leaving socket, depending on which read brought the lame-duck `INFO` (#203). When your own read brought it, the
+  failover ran inline in the listener's fiber, which became the recovery fiber, and every operation called from that
+  fiber was taken for one issued inside the recovery, which the #145 guard refuses: a `request()`, a
+  `processIncoming()`, `connect()`, `drain()` and the rest failed with `Connection is not open` although nothing
+  inside the recovery awaited them (a queued `drain()` hit the same false self-join rejection). Each operation now records
+  when it is called whether it is issued inside the recovery, and only then is refused; one issued before waits for
+  the failover within its own timeout and runs on the new server. When an operation's read brought the `INFO`, the
+  failover started in a fiber of its own after the listener returned, and a `processIncoming()` the listener started
+  read the leaving socket first: the client's own close of it was reported as `Socket closed by peer (EOF)`. A read
+  made while such a failover is leaving the connection now waits for the failover's completion (#202's boundary,
+  not the `Reconnected` listener) within its cancellation and wake-up, and returns 0 without reading either socket;
+  `waitForReconnect: false` refuses it at once, a mark for an older connection does not hold up the new one, and a
+  drain's flush still reads the connection it drains. Timeouts, cancellations, event order and exception messages are
+  unchanged. Not changed: the failover still starts once these listeners return, so an operation a listener awaits
+  runs on the leaving server; and a listener inside a recovery that awaits a future kept from before it, whose
+  operation waits for that recovery, still waits with it (a `request()` until its timeout). Found by the review of
+  #191 (2.21.0).
+
+### Testing & CI
+
+- `[docs]` New `ListenerOperationFailoverTest` (53 cases, #203): side operations started from both listeners on both
+  failover paths, directly and wrapped in `async()`; the ten other entry points, `connect()` and `drain()` included;
+  waiting disabled; a side request's and a side read's own cancellation and deadline while the failover's dial is held;
+  a side read returning while the `Reconnected` listener is held. 37 of them fail on 2.26.3.
+  `NatsConnectionInternalsTest::testAwaitOpenConnectionWaitsAgainWhenAnotherReconnectFollows` passes `false` for the
+  operation's provenance, the new second argument of `awaitOpenConnection()`.
+
 ## [2.26.3] - 2026-10-13
 
 ### Upgrade notes
