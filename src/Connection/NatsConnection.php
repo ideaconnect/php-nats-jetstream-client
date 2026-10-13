@@ -151,6 +151,8 @@ final class NatsConnection
      * @var array<int, true>
      */
     private array $stoppedByAFailure = [];
+    /** Application reads share this one-shot wake-up while waiting for the socket or its read slot (#199). */
+    private ?DeferredCancellation $stoppedSubscriptionWake = null;
     /**
      * Muxed request inbox base subject for the current connection epoch (e.g. "_INBOX.<24hex>"), null
      * until the first request establishes it. One long-lived wildcard subscription "<base>.*" serves
@@ -3866,8 +3868,10 @@ final class NatsConnection
      * another fiber's handler that awaits, unless a handler failure had already stopped one of them, which is then
      * continued whole, in order, the messages the held-up delivery brought for it included; the others wait for
      * that delivery, which goes on once the handler returns. A read already waiting on the socket, or for another
-     * fiber's read, is not woken when another fiber's read stops a subscription meanwhile: that remainder waits for
-     * your next read, or for any read that receives something.
+     * fiber's read, is woken when another fiber's read stops a subscription meanwhile, and returns no frames and no
+     * bytes consumed: your next read continues that subscription before it reads, and throws its next handler failure
+     * if there is one (#199). Keep reading after both an exception and a zero-frame result. It used to stay waiting,
+     * the remainder with it, until the server's next bytes or the read's own cancellation.
      *
      * A frame that ends the connection - a fatal -ERR, which the server sends right before it closes the
      * socket, or a PONG the socket would not take - recovers it before its error reaches the caller: with
@@ -3978,6 +3982,24 @@ final class NatsConnection
             wake: $wake,
             reportServerErrors: $reportServerErrors,
         );
+    }
+
+    /** The next stop wakes application reads already waiting, not the read that continues it first (#199). */
+    private function nextStoppedSubscription(): Cancellation
+    {
+        return ($this->stoppedSubscriptionWake ??= new DeferredCancellation())->getCancellation();
+    }
+
+    /** Remove before firing: a later application read must never take an already-fired wake-up. */
+    private function wakeReadsContinuingStoppedSubscriptions(): void
+    {
+        $wake = $this->stoppedSubscriptionWake;
+        if ($wake === null) {
+            return;
+        }
+
+        $this->stoppedSubscriptionWake = null;
+        $wake->cancel();
     }
 
     /**
@@ -4096,6 +4118,9 @@ final class NatsConnection
      *        handler failure had already stopped one of them, which is continued whole, the messages that delivery
      *        brought for it included. With the read's own rules, so that a handler that throws there ends the read
      *        without reading; otherwise the read goes on as it would have, and its result counts only what it read.
+     *        Its wait for the read slot or on the socket also ends when another fiber's read stops a subscription
+     *        meanwhile ({@see wakeReadsContinuingStoppedSubscriptions()}, #199), the read then returning no frames, so
+     *        that the next one continues it. Only those two waits: not a recovery the read runs or joins.
      *        Not what a disconnect() already under way when the read starts is to discard
      *        ({@see leftoversBelongToAClose()}): a pass already running when one begins goes on. Not for an
      *        operation's read, which reports the other subscriptions' failures and takes its own subscription's
@@ -4265,6 +4290,11 @@ final class NatsConnection
                 return new IncomingChunkResult(0, false);
             }
 
+            // Take this only after continuation, with no suspension before waiting. Keep it separate from
+            // $wake: that one also chooses operation recovery/failover semantics (#178, #191, #195).
+            $stoppedWake = $continueStoppedSubscriptions ? $this->nextStoppedSubscription() : null;
+            $readWaitCancellation = self::waitWith($waitCancellation, $stoppedWake);
+
             if ($this->readInProgress) {
                 // Another fiber owns the socket read - a request waiting for its reply, the heartbeat, a
                 // flush - and the transport allows one read at a time. Wait for that read to finish,
@@ -4275,9 +4305,9 @@ final class NatsConnection
                 // too: what that read delivers can be all the operation waits for, and the read can go on
                 // for a long time after, in a handler that awaits.
                 try {
-                    $this->readSlotReleased->getFuture()->await($waitCancellation);
+                    $this->readSlotReleased->getFuture()->await($readWaitCancellation);
                 } catch (CancelledException $cancelled) {
-                    if (!self::wokenUp($wake, $cancellation)) {
+                    if (!self::wokenUp($wake, $cancellation) && !self::wokenUp($stoppedWake, $cancellation)) {
                         $cancellation?->throwIfRequested();
 
                         throw $cancelled;
@@ -4306,9 +4336,9 @@ final class NatsConnection
 
             $readError = null;
             try {
-                $chunk = $this->transport->readLine($waitCancellation)->await();
+                $chunk = $this->transport->readLine($readWaitCancellation)->await();
             } catch (CancelledException $cancelledException) {
-                if (!self::wokenUp($wake, $cancellation)) {
+                if (!self::wokenUp($wake, $cancellation) && !self::wokenUp($stoppedWake, $cancellation)) {
                     $cancellation?->throwIfRequested();
 
                     throw $cancelledException;
@@ -4322,6 +4352,11 @@ final class NatsConnection
                 $readError = $e;
                 $chunk = '';
             } finally {
+                // These belong only to the read wait. Release their subscriptions before recovery can suspend
+                // or dispatch can fire the stop signal, including when the transport read failed.
+                $readWaitCancellation = null;
+                $stoppedWake = null;
+
                 // Released before a failed read recovers below. The recovery runs listeners and delivers
                 // what arrived meanwhile, and a read issued from any of them, or parked behind this one,
                 // must not wait for this read, which cannot end before the recovery does. No reader can
@@ -8592,6 +8627,7 @@ final class NatsConnection
                         // messages are still delivered.
                         $heldFailures[] = $overflow;
                         $this->stoppedByAFailure[$sid] = true;
+                        $this->wakeReadsContinuingStoppedSubscriptions();
 
                         break;
                     } else {
@@ -8610,6 +8646,7 @@ final class NatsConnection
                         // is left.
                         $heldFailures[] = $handlerFailure;
                         $this->stoppedByAFailure[$sid] = true;
+                        $this->wakeReadsContinuingStoppedSubscriptions();
 
                         break;
                     } else {

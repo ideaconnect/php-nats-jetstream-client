@@ -602,16 +602,14 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
     }
 
     /**
-     * A boundary that readIncoming() documents, pinned so that a change to it is made on purpose (#186): your read
-     * already waiting on the socket is not woken when another fiber's read stops a subscription meanwhile, and that
-     * remainder waits for the server's next bytes. Read A brings r1, s1 and s2 and is held up in r's handler; your
-     * read B, made meanwhile, finds nothing stopped yet and takes the socket; once r's handler returns, A stops "s" at
-     * s1, with s2 queued, and throws. B still waits, s2 with it, until the server sends a PING, which B reads and
-     * delivers s2 with. Decided by the order of events: s2 is still queued once A has thrown, and B returns the PING's
-     * frame. The code before #186 did the same. A read woken by the stop would return without reading, s2 left to
-     * the next read.
+     * Your read already waiting on the socket is woken when another fiber's read stops a subscription meanwhile (#199),
+     * where #186 left it waiting for the server's next bytes. Read A brings r1, s1 and s2 and is held up in r's handler;
+     * your read B, made meanwhile, finds nothing stopped yet and takes the socket; once r's handler returns, A stops "s"
+     * at s1, with s2 queued, and throws. B then returns 0 without reading, before any server bytes, and your next read
+     * continues s2 and reads the server's PING. Decided by the order of events. Up to 2.26.x B waited, s2 with it, until
+     * the server sent that PING (this test pinned that boundary).
      */
-    public function testAMarkSetWhileYourOtherReadWaitsOnTheSocketWaitsForTheServersNextBytes(): void
+    public function testAMarkSetWhileYourOtherReadWaitsOnTheSocketWakesItBeforeTheServersNextBytes(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
@@ -662,11 +660,11 @@ final class HandlerFailureInYourOwnReadTest extends TestCase
         }
 
         self::assertSame(['r:r1', 's:s1'], $seen, 's2 is still queued');
-        self::assertFalse($readB->isComplete(), 'B still waits on the socket');
+        self::assertSame(0, $readB->await(new TimeoutCancellation(2)), 'B wakes without reading');
 
         // The server's next bytes: B reads them and delivers s2 with them.
         $transport->pushFrame("PING\r\n");
-        self::assertSame(1, $readB->await(), "B read the server's PING");
+        self::assertSame(1, $client->processIncoming()->await(), "The next read continues s2 and reads the server's PING");
         self::assertSame(['r:r1', 's:s1', 's:s2'], $seen);
         self::assertSame([], $recorder->errors);
     }
