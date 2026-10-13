@@ -52,7 +52,9 @@ use function Amp\Socket\listen;
  *    connection's parser.
  *  - The wake-up is only a reason to look again. It belongs to the operation's own subscription, or to its own reply,
  *    so nothing else ends the read; one that finds nothing costs one more look; and an idle operation never wakes.
- *  - Application reads have none.
+ *  - Application reads have no such wake-up for a result. Their only one ends their wait when another fiber's read
+ *    stops a subscription at a handler failure (#199, StoppedSubscriptionReadWakeupTest), so that the next read
+ *    continues it; it never changes how they recover.
  *  - It fires once and is never reset, so no later state can match the one a read started from.
  */
 final class ReadWakeupTest extends TestCase

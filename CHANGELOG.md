@@ -15,6 +15,34 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.26.5] - 2026-10-13
+
+### Fixed
+
+- `[bugfix]` Your own read already waiting - `processIncoming()` or `readIncoming()` on the socket, or for the read
+  slot - is woken when another fiber's read stops a subscription at a handler failure, and returns zero frames (#199).
+  Since 2.20.0 (#186) your read continues such a subscription before it reads, but only once, at its start: one
+  already waiting stayed waiting, so the rest of that subscription waited for the server's next bytes (on an idle
+  connection its next `PING`, two minutes away by default) or for the read's own cancellation. It takes two of your
+  reads at once, or an operation under `handlerErrorsFailOperations: true` whose read is held up in a handler that
+  awaits while your read loop waits. A stop now fires a one-shot, connection-level wake-up that only your reads'
+  slot wait and socket read take, right before they wait: a woken read returns `IncomingChunkResult(0, false)` (0 from
+  `processIncoming()`), its transport read cancelled with nothing consumed, and your next call continues the stopped
+  subscription before it reads, throwing its next handler failure if there is one. Keep reading after both an
+  exception and a zero-frame result. Your cancellation still wins when both fire, with its own reason; operations'
+  reads, recovery and failover are unchanged, and a fired wake-up is never reused, so an idle loop does not spin. This
+  was a documented boundary of #186 (`readIncoming()`'s docblock), now removed. Found by the interleavings review of
+  #186 (2.20.0).
+
+### Testing & CI
+
+- `[docs]` New `StoppedSubscriptionReadWakeupTest` (19 cases, #199): your read on the socket or waiting for the slot
+  woken by a stop from your own held-up read or a poll, by a handler failure or an escaped overflow, through both read
+  APIs; an unrelated operation keeping the socket; both of your waiters woken by one stop; no reuse of a fired wake-up;
+  your cancellation's reason winning in either firing order; the default reporting mode not waking your read. 12 fail
+  on 2.26.3. `HandlerFailureInYourOwnReadTest::testAMarkSetWhileYourOtherReadWaitsOnTheSocketWaitsForTheServersNextBytes`,
+  which pinned the old boundary, becomes `testAMarkSetWhileYourOtherReadWaitsOnTheSocketWakesItBeforeTheServersNextBytes`.
+
 ## [2.26.4] - 2026-10-13
 
 ### Fixed

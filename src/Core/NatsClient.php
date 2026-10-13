@@ -451,6 +451,8 @@ final class NatsClient
      * earlier read stopped at a handler that threw, and throws the next such failure without reading (#186);
      * the count is still of the frames it read. The cancellation bounds the read's waits, not that delivery: a
      * read whose cancellation has already fired still makes it, then throws ({@see NatsConnection::readIncoming()}).
+     * A read already waiting when another fiber's read stops a subscription that way wakes and returns 0, so that
+     * your next read continues it (#199): keep reading after both an exception and a zero-frame result.
      *
      * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read.
      * @return Future<int>
@@ -466,7 +468,8 @@ final class NatsClient
      * skip its 1 ms idle sleep on partial-frame progress (a large payload arriving in socket-sized
      * chunks) and yield only on a genuinely idle read (#119). {@see processIncoming()} is the
      * frame-count-only view of the same cycle, and waits for another fiber's read, and continues the
-     * subscriptions an earlier read stopped at a handler that threw, the same way.
+     * subscriptions an earlier read stopped at a handler that threw, the same way, waking with no frames and no
+     * bytes consumed when another fiber's read stops one while it waits (#199).
      *
      * @param Cancellation|null $cancellation Optional token that cancels the underlying socket read.
      * @return Future<IncomingChunkResult>
