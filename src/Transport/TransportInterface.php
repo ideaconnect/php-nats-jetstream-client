@@ -56,6 +56,11 @@ interface TransportInterface
      * The connection cancels a read not only at a deadline but also to wake an operation whose result
      * another fiber delivered meanwhile, and then reads on (#174).
      *
+     * A read belongs to the connection it started on. Implementations should end pending reads
+     * when close() ends that connection, and must not mix bytes from different connections in a
+     * returned chunk. New connects start with fresh read buffers. The connection layer also
+     * isolates a custom transport's late old-connection read completion (#205).
+     *
      * @return Future<string>
      */
     public function readLine(?Cancellation $cancellation = null): Future;

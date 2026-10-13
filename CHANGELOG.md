@@ -15,6 +15,33 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A chunk a custom transport hands over after the connection its read started on was replaced, or closed,
+  is parsed with that connection's parser and dispatched as that connection's (#205). The read used to push it into
+  the parser that was current when it returned, the new connection's, and dispatch it as the new connection's: the old
+  server's `PING` was answered there, its `PONG` or a late reply could confirm the new connection's reply inbox, its
+  `INFO` replaced the new server's info, and a partial frame left the new parser expecting payload, so the new server's
+  own `PING` was taken as payload and never answered. `readChunk()` and the heartbeat's read now capture the parser,
+  the connection generation and the terminal-close count before they read, and `dispatchFrames()` takes that origin, so
+  the #182 rule for the old server's frames covers the whole chunk: its messages go to the subscriptions the reconnect
+  replayed, its control frames are not applied, its `-ERR` is reported as the old server's. A corrupt late chunk still
+  reports its parse failure and delivers the messages ahead of it, but starts or joins no recovery of the new
+  connection, and a heartbeat tick whose connection was replaced while its `PING` was written does not read the new
+  socket. The built-in transports cannot complete a read that late (their `close()` ends it); the
+  `TransportInterface::readLine()` docblock now says a read belongs to the connection it started on. Found by the
+  review of #191.
+
+### Testing & CI
+
+- `[docs]` New `LateTransportReadTest` (35 cases, #205), over a transport that holds a read's chunk across a
+  reconnect: through your read, an operation's and the heartbeat's (with and without its tick's generation), a late
+  `PING` and half `MSG`, a late chunk finishing the old parser's message, a late `PONG` or reply not confirming the new
+  inbox, a late `INFO` and `-ERR`, a late corrupt chunk, a terminal close alone, an unchanged connection (guard), a
+  corrupt late chunk not joining the new connection's recovery, and an obsolete heartbeat tick. 31 fail on 2.26.5.
+
 ## [2.26.6] - 2026-10-13
 
 ### Fixed
