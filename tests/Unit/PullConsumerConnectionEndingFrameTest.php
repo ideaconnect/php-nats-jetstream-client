@@ -718,32 +718,35 @@ final class PullConsumerConnectionEndingFrameTest extends TestCase
     }
 
     /**
-     * Guard, passes on both: a failure of the read that leaves the connection open still ends an infinite run, whatever
-     * the options: an -ERR the server keeps the connection open for ('Invalid Publish Subject', #209) fails the read, and
-     * the run hands over m-1, which its pull held, and throws that error, the connection Open with nothing reconnected
-     * and nothing reported. Only a frame that ended the connection lets the run go on.
+     * A nonfatal server -ERR is reported without retiring a partial pull or ending the run (#209).
+     * The former guard asserted the behavior this issue corrects.
      */
-    public function testAnErrKeepingTheConnectionOpenStillEndsTheRun(): void
+    public function testAnErrKeepingTheConnectionOpenIsReportedAndTheRunContinues(): void
     {
         [$transport, $watched, $client, $recorder] = $this->client();
         $server = $this->pullServer($transport, self::answerOnTheNewConnection(true, 'm-2'));
         $handled = self::payloadLog();
-        $run = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000)
-            ->handle(static function (NatsMessage $message) use ($handled): void {
-                $handled[] = $message->payload;
-            });
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(1)->setExpiresMs(30_000);
+        $run = $this->resources()->ownOperation($iterator->handle(static function (NatsMessage $message) use ($handled, $iterator): void {
+            $handled[] = $message->payload;
+            if ($message->payload === 'm-3') {
+                $iterator->stop();
+            }
+        }), $iterator->stop(...), 'pull consumer run');
         $this->waitUntil(static fn(): bool => $server->sid !== null && $watched->readsUnderWay === 1);
         $this->sendEachInAReadOfItsOwn($transport, $watched, $server, ['m-1']);
 
         $transport->pushFrame("-ERR 'Invalid Publish Subject'\r\n");
-        [, $error] = self::settle($run);
-
-        self::assertInstanceOf(ConnectionException::class, $error, sprintf('handle() threw %s', self::describe($error)));
-        self::assertSame("Server sent error frame: 'Invalid Publish Subject'", $error->getMessage());
-        self::assertSame(['m-1'], $handled->getArrayCopy());
+        $this->waitUntil(static fn(): bool => $run->isComplete() || $recorder->errors !== []);
+        self::assertFalse($run->isComplete());
+        self::assertSame([], $handled->getArrayCopy(), 'the partial batch is still held');
+        $transport->pushFrame(self::messages((int) $server->sid, 'm-2', 'm-3'));
+        self::assertSame(3, $run->await(new TimeoutCancellation(2)));
+        self::assertSame(['m-1', 'm-2', 'm-3'], $handled->getArrayCopy());
         self::assertSame(ConnectionState::Open, $client->state());
         self::assertSame(0, $client->statistics()->reconnects);
-        self::assertSame([], $recorder->errors);
+        self::assertSame(["Server sent error frame: 'Invalid Publish Subject'"], $recorder->errors);
+        self::assertSame([0], $server->epochs, 'no reconnect or extra pull');
     }
 
     /**

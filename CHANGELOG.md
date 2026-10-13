@@ -15,6 +15,49 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.26.3] - 2026-10-13
+
+### Upgrade notes
+
+- A pull consumer run (`pullConsumer()->handle()`, finite or infinite) no longer ends when its read meets an `-ERR` the
+  server keeps the connection open for (`maximum subscriptions exceeded`, `Invalid Publish Subject`, a `Permissions
+  Violation` such as `... for Publish with Reply of ...`): it reports it to the `errorListener` and the logger and
+  goes on (#209). Code that restarted a run after `handle()` threw `ConnectionException: Server sent error frame: ...`
+  for such an `-ERR` will no longer see it there; watch the error listener instead. The run's own reply inbox rejected
+  still fails `handle()`, now always with the `JetStreamException` naming the inbox.
+
+### Fixed
+
+- `[bugfix]` A pull consumer run ended when its read met an `-ERR` the server keeps the connection open for, such as
+  `maximum subscriptions exceeded` for an application's `subscribe()` beyond the subscription limit, a Key/Value
+  watch or the shared reply inbox of a first `request()` (#209). The run's only `SUB` is its guarded reply inbox,
+  whose rejection is tied to it in the dispatch whichever read meets it, and a denied `PUB` of the run draws a
+  recoverable `-ERR`, so such an `-ERR` was never the run's: it ended the run, an infinite one too, with an error
+  naming neither the consumer nor the `SUB` it answered, after handing over what the pulls held. The engine's read
+  now reports it to the `errorListener` and the logger (`NATS connection error: Server sent error frame: ...`) and
+  the run goes on, its partial batch kept, in finite and infinite mode alike, as a service's `run()` does. The
+  report is queued where the `-ERR` is classified and sent once the chunk is dispatched, so another subscription's
+  handler failure under `handlerErrorsFailOperations` or an overflow under `slowConsumerErrorsFailOperations` in
+  the same chunk still ends the run, also from the parsed prefix of a chunk that fails to parse, and a fatal `-ERR`
+  keeps its rules. When the run's own read met the limit `-ERR` that rejected its own inbox, `handle()` used to
+  fail with that bare `ConnectionException`; it now fails with the `JetStreamException` naming the inbox, as README
+  said. Requests, fetches, batched Direct Get, queue polls and your own reads keep failing on such an `-ERR`. An
+  internal `reportServerErrors` flag on `readIncomingForOperation()` carries this; `alwaysReport` would also have
+  reported handler failures and overflows regardless of the options and delivered other subscriptions' leftovers.
+  Found by the review of #197 (2.22.0).
+
+### Testing & CI
+
+- `[docs]` New `PullConsumerServerErrorTest` (27 cases, #209) and `OperationServerErrorReportingTest` (17 cases): an
+  unrelated nonfatal `-ERR` reported while the run's partial batch is kept, finite and infinite; an application's
+  `subscribe()` beyond the limit next to a running consumer; the run's own inbox rejection with the
+  `JetStreamException`; a configured handler or overflow failure, or a fatal `-ERR`, in the same chunk still ending
+  the run; the flag's opt-in, policy, ordering, observer and fatal-precedence rules.
+  `PullConsumerConnectionEndingFrameTest::testAnErrKeepingTheConnectionOpenStillEndsTheRun`, the guard of the old
+  behaviour, is replaced by `testAnErrKeepingTheConnectionOpenIsReportedAndTheRunContinues`;
+  `ServerErrorKeepingConnectionTest::testAnOperationsReadLeavesTheRemainderToYourNextRead` gains a row for a read
+  with the new flag, which, unlike a serving loop's, delivers no other subscription's leftovers.
+
 ## [2.26.2] - 2026-10-12
 
 ### Fixed
