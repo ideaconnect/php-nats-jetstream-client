@@ -24,6 +24,7 @@ use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\NatsThrowable;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\SlowConsumerException;
+use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Protocol\Enum\ProtocolFrameType;
 use IDCT\NATS\Protocol\ProtocolCodec;
@@ -3023,7 +3024,8 @@ final class NatsConnection
      * rejected the subscription while the subscribe waited - the SUB write failed, the reconnect replayed the SUB,
      * and the new server rejected it, which dropped the registration - and the connection is open: then
      * {@see subscribeInternal()} reports a closed connection, and this says what happened instead, as
-     * {@see ensureMuxInbox()} does for the reply inbox, with $failure as the cause.
+     * {@see ensureMuxInbox()} does for the reply inbox, with $failure as the cause. A
+     * {@see SubscriptionLimitException} when the server rejected it for the subscription limit (#242).
      *
      * @param string|null $rejection The -ERR text the rejection handler recorded, or null while it recorded none.
      */
@@ -3034,7 +3036,7 @@ final class NatsConnection
         }
 
         if ($this->isSubscriptionLimitError($rejection)) {
-            return new ConnectionException(
+            return new SubscriptionLimitException(
                 sprintf(
                     'Subscribe to "%s" failed: the server may have rejected it because the connection is at its '
                     . 'subscription limit (maximum subscriptions exceeded)',
@@ -5248,11 +5250,12 @@ final class NatsConnection
     /**
      * The error of a request whose mux reply-inbox subscription the client dropped because the server may have
      * rejected it for the subscription limit ({@see dropUnconfirmedMux()}): no reply can come on it. Unlike the
-     * permissions rejection of {@see muxRejectedException()} this is not latched, since a slot can free up.
+     * permissions rejection of {@see muxRejectedException()} this is not latched, since a slot can free up. Typed for
+     * the limit (#242), like the -ERR itself.
      */
-    private function muxDroppedException(?\Throwable $previous = null): ConnectionException
+    private function muxDroppedException(?\Throwable $previous = null): SubscriptionLimitException
     {
-        return new ConnectionException(
+        return new SubscriptionLimitException(
             'request/reply failed: the server may have rejected the shared reply-inbox subscription "'
             . $this->options->inboxPrefix . '.<inbox>.*" because the connection is at its subscription limit '
             . '(maximum subscriptions exceeded). The next request subscribes it again.',
@@ -7304,7 +7307,8 @@ final class NatsConnection
                 return;
             }
 
-            if ($this->isSubscriptionLimitError($error)) {
+            $subscriptionLimit = $this->isSubscriptionLimitError($error);
+            if ($subscriptionLimit) {
                 // The -ERR names no subject: it rejects the SUB whose answer the server owed next, which is any SUB
                 // written with a PING behind it whose PONG has not arrived: the reply inbox's, and each guarded
                 // inbox's (#175). Both are dropped before the read fails or reports, so that whichever fiber's read
@@ -7317,7 +7321,10 @@ final class NatsConnection
                 $this->rejectUnconfirmedSubscriptions($error);
             }
 
-            $serverError = new ConnectionException('Server sent error frame: ' . $error);
+            // Typed by its reason only (#242): the server may still close the connection behind it.
+            $serverError = $subscriptionLimit
+                ? new SubscriptionLimitException('Server sent error frame: ' . $error)
+                : new ConnectionException('Server sent error frame: ' . $error);
             // Classify before dispatch chooses a failure to throw (#209). Nonfatal server errors reported
             // here cannot hide a configured overflow or handler failure from the same chunk. Reports are
             // emitted after dispatch queues the whole chunk, as for recoverable errors above.

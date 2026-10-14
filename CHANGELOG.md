@@ -15,6 +15,41 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Upgrade notes
+
+- A subscription-limit failure is now a `SubscriptionLimitException`. It extends `ConnectionException`, so every
+  `catch (ConnectionException)` and `catch (NatsThrowable)` still catches it, and its message is unchanged. Only code
+  that compares the exact class name, such as `$e::class === ConnectionException::class`, sees the difference.
+
+### Added
+
+- `[feature]` New `IDCT\NATS\Exception\SubscriptionLimitException`, a final subclass of `ConnectionException`, for the
+  connection's subscription limit (#242). A caller could recognise the server's `-ERR 'maximum subscriptions exceeded'`
+  only by matching exception text, since the one classifier, `NatsClient::isSubscriptionLimitError()`, is internal and
+  takes the bare `-ERR`. The client now builds the typed error wherever it built a plain `ConnectionException` for the
+  limit: the read that meets the `-ERR` (`Server sent error frame: ...`, thrown, or handed to the error listener by the
+  heartbeat, a reconnect's replay and the other reading loops that report it); a request whose shared reply inbox was
+  dropped for it; a pull fetch or batched Direct Get whose reply inbox was dropped for it; and a guarded subscribe
+  whose replayed `SUB` the new server rejected for it. The type tells the reason, not the connection's state: the
+  server sends the same `-ERR` when it refuses a `SUB` beyond the limit, keeping the connection open, and when an
+  account's limit is lowered below what the connection holds, closing the connection about 20 ms later. And since the
+  `-ERR` names no subscription, an error about a reply inbox still says the server may have rejected it. A pull
+  consumer run keeps failing with a `JetStreamException`; when the subscribe itself reported the rejection, the typed
+  error is its previous one. Other server errors keep the plain class. Asked for by
+  ideaconnect/symfony-nats-messenger#76, which turns the limit into Symfony's `TransportException` for its pulls.
+
+### Testing & CI
+
+- `[docs]` New `SubscriptionLimitExceptionTest` (6 cases, #242) over `SubscriptionLimitServer`: the operation whose read
+  meets the limit `-ERR` fails with the typed error, the heartbeat's read hands the listener the same type, the `-ERR`
+  of a server that closes the connection behind it is typed the same while the EOF still ends the connection, and three
+  other server errors keep the plain class (guards). `JetStreamInboxRejectionTest` and `MuxInboxRejectionTest` now
+  assert the type of every limit error they produce, the typed previous error of a fetch and a pull consumer run whose
+  replayed inbox was rejected, and the plain class of a permissions violation and a fatal `-ERR`;
+  `ExceptionHierarchyTest` asserts the new class is a `ConnectionException` and a `NatsThrowable`.
+
 ## [2.26.8] - 2026-10-13
 
 ### Fixed
