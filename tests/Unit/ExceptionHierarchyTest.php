@@ -9,6 +9,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\NatsThrowable;
 use IDCT\NATS\Exception\SlowConsumerException;
+use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Protocol\ProtocolCodec;
 use IDCT\NATS\Transport\TlsRequiredException;
 use IDCT\NATS\Transport\TransportClosedException;
@@ -40,6 +41,9 @@ final class ExceptionHierarchyTest extends TestCase
         self::assertInstanceOf(NatsThrowable::class, $this->asThrowable(new JetStreamException('x')));
         self::assertInstanceOf(NatsThrowable::class, $this->asThrowable(new SlowConsumerException(7)));
         self::assertInstanceOf(ConnectionException::class, $this->asThrowable(new SlowConsumerException(7)));
+        // #242: existing catch (ConnectionException) handlers still catch a subscription-limit failure.
+        self::assertInstanceOf(NatsThrowable::class, $this->asThrowable(new SubscriptionLimitException('x')));
+        self::assertInstanceOf(ConnectionException::class, $this->asThrowable(new SubscriptionLimitException('x')));
     }
 
     public function testTransportExceptionsImplementMarkerWhileRemainingRuntimeExceptions(): void

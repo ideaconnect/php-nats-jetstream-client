@@ -16,6 +16,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\CompletionHoldingTransport;
 use IDCT\NATS\Tests\Support\FakeTransport;
@@ -41,7 +42,9 @@ use function Amp\delay;
  * fiber, drops the inbox, writes its UNSUB and fails the operation at once with an error naming the inbox and the
  * limit; several inboxes unconfirmed at once, the shared reply inbox among them, are all treated as rejected. A
  * reconnect replays an inbox under the same rule, also one whose own SUB write failed, when the subscribe itself
- * reports the rejection.
+ * reports the rejection. Since #242 the limit errors are SubscriptionLimitException, a ConnectionException; the pull
+ * pipeline's stays a JetStreamException, with the subscribe's typed error as its previous one when there is one, and a
+ * permissions violation keeps the plain class.
  *
  * Over `tests/Support/SubscriptionLimitServer.php`, which enforces the limit and answers in wire order, with an
  * application loop as the other reader, or with the heartbeat as the other reader while the fetch's writer is held
@@ -150,7 +153,7 @@ final class JetStreamInboxRejectionTest extends TestCase
             [, $error] = self::settle($fetching);
             $elapsed = self::secondsSince($start);
 
-            self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s ended after %.3f s with %s', $fetch, $elapsed, self::describe($error)));
+            self::assertInstanceOf(SubscriptionLimitException::class, $error, sprintf('%s ended after %.3f s with %s', $fetch, $elapsed, self::describe($error)));
             self::assertStringContainsString(self::LIMIT, $error->getMessage());
             self::assertStringContainsString('"_INBOX.JS.FETCH.', $error->getMessage(), 'the error names the inbox');
             self::assertLessThan(1.0, $elapsed, sprintf('%s failed after %.3f s, with a 2 s expiry and 1 s of slack', $fetch, $elapsed));
@@ -192,7 +195,7 @@ final class JetStreamInboxRejectionTest extends TestCase
             [, $error] = self::settle(self::startOperation('fetchBatch', $client->jetStream()));
             $elapsed = self::secondsSince($start);
 
-            self::assertInstanceOf(ConnectionException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
+            self::assertInstanceOf(SubscriptionLimitException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
             self::assertStringContainsString(self::LIMIT, $error->getMessage());
             self::assertLessThan(1.0, $elapsed, sprintf('the fetch failed after %.3f s, with a 3 s deadline', $elapsed));
             self::assertNotSame([], self::messagesContaining($failures, 'maximum subscriptions exceeded'), "the loop's read met the -ERR");
@@ -230,7 +233,7 @@ final class JetStreamInboxRejectionTest extends TestCase
             [, $error] = self::settle(self::startOperation('directGetBatch', $client->jetStream()));
             $elapsed = self::secondsSince($start);
 
-            self::assertInstanceOf(ConnectionException::class, $error, sprintf('the Direct Get batch ended after %.3f s with %s', $elapsed, self::describe($error)));
+            self::assertInstanceOf(SubscriptionLimitException::class, $error, sprintf('the Direct Get batch ended after %.3f s with %s', $elapsed, self::describe($error)));
             self::assertStringContainsString(self::LIMIT, $error->getMessage());
             self::assertStringContainsString('Direct Get batch for stream "S" failed', $error->getMessage());
             self::assertStringContainsString('"_INBOX.JS.DGET.', $error->getMessage(), 'the error names the inbox');
@@ -308,7 +311,7 @@ final class JetStreamInboxRejectionTest extends TestCase
         [, $error] = self::settle(self::startOperation('fetchBatch', $client->jetStream()));
         $elapsed = self::secondsSince($start);
 
-        self::assertInstanceOf(ConnectionException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
+        self::assertInstanceOf(SubscriptionLimitException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
         self::assertStringContainsString(self::SERVER_ERR, $error->getMessage());
         self::assertLessThan(1.0, $elapsed);
         $sid = self::lastSidOf($server->controlLines('SUB _INBOX.JS.FETCH'));
@@ -421,9 +424,9 @@ final class JetStreamInboxRejectionTest extends TestCase
             [, $secondError] = self::settle($second);
             $elapsed = self::secondsSince($start);
 
-            self::assertInstanceOf(ConnectionException::class, $firstError, 'the first fetch ended with ' . self::describe($firstError));
+            self::assertInstanceOf(SubscriptionLimitException::class, $firstError, 'the first fetch ended with ' . self::describe($firstError));
             self::assertStringContainsString(self::LIMIT, $firstError->getMessage());
-            self::assertInstanceOf(ConnectionException::class, $secondError, 'the second fetch ended with ' . self::describe($secondError));
+            self::assertInstanceOf(SubscriptionLimitException::class, $secondError, 'the second fetch ended with ' . self::describe($secondError));
             self::assertStringContainsString(self::LIMIT, $secondError->getMessage());
             self::assertLessThan(1.0, $elapsed, sprintf('both fetches ended after %.3f s, with 3 s deadlines', $elapsed));
             self::assertCount(2, $server->controlLines('UNSUB'), 'both inboxes were unsubscribed');
@@ -467,9 +470,9 @@ final class JetStreamInboxRejectionTest extends TestCase
             [, $fetchError] = self::settle($fetching);
             $elapsed = self::secondsSince($start);
 
-            self::assertInstanceOf(ConnectionException::class, $requestError, 'the request ended with ' . self::describe($requestError));
+            self::assertInstanceOf(SubscriptionLimitException::class, $requestError, 'the request ended with ' . self::describe($requestError));
             self::assertStringContainsString(self::MUX_DROPPED, $requestError->getMessage());
-            self::assertInstanceOf(ConnectionException::class, $fetchError, 'the fetch ended with ' . self::describe($fetchError));
+            self::assertInstanceOf(SubscriptionLimitException::class, $fetchError, 'the fetch ended with ' . self::describe($fetchError));
             self::assertStringContainsString(self::LIMIT, $fetchError->getMessage());
             self::assertLessThan(1.0, $elapsed, sprintf('the request and the fetch ended after %.3f s, with 3 s deadlines', $elapsed));
         } finally {
@@ -546,6 +549,7 @@ final class JetStreamInboxRejectionTest extends TestCase
             $elapsed = self::secondsSince($start);
 
             self::assertInstanceOf(ConnectionException::class, $error, sprintf('%s ended after %.3f s with %s', $operation, $elapsed, self::describe($error)));
+            self::assertSame(ConnectionException::class, $error::class, 'a permissions violation is not the limit (#242)');
             self::assertStringContainsString('the server rejected its reply-inbox subscription "' . $prefix . '.', $error->getMessage());
             self::assertStringContainsString('Permissions Violation for Subscription to', $error->getMessage());
             self::assertLessThan(1.0, $elapsed, sprintf('%s failed after %.3f s, with a 3 s deadline', $operation, $elapsed));
@@ -585,7 +589,7 @@ final class JetStreamInboxRejectionTest extends TestCase
         [, $error] = self::settle($fetching);
         $elapsed = self::secondsSince($start);
 
-        self::assertInstanceOf(ConnectionException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
+        self::assertInstanceOf(SubscriptionLimitException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
         self::assertStringContainsString(self::LIMIT, $error->getMessage());
         self::assertLessThan(1.0, $elapsed, sprintf('the fetch failed after %.3f s, with a 3 s deadline', $elapsed));
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open);
@@ -633,10 +637,12 @@ final class JetStreamInboxRejectionTest extends TestCase
         [, $error] = self::settle($fetching);
         $elapsed = self::secondsSince($start);
 
-        self::assertInstanceOf(ConnectionException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
+        self::assertInstanceOf(SubscriptionLimitException::class, $error, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($error)));
         self::assertStringContainsString('JetStream pull fetch failed', $error->getMessage());
         self::assertStringContainsString(self::LIMIT, $error->getMessage());
         self::assertStringNotContainsString('the connection was closed', $error->getMessage());
+        self::assertInstanceOf(SubscriptionLimitException::class, $error->getPrevious(), 'the subscribe reported the rejection, typed (#242)');
+        self::assertStringContainsString('Subscribe to "_INBOX.JS.FETCH.', $error->getPrevious()->getMessage());
         self::assertLessThan(1.0, $elapsed, sprintf('the fetch failed after %.3f s', $elapsed));
         $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Open);
         self::assertSame(1, $server->epoch());
@@ -688,7 +694,7 @@ final class JetStreamInboxRejectionTest extends TestCase
         } catch (JetStreamException $e) {
             self::assertStringContainsString('Pull consumer reply inbox "_INBOX.JS.PULL.', $e->getMessage());
             self::assertStringContainsString('may have been rejected by the server because the connection is at its subscription limit', $e->getMessage());
-            self::assertInstanceOf(ConnectionException::class, $e->getPrevious(), 'the subscribe reported the rejection');
+            self::assertInstanceOf(SubscriptionLimitException::class, $e->getPrevious(), 'the subscribe reported the rejection, typed (#242)');
         }
         $elapsed = self::secondsSince($start);
 

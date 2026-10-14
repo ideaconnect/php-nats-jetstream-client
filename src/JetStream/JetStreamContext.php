@@ -18,6 +18,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
@@ -4690,10 +4691,11 @@ final class JetStreamContext
     /**
      * Fails a pull fetch or a Direct Get batch whose reply inbox the server rejected, or may have rejected, as
      * its rejection handler recorded ({@see NatsClient::subscribeGuarded()}, #175); nothing while it recorded
-     * none. For the subscription limit ({@see NatsClient::isSubscriptionLimitError()}) the error is worded like
-     * the one a request reports when the shared reply inbox is dropped: the -ERR names no subject, so the inbox
-     * may have been rejected, and a retry subscribes a new one. A permissions violation names the subject, and is
-     * quoted. Loud on purpose: an empty pull (a 408) would hide a rejected inbox as a routine timeout.
+     * none. For the subscription limit ({@see NatsClient::isSubscriptionLimitError()}) the error is a
+     * {@see SubscriptionLimitException} (#242), worded like the one a request reports when the shared reply inbox is
+     * dropped: the -ERR names no subject, so the inbox may have been rejected, and a retry subscribes a new one. A
+     * permissions violation names the subject, and is quoted. Loud on purpose: an empty pull (a 408) would hide a
+     * rejected inbox as a routine timeout.
      *
      * @param string $operation What fails, e.g. 'JetStream pull fetch'.
      * @param string|null $serverError The -ERR text the handler recorded, read in the operation's fiber right
@@ -4707,7 +4709,7 @@ final class JetStreamContext
         }
 
         if ($this->client->isSubscriptionLimitError($serverError)) {
-            throw new ConnectionException(
+            throw new SubscriptionLimitException(
                 $operation . ' failed: the server may have rejected its reply-inbox subscription "' . $inbox
                 . '" because the connection is at its subscription limit (maximum subscriptions exceeded). '
                 . 'A retry subscribes a new one.',
@@ -4728,7 +4730,9 @@ final class JetStreamContext
      * handler recorded: for the connection's subscription limit ({@see NatsClient::isSubscriptionLimitError()}),
      * where the -ERR names no subject and the inbox may have been rejected (#175), or for a permissions violation,
      * a configuration error (#167's pull twin). Surfaced through handle()'s future, mirroring request()'s
-     * fail-fast, instead of polling forever on an inbox no reply can reach.
+     * fail-fast, instead of polling forever on an inbox no reply can reach. A JetStreamException for the limit too,
+     * as it always was, not a {@see SubscriptionLimitException}: a run's failures stay JetStream errors, and the typed
+     * error the subscribe reported, when it did, is the previous one (#242).
      *
      * @param \Throwable|null $previous The error the subscribe itself reported the rejection with, when it did.
      */

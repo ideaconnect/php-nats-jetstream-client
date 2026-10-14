@@ -17,6 +17,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\SlowConsumerException;
+use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\HeldDrainParticipant;
 use IDCT\NATS\Tests\Support\LifecycleRecorder;
@@ -76,6 +77,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->request('svc.echo', 'one', 1_000)->await();
             self::fail('expected the request to fail: the server rejected its reply inbox');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertSame(self::LIMIT_ERROR, $e->getMessage());
         }
         self::assertSame(ConnectionState::Open, $connection->state());
@@ -99,6 +101,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->requestMany('svc.echo', 'one', null, 1, 1_000)->await();
             self::fail('expected the requestMany to fail: the server rejected its reply inbox');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertSame(self::LIMIT_ERROR, $e->getMessage());
         }
 
@@ -129,6 +132,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->request('svc.echo', 'two', 10_000)->await();
             self::fail('expected the second request to fail');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
             self::assertStringContainsString('(maximum subscriptions exceeded)', $e->getMessage());
         }
@@ -157,7 +161,7 @@ final class MuxInboxRejectionTest extends TestCase
             }
         }
 
-        self::assertSame(array_fill(0, 10, ConnectionException::class), $failures);
+        self::assertSame(array_fill(0, 10, SubscriptionLimitException::class), $failures, 'each a limit error, typed (#242)');
         self::assertCount(1, $server->controlLines('PUB svc.echo'), 'only the first attempt was sent');
         self::assertCount(10, self::muxInstallWrites($server), 'each attempt tried to subscribe the mux');
     }
@@ -185,6 +189,7 @@ final class MuxInboxRejectionTest extends TestCase
                 $connection->request('svc.echo', 'again', 1_000)->await();
                 self::fail('expected the request to fail while the limit holds');
             } catch (ConnectionException $e) {
+                self::assertInstanceOf(SubscriptionLimitException::class, $e);
                 self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
                 self::assertSame(self::LIMIT_ERROR, $e->getPrevious()?->getMessage());
             }
@@ -364,6 +369,7 @@ final class MuxInboxRejectionTest extends TestCase
             $request->await();
             self::fail('expected the request to fail');
         } catch (ConnectionException $e) {
+            self::assertSame(ConnectionException::class, $e::class, 'not the limit (#242)');
             self::assertSame("Server sent error frame: 'Stale Connection'", $e->getMessage());
         }
         self::assertSame(ConnectionState::Closed, $connection->state());
@@ -463,7 +469,7 @@ final class MuxInboxRejectionTest extends TestCase
 
         self::assertCount(2, $errors);
         foreach ($errors as $error) {
-            self::assertInstanceOf(ConnectionException::class, $error, $error::class . ': ' . $error->getMessage());
+            self::assertInstanceOf(SubscriptionLimitException::class, $error, $error::class . ': ' . $error->getMessage());
             self::assertStringContainsString('maximum subscriptions exceeded', $error->getMessage());
         }
         self::assertLessThan(1.0, self::secondsSince($start));
@@ -487,6 +493,7 @@ final class MuxInboxRejectionTest extends TestCase
                 $connection->request('svc.echo', 'one', 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
+                self::assertInstanceOf(SubscriptionLimitException::class, $e);
                 self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
             }
             self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
@@ -555,6 +562,7 @@ final class MuxInboxRejectionTest extends TestCase
                 $client->request('svc.echo', 'one', 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
+                self::assertInstanceOf(SubscriptionLimitException::class, $e);
                 self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
             }
             self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
@@ -826,6 +834,7 @@ final class MuxInboxRejectionTest extends TestCase
                 try {
                     self::assertSame('echo:hello', $request->await()->payload, sprintf('after %d hop(s)', $hops));
                 } catch (ConnectionException $e) {
+                    self::assertInstanceOf(SubscriptionLimitException::class, $e);
                     self::assertSame(self::LIMIT_ERROR, $e->getMessage(), sprintf('after %d hop(s): only its own read meeting the -ERR fails it', $hops));
                 }
                 self::assertCount(1, self::muxInstallWrites($server), sprintf('after %d hop(s): the mux was kept', $hops));
@@ -990,6 +999,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->processIncoming()->await();
             self::fail('expected the read to fail with the rejection');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertSame(self::LIMIT_ERROR, $e->getMessage());
         }
 
@@ -1051,6 +1061,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->request('svc.echo', 'one', 1_000)->await();
             self::fail('expected the request to fail: the -ERR came before the PONG behind its mux SUB');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertSame(self::LIMIT_ERROR, $e->getMessage());
         }
 
@@ -1384,6 +1395,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->request('svc.echo', 'one', 10_000)->await();
             self::fail('expected the request to fail');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertStringContainsString(self::MUX_DROPPED, $e->getMessage());
         }
         self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
@@ -1414,6 +1426,7 @@ final class MuxInboxRejectionTest extends TestCase
                 $connection->request('svc.echo', $payload, 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
+                self::assertSame(ConnectionException::class, $e::class, 'not the limit (#242)');
                 self::assertStringContainsString('was rejected by the server (permissions violation)', $e->getMessage());
             }
             self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
@@ -1443,6 +1456,7 @@ final class MuxInboxRejectionTest extends TestCase
                 $connection->request('svc.echo', 'one', 10_000)->await();
                 self::fail('expected the request to fail');
             } catch (ConnectionException $e) {
+                self::assertSame(ConnectionException::class, $e::class, 'not the limit (#242)');
                 self::assertStringContainsString('was rejected by the server (permissions violation)', $e->getMessage());
             }
             self::assertLessThan(2.0, self::secondsSince($start), 'it did not wait out its ten-second timeout');
@@ -1580,6 +1594,7 @@ final class MuxInboxRejectionTest extends TestCase
             $connection->request('svc.echo', 'one', 1_000)->await();
             self::fail('expected the request to fail: the server rejected its reply inbox');
         } catch (ConnectionException $e) {
+            self::assertInstanceOf(SubscriptionLimitException::class, $e);
             self::assertSame(self::LIMIT_ERROR, $e->getMessage());
         }
         $connection->unsubscribe($appSid)->await();
