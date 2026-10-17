@@ -298,6 +298,87 @@ final class PullConsumerPinRetentionTest extends TestCase
     }
 
     /**
+     * A single 423 makes the group acquire its next pin serially (#247). The run captures p1 on its first batch and fans
+     * out two pulls carrying it; the first gets a 423, which drops p1, and the second expires (408). One pull without an
+     * id goes out; receiving m-4 under p2 issues nothing more while that batch is incomplete, and once m-5 and m-6
+     * complete it, two pulls carrying p2 go out. In testPinRecaptureStaysSerialUntilItsFirstBatchRetires the second
+     * pull's own 423, finding p1 dropped already, makes the run acquire serially as well, so that a 423 that dropped the
+     * pin without restarting the serial acquisition went unnoticed (a mutant CI's Mutation job skips as too slow): the
+     * run then fanned out as soon as p2 arrived.
+     */
+    public function testASingle423MakesTheGroupAcquireItsNextPinSerially(): void
+    {
+        [$transport, $watched, $client, $server] = $this->client();
+        $iterator = $this->iterator($client);
+        $run = $this->startRun($iterator);
+        $this->waitUntil(static fn(): bool => count($server->requests) === 1 && $watched->readsUnderWay === 1);
+        $transport->pushFrame(
+            self::message($server->requests[0]['sid'], 'm-1', 'p1')
+            . self::message($server->requests[0]['sid'], 'm-2', 'p1')
+            . self::message($server->requests[0]['sid'], 'm-3', 'p1'),
+        );
+        $this->waitUntil(static fn(): bool => count($server->requests) === 3 && $watched->readsUnderWay === 1);
+        self::assertSame(['p1', 'p1'], [$server->requests[1]['payload']['id'] ?? null, $server->requests[2]['payload']['id'] ?? null]);
+        $transport->pushFrame(
+            self::pinStatusFrame($server->requests[1]['reply'], $server->requests[1]['sid'], 423)
+            . ReconnectingTransport::hmsgFrame($server->requests[2]['reply'], $server->requests[2]['sid'], "NATS/1.0 408 Request Timeout\r\n\r\n", ''),
+        );
+        $this->waitUntil(static fn(): bool => count($server->requests) === 4 && $watched->readsUnderWay === 1);
+        self::assertArrayNotHasKey('id', $server->requests[3]['payload']);
+        $this->sendAndWait($transport, $watched, self::message($server->requests[3]['sid'], 'm-4', 'p2'));
+        self::assertCount(4, $server->requests, 'remembering p2 must not fan out before its first batch retires');
+        $transport->pushFrame(
+            self::message($server->requests[3]['sid'], 'm-5', 'p2')
+            . self::message($server->requests[3]['sid'], 'm-6', 'p2'),
+        );
+        $this->waitUntil(static fn(): bool => count($server->requests) === 6 && $watched->readsUnderWay === 1);
+        self::assertSame(['p2', 'p2'], [$server->requests[4]['payload']['id'] ?? null, $server->requests[5]['payload']['id'] ?? null]);
+        $iterator->stop();
+        self::assertSame([6, null], self::settle($run));
+    }
+
+    /**
+     * A 423 delayed past a newer pin leaves the run's readiness alone (#247). A run that starts with p1 pipelines at
+     * once, two pulls carrying it. Another run's 423 clears p1, and that run is then served under p2. The first run's
+     * own 423 for its p1 request comes afterwards: p2 stays, and the run, ready since it inherited p1, keeps
+     * pipelining, its next pull, carrying p2, going out at once beside the p1 pull still in flight, where a group
+     * acquiring its pin waits for that pull. The #208 tests checked that the pin stays, not that the group keeps
+     * pipelining, so that such a 423 restarting the serial acquisition went unnoticed (a mutant CI's Mutation job skips
+     * as too slow).
+     */
+    public function testA423DelayedPastANewerPinKeepsTheGroupPipelining(): void
+    {
+        [$transport, $watched, $client, $server] = $this->client();
+        $iterator = $this->iterator($client)->setBatching(1)->setIterations(1);
+        $seed = $this->startRun($iterator);
+        $this->waitUntil(static fn(): bool => count($server->requests) === 1 && $watched->readsUnderWay === 1);
+        $transport->pushFrame(self::message($server->requests[0]['sid'], 'seed', 'p1'));
+        self::assertSame([1, null], self::settle($seed));
+
+        $iterator->setBatching(3)->setIterations(null);
+        $pipelining = $this->startRun($iterator);
+        $this->waitUntil(static fn(): bool => count($server->requests) === 3 && $watched->readsUnderWay === 1);
+        self::assertSame(['p1', 'p1'], [$server->requests[1]['payload']['id'] ?? null, $server->requests[2]['payload']['id'] ?? null]);
+
+        $iterator->setBatching(1)->setIterations(2);
+        $other = $this->startRun($iterator);
+        $this->waitUntil(static fn(): bool => count($server->requests) === 4);
+        $transport->pushFrame(self::pinStatusFrame($server->requests[3]['reply'], $server->requests[3]['sid'], 423));
+        $this->waitUntil(static fn(): bool => count($server->requests) === 5);
+        self::assertArrayNotHasKey('id', $server->requests[4]['payload']);
+        $transport->pushFrame(self::message($server->requests[4]['sid'], 'new', 'p2'));
+        self::assertSame([1, null], self::settle($other));
+
+        // The first run's 423 for its p1 request, delayed past p2.
+        $this->sendAndWait($transport, $watched, self::pinStatusFrame($server->requests[1]['reply'], $server->requests[1]['sid'], 423));
+        self::assertCount(6, $server->requests, 'the run keeps pipelining: its next pull goes out beside the one still in flight');
+        self::assertSame('p2', $server->requests[5]['payload']['id'] ?? null);
+        $iterator->stop();
+        self::assertSame([0, null], self::settle($pipelining));
+        self::assertSame('p2', $this->restartPin($iterator, $server));
+    }
+
+    /**
      * An older run holds a partial batch received under p1 when a newer run's 423 rejects p1. The older run's pull then
      * expires and its buffer is delivered: delivery must not take p1 from the buffered message again.
      */
