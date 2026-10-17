@@ -15,6 +15,38 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A pull status read in the same chunk as a frame that ends the connection reaches `onError` (#214). Since
+  2.23.0 (#210) an infinite run goes on past a fatal `-ERR` (`Stale Connection`, say) or a `PONG` the socket would
+  not take once the reconnect has reopened the connection, handing what its pulls held to the handler. The read that
+  meets the frame routes what its chunk brought before it throws, so a status from that chunk is on its pull by then,
+  and the pulls used to leave the run with it unread: a terminal `409 Consumer Deleted`, which nats-server sends every
+  waiting pull as the consumer goes and which a process blocked long enough to draw `Stale Connection` finds in the
+  socket next to the `-ERR`, never reached `onError`, and the run pulled on, on a deleted consumer meeting the
+  no-responders path (a 503, routine, reported once) and never ending. The same status read on its own, before an
+  EOF, ended the run. Now, once every pull's messages have gone to the handler, each pull that brought no message is
+  classified in issue order as the retire phase classifies an empty retire: a terminal status ends the run as it ends
+  it there (the inbox closed first, #211, then `onError` once, what the overflow holds handed over, the count
+  returned, no pull on the new connection), a `423` drops the pin the request sent (#208), the group acquiring its pin
+  serially again, and a routine status, or none, changes nothing. A pull that brought messages keeps its status
+  unclassified, as in the retire phase. Both paths share the classification (`isRoutineEmptyRetireOfAnInfiniteRun()`,
+  `dropsThePinA423Rejected()`) and the end on a terminal status (`reportTerminalStatus()`), so that they keep in step.
+  Found by the review of #210 (2.23.0).
+
+### Testing & CI
+
+- `[docs]` New `PullConsumerStatusInTheChunkOfAConnectionEndingFrameTest` (13 cases, #214) over `ReconnectingTransport`
+  seen through `WatchedTransport`: a 409 in the chunk of a fatal `-ERR`, with the reconnect done within the read and
+  outlasting its wait, reaches `onError` once and ends the run with no pull on the new connection; what the pulls held
+  goes to the handler before the status goes to `onError`, and what the overflow took during the hand-over after it; a
+  rejection of the inbox while the run closes it, or during that overflow's hand-over, ends the run with the
+  rejection; a 423 there makes the next pull go out without the pin and the group acquire its pin serially again; and,
+  as guards, a routine status (404, 408, `409 Leadership Change`, 503) leaves the run going, a pull that brought a
+  message keeps its 409 unclassified, and a `stop()` during the hand-over keeps its precedence. 7 fail on 2.27.1.
+
 ## [2.27.1] - 2026-10-17
 
 ### Upgrade notes
