@@ -30,6 +30,7 @@ use IDCT\NATS\JetStream\Consumers\PullOverflow;
 use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
 use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
 use IDCT\NATS\JetStream\Consumers\PullPipelineDrainParticipant;
+use IDCT\NATS\JetStream\Consumers\PullTerminalStatusOutcome;
 use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
 use IDCT\NATS\JetStream\Models\AccountInfo;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
@@ -2811,11 +2812,19 @@ final class JetStreamContext
      * the pull (#212), and the router gives what that pull receives to the run's open pulls, in issue order, and what
      * none of them has room for to the overflow (#187), which also takes what arrives while the handler runs the
      * hand-over with every pull marked done: it goes to the handler on the next pass, behind what the pulls held. A
-     * status read in the same chunk as the frame (a terminal 409 Consumer Deleted, say) leaves with the pulls and never
-     * reaches onError, where one read before an EOF is classified first: the run goes on, and on a deleted consumer
-     * then meets the no-responders path (a 503, routine, reported to onError once). A finite run, reconnect off,
-     * waiting disabled, a reconnect that gave up while the read still waited for it and a close of the application's
-     * still end the run with the frame's error, as above. When the read's own wait ended before the reconnect did, the
+     * status read in the same chunk as the frame is on its pull by then, since the read routes what its chunk brought
+     * before it recovers the connection and throws (#214): once the pulls' messages have gone to the handler, each pull
+     * that brought no message is classified, in issue order, as the retire phase classifies an empty retire, before
+     * the pulls leave. A terminal status (a 409 Consumer Deleted, which nats-server sends every waiting pull as the
+     * consumer goes, and which a process blocked long enough to draw 'Stale Connection' finds in the socket next to the
+     * -ERR) ends the run as it ends it in the retire phase, below: the inbox closed, onError once, what the overflow
+     * holds handed over, the count returned, with no pull on the new connection; a 423 drops the pin the request sent;
+     * a routine status, or none, changes nothing, a 503 included. A pull that brought messages keeps its status
+     * unclassified, as there. Such a status used to leave with the pulls, never reaching onError: the run went on, and
+     * on a deleted consumer met the no-responders path (a 503, routine, reported to onError once) with no end. A
+     * finite run, reconnect off, waiting disabled, a reconnect that gave up while the read still waited for it and a
+     * close of the application's still end the run with the frame's error, as above. When the read's own wait ended
+     * before the reconnect did, the
      * run goes round as after an EOF whose reconnect outlasted that wait: the pulls still open stay in flight, emptied,
      * until their deadline or the reset at the top of the loop, so that the issue phase replaces only the pulls that
      * ended, as after that EOF, rather than a whole generation; a pull it issues meanwhile goes into the reconnect
@@ -3308,11 +3317,9 @@ final class JetStreamContext
                         if ($code === 423) {
                             // Stale pin (both modes): drop it and re-pull without it, serially until the first batch
                             // under the new pin retires. The pull already consumed a finite iteration slot (counted at
-                            // issue time). Only the pin this request sent is dropped (#208): a 423 delayed past a newer
-                            // pin, received by this run or by another run of the iterator, leaves that pin, and the
-                            // run's readiness, alone.
-                            if ($ctl->getPinId() === $pull->requestedPinId) {
-                                $ctl->setPinId(null);
+                            // issue time). Only the pin this request sent is dropped ({@see dropsThePinA423Rejected()},
+                            // #208).
+                            if (self::dropsThePinA423Rejected($pull, $ctl)) {
                                 $groupReadyForPipeline = false;
                             }
 
@@ -3341,11 +3348,7 @@ final class JetStreamContext
                         // (one-shot, re-armed by the next delivery or any routine non-503 retire - one
                         // onError per no-responders episode), and pacing comes from the normal
                         // empty-retire backoff below.
-                        $routine = $code === null
-                            || $code === 404
-                            || $code === 408
-                            || $code === 503
-                            || ($code === 409 && PullConsumerIterator::isNonTerminalPullStatus($description));
+                        $routine = self::isRoutineEmptyRetireOfAnInfiniteRun($code, $description);
                         if ($routine) {
                             if ($code === 503) {
                                 if (!$noRespondersSignaled && $cfg->onError !== null) {
@@ -3390,22 +3393,19 @@ final class JetStreamContext
                         // behind this one before it had the UNSUB - the answer to a refill a recreated consumer served,
                         // still on the socket when the status was read - is routed into them, to be handed over below,
                         // rather than read after the run's UNSUB and dropped. The fence runs even with nothing behind
-                        // this pull: an empty tail does not prove that nothing is on its way.
-                        $this->collectBeforeTheTerminalStatus($sid, $drainParticipant, $ctl);
-                        // The fence waited, and the run's lifecycle rules apply again, in their order. A stop, or a close
-                        // that discards what the connection received: the count delivered so far, with no terminal
-                        // callback and no tail.
-                        if ($ctl->isStopRequested() || $this->client->isDiscardingUndelivered()) {
+                        // this pull: an empty tail does not prove that nothing is on its way. The fence waited, and the
+                        // run's lifecycle rules apply again, in their order ({@see reportTerminalStatus()}): a stop, or a
+                        // close that discards what the connection received, returns the count delivered so far, with no
+                        // terminal callback and no tail; the client's drain() asking for the hand-over, or the server's
+                        // rejection of the inbox (#206), goes back to the top, which hands the rest over and ends with the
+                        // count, or throws the rejection, onError not called (the drain keeps its precedence there over
+                        // the rejection, and neither path pulls again); otherwise onError gets the status.
+                        $outcome = $this->reportTerminalStatus($sid, $drainParticipant, $ctl, $inboxRejection, $cfg, $code, $description);
+                        if ($outcome === PullTerminalStatusOutcome::ReturnTheCount) {
                             return $totalProcessed;
                         }
-                        // The client's drain() asked for the hand-over, or the server rejected the inbox (#206): back to
-                        // the top, which hands the rest over and ends with the count, or throws the rejection, onError
-                        // not called. The drain keeps its precedence there over the rejection. Neither path pulls again.
-                        if ($drainParticipant->isHandOverRequested() || $inboxRejection->error() !== null) {
+                        if ($outcome === PullTerminalStatusOutcome::BackToTheTop) {
                             continue 2;
-                        }
-                        if ($cfg->onError !== null) {
-                            ($cfg->onError)($this->pullStatusException($code, $description));
                         }
                         $terminated = true;
 
@@ -3707,11 +3707,31 @@ final class JetStreamContext
                         // the new connection, what such a request still brings going to the pulls issued then, or to
                         // the overflow (#187). When the read's own wait ended first, the run goes round as after an EOF
                         // whose reconnect outlasted that wait (below), and its next read waits for the reconnect.
+                        //
+                        // Before the pulls leave, a status the same read brought one of them is classified (#214): the
+                        // read routes what its chunk holds before it recovers the connection and throws, so a status
+                        // read in the frame's chunk (a 409 Consumer Deleted, say, which nats-server sends every waiting
+                        // pull as the consumer goes, and which a process blocked long enough to draw 'Stale Connection'
+                        // finds in the socket next to the -ERR) is on its pull here, where one read before an EOF reaches
+                        // the retire phase first. Each pull that brought no message is classified in issue order, once
+                        // every pull's messages have gone to the handler, as the retire phase classifies an empty
+                        // retire: a terminal status ends the run as it ends it there ({@see reportTerminalStatus()}), the
+                        // inbox closed first, then onError and what the overflow holds, with no pull on the new
+                        // connection; a 423 drops the pin the request sent; a routine status, or none, changes nothing,
+                        // the run pulling on as after an EOF (a 503 of the old connection's is not reported: the run is
+                        // past that connection). A pull that brought messages keeps its status unclassified, as in the
+                        // retire phase. The pulls used to leave with the status unread: the run polled on, on a deleted
+                        // consumer meeting the no-responders path (a 503, routine, reported once), and never ended.
                         $this->emitClientError($failure);
                         $handedOver = 0;
+                        // The pulls that held no message when handed over, in issue order, for the classification below.
+                        $broughtNothing = [];
                         foreach ($issueOrder as $token) {
                             $lostPull = $inflight[$token];
                             $lostPull->done = true;
+                            if ($lostPull->buffer === []) {
+                                $broughtNothing[] = $lostPull;
+                            }
                             $handedOver += $this->deliverPullBuffer($lostPull, $handler, $ctl);
                         }
                         $totalProcessed += $handedOver;
@@ -3725,6 +3745,40 @@ final class JetStreamContext
                             $groupReadyForPipeline = true;
                             $noRespondersSignaled = false;
                         }
+                        foreach ($broughtNothing as $lostPull) {
+                            $code = $lostPull->terminalCode;
+                            if ($code === 423) {
+                                if (self::dropsThePinA423Rejected($lostPull, $ctl)) {
+                                    $groupReadyForPipeline = false;
+                                }
+
+                                continue;
+                            }
+                            if (self::isRoutineEmptyRetireOfAnInfiniteRun($code, $lostPull->terminalDescription)) {
+                                continue;
+                            }
+
+                            // A terminal status: the pulls leave the run, handed over already, and it ends as on a
+                            // terminal status in the retire phase, what the inbox's close routes going to the overflow.
+                            $inflight = [];
+                            $issueOrder = [];
+                            $outcome = $this->reportTerminalStatus($sid, $drainParticipant, $ctl, $inboxRejection, $cfg, $code, $lostPull->terminalDescription);
+                            if ($outcome === PullTerminalStatusOutcome::ReturnTheCount) {
+                                return $totalProcessed;
+                            }
+                            // The client's drain() asked for the hand-over, or the server rejected the inbox, while the
+                            // inbox was closed or while onError waited (#206): the top of the loop ends the run, handing
+                            // the overflow over and returning the count, or throwing the rejection.
+                            if ($outcome === PullTerminalStatusOutcome::BackToTheTop || $inboxRejection->error() !== null) {
+                                continue 2;
+                            }
+                            $totalProcessed += $this->deliverPullBuffer($overflow, $handler, $ctl);
+                            if ($inboxRejection->error() !== null) {
+                                continue 2;
+                            }
+
+                            return $totalProcessed;
+                        }
                         if (
                             $this->client->state() === ConnectionState::Connecting
                             && !$this->client->isCloseRequested()
@@ -3737,10 +3791,10 @@ final class JetStreamContext
                             // would go out from the reconnect buffer on the new connection, for that reset to end it
                             // while the server still serves it, adding requests the run does not count; what they
                             // brought would go to the pulls issued after them, or to the overflow (#187). A full pull,
-                            // and one a status ended, leave the run. A run the iterator's drain() ends, which then
-                            // returns at the top of the loop with nothing left in flight, and one whose connection the
-                            // application is closing, which ends at the top of the loop or where it meets the close,
-                            // keep none of them (below).
+                            // and one a 423 or a routine status ended, leave the run (a terminal status ended the run
+                            // above). A run the iterator's drain() ends, which then returns at the top of the loop with
+                            // nothing left in flight, and one whose connection the application is closing, which ends
+                            // at the top of the loop or where it meets the close, keep none of them (below).
                             $stillOpen = [];
                             foreach ($issueOrder as $token) {
                                 $lostPull = $inflight[$token];
@@ -3922,6 +3976,77 @@ final class JetStreamContext
     private function collectBeforeTheTerminalStatus(int $sid, PullPipelineDrainParticipant $drainParticipant, PullPipelineControl $ctl): void
     {
         $this->retireRunInbox($sid, $drainParticipant, $ctl);
+    }
+
+    /**
+     * How an infinite {@see consumePipelined()} run meets a terminal pull status (a terminal 409 such as Consumer
+     * Deleted, a server error, ...), wherever the run classifies it: on an empty retire in the retire phase, or on a pull
+     * that brought no message when a frame that ended the connection made the run hand its pulls over (#214). The run's
+     * inbox is first closed to new deliveries ({@see collectBeforeTheTerminalStatus()}, #211). That wait can let another
+     * fiber run, so the run's lifecycle rules then apply again, in their order: a stop(), or a close that discards what
+     * the connection received, returns the count with no onError and no tail; the client's drain() asking for the
+     * hand-over, or a rejection of the inbox (#206), sends the run back to the top of its loop, onError not called, the
+     * drain keeping its precedence there over the rejection; otherwise onError, when set, gets the status, once, and the
+     * caller hands over what the run still holds and ends it. No path pulls again.
+     */
+    private function reportTerminalStatus(
+        int $sid,
+        PullPipelineDrainParticipant $drainParticipant,
+        PullPipelineControl $ctl,
+        PullInboxRejection $inboxRejection,
+        PullPipelineConfig $cfg,
+        ?int $code,
+        string $description,
+    ): PullTerminalStatusOutcome {
+        $this->collectBeforeTheTerminalStatus($sid, $drainParticipant, $ctl);
+        if ($ctl->isStopRequested() || $this->client->isDiscardingUndelivered()) {
+            return PullTerminalStatusOutcome::ReturnTheCount;
+        }
+        if ($drainParticipant->isHandOverRequested() || $inboxRejection->error() !== null) {
+            return PullTerminalStatusOutcome::BackToTheTop;
+        }
+        if ($cfg->onError !== null) {
+            ($cfg->onError)($this->pullStatusException($code, $description));
+        }
+
+        return PullTerminalStatusOutcome::EndAfterTheHandOver;
+    }
+
+    /**
+     * Whether an infinite {@see consumePipelined()} run polls on after a pull that brought no message ended with status
+     * $code, or none (a silent deadline): 404, 408, a non-terminal 409 ({@see PullConsumerIterator::isNonTerminalPullStatus()})
+     * and a 503 are routine, the 503 being transient (no JetStream responder: a server restarting, JetStream still wiring
+     * up after a reconnect, a leader election), like "409 Leadership Change" (nats.go Consume parity). Any other status
+     * but a 423, which drops the pin instead ({@see dropsThePinA423Rejected()}), is terminal. Shared by the retire phase
+     * and by the classification of what a frame that ended the connection left on the pulls (#214), so that the two
+     * keep in step.
+     */
+    private static function isRoutineEmptyRetireOfAnInfiniteRun(?int $code, string $description): bool
+    {
+        return $code === null
+            || $code === 404
+            || $code === 408
+            || $code === 503
+            || ($code === 409 && PullConsumerIterator::isNonTerminalPullStatus($description));
+    }
+
+    /**
+     * What a 423 (Nats-Pin-Id mismatch, the pin is stale) on a pull that brought no message does to a
+     * {@see consumePipelined()} run, in both modes, in the retire phase and when a frame that ended the connection left
+     * it on the pull (#214): it drops the run's pin, so that the next pull goes out without one, but only the pin this
+     * request sent (#208). A 423 delayed past a newer pin, received by this run or by another run of the iterator, leaves
+     * that pin, and the run's readiness, alone.
+     *
+     * @return bool Whether the pin was dropped: the caller then makes the group acquire its pin serially again.
+     */
+    private static function dropsThePinA423Rejected(PullInFlight $pull, PullPipelineControl $ctl): bool
+    {
+        if ($ctl->getPinId() !== $pull->requestedPinId) {
+            return false;
+        }
+        $ctl->setPinId(null);
+
+        return true;
     }
 
     /**
