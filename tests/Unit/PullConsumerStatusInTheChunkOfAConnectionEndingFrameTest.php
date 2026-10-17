@@ -342,6 +342,80 @@ final class PullConsumerStatusInTheChunkOfAConnectionEndingFrameTest extends Tes
     }
 
     /**
+     * A routine status ahead of a terminal one in the frame's chunk does not hide it (#247): depth 2 and batch 3, both
+     * pulls on the wire and empty, and one chunk brings the routine status for the first pull, a 409 Consumer Deleted
+     * for the second and the fatal -ERR, as when one pull's 408 and the next one's 409 meet in the socket. The
+     * classification goes past the routine status to the 409: onError gets it once, handle() returns 0, and the run
+     * pulls nothing on the new connection. A classification that stops at the first routine status (`continue` made
+     * `break`, a mutant CI's Mutation job skips as too slow) pulled on there, onError getting the 503.
+     */
+    #[DataProvider('routineStatuses')]
+    public function testARoutineStatusAheadOfATerminalOneInTheFramesChunkDoesNotHideIt(string $status): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport, self::noRespondersOnTheNewConnection());
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(3)->setDepth(2)->setExpiresMs(30_000);
+        $reported = self::log();
+        $iterator->setOnError(self::reportingUntilA503($reported, $iterator));
+        $handled = self::log();
+        $run = $this->resources()->ownOperation($iterator->handle(self::recording($handled)), $iterator->stop(...), 'pull consumer run');
+        $this->waitUntil(static fn(): bool => count($server->epochs) === 2 && $watched->readsUnderWay === 1);
+
+        $transport->pushFrame(
+            self::pullStatus($server->replyTos[0], (int) $server->sid, $status)
+            . self::pullStatus($server->replyTos[1], (int) $server->sid, '409 Consumer Deleted')
+            . self::STALE_CONNECTION,
+        );
+        [$processed, $error] = self::settle($run);
+
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame([self::CONSUMER_DELETED], $reported->getArrayCopy(), 'onError got the 409, once');
+        self::assertSame(0, $processed);
+        self::assertSame([], $handled->getArrayCopy());
+        self::assertSame([0, 0], $server->epochs, 'no pull on the new connection');
+        self::assertSame([self::STALE_CONNECTION_ERROR], $recorder->errors);
+    }
+
+    /**
+     * A 423 ahead of a terminal status in the frame's chunk does not hide it either (#247): the grouped run of
+     * testA423InTheFramesChunkDropsThePinItsRequestSent fans out two pulls carrying pin-1, and one chunk brings a 423
+     * for the first, for the pin its request sent, a 409 Consumer Deleted for the second and the fatal -ERR. The 423
+     * drops the pin and the classification goes on to the 409: onError gets it once, handle() returns 2 (m-1 and m-1b),
+     * and the run pulls nothing on the new connection. A classification that stops after a 423 (`continue` made `break`,
+     * a mutant CI's Mutation job skips as too slow) pulled on there without the pin, onError getting the 503.
+     */
+    public function testA423AheadOfATerminalStatusInTheFramesChunkDoesNotHideIt(): void
+    {
+        [$transport, $watched, $client, $recorder] = $this->client();
+        $server = $this->pullServer($transport, static fn(string $replyTo, int $sid, int $pull, int $epoch): array => match (true) {
+            $pull === 1 => [ReconnectingTransport::hmsgFrame('evt.s', $sid, "NATS/1.0\r\nNats-Pin-Id: pin-1\r\n\r\n", 'm-1', self::ACK_SUBJECT) . self::messages($sid, 'm-1b')],
+            $epoch >= 1 => [self::pullStatus($replyTo, $sid, '503')],
+            default => [],
+        });
+        $iterator = $client->jetStream()->pullConsumer('S', 'C')->setGroup('workers')->setBatching(2)->setDepth(2)->setExpiresMs(30_000);
+        $reported = self::log();
+        $iterator->setOnError(self::reportingUntilA503($reported, $iterator));
+        $handled = self::log();
+        $run = $this->resources()->ownOperation($iterator->handle(self::recording($handled)), $iterator->stop(...), 'pull consumer run');
+        $this->waitUntil(static fn(): bool => count($server->epochs) === 3 && $watched->readsUnderWay === 1);
+
+        $transport->pushFrame(
+            self::pullStatus($server->replyTos[1], (int) $server->sid, '423 Nats-Pin-Id Mismatch')
+            . self::pullStatus($server->replyTos[2], (int) $server->sid, '409 Consumer Deleted')
+            . self::STALE_CONNECTION,
+        );
+        [$processed, $error] = self::settle($run);
+
+        self::assertNull($error, sprintf('handle() threw %s', self::describe($error)));
+        self::assertSame([self::CONSUMER_DELETED], $reported->getArrayCopy(), 'onError got the 409, once');
+        self::assertSame(2, $processed);
+        self::assertSame(['m-1', 'm-1b'], $handled->getArrayCopy());
+        self::assertSame([0, 0, 0], $server->epochs, 'no pull on the new connection');
+        self::assertSame([null, 'pin-1', 'pin-1'], array_map(self::pinOfRequest(...), $server->requests));
+        self::assertSame([self::STALE_CONNECTION_ERROR], $recorder->errors);
+    }
+
+    /**
      * Guard, passes on both: a pull that brought a message keeps its status unclassified, as in the retire phase. Batch 3
      * and depth 1, one chunk brings m-1, a 409 Consumer Deleted for the same pull and the fatal -ERR; the server answers
      * the pull on the new connection with m-2 to m-4, and the handler stops the run on m-2. The handler gets m-1, then

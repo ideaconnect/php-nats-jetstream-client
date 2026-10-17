@@ -15,6 +15,25 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` Four mutants of the #214 change that no unit test killed are now covered (#247). CI's Mutation job never
+  sees them: its 20 s budget per mutant skips them as too slow. A local diff-mode run with a 300 s budget found them.
+  - `PullConsumerStatusInTheChunkOfAConnectionEndingFrameTest` (now 18 cases): a routine status (404, 408,
+    `409 Leadership Change`, 503) or a 423 ahead of a `409 Consumer Deleted` in the chunk of a fatal `-ERR` does not
+    hide the 409. `onError` gets it once, and the run pulls nothing on the new connection. A classification that
+    stopped at the first routine status, or after a 423, pulled on there.
+  - `PullConsumerPinRetentionTest`: a single 423 in the retire phase makes the group acquire its next pin serially.
+    In the existing case, the second pull's own 423 restarted the serial acquisition too, so a 423 that dropped the
+    pin without restarting it went unnoticed. A 423 delayed past a newer pin leaves the group pipelining: the #208
+    tests checked only that the pin stays.
+
+  Each new test was checked against a hand-mutated copy of `JetStreamContext` loaded with `auto_prepend_file`: each
+  mutant fails the new test aimed at it, while every existing test of both classes passes on it. No production code
+  changed.
+
 ## [2.27.2] - 2026-10-17
 
 ### Fixed
