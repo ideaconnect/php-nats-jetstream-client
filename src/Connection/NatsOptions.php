@@ -120,7 +120,12 @@ final class NatsOptions
       *        Requests never enter the reconnect publish buffer; a retry checks the same budget and
       *        reply inbox, and a transport write already in progress may finish after the request ends.
       *        Batch fetch setup uses its expiry plus a second; Direct Get renews that interval on replies,
-      *        including during PUB backpressure. Their failed writes obey this flag too (#188). Your
+      *        including during PUB backpressure. Their failed writes obey this flag too (#188). A plain
+      *        publish (publish(), publishWithHeaders(), a JetStream ack()/nak()/term(), respond()) whose
+      *        write is the first to notice the loss waits for neither setting: its frame goes to the
+      *        reconnect buffer, the publish resolves once it is accepted there, and the reconnect it starts
+      *        runs on its own (#244); with `true` the publish then yields one tick, as one buffered during
+      *        the reconnect does. To wait for the frame to go out, call flush(). Your
       *        own processIncoming()/readIncoming(), a serving loop's read and the heartbeat run the reconnect
       *        themselves and wait for all of it. Set `false` to fail fast instead (the behavior before this
       *        option existed): an operation whose own read or write noticed the loss, or whose read brought

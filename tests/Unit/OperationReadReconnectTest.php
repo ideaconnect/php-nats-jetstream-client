@@ -955,7 +955,9 @@ final class OperationReadReconnectTest extends TestCase
         $side = $client->subscribe('side', static function () use ($client, $transport, $failure): void {
             if ($failure === 'handler after a reconnect') {
                 $transport->failNextWriteContaining('PUB side.reply ');
+                // The publish resolves once its frame is buffered (#244); the flush waits for the reconnect.
                 $client->publish('side.reply', 'x')->await();
+                $client->flush()->await();
 
                 throw new ConnectionException('The handler failed after its own reconnect');
             }

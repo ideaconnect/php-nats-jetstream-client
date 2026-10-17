@@ -1014,11 +1014,12 @@ final class NatsConnection
      * recovery's Reconnected listener leaves in flight is waited for within the same budget.
      *
      * Such a write used to leave the connection Open on the dead socket, its raw error reaching the caller,
-     * and every operation that wrote a control frame failed the same way until the heartbeat noticed. A
-     * plain publish recovers inline and sends again; these hand the recovery to its own fiber, as the heartbeat
-     * does, so that a caller with a budget keeps to it. It joins a recovery another fiber already runs, and
-     * starts none for a connection since replaced ({@see recoverConnection()}). With reconnect off it closes
-     * the connection for good, and the caller gets its "Reconnect is disabled".
+     * and every operation that wrote a control frame failed the same way until the heartbeat noticed. These
+     * hand the recovery to its own fiber, as the heartbeat does, so that a caller with a budget keeps to it; a
+     * plain publish does as well, and hands its frame to the reconnect buffer ({@see handOverFailedPublish()}).
+     * It joins a recovery another fiber already runs, and starts none for a connection since replaced
+     * ({@see recoverConnection()}). With reconnect off it closes the connection for good, and the caller gets
+     * its "Reconnect is disabled".
      *
      * @param int $generation The {@see $connectionGeneration} the failed write ran on.
      * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
@@ -2319,9 +2320,21 @@ final class NatsConnection
      * use a JetStream publish-with-ack rather than treating this success as proof the bytes were
      * transmitted.
      *
-     * A publish issued on an Open connection writes directly. If that write fails, it runs one
-     * recovery inline and retries afterward, including with waitForReconnect=false. publish() has
-     * no timeout or caller cancellation; requests use their own bounded write path.
+     * A publish issued on an Open connection writes directly. If that write fails, the frame goes to the
+     * reconnect buffer the same way, and the Future resolves once it is accepted there, while the reconnect
+     * the failure starts runs in a fiber of its own (#244): the publish does not wait for the reconnect, with
+     * either {@see NatsOptions::$waitForReconnect}. A frame the buffer has no room for - buffering disabled,
+     * or the buffer full - fails the publish at once with "Connection is not open", the write's error its
+     * previous, and the reconnect goes on. A failed write that finds the connection closed, being closed, or
+     * closed and reopened since the write began fails the publish with its own error: nothing sends the frame
+     * then, nor on a later connection. Accepted, the frame is subject to what happens to every buffered
+     * publish: sent once the reconnect has replayed the subscriptions, before the connection is Open again,
+     * in the order frames were accepted; discarded and reported out of band when the reconnect gives up or
+     * fails authentication; discarded without a report by a disconnect(), the deliberately lossy close; sent
+     * again on the next attempt after a flush write that failed, so possibly twice. Only the original write,
+     * and a sealed flush (below), can still hold the Future up. To wait for the frame to go out call
+     * {@see flush()}; for the server's confirmation use a JetStream publish or ackSync(). publish() has no
+     * timeout or caller cancellation; requests use their own bounded write path.
      *
      * The one exception to "resolves immediately" is sustained publish pressure during the reconnect
      * flush: once the buffer has been drained {@see self::RECONNECT_FLUSH_MAX_PASSES} times it is sealed
@@ -2344,8 +2357,10 @@ final class NatsConnection
     }
 
     /**
-     * Publishes as {@see publish()} does, reconnect buffering and the retry after a failed write's recovery included,
-     * with $beforeWrite called before each attempt to send the frame, in the step that makes it: before the frame is
+     * Publishes as {@see publish()} does, reconnect buffering included, but for a write that fails on an Open
+     * connection: a guarded publish does not hand its frame to the reconnect buffer (#244), it runs that write's
+     * recovery inline and sends again afterwards, so that the guard decides once more after the replay. Throughout,
+     * $beforeWrite is called before each attempt to send the frame, in the step that makes it: before the frame is
      * written or buffered, before the retry that follows a failed write's recovery, once a sealed reconnect flush lets
      * it go on, and, while the connection drains, in the writer that hands it to the transport. The guard refuses the
      * send by throwing: the publish then fails with its exception, nothing written and no recovery run for it. A write
@@ -2489,8 +2504,9 @@ final class NatsConnection
     /**
      * Writes one coalesced publish segment with the same shape publish() uses for a single frame:
      * while not Open the WHOLE segment goes through the reconnect buffer (or fails), otherwise one
-     * transport write with a single recover-and-retry on failure. Outbound stats are recorded per
-     * message once the segment is buffered or written, matching per-message publishes.
+     * transport write, whose failure hands the WHOLE segment to the reconnect buffer (or fails it) as it
+     * hands a single frame (#244). Outbound stats are recorded per message once the segment is buffered
+     * or written, matching per-message publishes.
      *
      * @param list<string> $payloads The payloads carried by the segment, in frame order.
      */
@@ -2518,8 +2534,10 @@ final class NatsConnection
 
     /**
      * Writes an already-encoded publish frame with the state-appropriate delivery:
-     *   - Open: write to the socket, with a single recover-and-retry on a transient write failure. The
-     *     retry is sent the way a publish issued after the recovery would be, by the state it finds.
+     *   - Open: write to the socket. A write that fails hands the frame to the reconnect buffer and starts the
+     *     recovery in a fiber of its own ({@see handOverFailedPublish()}, #244). A guarded publish, and one with
+     *     reconnect off, recover inline instead and retry once; the retry is sent the way a publish issued after
+     *     the recovery would be, by the state it finds.
      *   - Draining: write straight to the still-live socket. A draining connection keeps its socket
      *     open until drain() closes it, and a handler's ack/reply (a JetStream ack, respond(), a
      *     request reply) MUST reach the wire - nats.go drains by publishing then closing. Buffering
@@ -2543,19 +2561,28 @@ final class NatsConnection
         $beforeWrite?->__invoke();
         if ($this->state === ConnectionState::Open) {
             $generation = $this->connectionGeneration;
+            $closes = $this->terminalCloses;
             try {
                 $this->transport->write($frame)->await();
             } catch (\Throwable $writeError) {
-                // The direct write failed mid-flight: recover, then re-send on the fresh socket. The
-                // re-send stays AFTER recovery (it is NOT seeded into the flush) on purpose: recovery
-                // success must be independent of this frame - a persistently rejected publish would
-                // otherwise cascade the whole recovery into exhaustion (#145) - and the post-recovery
-                // delivery drain must run before the retry write (#144). This frame therefore lands
-                // after any frames other publishers buffered during the outage: that is the
-                // buffered-before-direct ordering #148/#165 make global, and the at-least-once
-                // consequence documented on publish() (#121). Per-publisher order still holds: this
-                // publish() does not return until the frame is (re-)written, so the same publisher's
-                // next frame follows it on the wire.
+                // An ordinary publish hands its frame to the reconnect buffer and resolves once the frame is
+                // accepted there, while the recovery runs in a fiber of its own (#244). It used to run the whole
+                // recovery inline and send again afterwards: with the default policy the caller of a plain
+                // publish() or ack() waited about 100 s for a server that did not come back.
+                if ($beforeWrite === null && $this->options->reconnectEnabled) {
+                    $this->handOverFailedPublish($frame, $generation, $closes, $writeError);
+
+                    return;
+                }
+
+                // A guarded publish ({@see publishGuarded()}, #206), whose guard must run again after the replay,
+                // and a publish with reconnect off, whose recovery only closes the connection and fails it with
+                // "Reconnect is disabled" (#172), recover inline and send again on the fresh socket. The re-send
+                // stays AFTER recovery (it is NOT seeded into the flush): the post-recovery delivery drain runs
+                // before the retry write (#144), and the frame lands after any frames other publishers buffered
+                // during the outage, the buffered-before-direct ordering #148/#165 make global. Per-publisher
+                // order still holds: this publish() does not return until the frame is (re-)written, so the same
+                // publisher's next frame follows it on the wire.
                 $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
 
                 // The connection may have moved on while the reconnect announced it: the listener, or what it
@@ -2592,26 +2619,7 @@ final class NatsConnection
         }
 
         if ($this->state === ConnectionState::Draining) {
-            // Bounded by drain()'s own REMAINING budget, not a fresh full request timeout: a handler
-            // ack/reply published while drain delivers backlog rides a socket whose heartbeat is
-            // already cancelled, so an unbounded write on a backpressure-stalled peer would wedge
-            // the drain with no escalation left - and a fresh per-publish bound would let K queued
-            // handlers serially extend drain() to ~K x requestTimeoutMs past its documented single
-            // budget (#149). The fixed fallback covers a Draining state with no recorded deadline
-            // (defensive: drain() always records one before delivering). On the wedge the caller's
-            // failure is contained by drain's handler-error paths.
-            $drainDeadline = $this->drainDeadline;
-            try {
-                $this->writeBounded(
-                    $frame,
-                    $drainDeadline !== null
-                        ? $this->remainingBudgetCancellation($drainDeadline)
-                        : new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)),
-                    beforeWrite: $beforeWrite,
-                );
-            } catch (CancelledException) {
-                throw new TimeoutException('Publish during drain timed out (transport backpressure)');
-            }
+            $this->writePublishFrameWhileDraining($frame, $beforeWrite);
 
             return;
         }
@@ -2634,6 +2642,189 @@ final class NatsConnection
         }
 
         $this->yieldToInFlightRecovery();
+    }
+
+    /**
+     * The Draining branch of {@see writePublishFrame()}: writes straight to the socket the drain keeps open.
+     *
+     * Bounded by drain()'s own REMAINING budget, not a fresh full request timeout: a handler ack/reply published
+     * while drain delivers backlog rides a socket whose heartbeat is already cancelled, so an unbounded write on a
+     * backpressure-stalled peer would wedge the drain with no escalation left - and a fresh per-publish bound would
+     * let K queued handlers serially extend drain() to ~K x requestTimeoutMs past its documented single budget
+     * (#149). The fixed fallback covers a Draining state with no recorded deadline (defensive: drain() always
+     * records one before delivering). On the wedge the caller's failure is contained by drain's handler-error paths.
+     *
+     * @param (\Closure():void)|null $beforeWrite Must not suspend.
+     */
+    private function writePublishFrameWhileDraining(string $frame, ?\Closure $beforeWrite = null): void
+    {
+        $drainDeadline = $this->drainDeadline;
+        try {
+            $this->writeBounded(
+                $frame,
+                $drainDeadline !== null
+                    ? $this->remainingBudgetCancellation($drainDeadline)
+                    : new TimeoutCancellation(max(0.1, $this->options->requestTimeoutMs / 1000)),
+                beforeWrite: $beforeWrite,
+            );
+        } catch (CancelledException) {
+            throw new TimeoutException('Publish during drain timed out (transport backpressure)');
+        }
+    }
+
+    /**
+     * Hands an ordinary publish whose write failed on an Open connection to the reconnect buffer (#244): the
+     * publish resolves once its frame is accepted there, as a publish issued during the reconnect does, and the
+     * recovery runs in a fiber of its own. The frame is then sent by the reconnect's flush, after the subscription
+     * replay and before the connection is Open again; if the reconnect gives up, or fails authentication, it is
+     * discarded with the other buffered publishes and reported out of band ("Reconnect exhausted: N bytes of
+     * buffered publishes were discarded"); a disconnect() discards it without a report, as it discards every
+     * buffered publish. The publish used to run the whole recovery inline and write again afterwards: with the
+     * default policy the caller waited about 100 s for a server that did not come back, while the same frame
+     * published a moment later, once the heartbeat had noticed the loss, was buffered at once.
+     *
+     * Routed by the state found once the write failed, again after each wait:
+     *   - the connection's lifetime ended since the write began ({@see $terminalCloses}), or it is Closed, or being
+     *     closed other than by a drain(): nothing will send the frame, and the write's own error says why, as an
+     *     error of this library. A disconnect() and connect() made meanwhile do not get the old frame.
+     *   - Draining: written to the socket the drain keeps open, within its budget, as any publish then is.
+     *   - a reconnect in flight: appended to its buffer at once, without joining the reconnect, also when that one
+     *     already dials past the connection this write failed on. A sealed flush (#165) is waited for first, and the
+     *     frame then routed by what it left.
+     *   - Open on the connection the write failed on, with no reconnect in flight: a recovery is started in a fiber
+     *     of its own, and the frame is accepted, or refused, in that recovery's claim, right as it leaves Open and
+     *     before any listener or log call ({@see claimRecoveryForFailedPublish()}).
+     *   - Open on a newer connection: that connection is healthy and left alone; the frame gets the single direct
+     *     retry it got before, and a failure of that write fails the publish.
+     *   - Connecting for a connect() of the application's, with no reconnect: refused, since the frame would wait in
+     *     a buffer that nothing flushes.
+     *
+     * A frame that does not fit - buffering disabled ({@see NatsOptions::$reconnectBufferSize} 0), or the buffer full -
+     * fails the publish at once with "Connection is not open", the write's error its previous, while the recovery of
+     * the connection goes on. A frame accepted stays accepted. A publisher is never left waiting for the recovery:
+     * only the original write, and a sealed flush's gate, can hold it up.
+     *
+     * @param int $generation The {@see $connectionGeneration} the failed write ran on.
+     * @param int $closes The {@see $terminalCloses} when the write began.
+     *
+     * @throws ConnectionException When the frame is refused: no room in the buffer, or nothing that would send it.
+     */
+    private function handOverFailedPublish(string $frame, int $generation, int $closes, \Throwable $writeError): void
+    {
+        while (true) {
+            if (
+                $this->terminalCloses !== $closes
+                || $this->state === ConnectionState::Closed
+                || ($this->closing && $this->state !== ConnectionState::Draining)
+            ) {
+                throw $writeError instanceof NatsThrowable
+                    ? $writeError
+                    : new TransportClosedException('Transport is not connected', 0, $writeError);
+            }
+
+            if ($this->state === ConnectionState::Draining) {
+                $this->writePublishFrameWhileDraining($frame);
+
+                return;
+            }
+
+            if ($this->reconnecting !== null) {
+                $flushGate = $this->reconnectFlushGate;
+                if ($flushGate !== null) {
+                    $flushGate->getFuture()->await();
+
+                    continue;
+                }
+
+                if (!$this->bufferFrame($frame)) {
+                    throw new ConnectionException('Connection is not open', 0, $writeError);
+                }
+
+                $this->yieldToInFlightRecovery();
+
+                return;
+            }
+
+            if ($this->state !== ConnectionState::Open) {
+                throw new ConnectionException('Connection is not open', 0, $writeError);
+            }
+
+            if ($this->connectionGeneration !== $generation) {
+                $this->transport->write($frame)->await();
+
+                return;
+            }
+
+            if ($this->claimRecoveryForFailedPublish($frame, $generation, $closes, $writeError)) {
+                $this->yieldToInFlightRecovery();
+
+                return;
+            }
+        }
+    }
+
+    /**
+     * Starts the recovery of the connection a publish's write failed on, in a fiber of its own, and waits only for
+     * the frame's admission to its reconnect buffer ({@see handOverFailedPublish()}, #244).
+     *
+     * The admission is decided inside the recovery's claim ({@see recoverConnection()}): right after the recovery
+     * owns the connection and has left Open, before it calls a listener or the logger, closes the socket or dials.
+     * Decided in the publisher once the recovery had claimed the connection, it came after the Disconnected
+     * listener: a publish the listener made could take the buffer's room first, and a disconnect() it made closed the
+     * connection before the frame was accepted. The frame is accepted when it fits, or refused with "Connection is
+     * not open", the write's error its previous; either way the recovery goes on. A recovery another fiber started
+     * meanwhile takes the frame into its buffer instead: the recovery's fiber then joins it, the publisher does not.
+     *
+     * @param int $generation The {@see $connectionGeneration} the failed write ran on.
+     * @param int $closes The {@see $terminalCloses} when the write began.
+     * @return bool True once the frame is in the buffer; false when the recovery did not apply by the time its fiber
+     *         ran - the connection was being closed, was replaced, or was found closed - and the frame is to be
+     *         routed again by the state then.
+     *
+     * @throws ConnectionException When the frame does not fit in the buffer.
+     */
+    private function claimRecoveryForFailedPublish(string $frame, int $generation, int $closes, \Throwable $writeError): bool
+    {
+        /** @var DeferredFuture<bool> $admission */
+        $admission = new DeferredFuture();
+        // Called once, by the recovery's claim or ahead of a join of the recovery another fiber runs, past the
+        // close-intent guard of each. Never suspends.
+        $admit = function () use ($frame, $closes, $writeError, $admission): void {
+            // The application closed and reopened the connection meanwhile, the recovery joined is in its terminal
+            // close, or its flush is sealed: the publisher routes the frame by the state.
+            if (
+                $this->terminalCloses !== $closes
+                || $this->state === ConnectionState::Closed
+                || $this->reconnectFlushGate !== null
+            ) {
+                $admission->complete(false);
+
+                return;
+            }
+
+            if ($this->bufferFrame($frame)) {
+                $admission->complete(true);
+
+                return;
+            }
+
+            $admission->error(new ConnectionException('Connection is not open', 0, $writeError));
+        };
+
+        $recovery = async(function () use ($generation, $writeError, $admit, $admission): void {
+            try {
+                $this->recoverConnection(failedGeneration: $generation, cause: $writeError, admitFailedPublish: $admit);
+            } finally {
+                // A guard returned before the claim: the publisher routes the frame by the state now.
+                if (!$admission->isComplete()) {
+                    $admission->complete(false);
+                }
+            }
+        });
+        // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
+        $recovery->ignore();
+
+        return $admission->getFuture()->await();
     }
 
     /**
@@ -6254,6 +6445,11 @@ final class NatsConnection
      *                             that joins the recovery, learns why the connection ended (#172).
      * @param DeferredFuture<void>|null $operationReady Completes with owned recovery before announcement/delivery.
      *                             The spawning wrapper settles guard/join/failure exits with their existing outcome.
+     * @param (\Closure():void)|null $admitFailedPublish Decides whether a failed publish's frame enters the reconnect
+     *                             buffer ({@see claimRecoveryForFailedPublish()}, #244). Called once this call owns
+     *                             the recovery and the connection has left Open, before any listener, log or I/O
+     *                             ({@see performRecovery()}); or, when another fiber runs the recovery, before
+     *                             joining it. Must not suspend. The spawning wrapper settles the guard exits.
      */
     private function recoverConnection(
         bool $ownedByConnect = false,
@@ -6261,6 +6457,7 @@ final class NatsConnection
         ?int $failedGeneration = null,
         ?\Throwable $cause = null,
         ?DeferredFuture $operationReady = null,
+        ?\Closure $admitFailedPublish = null,
     ): void {
         // The user asked to close (disconnect/drain): never start or join a reconnect that would
         // re-open the connection (#84).
@@ -6293,6 +6490,10 @@ final class NatsConnection
                 return;
             }
 
+            // A failed publish's frame is taken into this recovery's buffer before the join, which its publisher does
+            // not wait for: it waits only for the frame's admission (#244).
+            $admitFailedPublish?->__invoke();
+
             $inProgress->getFuture()->await($joinCancellation);
 
             return;
@@ -6315,7 +6516,7 @@ final class NatsConnection
         $this->recoveryFiber = \Fiber::getCurrent();
 
         try {
-            $opened = $this->performRecovery($cause);
+            $opened = $this->performRecovery($cause, $admitFailedPublish);
             $deferred->complete();
             $operationReady?->complete();
         } catch (\Throwable $e) {
@@ -6455,11 +6656,13 @@ final class NatsConnection
      * Performs the actual reconnect + subscription replay, serialized by {@see recoverConnection()}.
      *
      * @param \Throwable|null $cause The error that ended the connection, chained to "Reconnect is disabled".
+     * @param (\Closure():void)|null $admitFailedPublish The admission of a failed publish's frame
+     *        ({@see recoverConnection()}, #244), called as the connection leaves Open.
      * @return ConnectionEvent|null The event that announces the reopened connection, which
      *         {@see recoverConnection()} emits once the reconnect is over; null when a close stopped the
      *         reconnect.
      */
-    private function performRecovery(?\Throwable $cause = null): ?ConnectionEvent
+    private function performRecovery(?\Throwable $cause = null, ?\Closure $admitFailedPublish = null): ?ConnectionEvent
     {
         // User close-intent set before/while recovery began: do not re-open (#84).
         if ($this->closing) {
@@ -6493,6 +6696,10 @@ final class NatsConnection
         // into the reconnect buffer, so staying Open across the transport close would let them
         // race a socket that is about to disappear (#124).
         $this->state = ConnectionState::Connecting;
+        // The frame of the publish whose failed write started this recovery takes its place in the buffer now,
+        // ahead of anything a listener called below publishes, and before a close a listener makes can refuse it
+        // (#244). Nothing between the state change and this call suspends or calls user code.
+        $admitFailedPublish?->__invoke();
 
         $this->cancelPingTimer();
         // How the reopened connection will be announced: the first-ever open reached through the recovery loop

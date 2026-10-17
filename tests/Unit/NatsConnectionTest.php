@@ -1840,16 +1840,14 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * Pins the wire-ordering contract of the failed-direct-publish re-send path (#121 write-order),
-     * confirming the path is covered by the buffered-before-direct invariant #148/#165 make global.
-     * When a direct (Open) publish's write fails, recovery runs and the frame is re-sent on the fresh
-     * socket AFTER the reconnect flush - so a frame a concurrent publisher buffered during the same
-     * outage precedes the re-sent frame (buffered-before-direct), while the re-sending publisher's OWN
-     * later publishes still follow the re-sent frame (publisher-relative order preserved). The re-send
-     * is deliberately NOT seeded into the flush: recovery success stays independent of the frame
-     * (#145) and the post-recovery delivery drain runs before the retry (#144).
+     * Pins the wire order of a failed direct publish (#121 write-order, #244). When a direct (Open) publish's write
+     * fails, its frame enters the reconnect buffer in the recovery's claim and is flushed in admission order: ahead of
+     * a frame a concurrent publisher buffers later in the same outage, and ahead of the publisher's own next frame,
+     * which it buffers once the first publish has resolved. Every buffered frame precedes a direct write made once the
+     * connection is Open (#148/#165). The frame used to be re-sent after the recovery, behind every frame buffered
+     * during the outage.
      */
-    public function testFailedDirectPublishReSendKeepsBufferedBeforeDirectAndPublisherOrder(): void
+    public function testFailedDirectPublishIsFlushedInAdmissionOrderAndKeepsPublisherOrder(): void
     {
         $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
         $release = new DeferredFuture();
@@ -1924,41 +1922,51 @@ final class NatsConnectionTest extends TestCase
         $connection = $this->own(new NatsConnection(new NatsOptions(reconnectDelayMs: 1, reconnectJitterMs: 0), $transport));
         $connection->connect()->await();
 
-        // P1: its first publish's direct write fails -> recovery -> re-send after recovery; then it
-        // publishes a second frame on the recovered socket.
+        // P1: its first publish's direct write fails -> recovery, which takes the frame into its buffer; then it
+        // publishes a second frame, buffered behind the first, while the reconnect dial is held.
         $p1 = async(static function () use ($connection): void {
             $connection->publish('p1.first', 'A')->await();
             $connection->publish('p1.second', 'C')->await();
         });
         delay(0.05);
-        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $stateWhileTheDialIsHeld = $connection->state();
+        self::assertSame(ConnectionState::Connecting, $stateWhileTheDialIsHeld);
+        self::assertTrue($p1->isComplete(), 'both publishes resolve while the reconnect dial is held');
 
         // A concurrent publisher buffers a frame during the same outage.
         $p2 = async(static fn(): null => $connection->publish('other.buffered', 'B')->await());
         delay(0.02);
 
-        $release->complete(); // dial completes -> flush -> re-send -> Open
+        $release->complete(); // dial completes -> flush -> Open
         $p1->await(new TimeoutCancellation(5.0));
         $p2->await(new TimeoutCancellation(5.0));
-
-        self::assertSame(ConnectionState::Open, $connection->state());
+        self::awaitUntil(static fn(): bool => $connection->state() === ConnectionState::Open, 'the recovery to reopen the connection');
+        $connection->publish('after.open', 'D')->await(new TimeoutCancellation(5.0));
 
         $wire = implode('', $transport->writes);
-        $bufferedPos = strpos($wire, 'other.buffered');
-        $reSentPos = strpos($wire, 'p1.first');
+        $failedPos = strpos($wire, 'p1.first');
         $nextPos = strpos($wire, 'p1.second');
+        $bufferedPos = strpos($wire, 'other.buffered');
+        $directPos = strpos($wire, 'after.open');
+        self::assertNotFalse($failedPos, 'the failed frame must reach the wire');
+        self::assertNotFalse($nextPos, "the failing publisher's next frame must reach the wire");
         self::assertNotFalse($bufferedPos, 'the concurrently buffered frame must reach the wire');
-        self::assertNotFalse($reSentPos, 'the re-sent failed frame must reach the wire');
-        self::assertNotFalse($nextPos, "the re-sending publisher's next frame must reach the wire");
-        self::assertLessThan(
-            $reSentPos,
-            $bufferedPos,
-            'a frame buffered during recovery precedes the re-sent frame (buffered-before-direct, #121/#148)',
-        );
+        self::assertNotFalse($directPos, 'the direct write after the reconnect must reach the wire');
+        self::assertSame(1, substr_count($wire, 'p1.first'), 'the failed frame is sent once');
         self::assertLessThan(
             $nextPos,
-            $reSentPos,
-            "the re-sent frame precedes the same publisher's later frame (publisher-relative order, #121)",
+            $failedPos,
+            "the failed frame precedes the same publisher's later frame (publisher-relative order, #121)",
+        );
+        self::assertLessThan(
+            $bufferedPos,
+            $nextPos,
+            'frames are flushed in admission order, across publishers (#244)',
+        );
+        self::assertLessThan(
+            $directPos,
+            $bufferedPos,
+            'every buffered frame precedes a direct write made once Open (buffered-before-direct, #148/#165)',
         );
     }
 
@@ -2221,7 +2229,7 @@ final class NatsConnectionTest extends TestCase
             $scenario['outcome'],
             'a user read during the replay window waits for the recovery, then reads the (idle) new socket',
         );
-        // The failed publish was retried onto the new socket after recovery.
+        // The failed publish's frame went to the reconnect buffer, and the recovery's flush sent it on the new socket.
         self::assertContains("PUB t.fail 1\r\nx\r\n", $scenario['writes']);
     }
 
@@ -2334,10 +2342,11 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
         $connection->subscribe('s.x', static function (): void {})->await();
 
-        // The failed write starts a recovery inside the publish fiber; it runs up to the
-        // replay's held drain poll and suspends there with its transport read in flight.
+        // The failed write starts a recovery in a fiber of its own and buffers the frame (#244); the recovery
+        // runs up to the replay's held drain poll and suspends there with its transport read in flight.
         $pubFuture = $connection->publish('t.fail', 'x');
         delay(0.05);
+        self::assertTrue($pubFuture->isComplete(), 'the publish resolves once its frame is buffered');
 
         // A user read lands mid-replay.
         $userRead = async(static fn(): int => $connection->processIncoming()->await());
@@ -2345,7 +2354,7 @@ final class NatsConnectionTest extends TestCase
 
         $drainGate->complete();
         $pubFuture->await();
-        self::assertSame(ConnectionState::Open, $connection->state());
+        self::awaitUntil(static fn(): bool => $connection->state() === ConnectionState::Open, 'the recovery to reopen the connection');
 
         try {
             $outcome = $userRead->await(new TimeoutCancellation(5));
@@ -4923,12 +4932,13 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * publish()'s write-failure retry calls recoverConnection(); a handler throwing during the
-     * post-recovery drain used to escape into that retry path, so the caller got an unrelated
-     * handler exception for a frame that was neither written nor buffered. The retried write must
-     * run and succeed; the handler error surfaces via the error listener only (#144).
+     * A handler throwing during the post-recovery drain of the recovery a failed publish write started: the
+     * recovery still opens the connection, the publish's frame is sent, and the handler error surfaces via the
+     * error listener only (#144). It used to escape into publish()'s inline retry, so the caller got an unrelated
+     * handler exception for a frame that was neither written nor buffered. The write fails once: a frame whose
+     * every write fails fails every reconnect's flush, since it is buffered (#244).
      */
-    public function testPublishRetrySucceedsWhenPostRecoveryHandlerThrows(): void
+    public function testFailedPublishIsSentWhenPostRecoveryHandlerThrows(): void
     {
         $errors = [];
         $transport = new FakeTransport([
@@ -4955,23 +4965,28 @@ final class NatsConnectionTest extends TestCase
         ));
         $connection->connect()->await();
 
-        $connection->subscribe('updates', static function (NatsMessage $message) use ($transport): void {
-            // The post-recovery drain runs before publish()'s retry write: heal the transport here
-            // so only the FIRST write of the publish frame fails, then throw.
-            $transport->throwOnWriteContaining = null;
-
+        $connection->subscribe('updates', static function (NatsMessage $message): void {
             throw new \RuntimeException('handler failed on ' . $message->payload);
         })->await();
 
+        // Only the FIRST write of the publish frame fails: the reconnect's CONNECT heals the transport.
         $transport->throwOnWriteContaining = 'PUB retry.subject';
+        $transport->onWrite = static function (string $bytes) use ($transport): array {
+            if (str_contains($bytes, 'CONNECT ')) {
+                $transport->throwOnWriteContaining = null;
+            }
 
-        // Write fails -> recoverConnection() -> replay captures the MSG -> the post-recovery drain
-        // invokes the throwing handler -> the retried write must still run and succeed.
+            return [];
+        };
+
+        // Write fails -> the frame is buffered and a recovery starts -> replay captures the MSG -> the
+        // flush sends the frame -> the post-recovery drain invokes the throwing handler.
         $connection->publish('retry.subject', 'hello')->await();
+        self::awaitUntil(static fn(): bool => in_array('handler failed on boom!', $errors, true), 'the handler error to be reported');
 
         self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertContains('handler failed on boom!', $errors);
-        self::assertStringContainsString("PUB retry.subject 5\r\nhello\r\n", implode('', $transport->writes));
+        self::assertSame(['handler failed on boom!'], $errors);
+        self::assertSame(1, substr_count(implode('', $transport->writes), "PUB retry.subject 5\r\nhello\r\n"));
     }
 
     /**
@@ -6634,7 +6649,11 @@ final class NatsConnectionTest extends TestCase
         $connection->subscribe('orders.a*', static function (NatsMessage $message): void {})->await();
     }
 
-    public function testPublishRecoversAndRetriesAfterWriteFailure(): void
+    /**
+     * A publish whose write fails hands its frame to the recovery it starts (#244): the recovery reconnects and its
+     * flush sends the frame on the new socket, once.
+     */
+    public function testPublishWhoseWriteFailsIsSentByTheRecoveryItStarts(): void
     {
         $transport = new class implements TransportInterface {
             /** @var list<string> */
@@ -6709,12 +6728,14 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
 
         $connection->publish('orders.created', '{"id":1}')->await();
+        self::awaitUntil(static fn(): bool => $connection->state() === ConnectionState::Open, 'the recovery to reopen the connection');
 
         self::assertCount(2, $transport->connectCalls);
-        self::assertStringContainsString('PUB orders.created ', implode('', $transport->writes));
+        self::assertSame(1, substr_count(implode('', $transport->writes), 'PUB orders.created '));
     }
 
-    public function testPublishWithHeadersRecoversAndRetriesAfterWriteFailure(): void
+    /** The same for an HPUB. */
+    public function testPublishWithHeadersWhoseWriteFailsIsSentByTheRecoveryItStarts(): void
     {
         $transport = new class implements TransportInterface {
             /** @var list<string> */
@@ -6789,9 +6810,10 @@ final class NatsConnectionTest extends TestCase
         $connection->connect()->await();
 
         $connection->publishWithHeaders('orders.created', '{"id":1}', ['X-Test' => '1'])->await();
+        self::awaitUntil(static fn(): bool => $connection->state() === ConnectionState::Open, 'the recovery to reopen the connection');
 
         self::assertCount(2, $transport->connectCalls);
-        self::assertStringContainsString('HPUB orders.created ', implode('', $transport->writes));
+        self::assertSame(1, substr_count(implode('', $transport->writes), 'HPUB orders.created '));
     }
 
     /**
@@ -9819,7 +9841,8 @@ final class NatsConnectionTest extends TestCase
      * recovery instead of being swallowed. The connection is already Open (markConnectionOpen ran),
      * and a publish on another fiber hits a write failure on the live socket. Settling the connecting
      * deferred before the Connected emission (plus the state !== Open clause on recoverConnection()'s
-     * in-flight-connect guard) keeps that failure from being dropped onto a dead socket (#145).
+     * in-flight-connect guard) keeps that failure from being dropped onto a dead socket (#145). The
+     * publish hands its frame to that recovery and resolves (#244); the recovery sends it on the new socket.
      */
     public function testLiveEpochFailureWhileConnectedListenerParkedStartsRecoveryNotSwallowed(): void
     {
@@ -9828,6 +9851,8 @@ final class NatsConnectionTest extends TestCase
 
         $transport = new class ($info) implements TransportInterface {
             public int $dials = 0;
+            /** @var list<string> */
+            public array $publishes = [];
             /** @var list<string> */
             private array $reads;
 
@@ -9850,11 +9875,18 @@ final class NatsConnectionTest extends TestCase
 
             public function write(string $bytes): Future
             {
-                return async(static function () use ($bytes): void {
-                    // The socket died right after the handshake: every publish write fails.
-                    if (str_starts_with($bytes, 'PUB ')) {
+                return async(function () use ($bytes): void {
+                    if (!str_starts_with($bytes, 'PUB ')) {
+                        return;
+                    }
+
+                    // The first socket died right after the handshake: its publish write fails. A frame that failed
+                    // on every socket would fail every reconnect's flush, and exhaust the reconnect (#244).
+                    if ($this->dials === 1) {
                         throw new TransportClosedException('broken pipe');
                     }
+
+                    $this->publishes[] = $bytes;
                 });
             }
 
@@ -9894,13 +9926,9 @@ final class NatsConnectionTest extends TestCase
         delay(0.05);
         self::assertSame(ConnectionState::Open, $connection->state());
 
-        // A publish on the LIVE epoch fails - a genuine current failure, not a stale continuation.
-        // It may throw (the transport rejects every PUB), but it must trigger a recovery.
-        try {
-            $connection->publish('orders.new', 'payload')->await(new TimeoutCancellation(5));
-        } catch (\Throwable) {
-            // Acceptable: the socket rejects every publish; only the recovery attempt is asserted.
-        }
+        // A publish on the LIVE epoch fails - a genuine current failure, not a stale continuation. It must
+        // trigger a recovery, which takes its frame.
+        $connection->publish('orders.new', 'payload')->await(new TimeoutCancellation(5));
 
         $gate->complete();
         $connect->await(new TimeoutCancellation(5));
@@ -9914,6 +9942,7 @@ final class NatsConnectionTest extends TestCase
         self::assertContains(ConnectionEvent::Reconnected, $events);
         self::assertSame(2, $transport->dials, 'the swallowed recovery would have left dials at 1 on a dead socket');
         self::assertSame(ConnectionState::Open, $connection->state());
+        self::assertSame(["PUB orders.new 7\r\npayload\r\n"], $transport->publishes);
     }
 
     /**
@@ -12680,11 +12709,12 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * A publish whose write fails while ANOTHER fiber's recovery is already in flight must AWAIT
-     * that recovery and retry on the fresh socket - returning early would retry on the dead socket
-     * and surface a spurious failure for a frame the recovery was about to make deliverable.
+     * A publish whose write fails while ANOTHER fiber's failed publish has a recovery under way puts its frame
+     * into that recovery's buffer, without waiting for the recovery and without starting a second one (#244):
+     * both frames land on the fresh socket, in admission order. Retrying on the dead socket instead would
+     * surface a spurious failure for a frame the recovery was about to make deliverable.
      */
-    public function testSecondFailingPublisherAwaitsInFlightRecoveryAndRetriesOnTheFreshSocket(): void
+    public function testSecondFailingPublisherJoinsTheInFlightRecoveryBufferAndIsSentOnTheFreshSocket(): void
     {
         $info = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
@@ -12751,10 +12781,11 @@ final class NatsConnectionTest extends TestCase
 
         $first->await(new TimeoutCancellation(5));
         $second->await(new TimeoutCancellation(5));
+        self::awaitUntil(static fn(): bool => $connection->state() === ConnectionState::Open, 'the shared recovery to reopen the connection');
 
-        self::assertSame(ConnectionState::Open, $connection->state());
-        $pubs = array_values(array_filter($transport->writes, static fn(string $w): bool => str_starts_with($w, 'PUB ')));
-        self::assertCount(2, $pubs, 'both publishes must land on the fresh socket after the shared recovery');
+        self::assertCount(2, $transport->connectCalls, 'one recovery owns the outage');
+        $wire = implode('', array_filter($transport->writes, static fn(string $w): bool => str_contains($w, 'PUB ')));
+        self::assertSame("PUB orders.a 2\r\na1\r\nPUB orders.b 2\r\nb1\r\n", $wire, 'both publishes land on the fresh socket, in order');
     }
 
     /**

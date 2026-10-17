@@ -35,7 +35,7 @@ use function Amp\async;
  *  - a message the reconnect's own delivery gave the pull in flight, queued behind a delivery a lower sid's handler
  *    held up while another fiber ran the reconnect;
  *  - the answer to a pull the engine issued on the new connection before it came round to see the reconnect, as when
- *    the handler's ack met the dead socket and ran the reconnect inline;
+ *    the handler's ack met the dead socket and the handler waited for the reconnect;
  *  - what a request the server kept across the reconnect brought (a server that outlives the connection serves its
  *    waiting requests once the reconnect subscribes the inbox again), and what a pull written from the reconnect
  *    buffer brought after the run had counted it as lost: more than the pulls the run counts have room for.
@@ -208,9 +208,10 @@ final class PullConsumerReconnectTest extends TestCase
     /**
      * A reconnect that the handler runs is seen before the run pulls again: no held delivery, the server answers the
      * first pull with m1 and the second with m2, and the handler of m1 drops the connection and acks, so that the ack's
-     * failed write runs the reconnect inline. The run sees the reconnect before it issues its next pull, which goes out
-     * on the new connection under the new count, and m2, its answer, reaches the handler before any third pull: two
-     * pulls, one on each connection. The engine used to issue that pull before it saw the reconnect, then drop it with
+     * failed write starts the reconnect, which the handler waits for with a flush (the ack itself resolves once its
+     * frame is in the reconnect buffer, #244). The run sees the reconnect before it issues its next pull, which goes
+     * out on the new connection under the new count, and m2, its answer, reaches the handler before any third pull:
+     * two pulls, one on each connection. The engine used to issue that pull before it saw the reconnect, then drop it with
      * m2 at the top of its loop and pull a third time.
      */
     public function testAPullIssuedWhileTheHandlerRanTheReconnectKeepsItsMessage(): void
@@ -231,11 +232,12 @@ final class PullConsumerReconnectTest extends TestCase
 
         $handled = self::log();
         $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(1)->setDepth(1)->setExpiresMs(30_000);
-        $run = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $iterator, $happened): void {
+        $run = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $client, $iterator, $happened): void {
             $handled[] = $message->payload;
             if ($message->payload === 'm1') {
                 $transport->dropConnection();
                 $js->ack($message)->await();
+                $client->flush()->await();
 
                 return;
             }
@@ -256,11 +258,11 @@ final class PullConsumerReconnectTest extends TestCase
     /**
      * A pull issued after a reconnect the handler ran is not ended with the old ones: batch 2, the first pull is
      * answered with m1 and a 409 Batch Completed on its reply subject, and m1's handler runs the reconnect through its
-     * ack, as above. The second pull, on the new connection, is answered with m2 only, and the server sends m3 for it
-     * once the engine's next read takes the socket. The run keeps that pull, which it issued under the new count, in
-     * flight until m3 fills it: m2 and m3 reach the handler before any third pull. Issued under the old count, the
-     * pull was ended at the top of the loop with m2, and a third pull went out before m3 came. The engine used to
-     * drop that pull with m2.
+     * ack and a flush, as above. The second pull, on the new connection, is answered with m2 only, and the server
+     * sends m3 for it once the engine's next read takes the socket. The run keeps that pull, which it issued under the
+     * new count, in flight until m3 fills it: m2 and m3 reach the handler before any third pull. Issued under the old
+     * count, the pull was ended at the top of the loop with m2, and a third pull went out before m3 came. The engine
+     * used to drop that pull with m2.
      */
     public function testAPullIssuedAfterAReconnectInTheHandlerIsNotEndedWithTheOldOnes(): void
     {
@@ -286,11 +288,12 @@ final class PullConsumerReconnectTest extends TestCase
 
         $handled = self::log();
         $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(2)->setDepth(1)->setExpiresMs(30_000);
-        $run = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $iterator, $happened): void {
+        $run = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $client, $iterator, $happened): void {
             $handled[] = $message->payload;
             if ($message->payload === 'm1') {
                 $transport->dropConnection();
                 $js->ack($message)->await();
+                $client->flush()->await();
             } elseif ($message->payload === 'm3') {
                 $happened('the handler got m3');
                 $iterator->stop();
@@ -309,11 +312,12 @@ final class PullConsumerReconnectTest extends TestCase
     /**
      * A reconnect the handler of one pull runs is seen before the next pull's status is classified: batch 1, depth 2,
      * and the second pull's answer brings m-1, which goes to the first pull, the oldest open, and a terminal 409
-     * Consumer Deleted for the second pull itself. The handler of m-1 runs the reconnect through its ack. The run comes
-     * round to the top of its loop before it retires the second pull, which it ends with the old connection: the 409
-     * neither ends the run nor reaches onError, and the run pulls twice on the new connection, whose answer, m-2,
-     * reaches the handler. Retired first, the old 409 ended the run through onError with one message processed, and so
-     * did the engine, which used to drop the pulls at the top of its loop only after the retire phase.
+     * Consumer Deleted for the second pull itself. The handler of m-1 runs the reconnect through its ack and a flush.
+     * The run comes round to the top of its loop before it retires the second pull, which it ends with the old
+     * connection: the 409 neither ends the run nor reaches onError, and the run pulls twice on the new connection,
+     * whose answer, m-2, reaches the handler. Retired first, the old 409 ended the run through onError with one message
+     * processed, and so did the engine, which used to drop the pulls at the top of its loop only after the retire
+     * phase.
      */
     public function testAReconnectInTheHandlerIsSeenBeforeTheNextPullsStatusIsClassified(): void
     {
@@ -330,11 +334,12 @@ final class PullConsumerReconnectTest extends TestCase
             ->setOnError(static function (\Throwable $error) use ($errors): void {
                 $errors[] = $error->getMessage();
             });
-        $processed = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $iterator): void {
+        $processed = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $client, $iterator): void {
             $handled[] = $message->payload;
             if ($message->payload === 'm-1') {
                 $transport->dropConnection();
                 $js->ack($message)->await();
+                $client->flush()->await();
             } else {
                 $iterator->stop();
             }
@@ -351,9 +356,9 @@ final class PullConsumerReconnectTest extends TestCase
      * The same rule keeps a pinned group's pin: a stale-pin 423 the old connection brought a pull behind the one whose
      * handler runs the reconnect leaves the run unclassified. The group's first pull captures the pin from m-1, the run
      * fans out to two pulls carrying it, and the answer to the second of them brings m-2 for the first and a 423 for
-     * itself; m-2's handler runs the reconnect through its ack. The pulls the run issues on the new connection still
-     * carry the pin, and m-3 reaches the handler. Classified, the 423 dropped the pin, and the next pull went out
-     * without it, serially, to capture a pin again.
+     * itself; m-2's handler runs the reconnect through its ack and a flush. The pulls the run issues on the new
+     * connection still carry the pin, and m-3 reaches the handler. Classified, the 423 dropped the pin, and the next
+     * pull went out without it, serially, to capture a pin again.
      */
     public function testAStalePinStatusTheOldConnectionBroughtDoesNotDropThePin(): void
     {
@@ -375,11 +380,12 @@ final class PullConsumerReconnectTest extends TestCase
         $handled = self::log();
         $iterator = $client->jetStream()->pullConsumer('S', 'C')->setBatching(1)->setDepth(2)->setExpiresMs(30_000)
             ->setGroup('workers');
-        $processed = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $iterator): void {
+        $processed = $iterator->handle(static function (NatsMessage $message, JetStreamContext $js) use ($handled, $transport, $client, $iterator): void {
             $handled[] = $message->payload;
             if ($message->payload === 'm-2') {
                 $transport->dropConnection();
                 $js->ack($message)->await();
+                $client->flush()->await();
             } elseif ($message->payload === 'm-3') {
                 $iterator->stop();
             }
@@ -524,7 +530,8 @@ final class PullConsumerReconnectTest extends TestCase
      * A reconnect that onError runs is seen before the idle backoff: no_wait, depth 1, the stream empty for six pulls
      * (404 No Messages each), so that the backoff between them has grown to 320 ms, and the seventh pull is answered
      * with a 503 No Responders, whose onError, the first of that outage, publishes an alert on the dead connection,
-     * which runs the reconnect inline. The run sees the reconnect in the retire phase, right after onError, and pulls on
+     * which starts the reconnect, and waits for it with a flush (the publish itself resolves once its frame is in the
+     * reconnect buffer, #244). The run sees the reconnect in the retire phase, right after onError, and pulls on
      * the new connection at once, the reset clearing the idle state, before a timer of 250 ms that starts when onError
      * returns fires; waiting out the backoff first held that pull for 500 ms, and so did the engine, which used to see the
      * reconnect only at the top of its loop, after the backoff. The bound sits far from both outcomes.
@@ -548,6 +555,7 @@ final class PullConsumerReconnectTest extends TestCase
         $iterator->setOnError(static function () use ($transport, $client, $happened): void {
             $transport->dropConnection();
             $client->publish('alerts', 'no responders')->await();
+            $client->flush()->await();
             EventLoop::delay(0.25, static fn() => $happened('the timer'));
         });
         $processed = $iterator->handle(static function (NatsMessage $message) use ($handled, $iterator): void {

@@ -88,8 +88,10 @@ final class CloseIntentTest extends TestCase
     /**
      * A publish whose write was still in flight when the application closed and reopened the connection,
      * over a transport that fails such a write only later - after the reopen (TransportInterface allows
-     * it; a plain socket fails it at the close, see the test below). That failure no longer tears down the
-     * new connection with a reconnect: the frame goes out on the new one.
+     * it; a plain socket fails it at the close, see testPublishInFlightWhenTheConnectionIsClosedFails...).
+     * That failure does not tear down the new connection with a reconnect, and the close wins over the frame,
+     * as it does when the socket fails the write at the close: the publish fails with its write's error, and
+     * nothing goes out on the new connection (#244). It used to be written to the new connection.
      */
     public function testWriteFailingOnAReplacedConnectionDoesNotTearDownTheNewOne(): void
     {
@@ -102,12 +104,18 @@ final class CloseIntentTest extends TestCase
         $connection->disconnect()->await();
         $connection->connect()->await();
         self::assertFalse($publish->isComplete(), 'the write fails only after the reopen');
-        $publish->await();
+        try {
+            $publish->await();
+            self::fail('expected the publish to fail');
+        } catch (TransportClosedException $e) {
+            self::assertSame('The connection is gone', $e->getMessage());
+        }
 
         self::assertSame(ConnectionState::Open, $connection->state());
         self::assertSame(1, $transport->epoch(), 'no reconnect after the reopen');
         self::assertSame(0, $connection->statistics()->reconnects);
-        self::assertSame(['PUB events 7'], $transport->controlLinesStartingWith('PUB events', 1));
+        self::assertSame(0, $connection->statistics()->outMsgs);
+        self::assertSame([], $transport->controlLinesStartingWith('PUB events'));
     }
 
     /**
@@ -824,23 +832,56 @@ final class CloseIntentTest extends TestCase
     }
 
     /**
-     * A publish whose failed write runs the reconnect, which disconnect() stops: the publish fails with an error
-     * of this library even when its write failed with the raw stream error a built-in transport passes on - a
-     * TransportClosedException "Transport is not connected" carrying that error, as when the retry went into
-     * the closed transport. The raw error, thrown as it was, would escape a catch (NatsThrowable).
+     * A publish whose failed write starts the reconnect, which disconnect() stops: the publish succeeded once its
+     * frame was in the reconnect buffer (#244), and the disconnect discards the frame with the rest of the buffer,
+     * without a report - disconnect() is the deliberately lossy close. Nothing is sent, then or on a later connect.
+     * The publish used to wait for the reconnect, and fail with its write's error when the disconnect stopped it.
      */
-    public function testPublishWhoseReconnectADisconnectStopsFailsWithAnErrorOfThisLibrary(): void
+    public function testPublishWhoseReconnectADisconnectStopsIsDiscardedByTheDisconnect(): void
+    {
+        $transport = new ReconnectingTransport();
+        $errors = [];
+        $connection = $this->connect($transport, errorListener: static function (\Throwable $error) use (&$errors): void {
+            $errors[] = $error->getMessage();
+        });
+        $transport->refuseDials();
+        $transport->failNextWriteContaining('PUB orders', new ClosedException('The stream is not writable'));
+
+        $connection->publish('orders', 'payload')->await(new TimeoutCancellation(2));
+        self::assertSame(ConnectionState::Connecting, $connection->state());
+        $connection->disconnect()->await();
+        $transport->acceptDials();
+        $connection->connect()->await();
+        $connection->flush()->await(new TimeoutCancellation(2));
+
+        self::assertSame([], $errors, 'disconnect() reports no discarded publish');
+        self::assertSame(1, $connection->statistics()->outMsgs);
+        self::assertSame([], $transport->controlLinesStartingWith('PUB'));
+    }
+
+    /**
+     * A publish whose write fails while disconnect() is closing the connection: nothing will send its frame, and
+     * the publish fails with an error of this library even when its write failed with the raw stream error a
+     * built-in transport passes on - a TransportClosedException "Transport is not connected" carrying that error.
+     * The raw error, thrown as it was, would escape a catch (NatsThrowable).
+     */
+    public function testPublishWhoseWriteFailsWhileADisconnectClosesFailsWithAnErrorOfThisLibrary(): void
     {
         $transport = new ReconnectingTransport();
         $connection = $this->connect($transport);
         $writeError = new ClosedException('The stream is not writable');
-        $transport->refuseDials();
+        // The write is held until the disconnect has begun closing the socket, and then fails with the raw error.
+        $transport->stallNextWriteContaining('PUB orders', 1.0);
         $transport->failNextWriteContaining('PUB orders', $writeError);
+        $transport->closeDelay = 0.05;
+        $transport->beforeClose = static function () use ($transport): void {
+            $transport->releaseStalledWrites();
+        };
 
         $publish = $connection->publish('orders', 'payload');
         $publish->ignore();
-        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
-        $connection->disconnect()->await();
+        $this->waitUntil(static fn(): bool => $transport->writesStalled() === 1);
+        $disconnect = $connection->disconnect();
 
         $failure = null;
         try {
@@ -848,11 +889,14 @@ final class CloseIntentTest extends TestCase
         } catch (\Throwable $e) {
             $failure = $e;
         }
+        $disconnect->await(new TimeoutCancellation(2));
 
         self::assertInstanceOf(TransportClosedException::class, $failure);
         self::assertSame('Transport is not connected', $failure->getMessage());
+        self::assertSame(0, $failure->getCode());
         self::assertSame($writeError, $failure->getPrevious());
         self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertCount(1, $transport->connectCalls, 'no reconnect');
         self::assertSame([], $transport->controlLinesStartingWith('PUB'));
     }
 

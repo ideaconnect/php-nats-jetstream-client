@@ -21,6 +21,8 @@ use IDCT\NATS\JetStream\ObjectStore\ObjectData;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\Tests\Support\DroppingTransport;
 use IDCT\NATS\Tests\Support\FrameAtATimeTransport;
+use IDCT\NATS\Tests\Support\GatedDialTransport;
+use IDCT\NATS\Tests\Support\SeveringTransport;
 use IDCT\NATS\Transport\AmpSocketTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -2428,6 +2430,62 @@ final class JetStreamIntegrationTest extends TestCase
         } finally {
             $client->disconnect()->await();
             $js->deleteStream($stream)->await();
+            $admin->disconnect()->await();
+        }
+    }
+
+    /**
+     * A plain ack() whose own write meets the dead socket - no heartbeat noticed it first - resolves while the server
+     * still refuses connections, and reaches the server once it is back (#244): the reconnect flushes it, and the
+     * consumer, asked after a flush, has nothing waiting for an ack. The ack used to run the reconnect inline and
+     * resolve only once the server was back: through the Symfony Messenger transport, 103 s at the default policy.
+     * A plain ack() is not a confirmation: ackSync() is the one that waits for the server to record it.
+     */
+    public function testAPlainAckWhoseWriteMeetsTheDeadSocketReachesTheRestoredServer(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'ITACKOUT' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.orders';
+        $consumer = 'worker';
+        $admin = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $admin->connect()->await();
+        $adminJs = $admin->jetStream();
+        $adminJs->createStream($stream, [$subject])->await();
+        $adminJs->createConsumer($stream, $consumer, $subject)->await();
+        $adminJs->publish($subject, 'order-1')->await();
+        // No heartbeat: the ack's own write is the first to meet the dead socket.
+        $options = new NatsOptions(
+            servers: [$this->integrationServerUrl()],
+            reconnectEnabled: true,
+            maxReconnectAttempts: 200,
+            reconnectDelayMs: 10,
+            reconnectMaxDelayMs: 50,
+            reconnectJitterMs: 0,
+            pingIntervalSeconds: 0,
+        );
+        $transport = new GatedDialTransport(new SeveringTransport(new AmpSocketTransport($options)));
+        $client = new NatsClient($options, $transport);
+        $client->connect()->await();
+
+        try {
+            $messages = $client->jetStream()->fetchBatch($stream, $consumer, 1, 3_000)->await();
+            self::assertCount(1, $messages);
+            $transport->refuseDials();
+            $transport->sever();
+
+            $client->jetStream()->ack($messages[0])->await(new TimeoutCancellation(2));
+            self::assertSame(ConnectionState::Connecting, $client->state(), 'the ack resolved while the server was down');
+            $transport->acceptDials();
+            $client->flush()->await(new TimeoutCancellation(5));
+
+            self::assertSame(1, $client->statistics()->reconnects);
+            $info = $adminJs->getConsumer($stream, $consumer)->await();
+            self::assertSame(0, (int) ($info->raw['num_ack_pending'] ?? -1), 'the server recorded the ack');
+            self::assertSame(0, (int) ($info->raw['num_redelivered'] ?? -1));
+        } finally {
+            $client->disconnect()->await();
+            $adminJs->deleteStream($stream)->await();
             $admin->disconnect()->await();
         }
     }
