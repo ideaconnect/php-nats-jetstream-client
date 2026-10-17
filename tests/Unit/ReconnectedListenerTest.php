@@ -820,58 +820,60 @@ final class ReconnectedListenerTest extends TestCase
     }
 
     /**
-     * A publish whose failed write runs the reconnect, whose listener returns while a lame-duck failover it let
-     * start holds its dial: the publish is buffered behind the failover and sent on the connection the failover
-     * opens. The failover used to join the reconnect, which was waiting for its listener, and never happen: the
-     * publish went to the connection the server was about to close.
+     * A guarded publish (the pull consumer engine's, which still runs the recovery of its failed write inline, #244)
+     * whose failed write runs the reconnect, whose listener returns while a lame-duck failover it let start holds
+     * its dial: the publish is buffered behind the failover and sent on the connection the failover opens. The
+     * failover used to join the reconnect, which was waiting for its listener, and never happen: the publish went
+     * to the connection the server was about to close. A plain publish hands its frame to the first reconnect
+     * instead ({@see FailedPublishWriteTest}).
      */
-    public function testPublishWhoseListenerLeavesAFailoverInFlightIsSentOnTheConnectionItOpens(): void
+    public function testGuardedPublishWhoseListenerLeavesAFailoverInFlightIsSentOnTheConnectionItOpens(): void
     {
         $transport = new ReconnectingTransport();
         [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startFailover(...));
 
         $transport->failNextWriteContaining('PUB orders');
-        $connection->publish('orders', 'payload')->await(new TimeoutCancellation(3));
+        self::publishGuarded($connection)->await(new TimeoutCancellation(3));
         $transport->releaseDial();
         $this->waitUntilOpen($connection);
 
         self::assertListenerLeftAReconnectInFlight($action);
         self::assertSame(2, $transport->epoch(), 'failed over');
-        self::assertSame(['PUB orders 7'], $transport->controlLinesStartingWith('PUB', 2));
+        self::assertSame(['PUB orders reply 7'], $transport->controlLinesStartingWith('PUB', 2));
         self::assertSame([], $transport->controlLinesStartingWith('PUB', 1));
     }
 
     /**
-     * The same while the next reconnect backs off between refused dials: the publish is buffered and sent on
-     * the next connection. It used to fail with "The connection is gone", the frame lost.
+     * The same while the next reconnect backs off between refused dials: the guarded publish is buffered and sent
+     * on the next connection. It used to fail with "The connection is gone", the frame lost.
      */
-    public function testPublishWhoseListenerLeavesAReconnectBackingOffIsSentOnTheNextConnection(): void
+    public function testGuardedPublishWhoseListenerLeavesAReconnectBackingOffIsSentOnTheNextConnection(): void
     {
         $transport = new ReconnectingTransport();
         [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startReconnectBetweenRefusedDials(...));
 
         $transport->failNextWriteContaining('PUB orders');
-        $connection->publish('orders', 'payload')->await(new TimeoutCancellation(3));
+        self::publishGuarded($connection)->await(new TimeoutCancellation(3));
         $transport->acceptDials();
         $this->waitUntilOpen($connection);
 
         self::assertListenerLeftAReconnectInFlight($action);
         self::assertSame(2, $transport->epoch());
-        self::assertSame(['PUB orders 7'], $transport->controlLinesStartingWith('PUB', 2));
+        self::assertSame(['PUB orders reply 7'], $transport->controlLinesStartingWith('PUB', 2));
     }
 
     /**
      * The same while the next reconnect has dialled and waits for the server's greeting: nothing is written on
      * the new connection ahead of its CONNECT, which a retry written as soon as the reconnect returned would be.
-     * The publish used to fail with "The connection is gone", the next reconnect joining the first.
+     * The guarded publish used to fail with "The connection is gone", the next reconnect joining the first.
      */
-    public function testPublishRetryIsNotWrittenAheadOfTheNextConnectionsConnect(): void
+    public function testGuardedPublishRetryIsNotWrittenAheadOfTheNextConnectionsConnect(): void
     {
         $transport = new ReconnectingTransport();
         [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startReconnectAwaitingTheGreeting(...));
 
         $transport->failNextWriteContaining('PUB orders');
-        $connection->publish('orders', 'payload')->await(new TimeoutCancellation(3));
+        self::publishGuarded($connection)->await(new TimeoutCancellation(3));
         $transport->releaseGreeting();
         $this->waitUntilOpen($connection);
 
@@ -879,16 +881,16 @@ final class ReconnectedListenerTest extends TestCase
         $lines = $transport->controlLines(2);
         self::assertNotSame([], $lines);
         self::assertStringStartsWith('CONNECT ', $lines[0]);
-        self::assertSame(['PUB orders 7'], $transport->controlLinesStartingWith('PUB', 2));
+        self::assertSame(['PUB orders reply 7'], $transport->controlLinesStartingWith('PUB', 2));
     }
 
     /**
      * Against a server that requires authentication, which refuses a connection whose first message is not
      * CONNECT: the connection is not closed for good, as it would be by a retry written ahead of CONNECT - the
-     * reconnect refused as unauthorized gives up at once. The publish used to fail with "The connection is
+     * reconnect refused as unauthorized gives up at once. The guarded publish used to fail with "The connection is
      * gone".
      */
-    public function testPublishRetryDoesNotGetTheConnectionClosedByAServerRequiringAuthentication(): void
+    public function testGuardedPublishRetryDoesNotGetTheConnectionClosedByAServerRequiringAuthentication(): void
     {
         $transport = new ReconnectingTransport();
         $transport->requireConnectFirst = true;
@@ -896,13 +898,13 @@ final class ReconnectedListenerTest extends TestCase
         [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startReconnectAwaitingTheGreeting(...), $recorder);
 
         $transport->failNextWriteContaining('PUB orders');
-        $connection->publish('orders', 'payload')->await(new TimeoutCancellation(3));
+        self::publishGuarded($connection)->await(new TimeoutCancellation(3));
         $transport->releaseGreeting();
         $this->waitUntilOpen($connection);
 
         self::assertListenerLeftAReconnectInFlight($action);
         self::assertSame(0, $recorder->closedEvents());
-        self::assertSame(['PUB orders 7'], $transport->controlLinesStartingWith('PUB', 2));
+        self::assertSame(['PUB orders reply 7'], $transport->controlLinesStartingWith('PUB', 2));
     }
 
     /**
@@ -963,14 +965,14 @@ final class ReconnectedListenerTest extends TestCase
     }
 
     /**
-     * A publish whose failed write runs the reconnect, whose listener closes the connection: the publish fails
-     * with the error of its write, and nothing is sent after the close. A raw stream error is wrapped in a
+     * A guarded publish whose failed write runs the reconnect, whose listener closes the connection: the publish
+     * fails with the error of its write, and nothing is sent after the close. A raw stream error is wrapped in a
      * TransportClosedException "Transport is not connected", so that the publish still fails with an error of
      * this library, as when its retry went into the closed transport; thrown as it was, it would escape a
-     * catch (NatsThrowable).
+     * catch (NatsThrowable). A plain publish's frame is sent by that reconnect before the listener runs (#244).
      */
     #[DataProvider('writeErrors')]
-    public function testPublishWhoseListenerClosesTheConnectionFailsWithTheErrorOfItsWrite(?\Throwable $writeError): void
+    public function testGuardedPublishWhoseListenerClosesTheConnectionFailsWithTheErrorOfItsWrite(?\Throwable $writeError): void
     {
         $transport = new ReconnectingTransport();
         $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection): void {
@@ -980,7 +982,7 @@ final class ReconnectedListenerTest extends TestCase
         $action->connection = $connection;
 
         $transport->failNextWriteContaining('PUB orders', $writeError);
-        $failure = $this->publishFailure($connection->publish('orders', 'payload'));
+        $failure = $this->publishFailure(self::publishGuarded($connection));
 
         self::assertInstanceOf(TransportClosedException::class, $failure);
         if ($writeError === null) {
@@ -995,13 +997,13 @@ final class ReconnectedListenerTest extends TestCase
     }
 
     /**
-     * A publish whose failed write runs the reconnect, while a drain() waits for that reconnect: the drain goes on
-     * once the reconnect is over, while the Reconnected listener is still busy, and is still flushing when the
-     * listener returns - its PING goes unanswered. The publish's retry goes to the connection being drained, like
-     * any publish made during a drain, and the publish succeeds. Failed with the error of its write instead, it
-     * would lose a frame the open connection could still take.
+     * A guarded publish whose failed write runs the reconnect, while a drain() waits for that reconnect: the drain
+     * goes on once the reconnect is over, while the Reconnected listener is still busy, and is still flushing when
+     * the listener returns - its PING goes unanswered. The publish's retry goes to the connection being drained,
+     * like any publish made during a drain, and the publish succeeds. Failed with the error of its write instead,
+     * it would lose a frame the open connection could still take.
      */
-    public function testPublishWhoseReconnectADrainWaitsForIsWrittenWhileTheDrainFlushes(): void
+    public function testGuardedPublishWhoseReconnectADrainWaitsForIsWrittenWhileTheDrainFlushes(): void
     {
         $transport = new ReconnectingTransport();
         $action = new ListenerAction(new LifecycleRecorder(), static function () use ($transport): bool {
@@ -1019,7 +1021,7 @@ final class ReconnectedListenerTest extends TestCase
         $drain->await(new TimeoutCancellation(3));
 
         self::assertTrue($action->result, 'the drain was under way while the listener ran');
-        self::assertSame(['PUB orders 7'], $transport->controlLinesStartingWith('PUB', 1), 'written to the connection being drained');
+        self::assertSame(['PUB orders reply 7'], $transport->controlLinesStartingWith('PUB', 1), 'written to the connection being drained');
         self::assertSame(['UNSUB 1'], $transport->controlLinesStartingWith('UNSUB', 1));
         self::assertSame(ConnectionState::Closed, $connection->state());
     }
@@ -1034,13 +1036,14 @@ final class ReconnectedListenerTest extends TestCase
 
     /**
      * The same, but the drain is over before the announcement of the reconnect is - the Reconnected listener, or
-     * the logger recording the Reconnected, takes its time: the publish fails with the error of its write, and its
-     * frame is not sent. The drain waits for the reconnect, not for its announcement, and closed the connection
-     * before the publish could retry. Pinned as it is: when the reconnect was announced from inside it, the retry
-     * came first, because the drain could not go on until the listener and the logger had returned.
+     * the logger recording the Reconnected, takes its time: the guarded publish fails with the error of its write,
+     * and its frame is not sent. The drain waits for the reconnect, not for its announcement, and closed the
+     * connection before the publish could retry. Pinned as it is: when the reconnect was announced from inside it,
+     * the retry came first, because the drain could not go on until the listener and the logger had returned. A
+     * plain publish's frame is sent by the reconnect's flush, ahead of the drain (#244).
      */
     #[DataProvider('slowAnnouncements')]
-    public function testPublishWhoseReconnectADrainWaitsForFailsWhenTheDrainEndsFirst(bool $slowListener): void
+    public function testGuardedPublishWhoseReconnectADrainWaitsForFailsWhenTheDrainEndsFirst(bool $slowListener): void
     {
         $transport = new ReconnectingTransport();
         if ($slowListener) {
@@ -1379,8 +1382,8 @@ final class ReconnectedListenerTest extends TestCase
     }
 
     /**
-     * Fails the next publish's write and holds the dial of the reconnect the publish then runs; calls drain() while
-     * that reconnect is in flight, and lets the dial through. Returns the publish and the drain.
+     * Fails the next guarded publish's write and holds the dial of the reconnect the publish then runs; calls drain()
+     * while that reconnect is in flight, and lets the dial through. Returns the publish and the drain.
      *
      * @return array{Future<void>, Future<void>}
      */
@@ -1388,7 +1391,7 @@ final class ReconnectedListenerTest extends TestCase
     {
         $transport->failNextWriteContaining('PUB orders');
         $transport->holdNextDial();
-        $publish = $connection->publish('orders', 'payload');
+        $publish = self::publishGuarded($connection);
         $publish->ignore();
         $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting);
         $drain = $connection->drain();
@@ -1397,6 +1400,17 @@ final class ReconnectedListenerTest extends TestCase
         $transport->releaseDial();
 
         return [$publish, $drain];
+    }
+
+    /**
+     * A guarded publish of "payload" to "orders", replies to "reply", whose guard lets it through: the one kind of
+     * publish that still recovers inline from a failed write and sends again afterwards (#206, #244).
+     *
+     * @return Future<void>
+     */
+    private static function publishGuarded(NatsConnection $connection): Future
+    {
+        return $connection->publishGuarded('orders', 'payload', 'reply', static function (): void {});
     }
 
     /**

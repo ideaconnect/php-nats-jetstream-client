@@ -15,6 +15,90 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.27.1] - 2026-10-17
+
+### Upgrade notes
+
+A plain publish whose write is the first to notice a lost connection no longer waits for the reconnect (#244). This
+covers `publish()`, `publishWithHeaders()`, a JetStream `ack()`, `nak()`, `term()` and `inProgress()`, `respond()`, a
+service's replies, flow-control replies and the intermediate messages of an atomic batch. Read these before upgrading:
+
+- **It resolves early.** The publish resolves once its frame is in the reconnect buffer, as a publish made during a
+  reconnect always did, not once the frame is written. It used to resolve only after the reconnect and the retry
+  write, and to fail with `Reconnect attempts exhausted` when the reconnect gave up.
+- **Losses are reported out of band.** A reconnect that gives up, or fails authentication, discards the frame with
+  the rest of the buffer. You learn of it from the `errorListener` (`Reconnect exhausted: N bytes of buffered
+  publishes were discarded`) and the `Closed` event, not from the publish. A resolved `ack()` never meant the server
+  recorded the ack: use `ackSync()` for that, or a JetStream publish for a PubAck.
+- **The buffer's limits apply.** A frame that does not fit fails the publish at once with `Connection is not open`,
+  the write's error as its previous one: buffering disabled (`reconnectBufferSize: 0`), or the buffer full. The
+  reconnect still goes on. A producer that relied on the inline wait to slow down now meets that limit. To wait for
+  the frame to go out, call `flush()`, which waits for the reconnect within `requestTimeoutMs` when
+  `waitForReconnect` is on.
+- **`disconnect()` stays lossy.** A `disconnect()` during the reconnect discards the accepted frame without a report,
+  as it discards every buffered publish. The frame is never sent on a later connection. Such a publish used to fail.
+  The same holds for a write that fails after you closed and reopened the connection: the publish now fails with its
+  write's error and nothing is sent on the new connection, where the frame used to be written to it.
+- **The order across publishers changes.** The frame is flushed in the order frames were accepted. It can now go out
+  ahead of frames other fibers buffered after it, where it used to come after every frame buffered during the outage.
+  A single publisher's frames keep their order.
+- **A frame that always fails can exhaust the reconnect.** Like any buffered frame, it now fails every flush. With the
+  built-in transports a write error belongs to the socket, not to the frame, so this only affects custom transports
+  or test doubles that reject one frame for good. A flush write that fails is retried on the next attempt, so a frame
+  may arrive twice, as any buffered frame may.
+- **Two waits remain.** The original write itself can still take a while. A publish that finds the reconnect's flush
+  sealed under sustained publishing (#165) still waits for the reconnect to end.
+- **Code that counted on the wait must wait itself.** A handler whose `ack()` met the dead socket used to return only
+  after the reconnect. Code that relied on that, in tests too, calls `flush()` after the publish.
+
+`publishGuarded()`, the pull consumer engine's internal publish, keeps the inline recovery and retry: its guard must
+run again after the subscription replay. With reconnect off, a failed write still fails the publish with `Reconnect
+is disabled`. Requests, `ackSync()` and JetStream publishes keep their bounded request path.
+
+### Fixed
+
+- `[bugfix]` A fire-and-forget publish whose write failed on a connection still reported Open ran the whole reconnect
+  loop inline (#244). `writePublishFrame()` called `recoverConnection()` in the caller's fiber, with no budget or
+  cancellation, and wrote the frame again once the loop was over. With the defaults (10 attempts, 100 ms doubling to
+  10 s) that is about 100 s for a server that does not come back, and a second publisher whose write failed meanwhile
+  joined the same wait. The same frame published a moment later, once the heartbeat had noticed the loss, was
+  buffered at once. Measured through `idct/symfony-nats-messenger` (ideaconnect/symfony-nats-messenger#81): an `ack()`
+  that met the outage returned after 103 s, one issued during the reconnect in under a millisecond.
+
+  The failed frame now goes to the reconnect buffer, and the recovery runs in a fiber of its own. The frame is
+  accepted, or refused, inside the recovery's claim: right after the recovery owns the connection and has left Open,
+  before it calls a listener or the logger, closes the socket or dials. Decided in the publisher instead, the decision
+  came after the `Disconnected` listener, which could fill the buffer first or close the connection. A write that
+  fails while another recovery runs puts its frame into that recovery's buffer without waiting for it. The other states
+  are routed explicitly. Closed, being closed, or closed and reopened since the write began: the publish fails with
+  its write's error, a raw stream error wrapped in a `TransportClosedException`. Draining: the frame goes to the socket
+  the drain holds, within its budget. Open on a newer connection: one direct retry. A connect() of your own dialling:
+  the frame is refused. A drain that waits for the reconnect now finds the frame sent, where a slow `Reconnected`
+  listener used to let the drain close the connection before the retry.
+
+### Testing & CI
+
+- `[docs]` New `FailedPublishWriteTest` (41 cases, #244) over `ReconnectingTransport`, with the recovery's dial held
+  where the publish must be done first. It covers the publish, an HPUB, a JetStream `ack()` and a header block
+  segment, each with and without waiting for a reconnect, resolving while the dial is held, then sent once after
+  `CONNECT` and the replay. The other cases: a second failed write, and one failing while another fiber's recovery
+  runs, joining that recovery's buffer; a `Disconnected` listener that publishes or closes; the buffer disabled, an
+  exact fit, one byte short, full, and a segment larger than the buffer; persistent and partial flush failures and an
+  ambiguous one; authentication failure; slow and throwing listeners and loggers; a close before the recovery claims
+  the connection; what the recovery's fiber finds when it runs; the one tick a frame buffered that way yields; a sealed
+  flush; a drain waiting for the reconnect and one already under way; an atomic batch committed behind its buffered
+  intermediates, or failed when they do not fit. The close and claim cases use the new
+  `tests/Support/HeldFailingWriteTransport.php`, which holds a write back and fails it when the test says.
+- `[docs]` New live test `JetStreamIntegrationTest::testAPlainAckWhoseWriteMeetsTheDeadSocketReachesTheRestoredServer`:
+  a plain `ack()` whose write meets a severed socket resolves while dials are refused, and the consumer has nothing
+  waiting for an ack once a flush returns after the reconnect.
+- `[docs]` Restaged for the new contract: the `NatsConnectionTest` failed-publish cases (ordering now by admission;
+  the #144 handler test fails its write once; the others wait for Open), `CloseIntentTest` (a disconnect discards the
+  accepted frame; a late write after a reopen fails; new: a write failing during a disconnect is wrapped),
+  `OperationReadReconnectTest` and `PullConsumerReconnectTest` (a handler or `onError` that publishes on the dead
+  connection waits for the reconnect with `flush()`). The `ReconnectedListenerTest` cases that pin the retry after the
+  reconnect now use `publishGuarded()`, which keeps it.
+
 ## [2.27.0] - 2026-10-14
 
 ### Upgrade notes
