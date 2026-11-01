@@ -51,15 +51,16 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Testing & CI
 
-- `[docs]` New `JetStreamPublishResendOnReconnectTest` (14 cases, #249) over `ReconnectingTransport`: a publish whose
+- `[docs]` New `JetStreamPublishResendOnReconnectTest` (15 cases, #249) over `ReconnectingTransport`: a publish whose
   connection drops right after its `HPUB` went out sends the same frame on the new session and returns its ack (stored
   now, or a duplicate) well before its timeout, logged without the payload; a lame-duck failover does the same, and so
-  does a publish waiting behind the application's own read loop as the connection drops. Guards: without a `msgId`,
-  with the option off or with `waitForReconnect: false` nothing is written again and the publish ends as before; a
-  slow ack without a reconnect gets no second write; a 10158 answering the second frame leaves the publish waiting for
-  the first frame's ack, or ending with the timeout, while one answering a frame written once still fails it, and so
-  does another error answering the second frame; the second write never extends the timeout; and a second reconnect
-  after it writes no third copy. 9 of the 14 fail with the resend disabled; the other 5 are guards.
+  does a publish waiting behind the application's own read loop as the connection drops. Guards: without a `msgId`
+  (with other headers or none), with the option off or with `waitForReconnect: false` nothing is written again and the
+  publish ends as before; a slow ack without a reconnect gets no second write; a 10158 answering the second frame
+  leaves the publish waiting for the first frame's ack, or ending with the timeout, while one answering a frame written
+  once still fails it, and so does another error answering the second frame; the second write never extends the
+  timeout; and a second reconnect after it writes no third copy. 9 of the 15 fail with the resend disabled; the other 6
+  are guards.
 
 - `[docs]` Four mutants of the #214 change that no unit test killed are now covered (#247). CI's Mutation job never
   sees them: its 20 s budget per mutant skips them as too slow. A local diff-mode run with a 300 s budget found them.

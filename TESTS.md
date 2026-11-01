@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3735 unit tests, 160 integration tests, 49 Behat scenarios.
+Indicative totals: 3736 unit tests, 160 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -706,9 +706,9 @@ The JetStream reply inboxes at the connection's subscription limit (#175): the p
 - `testTheMarksLeaveASidThatIsNoLongerRegisteredAlone` - Guard, white-box: markSubscriptionUnbounded() and markSubscriptionRejectionHandler() record nothing for a sid that is not registered (dropped by another fiber's read between the SUB write and these calls, which the operation makes once the write completes), so the exemption and handler maps stay empty.
 
 ### tests/Unit/JetStreamPublishResendOnReconnectTest.php
-A JetStream publish() with a `msgId` whose connection is lost after its frame went out and before its PubAck came (#249), under `NatsOptions::$resendJetStreamPublishOnReconnect`, over `ReconnectingTransport`: each session stands for a server, one that answers nothing to the publish for the stream leader that went down with the connection, and the connection is dropped right after the publish's frame was written to it. 9 of the 14 cases fail with the resend disabled; the other 5 are guards that hold either way.
+A JetStream publish() with a `msgId` whose connection is lost after its frame went out and before its PubAck came (#249), under `NatsOptions::$resendJetStreamPublishOnReconnect`, over `ReconnectingTransport`: each session stands for a server, one that answers nothing to the publish for the stream leader that went down with the connection, and the connection is dropped right after the publish's frame was written to it. 9 of the 15 cases fail with the resend disabled; the other 6 are guards that hold either way.
 - `testAPublishWhoseConnectionDropsAfterItsFrameWentOutSendsItAgainOnTheNewConnection` - (the first copy lost / the first copy stored) The same HPUB (subject, payload, Nats-Msg-Id, reply subject: byte for byte) goes out once on each session, and the second session's ack (seq 7, `duplicate` false or true) resolves the publish in under 2 s with a 5 s timeout; one `info` record `NATS request sent again on the new connection` with the subject and generations 1 -> 2, and no log record carries the payload. It used to time out after 5 s.
-- `testAPublishThatMayNotGoOutTwiceTimesOutAsBefore` - (no msgId with the option on / a msgId with the option off) Guard: one frame on the first session, none on the second, and the publish ends with `Request timed out for subject orders.created` at its 1 s deadline, the connection Open again long before.
+- `testAPublishThatMayNotGoOutTwiceTimesOutAsBefore` - (no msgId with the option on / other headers but no msgId with the option on / a msgId with the option off) Guard: one frame on the first session, none on the second, and the publish ends with `Request timed out for subject orders.created` at its 1 s deadline, the connection Open again long before.
 - `testWithWaitingForAReconnectDisabledThePublishFailsAtOnceAsBefore` - Guard: with `waitForReconnect: false` the publish fails at once with `Connection is not open`, and once the connection is back no frame went out on it.
 - `testASlowAckWithoutAReconnectIsWaitedForWithNoSecondWrite` - Guard: an ack delayed 0.5 s with no reconnect resolves the publish, with one frame written.
 - `testADuplicateInProcessAnswerToTheSecondFrameLeavesThePublishWaitingForTheFirstFramesAck` - The second session answers the second frame with `409 duplicate message id is in process` (10158) and the first frame's ack 0.3 s later, to the same reply subject: the publish returns that ack (seq 11), after more than 0.25 s and under 2 s.
