@@ -166,6 +166,22 @@ final class NatsOptions
       *        receives anything (#177, #186). processIncoming() and readIncoming() throw a handler's exception
       *        either way, after the same delivery. Service::run(), the heartbeat, a reconnect and
       *        drain()/drainSubscription() report it either way.
+      * @param bool $resendJetStreamPublishOnReconnect Whether a JetStream publish() that carries a `$msgId`
+      *        (`Nats-Msg-Id`) writes its frame once more on the new connection when the connection the frame went
+      *        out on is replaced - a reconnect, or a lame-duck failover - before its PubAck came (#249). Off by
+      *        default: such a publish then waits out the rest of its request timeout and throws a TimeoutException
+      *        (outcome unknown) when the server that took the frame went down with the connection, as it always
+      *        did. On, the same frame (subject, payload, headers and reply subject) goes out once per publish, on
+      *        the new connection, within the publish's own timeout, and whichever reply comes first resolves the
+      *        publish: the stream's de-duplication answers a copy it already stored with a PubAck whose
+      *        `duplicate` is true. A `409 duplicate message id is in process` (err_code 10158, NATS 2.11+) answering
+      *        that second frame is not the outcome: the first frame is still being stored, and the publish waits
+      *        for its ack. Only a reconnect triggers it, never a slow reply. With {@see $waitForReconnect} off, a
+      *        publish whose read notices the lost connection still fails at once with "Connection is not open".
+      *        Publishes without a `$msgId`, plain requests, JetStream API calls, atomic batches and Key/Value or
+      *        Object Store writes are never sent again. The stream's `duplicate_window` must be longer than the
+      *        request timeout (the 2-minute default is). On a NATS 2.10 cluster a new stream leader can take a
+      *        publish before it has applied what the old leader replicated, so a copy may be stored twice there.
      */
     public function __construct(
         public readonly array $servers = [self::DEFAULT_SERVER],
@@ -214,6 +230,7 @@ final class NatsOptions
         public readonly bool $waitForReconnect = true,
         public readonly bool $slowConsumerErrorsFailOperations = false,
         public readonly bool $handlerErrorsFailOperations = false,
+        public readonly bool $resendJetStreamPublishOnReconnect = false,
     ) {
         // Fail fast on values that have no valid meaning, rather than misbehaving later. Note that
         // pingIntervalSeconds <= 0 (disables the heartbeat) and an empty servers list (falls back to

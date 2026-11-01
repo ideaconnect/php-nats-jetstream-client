@@ -595,6 +595,28 @@ final class NatsClient
     }
 
     /**
+     * Sends a request with headers as {@see requestWithHeaders()} does, writing its frame once more on the new connection
+     * when the connection it went out on is replaced before the reply came (#249). See
+     * {@see NatsConnection::requestResendingOnReconnect()}.
+     *
+     * @internal For JetStreamContext::publish() with a Nats-Msg-Id; not part of the supported API.
+     *
+     * @param array<string,string> $headers
+     * @param \Closure(NatsMessage):bool $isInterimReply Must not suspend or throw.
+     * @return Future<NatsMessage>
+     */
+    public function requestResendingOnReconnect(
+        string $subject,
+        string $payload,
+        array $headers,
+        \Closure $isInterimReply,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future {
+        return $this->connection->requestResendingOnReconnect($subject, $payload, $headers, $isInterimReply, $timeoutMs, $cancellation);
+    }
+
+    /**
      * Sends one request and collects multiple replies (scatter-gather), terminating on the first of:
      * {@see $maxResponses} replies, a no-responders sentinel, the per-message {@see $stallMs} gap, or
      * the total timeout. Mirrors nats.go `RequestMany` / nats.java `Connection.requestMany`. While a
