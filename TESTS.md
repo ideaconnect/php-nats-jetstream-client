@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3743 unit tests, 160 integration tests, 49 Behat scenarios.
+Indicative totals: 3744 unit tests, 160 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -2220,10 +2220,11 @@ The `UNSUB` a dropped shared reply inbox (mux) owes belongs to the connection it
 - `testRejectsNegativeReconnectValue` - Asserts the constructor throws InvalidArgumentException ('reconnectDelayMs') for `reconnectDelayMs: -1`.
 - `testRejectsNonPositiveReadChunkSize` - Asserts the constructor throws InvalidArgumentException ('readChunkSizeBytes') for `readChunkSizeBytes: 0` (#119).
 - `testAllowsDisabledHeartbeatAndEmptyServers` - Asserts that `pingIntervalSeconds: 0`, `maxPingsOut: 0`, and an empty servers list are all accepted (heartbeat-disabled is legitimate), preserving the zero values.
-- `testDefaultsMatchDocumentedValues` - Asserts the full set of constructor defaults (servers, name, inboxPrefix, all timeouts, reconnect params, ping/TLS/auth fields, slowConsumerPolicy=DropOldest, reconnectBufferSize=8388608, WebSocket/logger defaults, readChunkSizeBytes=131072, waitForReconnect=true, slowConsumerErrorsFailOperations=false, handlerErrorsFailOperations=false, etc.) match the README configuration table, field by field.
+- `testDefaultsMatchDocumentedValues` - Asserts the full set of constructor defaults (servers, name, inboxPrefix, all timeouts, reconnect params, ping/TLS/auth fields, slowConsumerPolicy=DropOldest, reconnectBufferSize=8388608, WebSocket/logger defaults, readChunkSizeBytes=131072, waitForReconnect=true, slowConsumerErrorsFailOperations=false, handlerErrorsFailOperations=false, resendJetStreamPublishOnReconnect=false, etc.) match the README configuration table, field by field.
 - `testWaitForReconnectCanBeDisabled` - Asserts `waitForReconnect: false` (the fail-fast opt-out) is accepted and kept.
 - `testSlowConsumerErrorsCanBeMadeToFailOperations` - Asserts `slowConsumerErrorsFailOperations: true` (the opt-out to the old behaviour) is accepted and kept.
 - `testHandlerErrorsCanBeMadeToFailOperations` - Asserts `handlerErrorsFailOperations: true` (the opt-out to the old behaviour) is accepted and kept.
+- `testAJetStreamPublishCanBeMadeToGoOutAgainOnReconnect` - Asserts `resendJetStreamPublishOnReconnect: true` (#249) is accepted and kept.
 
 ### tests/Unit/NkeySeedSignerTest.php
 - `testPublicKeyMatchesKnownUserSeed` - Asserts `publicKey()` for a known sample user seed equals the expected public key; skips without the sodium extension.

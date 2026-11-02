@@ -67,7 +67,7 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   does another error answering the second frame; the second write never extends the timeout; and a second reconnect
   after it writes no third copy. 12 of the 22 fail with the resend disabled; the other 10 are guards. The counter,
   scheduled-publish and invalid-subject cases kill the three mutants a local Infection run on the changed lines found
-  escaping.
+  escaping, and `NatsOptionsTest` now checks the option's default (off), whose flip no test caught.
 
 - `[docs]` Four mutants of the #214 change that no unit test killed are now covered (#247). CI's Mutation job never
   sees them: its 20 s budget per mutant skips them as too slow. A local diff-mode run with a 300 s budget found them.
