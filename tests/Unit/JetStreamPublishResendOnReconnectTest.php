@@ -6,11 +6,13 @@ namespace IDCT\NATS\Tests\Unit;
 
 use Amp\DeferredCancellation;
 use Amp\Future;
+use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Models\PubAck;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
@@ -140,6 +142,61 @@ final class JetStreamPublishResendOnReconnectTest extends TestCase
         self::assertGreaterThan(0.8, $elapsed, sprintf('the publish ended after %.3f s, before its 1 s deadline', $elapsed));
         self::assertSame(ConnectionState::Open, $client->state(), 'the reconnect was over long before the deadline');
         self::assertSame([1, 0], self::publishesPerSession($transport, 2));
+    }
+
+    /** @return iterable<string, array{\Closure(NatsClient): Future<mixed>, string}> */
+    public static function headeredRequestsThatAreNotPublishes(): iterable
+    {
+        yield 'a counter increment' => [
+            static fn(NatsClient $client): Future => $client->jetStream()->incrementCounter(self::SUBJECT, '+1'),
+            '{"val":"1"}',
+        ];
+        yield 'a scheduled publish' => [
+            static fn(NatsClient $client): Future => $client->jetStream()->publishScheduled(self::SUBJECT, 'orders.later', self::PAYLOAD, '@every 1m'),
+            self::ack(7),
+        ];
+    }
+
+    /**
+     * The other JetStream requests that carry headers - a counter increment, which a second copy would count twice, and
+     * a scheduled publish - are never written again with the option on: one frame on the first session, none on the
+     * second (which would answer it), and the request times out at its 1 s deadline as before.
+     *
+     * @param \Closure(NatsClient): Future<mixed> $request
+     */
+    #[DataProvider('headeredRequestsThatAreNotPublishes')]
+    public function testOtherHeaderedJetStreamRequestsAreNeverSentAgain(\Closure $request, string $answerOnTheNewConnection): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, requestTimeoutMs: 1_000);
+        $transport->responder = self::stream($transport, [1 => $answerOnTheNewConnection]);
+        self::dropAfterThePublishOn($transport, 0);
+
+        $start = hrtime(true);
+        $error = self::failure($request($client));
+        $elapsed = $this->secondsSince($start);
+
+        self::assertInstanceOf(TimeoutException::class, $error);
+        self::assertGreaterThan(0.8, $elapsed, sprintf('the request ended after %.3f s, before its 1 s deadline', $elapsed));
+        self::assertSame([1, 0], self::publishesPerSession($transport, 2));
+    }
+
+    /**
+     * The publish that may go out twice checks its subject first, as every request does: one with an empty token fails
+     * with the ProtocolException before the request sets anything up - no reply inbox subscribed, no frame written.
+     */
+    public function testAPublishThatMayGoOutTwiceRefusesAnInvalidSubjectBeforeWritingAnything(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, requestTimeoutMs: 1_000);
+        $transport->responder = self::stream($transport, [0 => self::ack(7)]);
+
+        $error = self::failure($client->jetStream()->publish('orders..created', self::PAYLOAD, msgId: self::MSG_ID));
+
+        self::assertInstanceOf(ProtocolException::class, $error);
+        self::assertSame('Subject must not contain empty tokens', $error->getMessage());
+        $written = array_filter($transport->writes, static fn(array $write): bool => preg_match('/^(H?PUB|SUB) /', $write['bytes']) === 1);
+        self::assertSame([], $written, 'no SUB for the reply inbox and no PUB/HPUB went out');
     }
 
     /**
@@ -467,6 +524,60 @@ final class JetStreamPublishResendOnReconnectTest extends TestCase
         self::assertLessThan(2.0, $this->secondsSince($start));
         self::assertSame([1, 1], self::publishesPerSession($transport, 2));
         self::assertStringStartsWith('tcp://10.0.0.2:4222', $transport->connectCalls[count($transport->connectCalls) - 1]);
+    }
+
+    /**
+     * Both copies are answered and the two acks come in one read - the first frame's, then the second frame's as a
+     * duplicate: the first resolves the publish, and the second, delivered to the same reply subject in the same batch,
+     * is ignored. The connection carries on: the next publish on it gets its own ack.
+     */
+    public function testTheFirstOfTwoAcksInOneReadResolvesThePublishAndTheSecondIsIgnored(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, requestTimeoutMs: 5_000);
+        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport): array {
+            if ($replyTo === null) {
+                return [];
+            }
+
+            if ($subject !== self::SUBJECT) {
+                return $transport->replyFrame($replyTo, self::ack(12));
+            }
+
+            if ($transport->epoch() !== 1) {
+                return [];
+            }
+
+            // One chunk carrying both acks.
+            return [implode('', [...$transport->replyFrame($replyTo, self::ack(7)), ...$transport->replyFrame($replyTo, self::ack(7, true))])];
+        };
+        self::dropAfterThePublishOn($transport, 0);
+
+        $ack = $client->jetStream()->publish(self::SUBJECT, self::PAYLOAD, msgId: self::MSG_ID)->await();
+        $next = $client->jetStream()->publish('orders.next', 'x')->await();
+
+        self::assertSame(7, $ack->seq);
+        self::assertFalse($ack->duplicate, 'the first of the two acks resolved the publish');
+        self::assertSame(12, $next->seq);
+        self::assertSame([1, 1], self::publishesPerSession($transport, 2));
+    }
+
+    /**
+     * #249 gave publishFrameWithin() a result, the generation its frame went out on. A batch request whose payload says
+     * that replies have settled it already ({@see NatsClient::publishWithin()}, a null payload) still writes nothing and
+     * returns.
+     */
+    public function testABatchRequestWithNothingLeftToSendWritesNothing(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport);
+        $sid = $client->subscribe('_INBOX.batch', static function (): void {})->await();
+        $before = count($transport->writes);
+
+        $client->publishWithin('orders.batch', static fn(): ?string => null, '_INBOX.batch', $sid, new TimeoutCancellation(1.0), static function (): void {})->await();
+
+        $batchWrites = array_filter(array_slice($transport->writes, $before), static fn(array $write): bool => str_contains($write['bytes'], 'orders.batch'));
+        self::assertSame([], $batchWrites);
     }
 
     private function client(

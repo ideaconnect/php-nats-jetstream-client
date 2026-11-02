@@ -2209,7 +2209,7 @@ final class JetStreamContext
      * @param bool $resendOnReconnect See {@see jsRequest()}: each attempt is a request of its own, which may write its
      *        frame once more after a reconnect.
      */
-    private function publishWithRetry(string $subject, string $payload, ?array $headers, bool $resendOnReconnect = false): NatsMessage
+    private function publishWithRetry(string $subject, string $payload, ?array $headers, bool $resendOnReconnect): NatsMessage
     {
         $attempts = max(1, $this->publishRetryAttempts);
 
