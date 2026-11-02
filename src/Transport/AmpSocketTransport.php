@@ -17,9 +17,10 @@ use function Amp\async;
 /**
  * Amp-based socket transport implementation for NATS connections.
  */
-final class AmpSocketTransport implements TlsAwareTransportInterface, CancellableDialTransportInterface
+final class AmpSocketTransport implements TlsAwareTransportInterface, CancellableDialTransportInterface, PeerCloseAwareTransportInterface
 {
     use AssemblesClientTlsContext;
+    use ChecksForAPeerClose;
     use OpensSocketCancellably;
 
     private ?Socket $socket = null;
@@ -201,6 +202,15 @@ final class AmpSocketTransport implements TlsAwareTransportInterface, Cancellabl
         }
 
         return Future::complete($chunk);
+    }
+
+    /**
+     * Whether the server has closed the socket with nothing left unread ({@see PeerCloseAwareTransportInterface}): a
+     * peek, which reads nothing and does not wait. False with no socket, and while bytes wait ahead of the close.
+     */
+    public function peerClosed(): bool
+    {
+        return self::peerHasClosed($this->socket);
     }
 
     /**

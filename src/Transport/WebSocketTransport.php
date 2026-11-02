@@ -27,9 +27,10 @@ use function Amp\async;
  * control frames handled transparently. TLS for `wss://` is negotiated during {@see connect()}, so
  * {@see upgradeTls()} is a no-op (there is no separate post-INFO upgrade for WebSocket).
  */
-final class WebSocketTransport implements TlsAwareTransportInterface, CancellableDialTransportInterface
+final class WebSocketTransport implements TlsAwareTransportInterface, CancellableDialTransportInterface, PeerCloseAwareTransportInterface
 {
     use AssemblesClientTlsContext;
+    use ChecksForAPeerClose;
     use OpensSocketCancellably;
 
     /** Hard cap on a reassembled fragmented message, bounding memory against a hostile/buggy server (#89). */
@@ -238,6 +239,16 @@ final class WebSocketTransport implements TlsAwareTransportInterface, Cancellabl
     public function tlsActive(): bool
     {
         return $this->tlsEstablished;
+    }
+
+    /**
+     * Whether the server has closed the socket with nothing left unread ({@see PeerCloseAwareTransportInterface}): a
+     * peek at the socket, which reads nothing and does not wait. A server that sends a Close frame ahead of its close
+     * leaves that frame unread, which answers false, as bytes waiting do.
+     */
+    public function peerClosed(): bool
+    {
+        return self::peerHasClosed($this->socket);
     }
 
     /**
