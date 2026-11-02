@@ -15,6 +15,12 @@ final class ApiErrCode
     public const STREAM_WRONG_LAST_SEQUENCE = 10071;
 
     /**
+     * `409 duplicate message id is in process` (nats-server `JSStreamDuplicateMessageConflict`, NATS 2.11+): a publish
+     * whose Nats-Msg-Id matches one the stream is still storing. Not a refusal: the earlier publish's ack decides.
+     */
+    public const STREAM_DUPLICATE_MESSAGE_CONFLICT = 10158;
+
+    /**
      * Extracts `err_code` from a decoded error envelope, or null when absent (a server predating the
      * field). A zero is treated as absent: real servers never emit `err_code: 0` (Go omitempty), so
      * it can only come from a malformed proxy - taking it as authoritative would disable the

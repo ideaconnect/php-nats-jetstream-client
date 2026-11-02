@@ -2083,10 +2083,17 @@ final class JetStreamContext
      * (e.g. publishing to a subject not bound to any stream, or with JetStream disabled).
      *
      * @param array<string,string>|null $headers
+     * @param bool $resendOnReconnect Whether the frame goes out once more when the connection it went out on is
+     *        replaced before the reply came (#249): a publish() with a Nats-Msg-Id, under
+     *        {@see \IDCT\NATS\Connection\NatsOptions::$resendJetStreamPublishOnReconnect}.
      */
-    private function jsRequest(string $subject, string $payload, ?array $headers = null): NatsMessage
+    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false): NatsMessage
     {
         try {
+            if ($resendOnReconnect && $headers !== null) {
+                return $this->client->requestResendingOnReconnect($subject, $payload, $headers, self::isDuplicateMessageInProcess(...))->await();
+            }
+
             return $headers === null
                 ? $this->client->request($subject, $payload)->await()
                 : $this->client->requestWithHeaders($subject, $payload, $headers)->await();
@@ -2095,6 +2102,25 @@ final class JetStreamContext
         } catch (NatsException $e) {
             throw JetStreamRequest::normalizeNoResponders($e, $subject);
         }
+    }
+
+    /**
+     * Whether a publish reply is `409 duplicate message id is in process` (err_code 10158, NATS 2.11+): the stream is
+     * still storing a publish with the same Nats-Msg-Id. Once a publish's frame went out a second time after a reconnect
+     * (#249), that is the answer to the second frame while the first is still on its way to being stored, not the
+     * outcome. Called from the delivery of the reply inbox: never suspends or throws.
+     */
+    private static function isDuplicateMessageInProcess(NatsMessage $reply): bool
+    {
+        $data = json_decode($reply->payload, true);
+        if (!is_array($data) || !is_array($data['error'] ?? null)) {
+            return false;
+        }
+
+        /** @var array<string,mixed> $error */
+        $error = $data['error'];
+
+        return ApiErrCode::fromEnvelope($error) === ApiErrCode::STREAM_DUPLICATE_MESSAGE_CONFLICT;
     }
 
     /**
@@ -2163,7 +2189,12 @@ final class JetStreamContext
                 $headers['Nats-Expected-Last-Msg-Id'] = $expectedLastMsgId;
             }
 
-            $message = $this->publishWithRetry($subject, $payload, $headers === [] ? null : $headers);
+            $message = $this->publishWithRetry(
+                $subject,
+                $payload,
+                $headers === [] ? null : $headers,
+                $msgId !== null && $this->client->options()->resendJetStreamPublishOnReconnect,
+            );
 
             return $this->parsePublishAck($message);
         });
@@ -2175,14 +2206,16 @@ final class JetStreamContext
      * nats.go `RetryAttempts`/`RetryWait` and nats.java's publish retry (#29).
      *
      * @param array<string,string>|null $headers
+     * @param bool $resendOnReconnect See {@see jsRequest()}: each attempt is a request of its own, which may write its
+     *        frame once more after a reconnect.
      */
-    private function publishWithRetry(string $subject, string $payload, ?array $headers): NatsMessage
+    private function publishWithRetry(string $subject, string $payload, ?array $headers, bool $resendOnReconnect): NatsMessage
     {
         $attempts = max(1, $this->publishRetryAttempts);
 
         for ($attempt = 1; ; $attempt++) {
             try {
-                return $this->jsRequest($subject, $payload, $headers);
+                return $this->jsRequest($subject, $payload, $headers, $resendOnReconnect);
             } catch (JetStreamException $e) {
                 // Only transient "no responder" failures are retried; a real publish error (bad
                 // subject, precondition mismatch, ...) is surfaced immediately.

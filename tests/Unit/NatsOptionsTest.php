@@ -124,6 +124,7 @@ final class NatsOptionsTest extends TestCase
         self::assertTrue($options->waitForReconnect);
         self::assertFalse($options->slowConsumerErrorsFailOperations);
         self::assertFalse($options->handlerErrorsFailOperations);
+        self::assertFalse($options->resendJetStreamPublishOnReconnect);
     }
 
     public function testWaitForReconnectCanBeDisabled(): void
@@ -139,5 +140,10 @@ final class NatsOptionsTest extends TestCase
     public function testHandlerErrorsCanBeMadeToFailOperations(): void
     {
         self::assertTrue((new NatsOptions(handlerErrorsFailOperations: true))->handlerErrorsFailOperations);
+    }
+
+    public function testAJetStreamPublishCanBeMadeToGoOutAgainOnReconnect(): void
+    {
+        self::assertTrue((new NatsOptions(resendJetStreamPublishOnReconnect: true))->resendJetStreamPublishOnReconnect);
     }
 }

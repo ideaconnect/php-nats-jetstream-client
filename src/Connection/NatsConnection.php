@@ -5050,6 +5050,43 @@ final class NatsConnection
     }
 
     /**
+     * @internal The request of a JetStream publish() that carries a Nats-Msg-Id, under
+     *           {@see NatsOptions::$resendJetStreamPublishOnReconnect} (#249); not part of the supported API.
+     *
+     * Sends as {@see requestWithHeaders()} does, with the same single budget, and writes the frame once more when the
+     * connection it went out on is replaced - a reconnect, or a lame-duck failover - before the reply came: the same
+     * subject, payload, headers and reply subject, on the new connection, once it is open, within that budget. The
+     * reply inbox was replayed with the other subscriptions, so whichever reply comes first ends the request. At most
+     * once per request: a second replacement after that write writes nothing more. Only a replacement triggers it,
+     * never a slow reply. With {@see NatsOptions::$waitForReconnect} off, a request whose read notices the lost
+     * connection fails at once, as {@see requestWithHeaders()} does, before it gets to write anything again.
+     *
+     * @param array<string,string> $headers Must carry the Nats-Msg-Id that makes a second copy of the frame harmless.
+     * @param \Closure(NatsMessage):bool $isInterimReply Whether a reply that comes once the frame went out again is only
+     *        the server's word that the first frame is still being processed, not the outcome: the request then waits on
+     *        for the reply to the first frame, within its budget. Called from the delivery of the reply inbox, so it must
+     *        not suspend or throw.
+     * @param Cancellation|null $cancellation Optional external cancellation token.
+     * @return Future<NatsMessage>
+     */
+    public function requestResendingOnReconnect(
+        string $subject,
+        string $payload,
+        array $headers,
+        \Closure $isInterimReply,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future {
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
+
+        return async(function () use ($subject, $payload, $headers, $isInterimReply, $timeoutMs, $cancellation, $issuedDuringRecovery): NatsMessage {
+            $this->validateSubjectCached($subject);
+
+            return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation, $issuedDuringRecovery, $isInterimReply);
+        });
+    }
+
+    /**
      * Establishes the per-connection mux request inbox on first use: one wildcard subscription
      * "<base>.*" whose handler ({@see dispatchMuxReply()}) routes every reply to its per-token waiter.
      * Idempotent - a no-op once established, so it survives reconnect (muxSid/muxBase are retained until
@@ -5624,6 +5661,7 @@ final class NatsConnection
      *
      * @param array<string,string>|null $headers
      * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
+     * @return int|null The {@see $connectionGeneration} of the connection the frame went out on.
      */
     private function publishRequestWithin(
         string $subject,
@@ -5636,10 +5674,10 @@ final class NatsConnection
         bool $issuedDuringRecovery,
         int $closes,
         int $muxGeneration,
-    ): void {
+    ): ?int {
         $frame = $this->encodePublishFrame($subject, $payload, $headers, $replyTo);
         try {
-            $this->publishFrameWithin(
+            return $this->publishFrameWithin(
                 static fn(): array => [$frame, $payload],
                 $budget,
                 $issuedDuringRecovery,
@@ -5691,12 +5729,16 @@ final class NatsConnection
      * @param bool $duringDrainDelivery Whether the frame may go out on a connection a drain() holds while that drain
      *        still delivers (a request's, #213). A write that fails on such a connection is not retried: close-intent
      *        forbids the reconnect, and {@see recoverAfterFailedWrite()} fails it, the drain closing the connection.
+     * @return int|null The {@see $connectionGeneration} of the connection the frame went out on, or null when
+     *         $makeFrame had nothing to send.
      */
-    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, bool $issuedDuringRecovery, \Closure $guard, bool $duringDrainDelivery = false): void
+    private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, bool $issuedDuringRecovery, \Closure $guard, bool $duringDrainDelivery = false): ?int
     {
+        /** @var int|null $sentOn Set by the write below once the frame is on the wire. */
+        $sentOn = null;
         for ($attempt = 0; ; $attempt++) {
             $budget->throwIfRequested();
-            $write = async(function () use ($makeFrame, $budget, $issuedDuringRecovery, $guard, $duringDrainDelivery): ?array {
+            $write = async(function () use ($makeFrame, $budget, $issuedDuringRecovery, $guard, $duringDrainDelivery, &$sentOn): ?array {
                 $budget->throwIfRequested();
                 $this->awaitOpenConnection($budget, $issuedDuringRecovery, duringDrainDelivery: $duringDrainDelivery);
                 $budget->throwIfRequested();
@@ -5722,13 +5764,14 @@ final class NatsConnection
                 }
 
                 $this->recordOutbound($payload);
+                $sentOn = $generation;
 
                 return null;
             });
             $write->ignore();
             $failure = $write->await($budget);
             if ($failure === null) {
-                return;
+                return $sentOn;
             }
 
             [$generation, $writeError] = $failure;
@@ -5753,6 +5796,9 @@ final class NatsConnection
      *
      * @param array<string,string>|null $headers
      * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
+     * @param (\Closure(NatsMessage):bool)|null $isInterimReply Given for a request that writes its frame once more when
+     *        the connection it went out on is replaced before its reply came ({@see requestResendingOnReconnect()},
+     *        #249): whether a reply that comes once the frame went out again leaves the request waiting.
      */
     private function requestInternal(
         string $subject,
@@ -5761,6 +5807,7 @@ final class NatsConnection
         ?int $timeoutMs,
         ?Cancellation $cancellation,
         bool $issuedDuringRecovery = false,
+        ?\Closure $isInterimReply = null,
     ): NatsMessage {
         $deadlineMs = $timeoutMs ?? $this->options->requestTimeoutMs;
         if ($deadlineMs <= 0) {
@@ -5796,20 +5843,32 @@ final class NatsConnection
         // What the request waits with while it is parked behind another fiber's read, below: its budget and its
         // wake-up, so that a drop of the inbox ends that wait as it ends a read (#180).
         $parkedWith = new CompositeCancellation($waitCancellation, $replyArrived->getCancellation());
+        // A request that writes its frame once more when the connection it went out on is replaced before its reply came
+        // (#249). With waiting for a reconnect disabled, a request whose read notices the lost connection still fails at
+        // once, before it gets to look again; with reconnect off nothing replaces the connection.
+        $resendable = $isInterimReply !== null;
+        // Whether the frame is going out, or went out, a second time: once per request at most, and from then on a reply
+        // that $isInterimReply recognises leaves the request waiting.
+        /** @var bool $resent Shared with the waiter below, by reference; set by the loop. */
+        $resent = false;
 
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118). The
         // handler body is unchanged and idempotent: a coalesced duplicate arriving in the same drain
         // batch (before the finally removes the waiter) is ignored by the isComplete() guard.
-        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived, $replyArrived): void {
-            if (!$deferred->isComplete()) {
-                $deferred->complete($message);
-                $replyReceived = true;
-                $replyArrived->cancel();
+        $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived, $replyArrived, &$resent, $isInterimReply): void {
+            // The server's answer to the frame written again can be that the first frame is still being processed
+            // (#249): not the outcome, which the reply to the first frame brings, to the same reply subject.
+            if ($deferred->isComplete() || ($resent && $isInterimReply !== null && $isInterimReply($message))) {
+                return;
             }
+
+            $deferred->complete($message);
+            $replyReceived = true;
+            $replyArrived->cancel();
         }, $replyArrived);
 
         try {
-            $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
+            $sentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
 
             while (true) {
                 // Completion is checked BEFORE the deadline so a reply delivered in the same tick the
@@ -5850,6 +5909,34 @@ final class NatsConnection
                     }
 
                     throw new TimeoutException('Request timed out for subject ' . $subject);
+                }
+
+                // The connection the frame went out on was replaced before the reply came (#249): when the server that
+                // took the frame went down with it, no reply can come any more. The frame goes out once more on the new
+                // connection, within the request's budget, and whichever reply comes first ends the request; a second
+                // replacement after that write writes nothing more. The request gets here as soon as the reconnect is
+                // over: a read on the lost socket fails and frees the read slot, and an operation's read that waited
+                // for a reconnect returns without reading ({@see readChunk()}). While the new connection is not open
+                // yet, the read below waits for it.
+                if ($resendable && !$resent && $sentOn !== null && $this->connectionGeneration !== $sentOn
+                    && $this->isUsableForOperations(false, duringDrainDelivery: true)
+                ) {
+                    $resent = true;
+                    $this->resendRequest(
+                        $subject,
+                        $payload,
+                        $headers,
+                        $replyTo,
+                        $waitCancellation,
+                        $cancellation,
+                        $lifetime,
+                        $issuedDuringRecovery,
+                        $closes,
+                        $muxGeneration,
+                        $sentOn,
+                    );
+
+                    continue;
                 }
 
                 if ($this->readInProgress) {
@@ -5900,6 +5987,71 @@ final class NatsConnection
             return $response;
         } finally {
             $this->removeMuxWaiter($token);
+        }
+    }
+
+    /**
+     * Writes a request's frame once more, on the connection that replaced the one its first write went out on (#249),
+     * with the checks of the first write ({@see publishRequestWithin()}) and within the request's budget, and logs it:
+     * the subject and the generations of both connections, never the payload. A reply that came in the meantime makes
+     * the second copy redundant, not harmful: the Nats-Msg-Id is what makes it safe, and the reply to it finds no
+     * waiter once the request has returned.
+     *
+     * A write that does not happen does not end the request: it looks again, and ends as it would have without it - with
+     * the reply to the first frame, at its deadline, with the close of the connection or the drop of the reply inbox.
+     * A failure the budget does not explain, a write that failed again after its recovery say, is logged as a warning.
+     *
+     * @param array<string,string>|null $headers
+     * @param int $sentOn The {@see $connectionGeneration} the first write went out on.
+     */
+    private function resendRequest(
+        string $subject,
+        string $payload,
+        ?array $headers,
+        string $replyTo,
+        Cancellation $budget,
+        ?Cancellation $cancellation,
+        DeferredCancellation $lifetime,
+        bool $issuedDuringRecovery,
+        int $closes,
+        int $muxGeneration,
+        int $sentOn,
+    ): void {
+        try {
+            $resentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $budget, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
+        } catch (\Throwable $failure) {
+            if (!$budget->isRequested()) {
+                $this->logSafely('warning', 'NATS request could not be sent again on the new connection', [
+                    'subject' => $subject,
+                    'previousGeneration' => $sentOn,
+                    'exception' => $failure,
+                ]);
+            }
+
+            return;
+        }
+
+        if ($resentOn !== null) {
+            $this->logSafely('info', 'NATS request sent again on the new connection', [
+                'subject' => $subject,
+                'generation' => $resentOn,
+                'previousGeneration' => $sentOn,
+            ]);
+        }
+    }
+
+    /**
+     * Logs through the configured logger, swallowing what a throwing logger throws: a log line must not change the
+     * outcome of the operation it describes.
+     *
+     * @param array<string,mixed> $context
+     */
+    private function logSafely(string $level, string $message, array $context): void
+    {
+        try {
+            $this->logger->log($level, $message, $context);
+        } catch (\Throwable) {
+            // Swallowed: see above.
         }
     }
 

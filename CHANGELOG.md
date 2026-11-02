@@ -17,7 +17,57 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Added
+
+- `[feature]` New `NatsOptions::$resendJetStreamPublishOnReconnect` (default `false`): a JetStream `publish()` that
+  carries a `$msgId` writes its frame once more on the new connection when the connection it went out on is replaced -
+  a reconnect, or a lame-duck failover - before its PubAck came (#249). Such a publish used to wait out the rest of its
+  request timeout on the new connection and throw a `TimeoutException` (outcome unknown) whenever the server that took
+  the frame, the stream's leader, went down with the connection: nothing sent it again, though the client had already
+  failed over and the `Nats-Msg-Id` makes a second copy harmless. Measured in ideaconnect/symfony-nats-messenger#95 on
+  a three-server cluster (nats-server 2.15.1, `requestTimeoutMs` 10 s): the retry publish of a failed handler ended
+  after 10.3 s with the timeout and the worker exited, while the same frame published again on the recovered connection
+  was stored at once.
+
+  With the option on, the request behind the publish remembers the connection generation its frame went out on. Once
+  the reconnect is over and that generation has moved, it writes the same frame (subject, payload, headers and the same
+  reply subject on the replayed reply inbox) on the new connection, within its own timeout, and whichever reply comes
+  first resolves the publish: the stream answers a copy it already stored with a PubAck whose `duplicate` is true. At
+  most once per publish attempt; a reconnect after that second write writes nothing more. Only a replaced connection
+  triggers it, never a slow reply (a second publish after a plain timeout misfired in the measurements: a slow leader
+  answered it with a 409, and with the whole cluster down the wait doubled). A `409 duplicate message id is in process`
+  (`ApiErrCode::STREAM_DUPLICATE_MESSAGE_CONFLICT`, err_code 10158, NATS 2.11+) answering the second frame is not the
+  outcome: the first frame is still being stored, so the publish keeps waiting for its ack and ends with the
+  `TimeoutException` when none comes; answering a frame written once it still fails the publish as before. The second
+  write is logged at `info` (`NATS request sent again on the new connection`, with the subject and both generations,
+  never the payload). A publish whose own read notices the lost connection with `waitForReconnect: false` still fails at
+  once, and with reconnect off nothing changes. Publishes without a `$msgId`, plain requests, JetStream API calls,
+  atomic batches and Key/Value or Object Store writes are never sent again.
+
+  Off by default because of two limits, documented with the option: the stream's `duplicate_window` must be longer
+  than the request timeout (the 2-minute default is), and on a NATS 2.10 cluster a new stream leader can take a publish
+  before it has applied what the old leader replicated, so a copy may be stored twice there (read from the server
+  source; 2.15.1 applies first, and the release that changed it is not pinned down).
+
 ### Testing & CI
+
+- `[docs]` New `JetStreamPublishResendOnReconnectTest` (22 cases, #249) over `ReconnectingTransport`: a publish whose
+  connection drops right after its `HPUB` went out sends the same frame on the new session and returns its ack (stored
+  now, or a duplicate) well before its timeout, logged without the payload; a lame-duck failover does the same, and so
+  does a publish waiting behind the application's own read loop as the connection drops. When both copies are
+  answered in one read, the first ack resolves the publish and the second is ignored. A second write that fails,
+  and fails again after its own reconnect, is logged as a warning and leaves the publish to its deadline; a logger
+  that throws on the second write's record changes nothing. Guards: without a `msgId` (with other headers or none),
+  with the option off or with `waitForReconnect: false` nothing is written again and the publish ends as before; a
+  counter increment and a scheduled publish, the other JetStream requests with headers, are never written again
+  either (a second increment would count twice); a publish with an invalid subject is refused before it subscribes its
+  reply inbox or writes anything; a batch request with nothing left to send writes nothing; a
+  slow ack without a reconnect gets no second write; a 10158 answering the second frame leaves the publish waiting for
+  the first frame's ack, or ending with the timeout, while one answering a frame written once still fails it, and so
+  does another error answering the second frame; the second write never extends the timeout; and a second reconnect
+  after it writes no third copy. 12 of the 22 fail with the resend disabled; the other 10 are guards. The counter,
+  scheduled-publish and invalid-subject cases kill the three mutants a local Infection run on the changed lines found
+  escaping, and `NatsOptionsTest` now checks the option's default (off), whose flip no test caught.
 
 - `[docs]` Four mutants of the #214 change that no unit test killed are now covered (#247). CI's Mutation job never
   sees them: its 20 s budget per mutant skips them as too slow. A local diff-mode run with a 300 s budget found them.

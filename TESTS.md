@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3721 unit tests, 160 integration tests, 49 Behat scenarios.
+Indicative totals: 3744 unit tests, 160 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -704,6 +704,27 @@ The JetStream reply inboxes at the connection's subscription limit (#175): the p
 - `testNoGuardStateIsLeftBehindOnceAnOperationEnds` - Guard, white-box: the guarded sids, the unconfirmed sids, the UNSUBs owed, the slow-consumer exemptions and the rejection handlers are all empty after a fetch got its message, after one timed out (408) and after one whose inbox was rejected.
 - `testDroppingASubscriptionsStateRemovesItsGuard` - Guard, white-box: dropSubscriptionState() removes the sid from the guarded and the unconfirmed sids and leaves the other guarded sids alone.
 - `testTheMarksLeaveASidThatIsNoLongerRegisteredAlone` - Guard, white-box: markSubscriptionUnbounded() and markSubscriptionRejectionHandler() record nothing for a sid that is not registered (dropped by another fiber's read between the SUB write and these calls, which the operation makes once the write completes), so the exemption and handler maps stay empty.
+
+### tests/Unit/JetStreamPublishResendOnReconnectTest.php
+A JetStream publish() with a `msgId` whose connection is lost after its frame went out and before its PubAck came (#249), under `NatsOptions::$resendJetStreamPublishOnReconnect`, over `ReconnectingTransport`: each session stands for a server, one that answers nothing to the publish for the stream leader that went down with the connection, and the connection is dropped right after the publish's frame was written to it. 12 of the 22 cases fail with the resend disabled; the other 10 are guards that hold either way.
+- `testAPublishWhoseConnectionDropsAfterItsFrameWentOutSendsItAgainOnTheNewConnection` - (the first copy lost / the first copy stored) The same HPUB (subject, payload, Nats-Msg-Id, reply subject: byte for byte) goes out once on each session, and the second session's ack (seq 7, `duplicate` false or true) resolves the publish in under 2 s with a 5 s timeout; one `info` record `NATS request sent again on the new connection` with the subject and generations 1 -> 2, and no log record carries the payload. It used to time out after 5 s.
+- `testAPublishThatMayNotGoOutTwiceTimesOutAsBefore` - (no msgId with the option on / other headers but no msgId with the option on / a msgId with the option off) Guard: one frame on the first session, none on the second, and the publish ends with `Request timed out for subject orders.created` at its 1 s deadline, the connection Open again long before.
+- `testOtherHeaderedJetStreamRequestsAreNeverSentAgain` - (a counter increment / a scheduled publish) Guard: the other JetStream requests that carry headers are never written again with the option on - one frame on the first session, none on the second (which would answer it), and the request times out at its 1 s deadline. A second increment would count twice.
+- `testAPublishThatMayGoOutTwiceRefusesAnInvalidSubjectBeforeWritingAnything` - Guard: a publish with a `msgId` to `orders..created` fails with the ProtocolException `Subject must not contain empty tokens` before it subscribes the reply inbox or writes a PUB/HPUB.
+- `testWithWaitingForAReconnectDisabledThePublishFailsAtOnceAsBefore` - Guard: with `waitForReconnect: false` the publish fails at once with `Connection is not open`, and once the connection is back no frame went out on it.
+- `testASlowAckWithoutAReconnectIsWaitedForWithNoSecondWrite` - Guard: an ack delayed 0.5 s with no reconnect resolves the publish, with one frame written.
+- `testADuplicateInProcessAnswerToTheSecondFrameLeavesThePublishWaitingForTheFirstFramesAck` - The second session answers the second frame with `409 duplicate message id is in process` (10158) and the first frame's ack 0.3 s later, to the same reply subject: the publish returns that ack (seq 11), after more than 0.25 s and under 2 s.
+- `testADuplicateInProcessAnswerWithNoAckAfterItEndsWithTheTimeout` - The same 409 and nothing after it: the publish ends with its TimeoutException at the 1.5 s deadline, not with the 409.
+- `testADuplicateInProcessAnswerToAFrameWrittenOnceStillEndsThePublish` - Guard: the 409 answering a frame written once (no reconnect) still fails the publish with a JetStreamException (409, err_code 10158).
+- `testAnotherErrorAnsweringTheSecondFrameEndsThePublish` - Any other API error (10071) answering the second frame ends the publish with that JetStreamException, under 2 s.
+- `testTheSecondWriteDrawsOnThePublishsOwnTimeout` - A 1 s reconnect (dials refused) and no answer to the second frame: the publish still ends at its 1.5 s deadline (under 2 s), with one frame on each session.
+- `testASecondReconnectAfterTheSecondWriteWritesNothingMore` - The connection drops again right after the second write: the third session gets no frame (1, 1, 0) and the publish times out.
+- `testAPublishWaitingBehindTheApplicationsReadSendsItsFrameAgainOnceTheReconnectIsOver` - The application's processIncoming() loop holds the read slot (seen through `WatchedTransport`) as the connection drops with dials refused for 0.2 s: the publish parked behind it sends its frame again once the reconnect is over and returns the new session's ack in under 2 s with a 5 s timeout (the question #249 raised about a publish parked behind another fiber's read).
+- `testASecondWriteThatFailsIsLoggedAndLeavesThePublishToItsDeadline` - The second write fails on the second session, and its retry after that session's reconnect (#215) fails on the third: one `warning` record `NATS request could not be sent again on the new connection` with the subject, generation 1 and the exception, no `info` record of a second write, and the publish ends with its TimeoutException at the 1.5 s deadline.
+- `testALoggerThatThrowsOnTheSecondWritesRecordDoesNotChangeTheOutcome` - With `ThrowingLogger('sent again')` the publish still returns the new session's ack (seq 8), with one frame on each session.
+- `testALameDuckFailoverSendsTheFrameAgainOnTheServerItFailsOverTo` - The first server answers the publish with a lame-duck INFO naming 10.0.0.2: the client fails over there, the frame goes out again on that server, and its ack resolves the publish in under 2 s.
+- `testTheFirstOfTwoAcksInOneReadResolvesThePublishAndTheSecondIsIgnored` - The second session answers the frame written again with two acks in one read (seq 7, then the same seq as a duplicate): the first resolves the publish (`duplicate` false), the second is ignored, and the next publish on the connection gets its own ack (seq 12).
+- `testABatchRequestWithNothingLeftToSendWritesNothing` - Guard: `publishWithin()` whose payload is null (replies settled the batch already) writes nothing and returns, through `publishFrameWithin()`, whose result #249 changed.
 
 ### tests/Unit/JsMessageMetadataTest.php
 - `testFromMessageReturnsNullWhenReplyToIsNull` - `fromMessage()` returns null when the message has no reply subject.
@@ -2199,10 +2220,11 @@ The `UNSUB` a dropped shared reply inbox (mux) owes belongs to the connection it
 - `testRejectsNegativeReconnectValue` - Asserts the constructor throws InvalidArgumentException ('reconnectDelayMs') for `reconnectDelayMs: -1`.
 - `testRejectsNonPositiveReadChunkSize` - Asserts the constructor throws InvalidArgumentException ('readChunkSizeBytes') for `readChunkSizeBytes: 0` (#119).
 - `testAllowsDisabledHeartbeatAndEmptyServers` - Asserts that `pingIntervalSeconds: 0`, `maxPingsOut: 0`, and an empty servers list are all accepted (heartbeat-disabled is legitimate), preserving the zero values.
-- `testDefaultsMatchDocumentedValues` - Asserts the full set of constructor defaults (servers, name, inboxPrefix, all timeouts, reconnect params, ping/TLS/auth fields, slowConsumerPolicy=DropOldest, reconnectBufferSize=8388608, WebSocket/logger defaults, readChunkSizeBytes=131072, waitForReconnect=true, slowConsumerErrorsFailOperations=false, handlerErrorsFailOperations=false, etc.) match the README configuration table, field by field.
+- `testDefaultsMatchDocumentedValues` - Asserts the full set of constructor defaults (servers, name, inboxPrefix, all timeouts, reconnect params, ping/TLS/auth fields, slowConsumerPolicy=DropOldest, reconnectBufferSize=8388608, WebSocket/logger defaults, readChunkSizeBytes=131072, waitForReconnect=true, slowConsumerErrorsFailOperations=false, handlerErrorsFailOperations=false, resendJetStreamPublishOnReconnect=false, etc.) match the README configuration table, field by field.
 - `testWaitForReconnectCanBeDisabled` - Asserts `waitForReconnect: false` (the fail-fast opt-out) is accepted and kept.
 - `testSlowConsumerErrorsCanBeMadeToFailOperations` - Asserts `slowConsumerErrorsFailOperations: true` (the opt-out to the old behaviour) is accepted and kept.
 - `testHandlerErrorsCanBeMadeToFailOperations` - Asserts `handlerErrorsFailOperations: true` (the opt-out to the old behaviour) is accepted and kept.
+- `testAJetStreamPublishCanBeMadeToGoOutAgainOnReconnect` - Asserts `resendJetStreamPublishOnReconnect: true` (#249) is accepted and kept.
 
 ### tests/Unit/NkeySeedSignerTest.php
 - `testPublicKeyMatchesKnownUserSeed` - Asserts `publicKey()` for a known sample user seed equals the expected public key; skips without the sodium extension.
