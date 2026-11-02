@@ -5734,9 +5734,11 @@ final class NatsConnection
      */
     private function publishFrameWithin(\Closure $makeFrame, Cancellation $budget, bool $issuedDuringRecovery, \Closure $guard, bool $duringDrainDelivery = false): ?int
     {
+        /** @var int|null $sentOn Set by the write below once the frame is on the wire. */
+        $sentOn = null;
         for ($attempt = 0; ; $attempt++) {
             $budget->throwIfRequested();
-            $write = async(function () use ($makeFrame, $budget, $issuedDuringRecovery, $guard, $duringDrainDelivery): ?array {
+            $write = async(function () use ($makeFrame, $budget, $issuedDuringRecovery, $guard, $duringDrainDelivery, &$sentOn): ?array {
                 $budget->throwIfRequested();
                 $this->awaitOpenConnection($budget, $issuedDuringRecovery, duringDrainDelivery: $duringDrainDelivery);
                 $budget->throwIfRequested();
@@ -5762,20 +5764,17 @@ final class NatsConnection
                 }
 
                 $this->recordOutbound($payload);
+                $sentOn = $generation;
 
-                return [$generation, null];
+                return null;
             });
             $write->ignore();
-            $outcome = $write->await($budget);
-            if ($outcome === null) {
-                return null;
+            $failure = $write->await($budget);
+            if ($failure === null) {
+                return $sentOn;
             }
 
-            [$generation, $writeError] = $outcome;
-            if ($writeError === null) {
-                return $generation;
-            }
-
+            [$generation, $writeError] = $failure;
             if ($attempt === 1) {
                 throw $writeError;
             }
@@ -5857,13 +5856,9 @@ final class NatsConnection
         // handler body is unchanged and idempotent: a coalesced duplicate arriving in the same drain
         // batch (before the finally removes the waiter) is ignored by the isComplete() guard.
         $this->registerMuxWaiter($token, static function (NatsMessage $message) use ($deferred, &$replyReceived, $replyArrived, &$resent, $isInterimReply): void {
-            if ($deferred->isComplete()) {
-                return;
-            }
-
             // The server's answer to the frame written again can be that the first frame is still being processed
             // (#249): not the outcome, which the reply to the first frame brings, to the same reply subject.
-            if ($resent && $isInterimReply !== null && $isInterimReply($message)) {
+            if ($deferred->isComplete() || ($resent && $isInterimReply !== null && $isInterimReply($message))) {
                 return;
             }
 

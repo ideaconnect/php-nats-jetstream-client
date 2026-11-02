@@ -15,6 +15,7 @@ use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Models\PubAck;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
+use IDCT\NATS\Tests\Support\ThrowingLogger;
 use IDCT\NATS\Tests\Support\WatchedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
@@ -370,6 +371,75 @@ final class JetStreamPublishResendOnReconnectTest extends TestCase
         self::assertSame(5, $ack->seq);
         self::assertGreaterThan(0.15, $elapsed, 'the frame went out again only once the reconnect was over');
         self::assertLessThan(2.0, $elapsed, sprintf('the publish took %.3f s, with a 5 s timeout', $elapsed));
+        self::assertSame([1, 1], self::publishesPerSession($transport, 2));
+    }
+
+    /**
+     * The second write finds the new socket dead too, and so does its retry after that socket's own reconnect (#215):
+     * the failure is logged as a warning naming the subject, and it does not end the publish, which waits on and ends
+     * at its 1.5 s deadline with its TimeoutException, as it would have without the second write.
+     */
+    public function testASecondWriteThatFailsIsLoggedAndLeavesThePublishToItsDeadline(): void
+    {
+        $transport = new ReconnectingTransport();
+        $logger = new class extends AbstractLogger {
+            /** @var list<array{string, string, array<mixed>}> */
+            public array $records = [];
+
+            /** @param array<mixed> $context */
+            public function log($level, string|\Stringable $message, array $context = []): void
+            {
+                $this->records[] = [is_string($level) ? $level : '', (string) $message, $context];
+            }
+        };
+        $client = $this->client($transport, requestTimeoutMs: 1_500, logger: $logger);
+        $transport->responder = self::stream($transport, []);
+        /** @var array<int, true> $armed */
+        $armed = [];
+        $transport->afterWrite = static function (string $bytes) use ($transport, &$armed): void {
+            $epoch = $transport->epoch();
+            if ($epoch === 0 && self::isPublish($bytes)) {
+                $transport->dropConnection();
+
+                return;
+            }
+
+            // The first write of the second and the third session (the handshake) arms the failure of the publish's
+            // frame on that session.
+            if (($epoch === 1 || $epoch === 2) && !isset($armed[$epoch])) {
+                $armed[$epoch] = true;
+                $transport->failNextWriteContaining('HPUB ' . self::SUBJECT . ' ');
+            }
+        };
+
+        $start = hrtime(true);
+        $error = self::failure($client->jetStream()->publish(self::SUBJECT, self::PAYLOAD, msgId: self::MSG_ID));
+        $elapsed = $this->secondsSince($start);
+
+        self::assertInstanceOf(TimeoutException::class, $error);
+        self::assertSame('Request timed out for subject ' . self::SUBJECT, $error->getMessage());
+        self::assertGreaterThan(1.3, $elapsed);
+        self::assertLessThan(2.3, $elapsed);
+        $failed = array_values(array_filter($logger->records, static fn(array $record): bool => $record[1] === 'NATS request could not be sent again on the new connection'));
+        self::assertCount(1, $failed);
+        self::assertSame('warning', $failed[0][0]);
+        self::assertSame(self::SUBJECT, $failed[0][2]['subject'] ?? null);
+        self::assertSame(1, $failed[0][2]['previousGeneration'] ?? null);
+        self::assertInstanceOf(\Throwable::class, $failed[0][2]['exception'] ?? null);
+        self::assertSame([], array_filter($logger->records, static fn(array $record): bool => $record[1] === 'NATS request sent again on the new connection'));
+    }
+
+    /** A logger that throws while it logs the second write changes nothing: the publish returns the new session's ack. */
+    public function testALoggerThatThrowsOnTheSecondWritesRecordDoesNotChangeTheOutcome(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, requestTimeoutMs: 5_000, logger: new ThrowingLogger('sent again'));
+        $transport->responder = self::stream($transport, [1 => self::ack(8)]);
+        self::dropAfterThePublishOn($transport, 0);
+
+        $ack = $client->jetStream()->publish(self::SUBJECT, self::PAYLOAD, msgId: self::MSG_ID)->await();
+
+        self::assertSame(8, $ack->seq);
         self::assertSame([1, 1], self::publishesPerSession($transport, 2));
     }
 
