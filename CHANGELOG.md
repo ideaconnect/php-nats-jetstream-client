@@ -15,7 +15,7 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.28.0] - 2026-11-03
 
 ### Added
 
@@ -49,7 +49,43 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   before it has applied what the old leader replicated, so a copy may be stored twice there (read from the server
   source; 2.15.1 applies first, and the release that changed it is not pinned down).
 
+### Fixed
+
+- `[bugfix]` A publish, a JetStream `ack()`/`nak()`/`term()`/`inProgress()` or a request made after the server had
+  closed the connection, while nothing read the socket, no longer goes into the closed socket (#252). The connection
+  reads the socket only while an operation waits for a reply, so a close the server sends meanwhile (a restart, a
+  rolling upgrade, a failover, `docker stop`) stayed unread, and a write that waits for no reply was still taken by
+  the socket and reached no server: the publish resolved and its message was lost; an `ack()` was lost and the message
+  came back after its `ack_wait` and was handled again. A request's frame was lost the same way, and the request waited
+  for its reply on the recovered connection until its timeout. Measured in ideaconnect/symfony-nats-messenger#98 on a
+  three-server cluster (nats-server 2.15.1, the worker's server stopped with `docker stop` while a handler ran): the
+  ACK of a handled message, before 1 of 1 still pending after the run, now 0; the Symfony retry copy of a failed one
+  (a JetStream publish), before a `TimeoutException` after 10.7 s that ended the worker, now stored at once.
+
+  Before such a write the connection now asks the transport whether the server has closed the socket, and handles a
+  yes as a write that failed there (#244, #215): a publish hands its frame to the reconnect buffer and resolves, the
+  frame going out on the new connection after the subscription replay; a request recovers and writes again within its
+  budget. With reconnect off the write fails with `Reconnect is disabled` (the found close its previous) instead of
+  resolving with the frame lost. The question is new, optional `Transport\PeerCloseAwareTransportInterface::peerClosed()`,
+  which both built-in transports implement with a peek at the socket: it reads nothing, does not wait and takes about
+  half a microsecond. A custom transport without it is written to as before.
+
+  The peek sees a close with nothing left unread before it. A close behind bytes not read yet - a frame the server sent
+  just before stopping, or over TLS the `close_notify` alert the server sends ahead of its close - is still found only
+  by the next read, as before; so is a WebSocket server's Close frame.
+
 ### Testing & CI
+
+- `[docs]` New `PeerClosedBeforeWriteTest` (18 cases, #252): a publish (plain, with headers, an `ack()`, a `nak()`, a
+  header block segment, each waiting and not waiting for a reconnect) into a session the server closed unread goes out
+  once on the new connection after the replay, nothing into the closed socket; a request is sent on the new connection
+  and gets its reply well before its timeout; with reconnect off both fail at once; an open socket is asked once per
+  write; `AmpSocketTransport` and `WebSocketTransport` answer false with no socket, on an idle one and while bytes wait
+  (which the next read still gets), and true once the peer has closed; a close behind unread bytes, over TCP and over
+  TLS, is left for the next read; and end to end on a real socket an ack published after the server closed the
+  connection reaches the server on the next one. 14 cases fail without the check. `tests/Support/PeerClosingTransport.php`
+  closes a scripted session unread; `tests/Support/LoopbackNatsServer.php` now accepts one connection after another
+  and records what was published on each.
 
 - `[docs]` New `JetStreamPublishResendOnReconnectTest` (22 cases, #249) over `ReconnectingTransport`: a publish whose
   connection drops right after its `HPUB` went out sends the same frame on the new session and returns its ack (stored

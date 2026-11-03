@@ -32,6 +32,7 @@ use IDCT\NATS\Protocol\ProtocolFrame;
 use IDCT\NATS\Protocol\ProtocolParser;
 use IDCT\NATS\Protocol\ServerInfo;
 use IDCT\NATS\Transport\CancellableDialTransportInterface;
+use IDCT\NATS\Transport\PeerCloseAwareTransportInterface;
 use IDCT\NATS\Transport\TlsAwareTransportInterface;
 use IDCT\NATS\Transport\TransportClosedException;
 use IDCT\NATS\Transport\TransportInterface;
@@ -2537,7 +2538,8 @@ final class NatsConnection
      *   - Open: write to the socket. A write that fails hands the frame to the reconnect buffer and starts the
      *     recovery in a fiber of its own ({@see handOverFailedPublish()}, #244). A guarded publish, and one with
      *     reconnect off, recover inline instead and retry once; the retry is sent the way a publish issued after
-     *     the recovery would be, by the state it finds.
+     *     the recovery would be, by the state it finds. A socket the server has already closed, with nothing left
+     *     unread, fails the write before it is made ({@see failIfThePeerHasClosed()}).
      *   - Draining: write straight to the still-live socket. A draining connection keeps its socket
      *     open until drain() closes it, and a handler's ack/reply (a JetStream ack, respond(), a
      *     request reply) MUST reach the wire - nats.go drains by publishing then closing. Buffering
@@ -2563,6 +2565,7 @@ final class NatsConnection
             $generation = $this->connectionGeneration;
             $closes = $this->terminalCloses;
             try {
+                $this->failIfThePeerHasClosed();
                 $this->transport->write($frame)->await();
             } catch (\Throwable $writeError) {
                 // An ordinary publish hands its frame to the reconnect buffer and resolves once the frame is
@@ -2856,6 +2859,31 @@ final class NatsConnection
         $this->reconnectBuffer .= $frame;
 
         return true;
+    }
+
+    /**
+     * Fails a write that would go into a socket the server has already closed, with nothing it sent before the close
+     * left unread ({@see PeerCloseAwareTransportInterface}), so that the caller handles it as the write that fails
+     * there: a publish hands its frame to the reconnect buffer ({@see handOverFailedPublish()}), or, guarded or with
+     * reconnect off, recovers inline first; a request recovers and writes again within its budget
+     * ({@see publishFrameWithin()}).
+     *
+     * The connection reads the socket only while an operation waits for a reply, so a close the server sends while
+     * nothing reads - a restart, a rolling upgrade, `docker stop` - stays unread. A frame that waits for no reply, an
+     * ACK or a NAK of a JetStream message say, was still taken by the socket and reached no server: the message came
+     * back after its `ack_wait` and was handled again (measured in ideaconnect/symfony-nats-messenger#98 on a
+     * three-server cluster, the server stopped while the handler ran). A request's frame was lost the same way, and
+     * the request waited for its reply on the recovered connection until its timeout. Nothing is read here: a close
+     * behind bytes still unread, such as the close_notify a TLS server sends first, is seen by the next read, as
+     * before.
+     *
+     * @throws TransportClosedException When the server has closed the socket.
+     */
+    private function failIfThePeerHasClosed(): void
+    {
+        if ($this->transport instanceof PeerCloseAwareTransportInterface && $this->transport->peerClosed()) {
+            throw new TransportClosedException('Socket closed by peer (EOF), found before a write');
+        }
     }
 
     /**
@@ -5752,6 +5780,7 @@ final class NatsConnection
                 $generation = $this->connectionGeneration;
 
                 try {
+                    $this->failIfThePeerHasClosed();
                     $this->transport->write($frame)->await();
                 } catch (\Throwable $writeError) {
                     if ($budget->isRequested()) {
