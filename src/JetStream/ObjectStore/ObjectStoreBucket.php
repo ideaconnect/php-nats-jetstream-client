@@ -1363,7 +1363,7 @@ final class ObjectStoreBucket
                 'subjects_filter' => $this->metaPrefix() . '>',
                 'offset' => $offset,
             ], JSON_THROW_ON_ERROR);
-            $message = $this->client->request($apiSubject, $payload)->await();
+            $message = JetStreamRequest::plain($this->client, $apiSubject, $payload);
 
             /** @var array<string,mixed> $data */
             $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
@@ -1397,7 +1397,7 @@ final class ObjectStoreBucket
     {
         $apiSubject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
         $payload = json_encode(['last_by_subj' => $subject], JSON_THROW_ON_ERROR);
-        $message = $this->client->request($apiSubject, $payload)->await();
+        $message = JetStreamRequest::plain($this->client, $apiSubject, $payload);
 
         /** @var array<string,mixed> $data */
         $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);

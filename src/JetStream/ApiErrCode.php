@@ -11,6 +11,12 @@ namespace IDCT\NATS\JetStream;
  */
 final class ApiErrCode
 {
+    /** `404 consumer not found` (nats-server `JSConsumerNotFoundErr`). */
+    public const CONSUMER_NOT_FOUND = 10014;
+
+    /** `404 stream not found` (nats-server `JSStreamNotFoundErr`). */
+    public const STREAM_NOT_FOUND = 10059;
+
     public const STREAM_NAME_IN_USE = 10058;
     public const STREAM_WRONG_LAST_SEQUENCE = 10071;
 

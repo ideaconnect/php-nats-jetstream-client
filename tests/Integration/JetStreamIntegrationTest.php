@@ -14,6 +14,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Enum\NoRespondersCause;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
@@ -90,6 +91,44 @@ final class JetStreamIntegrationTest extends TestCase
         self::assertTrue($deletedStream);
 
         $client->disconnect()->await();
+    }
+
+    /**
+     * diagnoseNoResponders() on a live server that stays (ideaconnect/symfony-nats-messenger#106): a pull from a consumer
+     * that does not exist ends with 503, and the question answers why - ConsumerNotFound, StreamNotFound for a stream that
+     * does not exist, ConsumerFound once the consumer is there - with the real server's err_codes and consumer info. A
+     * server that is going away is the unit tests' (DiagnoseNoRespondersTest), as these fixtures are shared.
+     */
+    public function testJetStreamDiagnoseNoRespondersOnAServerThatStays(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $subject = 'it.' . strtolower($stream) . '.events';
+        $consumer = 'C_' . strtoupper(bin2hex(random_bytes(2)));
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+        $js = $client->jetStream();
+        $js->createStream($stream, [$subject])->await();
+
+        try {
+            try {
+                $js->fetchBatch($stream, $consumer, 1, 500)->await();
+                self::fail('expected the pull from a consumer that does not exist to fail');
+            } catch (JetStreamException $pull) {
+                self::assertSame(503, $pull->getCode(), $pull->getMessage());
+            }
+
+            self::assertSame(NoRespondersCause::ConsumerNotFound, $js->diagnoseNoResponders($stream, $consumer)->await());
+            self::assertSame(NoRespondersCause::StreamNotFound, $js->diagnoseNoResponders($stream . '_GONE', $consumer)->await());
+
+            $js->createConsumer($stream, $consumer, $subject)->await();
+            self::assertSame(NoRespondersCause::ConsumerFound, $js->diagnoseNoResponders($stream, $consumer)->await());
+        } finally {
+            $js->deleteStream($stream)->await();
+            $client->disconnect()->await();
+        }
     }
 
     /**

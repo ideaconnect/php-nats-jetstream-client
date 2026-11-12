@@ -1648,6 +1648,47 @@ Notes:
    is omitted and its local miss check disabled. No new attempt starts after the operation ends;
    an already-started write can complete later. Inbox cleanup cannot overrun this budget (#188).
 4. At the connection's subscription limit the fetch fails at once instead of reporting an empty batch after its expiry: with a `SubscriptionLimitException` naming its inbox when another read meets the server's `-ERR`, with the server's error when its own read does - see [JetStream Pull Consumer (Fetch + ACK)](#jetstream-pull-consumer-fetch--ack) (#175).
+5. A fetch that ends with `JetStreamException` code 503 (`JetStream pull request ended with status 503`) met no responder for the consumer's pull subject. That happens when the consumer or its stream does not exist, and also in the last moments of a server that is going away - a graceful stop, or lame duck mode - which stops its consumers before it closes the connections (NATS 2.15 takes about 10 ms for each durable consumer on a file stream). The 503 alone cannot tell them apart; `diagnoseNoResponders()` asks the server for the consumer while it watches the connection, and tells which it was, so that a consumer loop does not end, or create the consumer again, on a server that is going away:
+
+```php
+use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\Enum\NoRespondersCause;
+
+use function Amp\delay;
+
+while (true) {
+	try {
+		$messages = $js->fetchBatch('LOGS', 'BATCH', batch: 10, expiresMs: 3000)->await();
+	} catch (JetStreamException $e) {
+		$empty = match ($e->getCode()) {
+			// No messages within the expiry: a routine empty pull.
+			404, 408 => true,
+			// Asked right after the pull, about the connection it came on.
+			503 => $js->diagnoseNoResponders('LOGS', 'BATCH')->await() === NoRespondersCause::ServerGoingAway,
+			default => false,
+		};
+		if (!$empty) {
+			// Another status, or a server that stays: the consumer or its stream is missing (ConsumerNotFound,
+			// StreamNotFound), it exists and nothing served its pulls for a moment (ConsumerFound), JetStream
+			// answered with an error (JetStreamError), or nothing answered on a connection that stays (NoAnswer).
+			throw $e;
+		}
+
+		// The server is going away. Pause before the next pull: a server in lame duck mode keeps the connection
+		// open for its grace period, and every pull meanwhile gets the 503 again at once.
+		delay(1);
+		continue;
+	}
+
+	foreach ($messages as $message) {
+		$js->ack($message)->await();
+	}
+}
+```
+
+   A server that stays answers the question at once, with the consumer or with a 404 (`ConsumerNotFound` for err_code 10014, `StreamNotFound` for 10059), or with another error (`JetStreamError`, which a missing responder for the question is too). A server that is going away answers nothing: a graceful stop drops every JetStream API reply before it stops the first consumer, and lame duck mode stops JetStream before it tells the clients it is going away. So the cause is `ServerGoingAway` once the connection is gone, without waiting for the question's timeout: closed (with reconnect off the client closes it as the server does), being recovered or replaced by a reconnect, closed or drained by the application, or its server announced lame duck mode (`serverInfo()->lameDuckMode`). An answer read once the connection has been replaced is not about the 503 of the server before, and is `ServerGoingAway` too. Once the server has closed the connection, the next pull goes out on the connection that follows; until then - lame duck mode keeps it open for its grace period, 10 s by default, when the client has no other server to fail over to - a pull gets the 503 again at once, and the diagnosis answers `ServerGoingAway` at once without asking, so a loop has to pause between pulls, as above. Nothing answering on a connection that stays is `NoAnswer`, at the timeout (`$timeoutMs`, the request timeout by default): a user allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer. Call it right after the pull's 503: it watches the connection that is current when it is called. It costs one round trip on a server that stays; call it only after a 503. The going-away behaviour was measured on nats-server 2.15.2, and the answers of a server that stays on 2.15.2 and 2.10.29.
+
+_Verified by: [DiagnoseNoRespondersTest](tests/Unit/DiagnoseNoRespondersTest.php) (`testTheAnswerOfAServerThatStaysTellsTheCause`, `testAQuestionTheServerClosesTheConnectionOnIsServerGoingAway`, `testAQuestionWhoseConnectionTheClientRecoversIsServerGoingAway`, `testAQuestionLeftUnansweredByAServerThatAnnouncesLameDuckModeIsServerGoingAway`, `testAnApplicationCloseWhileTheQuestionWaitsIsServerGoingAway`, `testAQuestionLeftUnansweredOnAConnectionThatStaysIsNoAnswerAtItsTimeout`); [JetStreamIntegrationTest](tests/Integration/JetStreamIntegrationTest.php) (`testJetStreamDiagnoseNoRespondersOnAServerThatStays`)._
 
 ### Stream Purge and List
 

@@ -31,6 +31,7 @@ use IDCT\NATS\JetStream\Consumers\PullPipelineConfig;
 use IDCT\NATS\JetStream\Consumers\PullPipelineControl;
 use IDCT\NATS\JetStream\Consumers\PullPipelineDrainParticipant;
 use IDCT\NATS\JetStream\Consumers\PullTerminalStatusOutcome;
+use IDCT\NATS\JetStream\Enum\NoRespondersCause;
 use IDCT\NATS\JetStream\KeyValue\KeyValueBucket;
 use IDCT\NATS\JetStream\Models\AccountInfo;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
@@ -66,6 +67,12 @@ final class JetStreamContext
      * Overridable per subscription via subscribeOrderedConsumer()'s $idleHeartbeatNs.
      */
     private const ORDERED_IDLE_HEARTBEAT_NS = 5_000_000_000;
+
+    /**
+     * How often {@see diagnoseNoResponders()} looks at the connection while its question waits for an answer, in
+     * seconds. A server that stays answers within a few milliseconds, before the first look.
+     */
+    private const NO_RESPONDERS_LOOK_SECONDS = 0.02;
 
     /**
      * Creates a JetStream API context bound to a NATS client.
@@ -2699,6 +2706,144 @@ final class JetStreamContext
     }
 
     /**
+     * Tells why a pull from a durable consumer ended with status 503 (no responders), by asking the server for the
+     * consumer (CONSUMER.INFO) while it watches the connection the pull came on.
+     *
+     * A pull is a request to `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>`, and nats-server answers it with 503
+     * whenever nothing is subscribed to that subject. That is so when the consumer or its stream does not exist, and
+     * also while a server that is going away has already stopped the consumer and not yet closed the connection: in
+     * a graceful stop, or in lame duck mode. NATS 2.15 stops each durable consumer on a file stream in about 10 ms, so
+     * with many of them that moment is long enough for pulls to land in it. {@see fetchBatch()} reports both as the
+     * same JetStreamException(503), and a consumer loop that reads it as a missing consumer ends, or creates the
+     * consumer again on the server that is going away (ideaconnect/symfony-nats-messenger#106).
+     *
+     * The answer to CONSUMER.INFO tells them apart. A server that stays answers it at once: with the consumer, or with
+     * a 404. A server that is going away does not answer it. A graceful stop shuts the server's eventing down, which
+     * drops every JetStream API reply from then on, before it stops the first consumer, and closes the connection
+     * after the last; lame duck mode stops JetStream, whose API then answers nothing, before it tells the clients it is
+     * going away (INFO `ldm`) and closes their connections over its lame duck duration. Measured on nats-server 2.15.2
+     * with 48 consumers on a file stream: after SIGTERM, pulls got 503 from about 100 ms on and every CONSUMER.INFO sent
+     * from then on went unanswered until the close, about 570 ms in; after SIGUSR2 (lame duck mode), pulls got 503 from
+     * 50 ms on, CONSUMER.INFO went unanswered from 45 ms on, and the client read the lame duck INFO about 515 ms in,
+     * the connection staying open. The causes:
+     *
+     *  - {@see NoRespondersCause::ConsumerNotFound} or {@see NoRespondersCause::StreamNotFound}: the 404 (err_code
+     *    10014 or 10059; a 404 without err_code is taken for the consumer's).
+     *  - {@see NoRespondersCause::ConsumerFound}: the consumer exists, and nothing served its pulls for a moment.
+     *  - {@see NoRespondersCause::JetStreamError}: another JetStream error, or no responder for the question either.
+     *  - {@see NoRespondersCause::ServerGoingAway}: the connection the pull came on left the client's use before an
+     *    answer was read: the client closed it, is recovering it, has replaced it or is draining it, the application
+     *    is closing it, or its server announced lame duck mode. Read the pull as empty, and pull again after a pause:
+     *    once the server has closed the connection the next pull goes out on the connection that follows, and until
+     *    then - lame duck mode keeps it open for its grace period when the client has no other server to fail over
+     *    to - a pull gets the 503 again at once, and this answers ServerGoingAway at once, without asking.
+     *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays: a user
+     *    allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful
+     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer.
+     *
+     * The question waits for its answer only while that connection stays. The client keeps a request waiting for its
+     * reply across a reconnect, up to its timeout, but the server that would have answered this one is gone, and an
+     * answer read once the connection has left - from the server that follows, say, when the question's write failed
+     * and it went out on the new connection - is not about the 503 of the one before: the cause is ServerGoingAway
+     * then. The wait looks at the connection every 20 ms, and a question it gives up is cancelled. When the
+     * connection has already left, or its server announced lame duck mode, nothing is asked. Call it right after the
+     * pull's 503: it watches the connection that is current when it is called, which is the pull's unless something
+     * reconnected in between. On a server that stays this costs one round trip; call it only after a pull's 503, since
+     * every other status already says what it means.
+     *
+     * @param int|null $timeoutMs How long the question may wait for its answer on a connection that stays; null for
+     *                            the client's request timeout.
+     * @return Future<NoRespondersCause>
+     *
+     * @throws \InvalidArgumentException When $timeoutMs is not positive.
+     */
+    public function diagnoseNoResponders(string $stream, string $consumer, ?int $timeoutMs = null): Future
+    {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+        if ($timeoutMs !== null && $timeoutMs <= 0) {
+            throw new \InvalidArgumentException('The timeout of diagnoseNoResponders() must be a positive number of milliseconds');
+        }
+
+        return async(function () use ($stream, $consumer, $timeoutMs): NoRespondersCause {
+            $generation = $this->client->connectionGeneration();
+            if ($this->connectionLeftSince($generation)) {
+                return NoRespondersCause::ServerGoingAway;
+            }
+
+            $subject = JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer;
+            $giveUp = new DeferredCancellation();
+            $question = $this->client->request($subject, '{}', $timeoutMs, $giveUp->getCancellation());
+
+            while (true) {
+                try {
+                    $answer = $question->await(new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS));
+
+                    break;
+                } catch (\Exception $failure) {
+                    if ($failure instanceof CancelledException && !$question->isComplete()) {
+                        // The look at the connection came due with the question still waiting.
+                        if (!$this->connectionLeftSince($generation)) {
+                            continue;
+                        }
+
+                        $giveUp->cancel();
+
+                        return NoRespondersCause::ServerGoingAway;
+                    }
+
+                    // The question ended unanswered: with the connection's exception, the request's timeout, its inbox
+                    // refused, or a write that failed on the new connection too (the raw transport error then). The
+                    // server had no responder for the question either when it says so: JetStream is not there to
+                    // answer it.
+                    if ($this->connectionLeftSince($generation)) {
+                        return NoRespondersCause::ServerGoingAway;
+                    }
+
+                    return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
+                        ? NoRespondersCause::JetStreamError
+                        : NoRespondersCause::NoAnswer;
+                }
+            }
+
+            if ($this->connectionLeftSince($generation)) {
+                return NoRespondersCause::ServerGoingAway;
+            }
+
+            try {
+                $this->decodeApiResponse($answer);
+            } catch (JetStreamException $error) {
+                if ($error->getCode() !== 404) {
+                    return NoRespondersCause::JetStreamError;
+                }
+
+                return $error->getErrCode() === ApiErrCode::STREAM_NOT_FOUND
+                    ? NoRespondersCause::StreamNotFound
+                    : NoRespondersCause::ConsumerNotFound;
+            }
+
+            return NoRespondersCause::ConsumerFound;
+        });
+    }
+
+    /**
+     * Whether the connection that was current at $generation has left the client's use, as
+     * {@see diagnoseNoResponders()} reads it: the client is no longer Open on it (Closed, recovering it, draining it),
+     * it has been replaced, the application is closing it, or its server announced lame duck mode. The application's
+     * close counts from its start: disconnect() ends the requests waiting on the connection before it closes the
+     * transport, and the client is Closed only once that close, a TLS or WebSocket close handshake say, is over.
+     *
+     * @phpstan-impure The connection changes while a question waits, so each call reads it afresh.
+     */
+    private function connectionLeftSince(int $generation): bool
+    {
+        return $this->client->state() !== ConnectionState::Open
+            || $this->client->connectionGeneration() !== $generation
+            || $this->client->isCloseRequested()
+            || $this->client->serverInfo()?->lameDuckMode === true;
+    }
+
+    /**
      * Pipelined pull-consumer engine backing {@see PullConsumerIterator::handle()}. Generalizes the
      * single-shot {@see fetchBatch()} to up to `depth` CONSUMER.MSG.NEXT requests in flight at once,
      * overlapping their network round-trips with handler processing while preserving delivery order.
@@ -4960,6 +5105,11 @@ final class JetStreamContext
     /**
      * Executes a JetStream API request and returns decoded JSON response.
      *
+     * A request nothing answers at once (no responders: JetStream is not enabled, or not for the account) fails with
+     * JetStreamException(503), as on every other JetStream path ({@see jsRequest()}, #161). It went through to the
+     * caller as the connection's bare NatsException, so getConsumer(), addStream() and the other API calls here
+     * reported it differently from publish() and fetchBatch().
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */
@@ -4967,14 +5117,30 @@ final class JetStreamContext
     {
         $jsonBody = $body === [] ? (object) [] : $body;
         $json = json_encode($jsonBody, JSON_THROW_ON_ERROR);
-        $message = $this->client->request($subject, $json)->await();
 
+        return $this->decodeApiResponse($this->jsRequest($subject, $json));
+    }
+
+    /**
+     * Decodes a JetStream API reply, throwing the JetStreamException its error envelope describes.
+     *
+     * @return array<string,mixed>
+     */
+    private function decodeApiResponse(NatsMessage $message): array
+    {
         try {
-            /** @var array<string,mixed> $data */
             $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             throw new JetStreamException('Malformed JetStream API response: ' . $e->getMessage(), 0, $e);
         }
+
+        // JSON that is not an object or a list (a number, a string, true, null) went on as the array this returns, and
+        // failed with a TypeError.
+        if (!is_array($data)) {
+            throw new JetStreamException('Malformed JetStream API response: not a JSON object');
+        }
+
+        /** @var array<string,mixed> $data */
 
         /** @var array<string,mixed>|null $error */
         $error = is_array($data['error'] ?? null) ? $data['error'] : null;

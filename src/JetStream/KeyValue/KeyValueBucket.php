@@ -566,7 +566,7 @@ final class KeyValueBucket
     {
         $subject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
         $payload = json_encode(['last_by_subj' => $this->subjectForKey($key)], JSON_THROW_ON_ERROR);
-        $data = $this->decodeReply($this->client->request($subject, $payload)->await()->payload);
+        $data = $this->decodeReply(JetStreamRequest::plain($this->client, $subject, $payload)->payload);
 
         $error = is_array($data['error'] ?? null) ? $data['error'] : null;
         if ($error !== null && (int) ($error['code'] ?? 0) === 404) {
@@ -1206,7 +1206,7 @@ final class KeyValueBucket
                 'subjects_filter' => $this->subjectPrefix() . '>',
                 'offset' => $offset,
             ], JSON_THROW_ON_ERROR);
-            $data = $this->decodeReply($this->client->request($subject, $payload)->await()->payload);
+            $data = $this->decodeReply(JetStreamRequest::plain($this->client, $subject, $payload)->payload);
 
             $this->throwIfApiError($data);
 
