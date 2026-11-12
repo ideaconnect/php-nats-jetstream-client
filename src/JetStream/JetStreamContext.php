@@ -2722,8 +2722,9 @@ final class JetStreamContext
      * drops every JetStream API reply from then on, before it stops the first consumer, and closes the connection
      * after the last; lame duck mode stops JetStream, whose API then answers nothing, before it tells the clients it is
      * going away (INFO `ldm`) and closes their connections over its lame duck duration. Measured on nats-server 2.15.2
-     * with 48 consumers on a file stream: after SIGTERM, pulls got 503 from about 100 ms on and every CONSUMER.INFO sent
-     * from then on went unanswered until the close, about 570 ms in; after SIGUSR2 (lame duck mode), pulls got 503 from
+     * with 48 consumers on a file stream, pulling from one of them: after SIGTERM, CONSUMER.INFO went unanswered from
+     * about 110 ms until the close, about 570 ms in, and the pulls got 503 between about 300 and 550 ms, at a different
+     * moment in each round, always after the API had gone silent; after SIGUSR2 (lame duck mode), pulls got 503 from
      * 50 ms on, CONSUMER.INFO went unanswered from 45 ms on, and the client read the lame duck INFO about 515 ms in,
      * the connection staying open. The causes:
      *

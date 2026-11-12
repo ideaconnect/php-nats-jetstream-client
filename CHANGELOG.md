@@ -34,9 +34,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `ServerGoingAway` as soon as that connection is closed, being recovered or replaced by a reconnect, or draining, or
   its server announced lame duck mode (INFO `ldm`), without waiting for the question's timeout, which the client would
   otherwise keep across a reconnect. An answer read once the connection has been replaced is `ServerGoingAway` as
-  well, and a question given up is cancelled. Measured on nats-server 2.15.2 with 48 consumers on a file stream:
-  after SIGTERM, pulls got 503 from about 100 ms on and every CONSUMER.INFO sent from then on went unanswered until
-  the server closed the connection, about 570 ms in; after SIGUSR2, pulls got 503 from 50 ms on, CONSUMER.INFO went
+  well, and a question given up is cancelled. Measured on nats-server 2.15.2 with 48 consumers on a file stream,
+  pulling from one of them: after SIGTERM, CONSUMER.INFO went unanswered from about 110 ms until the server closed the
+  connection, about 570 ms in, and the pulls got 503 between about 300 and 550 ms, at a different moment in each round,
+  always after the API had gone silent (an earlier version of this entry said "from about 100 ms", which was the
+  figure of another run, with 16 consumers); after SIGUSR2, pulls got 503 from 50 ms on, CONSUMER.INFO went
   unanswered from 45 ms on, and the lame duck INFO came about 515 ms in, the connection staying open. One round trip
   on a server that stays; nothing is asked when the connection is already gone. Call it right after the pull's 503,
   as it watches the connection that is current when it is called, and pause before the next pull: a server in lame
