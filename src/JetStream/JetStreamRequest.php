@@ -47,9 +47,9 @@ final class JetStreamRequest
     {
         try {
             return $client->request($subject, $payload)->await();
-        } catch (JetStreamException $e) {
-            throw $e;
         } catch (NatsException $e) {
+            // Only the connection's no-responders error is mapped; anything else, a JetStreamException included, goes
+            // through as it is.
             throw self::normalizeNoResponders($e, $subject);
         }
     }
