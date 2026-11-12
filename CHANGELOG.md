@@ -38,8 +38,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   after SIGTERM, pulls got 503 from about 100 ms on and every CONSUMER.INFO sent from then on went unanswered until
   the server closed the connection, about 570 ms in; after SIGUSR2, pulls got 503 from 50 ms on, CONSUMER.INFO went
   unanswered from 45 ms on, and the lame duck INFO came about 515 ms in, the connection staying open. One round trip
-  on a server that stays; nothing is asked when the connection is already gone. The client's own pull consumers
-  (`PullConsumerIterator`, `consumePipelined()`) keep reading a 503 as transient, as before.
+  on a server that stays; nothing is asked when the connection is already gone. Call it right after the pull's 503,
+  as it watches the connection that is current when it is called, and pause before the next pull: a server in lame
+  duck mode keeps the connection open for its grace period when the client has no other server to fail over to, and
+  every pull meanwhile gets the 503 again at once. `NoAnswer` also covers a server whose graceful stop takes longer
+  than the question's timeout, as it closes the connections only once it has stopped every consumer. The client's own
+  pull consumers (`PullConsumerIterator`, `consumePipelined()`) keep reading a 503 as transient, as before.
 - `ApiErrCode::CONSUMER_NOT_FOUND` (10014) and `ApiErrCode::STREAM_NOT_FOUND` (10059).
 
 ### Fixed

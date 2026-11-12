@@ -31,15 +31,18 @@ enum NoRespondersCause: string
     /**
      * Nothing answered, and the connection the pull came on left the client's use meanwhile: the client closed it,
      * is recovering it, has replaced it or is draining it, the application is closing it, or its server announced lame
-     * duck mode. The pull met a
-     * server that is going away, which stops its consumers before it closes the connection; the next pull goes out
-     * on the connection that follows.
+     * duck mode. The pull met a server that is going away, which stops its consumers before it closes the connection.
+     * Once the server has closed it, the next pull goes out on the connection that follows; until then (lame duck mode
+     * keeps it open for its grace period when there is no other server to fail over to) a pull gets the 503 again at
+     * once, so a loop pauses before it pulls again.
      */
     case ServerGoingAway = 'server_going_away';
 
     /**
      * Nothing answered within the timeout, on a connection that stays: a user allowed to pull but not to ask for
-     * consumer info (the server reports a permissions violation and answers nothing), or a server too busy to answer.
+     * consumer info (the server reports a permissions violation and answers nothing), a server too busy to answer, or a
+     * server whose graceful stop takes longer than the timeout, as it closes the connections only once it has stopped
+     * every consumer.
      */
     case NoAnswer = 'no_answer';
 }

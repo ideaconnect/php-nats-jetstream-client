@@ -2732,17 +2732,24 @@ final class JetStreamContext
      *  - {@see NoRespondersCause::ConsumerFound}: the consumer exists, and nothing served its pulls for a moment.
      *  - {@see NoRespondersCause::JetStreamError}: another JetStream error, or no responder for the question either.
      *  - {@see NoRespondersCause::ServerGoingAway}: the connection the pull came on left the client's use before an
-     *    answer was read: the client closed it, is recovering it, has replaced it or is draining it, or its server
-     *    announced lame duck mode. Read the pull as empty: the next one goes out on the connection that follows.
-     *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays.
+     *    answer was read: the client closed it, is recovering it, has replaced it or is draining it, the application
+     *    is closing it, or its server announced lame duck mode. Read the pull as empty, and pull again after a pause:
+     *    once the server has closed the connection the next pull goes out on the connection that follows, and until
+     *    then - lame duck mode keeps it open for its grace period when the client has no other server to fail over
+     *    to - a pull gets the 503 again at once, and this answers ServerGoingAway at once, without asking.
+     *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays: a user
+     *    allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful
+     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer.
      *
      * The question waits for its answer only while that connection stays. The client keeps a request waiting for its
      * reply across a reconnect, up to its timeout, but the server that would have answered this one is gone, and an
      * answer read once the connection has left - from the server that follows, say, when the question's write failed
      * and it went out on the new connection - is not about the 503 of the one before: the cause is ServerGoingAway
      * then. The wait looks at the connection every 20 ms, and a question it gives up is cancelled. When the
-     * connection has already left, or its server announced lame duck mode, nothing is asked. On a server that stays
-     * this costs one round trip; call it only after a pull's 503, since every other status already says what it means.
+     * connection has already left, or its server announced lame duck mode, nothing is asked. Call it right after the
+     * pull's 503: it watches the connection that is current when it is called, which is the pull's unless something
+     * reconnected in between. On a server that stays this costs one round trip; call it only after a pull's 503, since
+     * every other status already says what it means.
      *
      * @param int|null $timeoutMs How long the question may wait for its answer on a connection that stays; null for
      *                            the client's request timeout.
