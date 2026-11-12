@@ -280,6 +280,27 @@ final class DiagnoseNoRespondersTest extends TestCase
     }
 
     /**
+     * The application closes the client while the question waits, with a close that takes a while (a TLS or WebSocket
+     * close handshake): the close ends the question first, while the client still reports Open. The application's close
+     * is the connection leaving the client's use, as a drain() is: ServerGoingAway. It was NoAnswer.
+     */
+    public function testAnApplicationCloseWhileTheQuestionWaitsIsServerGoingAway(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: false);
+        $transport->responder = self::answering($transport, []);
+        $transport->closeDelay = 0.3;
+
+        $diagnosis = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', self::BUDGET_MS);
+        $this->waitUntil(static fn(): bool => self::questionsPerSession($transport, 1) === [1]);
+        $close = $client->disconnect();
+
+        self::assertSame(NoRespondersCause::ServerGoingAway, $diagnosis->await());
+        $close->await();
+        self::assertSame(ConnectionState::Closed, $client->state());
+    }
+
+    /**
      * A question left unanswered on a connection that stays - a user allowed to pull but not to ask for consumer info,
      * whom the server answers nothing - is NoAnswer at the timeout given, not the client's 5 s request timeout. The
      * connection stays Open.

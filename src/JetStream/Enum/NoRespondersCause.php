@@ -30,7 +30,8 @@ enum NoRespondersCause: string
 
     /**
      * Nothing answered, and the connection the pull came on left the client's use meanwhile: the client closed it,
-     * is recovering it, has replaced it or is draining it, or its server announced lame duck mode. The pull met a
+     * is recovering it, has replaced it or is draining it, the application is closing it, or its server announced lame
+     * duck mode. The pull met a
      * server that is going away, which stops its consumers before it closes the connection; the next pull goes out
      * on the connection that follows.
      */

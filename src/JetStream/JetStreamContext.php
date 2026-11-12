@@ -2822,7 +2822,9 @@ final class JetStreamContext
     /**
      * Whether the connection that was current at $generation has left the client's use, as
      * {@see diagnoseNoResponders()} reads it: the client is no longer Open on it (Closed, recovering it, draining it),
-     * it has been replaced, or its server announced lame duck mode.
+     * it has been replaced, the application is closing it, or its server announced lame duck mode. The application's
+     * close counts from its start: disconnect() ends the requests waiting on the connection before it closes the
+     * transport, and the client is Closed only once that close, a TLS or WebSocket close handshake say, is over.
      *
      * @phpstan-impure The connection changes while a question waits, so each call reads it afresh.
      */
@@ -2830,6 +2832,7 @@ final class JetStreamContext
     {
         return $this->client->state() !== ConnectionState::Open
             || $this->client->connectionGeneration() !== $generation
+            || $this->client->isCloseRequested()
             || $this->client->serverInfo()?->lameDuckMode === true;
     }
 
