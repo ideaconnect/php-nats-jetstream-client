@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
@@ -170,6 +171,29 @@ final class DiagnoseNoRespondersTest extends TestCase
         self::assertSame(ConnectionState::Open, $client->state());
     }
 
+    /**
+     * With reconnect, a question whose write meets a dead socket, and whose write on the connection that follows fails
+     * too, ends with the transport's own error (TransportClosedException here, Amp's StreamException on a real socket),
+     * which is not a NatsException. The diagnosis still returns a cause: the connection the pull came on is gone. It
+     * used to throw that error.
+     */
+    public function testAQuestionWhoseWriteFailsOnTheNewConnectionTooIsServerGoingAway(): void
+    {
+        $transport = new ReconnectingTransport();
+        $armed = false;
+        $client = $this->client($transport, reconnect: true, connectionListener: static function (ConnectionEvent $event) use ($transport, &$armed): void {
+            if ($event === ConnectionEvent::Reconnected && !$armed) {
+                $armed = true;
+                $transport->failNextWriteContaining(self::QUESTION);
+            }
+        });
+        $transport->responder = self::answering($transport, []);
+        $transport->failNextWriteContaining(self::QUESTION);
+
+        self::assertSame(NoRespondersCause::ServerGoingAway, $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', self::BUDGET_MS)->await());
+        self::assertTrue($armed, 'the client reconnected and its write of the question failed again');
+    }
+
     /** @return iterable<string, array{bool}> */
     public static function reconnectModes(): iterable
     {
@@ -332,7 +356,10 @@ final class DiagnoseNoRespondersTest extends TestCase
         self::assertSame([], $transport->controlLinesStartingWith('PUB $JS.API.'));
     }
 
-    private function client(ReconnectingTransport $transport, bool $reconnect, int $requestTimeoutMs = self::BUDGET_MS): NatsClient
+    /**
+     * @param (\Closure(ConnectionEvent, ?\Throwable): void)|null $connectionListener
+     */
+    private function client(ReconnectingTransport $transport, bool $reconnect, int $requestTimeoutMs = self::BUDGET_MS, ?\Closure $connectionListener = null): NatsClient
     {
         $client = new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
@@ -343,6 +370,7 @@ final class DiagnoseNoRespondersTest extends TestCase
             reconnectMaxDelayMs: 20,
             reconnectJitterMs: 0,
             pingIntervalSeconds: 0,
+            connectionListener: $connectionListener,
         ), $transport);
         $this->opened[] = $this->own($client);
         $client->connect()->await();

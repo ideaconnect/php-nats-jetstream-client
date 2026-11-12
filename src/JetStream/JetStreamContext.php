@@ -2771,50 +2771,51 @@ final class JetStreamContext
             while (true) {
                 try {
                     $answer = $question->await(new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS));
-                } catch (CancelledException) {
-                    if ($question->isComplete()) {
-                        // The question ended with a cancellation of its own: nothing answered it.
-                        return $this->connectionLeftSince($generation) ? NoRespondersCause::ServerGoingAway : NoRespondersCause::NoAnswer;
+
+                    break;
+                } catch (\Exception $failure) {
+                    if ($failure instanceof CancelledException && !$question->isComplete()) {
+                        // The look at the connection came due with the question still waiting.
+                        if (!$this->connectionLeftSince($generation)) {
+                            continue;
+                        }
+
+                        $giveUp->cancel();
+
+                        return NoRespondersCause::ServerGoingAway;
                     }
 
-                    // The look at the connection came due with the question still waiting.
-                    if (!$this->connectionLeftSince($generation)) {
-                        continue;
-                    }
-
-                    $giveUp->cancel();
-
-                    return NoRespondersCause::ServerGoingAway;
-                } catch (NatsException $failure) {
+                    // The question ended unanswered: with the connection's exception, the request's timeout, its inbox
+                    // refused, or a write that failed on the new connection too (the raw transport error then). The
+                    // server had no responder for the question either when it says so: JetStream is not there to
+                    // answer it.
                     if ($this->connectionLeftSince($generation)) {
                         return NoRespondersCause::ServerGoingAway;
                     }
 
-                    // The server had no responder for the question either: JetStream is not there to answer it. Any
-                    // other failure (the request's timeout, its inbox refused) leaves the question unanswered.
-                    return str_contains($failure->getMessage(), 'No responders')
+                    return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
                         ? NoRespondersCause::JetStreamError
                         : NoRespondersCause::NoAnswer;
                 }
-
-                if ($this->connectionLeftSince($generation)) {
-                    return NoRespondersCause::ServerGoingAway;
-                }
-
-                try {
-                    $this->decodeApiResponse($answer);
-                } catch (JetStreamException $error) {
-                    if ($error->getCode() !== 404) {
-                        return NoRespondersCause::JetStreamError;
-                    }
-
-                    return $error->getErrCode() === ApiErrCode::STREAM_NOT_FOUND
-                        ? NoRespondersCause::StreamNotFound
-                        : NoRespondersCause::ConsumerNotFound;
-                }
-
-                return NoRespondersCause::ConsumerFound;
             }
+
+            if ($this->connectionLeftSince($generation)) {
+                return NoRespondersCause::ServerGoingAway;
+            }
+
+            try {
+                $this->decodeApiResponse($answer);
+            } catch (JetStreamException $error) {
+                if ($error->getCode() !== 404) {
+                    return NoRespondersCause::JetStreamError;
+                }
+
+                return $error->getErrCode() === ApiErrCode::STREAM_NOT_FOUND
+                    ? NoRespondersCause::StreamNotFound
+                    : NoRespondersCause::ConsumerNotFound;
+            }
+
+            return NoRespondersCause::ConsumerFound;
         });
     }
 
