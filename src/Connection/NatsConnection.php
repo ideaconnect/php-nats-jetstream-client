@@ -680,6 +680,18 @@ final class NatsConnection
     }
 
     /**
+     * Which connection this is: the count of connections this client has made ({@see $connectionGeneration}), bumped
+     * by every handshake attempt. A different value means a different connection: the client reconnected, or the
+     * application closed and connected again.
+     *
+     * @internal For {@see \IDCT\NATS\JetStream\JetStreamContext::diagnoseNoResponders()}; not part of the supported API.
+     */
+    public function connectionGeneration(): int
+    {
+        return $this->connectionGeneration;
+    }
+
+    /**
      * The server URL the connection is currently attached to, or null when not connected.
      */
     public function connectedUrl(): ?string

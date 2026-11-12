@@ -17,6 +17,31 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Added
+
+- `[feature]` New `JetStreamContext::diagnoseNoResponders($stream, $consumer, $timeoutMs = null)` tells why a pull
+  ended with status 503 (no responders), as a `NoRespondersCause`: `ConsumerNotFound`, `StreamNotFound`,
+  `ConsumerFound`, `JetStreamError`, `ServerGoingAway` or `NoAnswer`. nats-server answers a pull with 503 whenever
+  nothing is subscribed to the consumer's pull subject: when the consumer or its stream does not exist, and also in
+  the last moments of a server that is going away, a graceful stop or lame duck mode, which stops its consumers before
+  it closes the connections. NATS 2.15 stops each durable consumer on a file stream in about 10 ms, so with many of
+  them pulls land in that moment, and `fetchBatch()` reports both as the same `JetStreamException(503)`: a consumer
+  loop that read it as a missing consumer ended, or created the consumer again on the server that was going away
+  (ideaconnect/symfony-nats-messenger#106). The method asks the server for the consumer (CONSUMER.INFO) while it
+  watches the connection the pull came on. A server that stays answers at once. One that is going away answers
+  nothing, since a graceful stop shuts down its eventing, which drops every JetStream API reply, before it stops the
+  first consumer, and lame duck mode stops JetStream before it tells the clients it is going away: the cause is
+  `ServerGoingAway` as soon as that connection is closed, being recovered or replaced by a reconnect, or draining, or
+  its server announced lame duck mode (INFO `ldm`), without waiting for the question's timeout, which the client would
+  otherwise keep across a reconnect. An answer read once the connection has been replaced is `ServerGoingAway` as
+  well, and a question given up is cancelled. Measured on nats-server 2.15.2 with 48 consumers on a file stream:
+  after SIGTERM, pulls got 503 from about 100 ms on and every CONSUMER.INFO sent from then on went unanswered until
+  the server closed the connection, about 570 ms in; after SIGUSR2, pulls got 503 from 50 ms on, CONSUMER.INFO went
+  unanswered from 45 ms on, and the lame duck INFO came about 515 ms in, the connection staying open. One round trip
+  on a server that stays; nothing is asked when the connection is already gone. The client's own pull consumers
+  (`PullConsumerIterator`, `consumePipelined()`) keep reading a 503 as transient, as before.
+- `ApiErrCode::CONSUMER_NOT_FOUND` (10014) and `ApiErrCode::STREAM_NOT_FOUND` (10059).
+
 ### Fixed
 
 - `[bugfix]` A JetStream API call that nothing answers now fails with `JetStreamException` code 503, as `publish()` and

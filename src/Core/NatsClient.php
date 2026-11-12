@@ -650,6 +650,17 @@ final class NatsClient
     }
 
     /**
+     * Which connection this is: a different value means a different connection. See
+     * {@see NatsConnection::connectionGeneration()}.
+     *
+     * @internal For {@see \IDCT\NATS\JetStream\JetStreamContext::diagnoseNoResponders()}; not part of the supported API.
+     */
+    public function connectionGeneration(): int
+    {
+        return $this->connection->connectionGeneration();
+    }
+
+    /**
      * The server URL currently connected to, or null when not connected.
      */
     public function connectedUrl(): ?string
