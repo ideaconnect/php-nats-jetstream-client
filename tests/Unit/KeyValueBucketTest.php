@@ -2497,6 +2497,53 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
+     * A STREAM.MSG.GET fallback nothing answers (status 503, no responders) fails with JetStreamException(503), as
+     * every JetStream path reports no responders (#161). It used to let the connection's bare NatsException through.
+     */
+    public function testGetFallbackReportsNoRespondersAsAJetStreamException(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            $this->kvDirectStatus(1, 503, 'No Responders'),  // Direct Get -> 503 fallback trigger
+            $this->kvDirectStatus(2, 503, 'No Responders'),  // STREAM.MSG.GET -> no responders
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder for subject $JS.API.STREAM.MSG.GET.KV_cfg');
+        $client->jetStream()->keyValue('cfg')->get('theme')->await();
+    }
+
+    /**
+     * A STREAM.INFO page request of getAll() nothing answers fails with JetStreamException(503) (#161), not with the
+     * connection's bare NatsException.
+     */
+    public function testGetAllReportsNoRespondersToItsStreamInfoAsAJetStreamException(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxServer($transport, [
+            $this->kvDirectStatus(1, 503, 'No Responders'),  // STREAM.INFO -> no responders
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder for subject $JS.API.STREAM.INFO.KV_cfg');
+        $client->jetStream()->keyValue('cfg')->getAll()->await();
+    }
+
+    /**
      * Verifies the STREAM.MSG.GET fallback returns null when the reply has no 'message' field.
      */
     public function testGetFallbackReturnsNullWhenMessageFieldMissing(): void

@@ -16,8 +16,9 @@ use IDCT\NATS\Exception\NatsException;
  * translate that into a {@see JetStreamException} with code 503 so callers catching JetStreamException
  * see one exception taxonomy, regardless of which request site produced it (#161).
  *
- * {@see JetStreamContext::jsRequest()} and the header-request sites in KeyValueBucket /
- * ObjectStoreBucket / BatchPublisher all funnel their no-responders case through here.
+ * {@see JetStreamContext::jsRequest()} (which the JetStream API calls of the context, such as getConsumer() and
+ * addStream(), go through), the plain and header-request sites in KeyValueBucket / ObjectStoreBucket and
+ * BatchPublisher all funnel their no-responders case through here.
  */
 final class JetStreamRequest
 {
@@ -31,6 +32,21 @@ final class JetStreamRequest
     {
         try {
             return $client->requestWithHeaders($subject, $payload, $headers)->await();
+        } catch (JetStreamException $e) {
+            throw $e;
+        } catch (NatsException $e) {
+            throw self::normalizeNoResponders($e, $subject);
+        }
+    }
+
+    /**
+     * Performs a plain request/reply and normalizes a no-responders failure to JetStreamException(503), as
+     * {@see withHeaders()} does for a header request. Returns the reply message unchanged on success.
+     */
+    public static function plain(NatsClient $client, string $subject, string $payload): NatsMessage
+    {
+        try {
+            return $client->request($subject, $payload)->await();
         } catch (JetStreamException $e) {
             throw $e;
         } catch (NatsException $e) {

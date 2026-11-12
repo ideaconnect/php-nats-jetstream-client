@@ -2252,6 +2252,54 @@ final class ObjectStoreBucketTest extends TestCase
     }
 
     /**
+     * A STREAM.INFO subjects page of list() nothing answers (status 503, no responders) fails with
+     * JetStreamException(503), as every JetStream path reports no responders (#161). It used to let the connection's
+     * bare NatsException through.
+     */
+    public function testListReportsNoRespondersToItsSubjectEnumerationAsAJetStreamException(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            $this->directStatusReply(1, 503, 'No Responders'),  // metaSubjects() STREAM.INFO -> no responders
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder for subject $JS.API.STREAM.INFO.OBJ_assets');
+        $client->jetStream()->objectStore('assets')->list()->await();
+    }
+
+    /**
+     * The STREAM.MSG.GET fallback of info() nothing answers fails with JetStreamException(503) (#161), not with the
+     * connection's bare NatsException.
+     */
+    public function testInfoFallbackReportsNoRespondersAsAJetStreamException(): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            $this->directStatusReply(1, 503, 'No Responders'),  // Direct Get -> 503 fallback trigger
+            $this->directStatusReply(2, 503, 'No Responders'),  // STREAM.MSG.GET -> no responders
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionCode(503);
+        $this->expectExceptionMessage('No JetStream responder for subject $JS.API.STREAM.MSG.GET.OBJ_assets');
+        $client->jetStream()->objectStore('assets')->info('doc.txt')->await();
+    }
+
+    /**
      * Verifies delete() still succeeds when the best-effort chunk purge fails.
      */
     public function testDeleteToleratesPurgeFailure(): void

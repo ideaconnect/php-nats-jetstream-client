@@ -382,6 +382,10 @@ A handler that throws in the application's own read, processIncoming() or readIn
 - `testACorruptLineBehindAThrowingHandlerIsRecoveredAndTheHeldFailureThrown` - The parse-error path of readChunk(): a:x (its handler throws), b:z and a line that does not parse: b:z is delivered on the first dial, before the corrupt stream is reported (once) and recovered with a reconnect (2 dials, Open), and 'handler a' is then thrown, not reported. b:z used to wait for the delivery after the reconnect (#173).
 - `testTheStoppedMarkGoesWithTheRemainder` - By reflection, the subscriptions marked as stopped by a held failure (`NatsConnection::$stoppedByAFailure`, #186): `[sid => true]` while the remainder is queued, set by the branch for a handler's failure and by the one for another subscription's overflow escaping a handler (here a handler throwing a SlowConsumerException for sid 999); empty once the next read has delivered the remainder, after unsubscribe() of a stopped subscription, and after disconnect(). A stale mark would cost your next read only an empty pass.
 
+### tests/Unit/JetStreamApiNoRespondersTest.php
+A JetStream API call nothing answers fails with JetStreamException(503) (#161). A server without JetStream, or an account without it, answers such a request with status 503 at once; the calls that go through `JetStreamContext::requestJson()` let the connection's bare NatsException ("No responders for subject ...") through instead. Over `FakeTransport`, answering every request on the client's request inbox with status 503 and no body. Every case fails before the fix.
+- `testAJetStreamApiCallNothingAnswersFailsWithAJetStreamException503` - (accountInfo, createStream, addStream, updateStream, getStream, deleteStream, purgeStream, streamNames, listStreams, listConsumers, consumerNames, getStreamMessage, getLastMessageForSubject, deleteMessage, createConsumer, addConsumer, createEphemeralConsumer, createPushConsumer, createEphemeralPushConsumer, getConsumer, deleteConsumer, pauseConsumer, resumeConsumer, unpinConsumer) Each call fails with JetStreamException code 503 whose message starts with "No JetStream responder for subject $JS.API.", the connection's "No responders" NatsException as its previous one.
+
 ### tests/Unit/JetStreamContextTest.php
 
 - `testAccountInfo` - accountInfo() parses account metrics (memory/storage) and issues a `PUB $JS.API.INFO` request.
@@ -812,6 +816,7 @@ A JetStream publish() with a `msgId` whose connection is lost after its frame we
 - `testUpdateRejectsNonPositiveExpectedRevision` - update() with expected revision 0 throws JetStreamException "Expected revision must be greater than zero".
 - `testGetAllSkipsKeysThatReturnNotFound` - getAll() skips a key whose Direct Get races a deletion and returns 404, returning only the surviving key.
 - `testGetAllThrowsOnStreamInfoApiError` - getAll() surfaces a STREAM.INFO API error ("stream not found") instead of swallowing it into an empty result.
+- `testGetAllReportsNoRespondersToItsStreamInfoAsAJetStreamException` - A STREAM.INFO page request of getAll() nothing answers (status 503) fails with JetStreamException(503) naming `$JS.API.STREAM.INFO.KV_cfg`, not with the bare NatsException it let through before (#161).
 - `testGetStatusFallsBackLastSequenceToMessagesWhenMissing` - getStatus() falls back last_sequence to the messages count when last_seq is absent from state.
 - `testDeletePropagatesApiError` - delete() propagates a JetStream API error ("delete failed") as a JetStreamException.
 - `testCreateWithMirrorArrayBucketKeyTranslatesName` - create() with a mirror given as an array with a 'bucket' key replaces it with name:KV_src, retains extra fields (start_seq), drops the 'bucket' key, and emits empty subjects (#62).
@@ -821,6 +826,7 @@ A JetStream publish() with a `msgId` whose connection is lost after its frame we
 - `testGetRevisionReturnsNullOnNotFound` - getRevision() returns null when STREAM.MSG.GET replies with a 404 error.
 - `testGetRevisionPropagatesNon404Error` - getRevision() re-throws a non-404 STREAM.MSG.GET error ("internal server error").
 - `testGetFallbackReturnsNullOnStreamMessage404` - the STREAM.MSG.GET fallback (after a 503 Direct Get) returns null when the API replies with a 404 error.
+- `testGetFallbackReportsNoRespondersAsAJetStreamException` - The STREAM.MSG.GET fallback (after a 503 Direct Get) that nothing answers fails with JetStreamException(503) naming `$JS.API.STREAM.MSG.GET.KV_cfg`, not with the bare NatsException it let through before (#161).
 - `testGetFallbackPropagatesNon404StreamMessageError` - the STREAM.MSG.GET fallback propagates a non-404 API error ("service unavailable").
 - `testGetFallbackReturnsNullWhenMessageFieldMissing` - the STREAM.MSG.GET fallback returns null when the reply JSON has no 'message' field.
 - `testGetFallbackDecodesEncodedHeaders` - the STREAM.MSG.GET fallback decodes base64 'hdrs' and resolves a KV-Operation:DEL header to operation DEL with a null value at revision 11.
@@ -2275,6 +2281,7 @@ The `UNSUB` a dropped shared reply inbox (mux) owes belongs to the connection it
 - `testListUsesSingleBatchedDirectGetOnModernServer` - list() on a 2.11+ server issues exactly ONE batched multi_last Direct Get for all objects (asserted count 1), returns BOTH active objects with the correct revisions (list not truncated to one); the single-request assertion fails on the pre-#110 per-subject fan-out (#110).
 - `testInfoIncludesRevisionFromSequenceHeader` - info() sets ObjectInfo.revision from the Direct Get Nats-Sequence header (revision=2).
 - `testInfoFallsBackToStreamMessageWhenDirectGetUnavailable` - info() falls back to STREAM.MSG.GET when Direct Get returns 503 and still returns the metadata, exercising both API subjects.
+- `testInfoFallbackReportsNoRespondersAsAJetStreamException` - The STREAM.MSG.GET fallback of info() that nothing answers fails with JetStreamException(503) naming `$JS.API.STREAM.MSG.GET.OBJ_assets`, not with the bare NatsException it let through before (#161).
 - `testListFallsBackToStreamMessageWhenDirectGetUnavailable` - list()'s per-subject fan-out falls back to the leader STREAM.MSG.GET per object when a bucket without Direct Get answers 503, returning the object instead of failing the whole enumeration.
 - `testListFallbackQueriesLeaderByEnumeratedSubjectForNonCanonicalToken` - list()'s 503 fallback reads the leader by the ENUMERATED meta subject verbatim ("$O.assets.M.QQ", never a padded re-encode), so a record stored under a non-canonical base64url token still appears in the listing with its revision.
 - `testInfoReturnsNullWhenNotFound` - info() returns null when Direct Get responds 404.
@@ -2297,6 +2304,7 @@ The `UNSUB` a dropped shared reply inbox (mux) owes belongs to the connection it
 - `testGetDownloadsMultipleChunksInSingleBatch` - get() of a multi-chunk object uses a single batched pull (one CONSUMER.MSG.NEXT with batch:3 on the NUID filter_subject), reassembles in order and verifies the digest.
 - `testListRethrowsNonNotFoundError` - list() rethrows a non-404 (500 'boom') error raised while Direct-Getting a meta record.
 - `testListThrowsWhenSubjectEnumerationFails` - list() surfaces an error ('info failed') from the meta-subject enumeration (STREAM.INFO) request.
+- `testListReportsNoRespondersToItsSubjectEnumerationAsAJetStreamException` - The STREAM.INFO subjects page of list() that nothing answers fails with JetStreamException(503) naming `$JS.API.STREAM.INFO.OBJ_assets`, not with the bare NatsException it let through before (#161).
 - `testDeleteToleratesPurgeFailure` - delete() still returns deleted=true when the best-effort chunk purge fails with a 500.
 - `testListSkipsNotFoundSubject` - list() skips a meta subject whose Direct Get returns 404 and includes the remaining present object.
 - `testDeleteToleratesMissingPreviousMetadata` - delete() proceeds (deleted=true) when the previous-metadata lookup fails with a non-404 (500) error.

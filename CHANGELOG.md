@@ -15,6 +15,26 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A JetStream API call that nothing answers now fails with `JetStreamException` code 503, as `publish()` and
+  `fetchBatch()` do (#161). A server without JetStream, or an account without it, answers such a request with the
+  no-responders status at once, and the calls that go through `JetStreamContext::requestJson()` - `accountInfo()`,
+  the stream and consumer calls (`createStream()`, `addStream()`, `updateStream()`, `getStream()`, `deleteStream()`,
+  `purgeStream()`, `streamNames()`, `listStreams()`, `getStreamMessage()`, `getLastMessageForSubject()`,
+  `deleteMessage()`, `createConsumer()`, `addConsumer()`, the ephemeral and push variants, `getConsumer()`,
+  `deleteConsumer()`, `listConsumers()`, `consumerNames()`, `pauseConsumer()`, `resumeConsumer()`,
+  `unpinConsumer()`) - let the connection's bare `NatsException` ("No responders for subject ...") through, so a
+  caller catching `JetStreamException`, as the #161 rule says every JetStream path lets it, missed it. So did four
+  plain requests of the buckets: the Key/Value `get()` fallback to STREAM.MSG.GET and the STREAM.INFO pages of
+  `getAll()`, and the Object Store `info()` fallback and the subject enumeration of `list()`. The message is now
+  `No JetStream responder for subject <subject> (...)`, with the connection's exception as the previous one; code
+  that matched the old message on these calls should match the code 503 instead. Found while telling a pull's 503
+  apart for ideaconnect/symfony-nats-messenger#106: a CONSUMER.INFO asked of a server without JetStream threw the
+  bare exception.
+
 ## [2.28.0] - 2026-11-03
 
 ### Added

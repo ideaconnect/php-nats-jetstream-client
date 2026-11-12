@@ -4960,6 +4960,11 @@ final class JetStreamContext
     /**
      * Executes a JetStream API request and returns decoded JSON response.
      *
+     * A request nothing answers at once (no responders: JetStream is not enabled, or not for the account) fails with
+     * JetStreamException(503), as on every other JetStream path ({@see jsRequest()}, #161). It went through to the
+     * caller as the connection's bare NatsException, so getConsumer(), addStream() and the other API calls here
+     * reported it differently from publish() and fetchBatch().
+     *
      * @param array<string,mixed> $body
      * @return array<string,mixed>
      */
@@ -4967,7 +4972,7 @@ final class JetStreamContext
     {
         $jsonBody = $body === [] ? (object) [] : $body;
         $json = json_encode($jsonBody, JSON_THROW_ON_ERROR);
-        $message = $this->client->request($subject, $json)->await();
+        $message = $this->jsRequest($subject, $json);
 
         try {
             /** @var array<string,mixed> $data */
