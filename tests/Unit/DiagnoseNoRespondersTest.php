@@ -55,6 +55,7 @@ final class DiagnoseNoRespondersTest extends TestCase
         yield 'JetStream temporarily unavailable' => ['{"error":{"code":503,"err_code":10008,"description":"JetStream system temporarily unavailable"}}', NoRespondersCause::JetStreamError];
         yield 'another error' => ['{"error":{"code":500,"description":"backend failure"}}', NoRespondersCause::JetStreamError];
         yield 'a malformed answer' => ['not json', NoRespondersCause::JetStreamError];
+        yield 'an answer that is JSON but not an object' => ['123', NoRespondersCause::JetStreamError];
     }
 
     /**

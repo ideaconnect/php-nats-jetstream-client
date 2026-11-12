@@ -5118,11 +5118,18 @@ final class JetStreamContext
     private function decodeApiResponse(NatsMessage $message): array
     {
         try {
-            /** @var array<string,mixed> $data */
             $data = json_decode($message->payload, true, 512, JSON_THROW_ON_ERROR);
         } catch (\JsonException $e) {
             throw new JetStreamException('Malformed JetStream API response: ' . $e->getMessage(), 0, $e);
         }
+
+        // JSON that is not an object or a list (a number, a string, true, null) went on as the array this returns, and
+        // failed with a TypeError.
+        if (!is_array($data)) {
+            throw new JetStreamException('Malformed JetStream API response: not a JSON object');
+        }
+
+        /** @var array<string,mixed> $data */
 
         /** @var array<string,mixed>|null $error */
         $error = is_array($data['error'] ?? null) ? $data['error'] : null;

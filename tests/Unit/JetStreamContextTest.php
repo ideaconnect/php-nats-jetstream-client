@@ -26,6 +26,7 @@ use IDCT\NATS\JetStream\Models\StreamInfo;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 use Revolt\EventLoop\CallbackType;
@@ -3151,6 +3152,38 @@ final class JetStreamContextTest extends TestCase
         $this->expectException(JetStreamException::class);
         $this->expectExceptionMessage('Malformed JetStream API response');
         $client->jetStream()->accountInfo()->await();
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function repliesThatAreJsonButNotAnObject(): iterable
+    {
+        yield 'a number' => ['123'];
+        yield 'a string' => ['"ok"'];
+        yield 'true' => ['true'];
+        yield 'null' => ['null'];
+    }
+
+    /**
+     * A JetStream API reply that is JSON but not an object fails with the JetStreamException of a malformed reply, as a
+     * reply that is not JSON does. It went on as the array requestJson() returns, and failed with a TypeError.
+     */
+    #[DataProvider('repliesThatAreJsonButNotAnObject')]
+    public function testRequestJsonRejectsAReplyThatIsJsonButNotAnObject(string $reply): void
+    {
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.any 1 %d\r\n%s\r\n", strlen($reply), $reply),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Malformed JetStream API response: not a JSON object');
+        $client->jetStream()->getConsumer('ORDERS', 'worker')->await();
     }
 
     // ─── Phase 3: Feature Gaps ────────────────────────────────────────

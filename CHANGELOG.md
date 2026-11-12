@@ -59,6 +59,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   that matched the old message on these calls should match the code 503 instead. Found while telling a pull's 503
   apart for ideaconnect/symfony-nats-messenger#106: a CONSUMER.INFO asked of a server without JetStream threw the
   bare exception.
+- `[bugfix]` A JetStream API reply that is JSON but not an object (a number, a string, `true`, `null`), which only a
+  broken server or proxy sends, now fails the call with `JetStreamException` ("Malformed JetStream API response: not a
+  JSON object"), as a reply that is not JSON does. It went on as the array the calls through `requestJson()` decode it
+  into, and failed with a `TypeError`. Found by the review of `diagnoseNoResponders()`, which reads such an answer as
+  `JetStreamError` now.
 
 ## [2.28.0] - 2026-11-03
 
