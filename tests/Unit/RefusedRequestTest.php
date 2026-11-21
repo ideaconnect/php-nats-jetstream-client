@@ -179,6 +179,35 @@ final class RefusedRequestTest extends TestCase
         self::assertNoRequestStateLeft($connection);
     }
 
+    /**
+     * A requestMany() that has collected a reply returns it when a refusal of its subject arrives after the reply, as one
+     * of a plain publish to the same subject would: the reply answered a publish the server let through. Before the
+     * fix it waited out its timeout and returned the same reply.
+     */
+    public function testARequestManyWithRepliesCollectedReturnsThemWhenItsSubjectIsRefusedLater(): void
+    {
+        $transport = self::server([]);
+        $inner = $transport->onWrite;
+        self::assertNotNull($inner);
+        $transport->onWrite = static function (string $bytes) use ($inner): array {
+            $frames = $inner($bytes);
+            if (str_starts_with($bytes, 'PUB svc.scatter ')) {
+                $frames[] = "-ERR 'Permissions Violation for Publish to \"svc.scatter\"'\r\n";
+            }
+
+            return $frames;
+        };
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5_000), $transport));
+        $connection->connect()->await();
+
+        $start = hrtime(true);
+        $replies = $connection->requestMany('svc.scatter', 'x', null, 5, 5_000)->await();
+
+        self::assertSame(['ok'], array_map(static fn(NatsMessage $message): string => $message->payload, $replies));
+        self::assertLessThan(2.5, (hrtime(true) - $start) / 1e9, 'returned at the refusal, well before the 5 s timeout');
+        self::assertNoRequestStateLeft($connection);
+    }
+
     /** @return iterable<string, array{\Closure(JetStreamContext): Future<mixed>, string}> */
     public static function jetStreamCalls(): iterable
     {
