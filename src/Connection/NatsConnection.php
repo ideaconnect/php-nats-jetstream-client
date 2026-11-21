@@ -22,6 +22,7 @@ use IDCT\NATS\Exception\AuthenticationException;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\NatsThrowable;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\SubscriptionLimitException;
@@ -199,6 +200,22 @@ final class NatsConnection
      * @var array<string, DeferredCancellation>
      */
     private array $muxWakes = [];
+    /**
+     * The subject each in-flight request is sent to, keyed like {@see $muxWaiters}. A permissions violation for a
+     * publish names the subject alone, so every request to it is refused by it ({@see refuseRequestsTo()}).
+     * Registered and removed with the waiter.
+     *
+     * @var array<string, string>
+     */
+    private array $muxSubjects = [];
+    /**
+     * The server's -ERR text for each in-flight request whose publish the server refused for lack of permission,
+     * keyed like {@see $muxWaiters}: the request fails with it at its next look ({@see requestRefusedException()}).
+     * Removed with the waiter.
+     *
+     * @var array<string, string>
+     */
+    private array $muxRefusals = [];
     /**
      * Strictly-increasing per-connection token counter. Guarantees pairwise-distinct request tokens
      * within an epoch by construction (never reset); the random $muxBase provides unguessability (#118).
@@ -1528,6 +1545,8 @@ final class NatsConnection
         $this->forgetMux();
         $this->muxWaiters = [];
         $this->muxWakes = [];
+        $this->muxSubjects = [];
+        $this->muxRefusals = [];
         // A fresh connect() may target an account/server that permits the reply-inbox wildcard, so a
         // terminal close clears the rejection latch and lets ensureMuxInbox() re-attempt the mux (#167).
         $this->muxRejected = false;
@@ -5406,11 +5425,14 @@ final class NatsConnection
      *
      * @param callable(NatsMessage):void $handler
      * @param DeferredCancellation $wake What the request reads with next; fires once, like any wake-up.
+     * @param string $subject The subject the request is sent to, which a refusal of its publish names
+     *        ({@see refuseRequestsTo()}).
      */
-    private function registerMuxWaiter(string $token, callable $handler, DeferredCancellation $wake): void
+    private function registerMuxWaiter(string $token, callable $handler, DeferredCancellation $wake, string $subject): void
     {
         $this->muxWaiters[$token] = $handler;
         $this->muxWakes[$token] = $wake;
+        $this->muxSubjects[$token] = $subject;
     }
 
     /**
@@ -5430,7 +5452,61 @@ final class NatsConnection
      */
     private function removeMuxWaiter(string $token): void
     {
-        unset($this->muxWaiters[$token], $this->muxWakes[$token]);
+        unset($this->muxWaiters[$token], $this->muxWakes[$token], $this->muxSubjects[$token], $this->muxRefusals[$token]);
+    }
+
+    /**
+     * Refuses every request in flight to $subject, the subject a permissions violation for a publish names: the server
+     * answered a PUB to it with "-ERR 'Permissions Violation for Publish to "<subject>"'" and kept the connection open.
+     * The request reached no responder, so no reply will come, and each request fails at its next look with
+     * {@see requestRefusedException()}; its wake-up is fired, so that it looks at once, wherever it waits - in a read,
+     * on the socket, behind another fiber's read, or for the read slot (as for a drop of the inbox, #180). It used to
+     * wait out its timeout and fail with a TimeoutException.
+     *
+     * The -ERR names the subject and not the request, and the server sends one for each refused publish, in order. The
+     * permissions are the user's, so a request to that subject is refused whichever publish the -ERR answers, a plain
+     * publish() to it included: every request in flight to it is refused, and a later -ERR finds none to refuse. A
+     * request to another subject is left alone. Called from the dispatch of the -ERR, so it must not suspend.
+     */
+    private function refuseRequestsTo(string $subject, string $error): void
+    {
+        foreach ($this->muxSubjects as $token => $requested) {
+            if ($requested !== $subject || isset($this->muxRefusals[$token])) {
+                continue;
+            }
+
+            $this->muxRefusals[$token] = $error;
+            // Registered with the subject, and renewed but never removed without it.
+            $this->muxWakes[$token]->cancel();
+        }
+    }
+
+    /**
+     * The subject a "Permissions Violation for Publish to" -ERR names, or null for any other error. nats-server writes
+     * it with Go's %q, so it is in double quotes, with a backslash before a double quote or a backslash in it, and an
+     * apostrophe left as it is, although the whole text is in single quotes: -ERR 'Permissions Violation for Publish to
+     * "svc.o'brien"'. A subject without the quotes, as a server could write it, ends at a space or a quote.
+     */
+    private static function subjectOfAPublishViolation(string $error): ?string
+    {
+        if (preg_match('/permissions violation for publish to "((?:[^"\\\\]|\\\\.)*)"/i', $error, $quoted) === 1) {
+            return stripcslashes($quoted[1]);
+        }
+
+        return preg_match('/permissions violation for publish to ([^\s"\']+)/i', $error, $bare) === 1 ? $bare[1] : null;
+    }
+
+    /**
+     * The error of a request whose publish the server refused for lack of permission ({@see refuseRequestsTo()}),
+     * carrying the server's text and naming the permission needed.
+     */
+    private function requestRefusedException(string $subject, string $error): PermissionViolationException
+    {
+        return new PermissionViolationException(
+            'The server refused the request to "' . $subject . '": ' . trim($error, "' ") . '. No responder received it.'
+            . ' Grant this connection\'s user permission to publish to "' . $subject . '".',
+            subject: $subject,
+        );
     }
 
     /**
@@ -5906,7 +5982,7 @@ final class NatsConnection
             $deferred->complete($message);
             $replyReceived = true;
             $replyArrived->cancel();
-        }, $replyArrived);
+        }, $replyArrived, $subject);
 
         try {
             $sentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
@@ -5929,6 +6005,12 @@ final class NatsConnection
                 // come, whose reply would come too late.
                 if ($this->terminalCloses !== $closes || $lifetime->isCancelled()) {
                     throw new ConnectionException('Connection is not open');
+                }
+
+                // The server refused the request's publish for lack of permission: no responder got it, so no reply
+                // can come ({@see refuseRequestsTo()}).
+                if (isset($this->muxRefusals[$token])) {
+                    throw $this->requestRefusedException($subject, $this->muxRefusals[$token]);
                 }
 
                 // The mux reply inbox was permission-rejected mid-flight (the async -ERR was just read);
@@ -6220,7 +6302,7 @@ final class NatsConnection
             $replyWake = new DeferredCancellation();
             $this->renewMuxWake($token, $replyWake);
             $wake->cancel();
-        }, $replyWake);
+        }, $replyWake, $subject);
 
         try {
             $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
@@ -6236,6 +6318,16 @@ final class NatsConnection
                     }
 
                     throw new ConnectionException('Connection is not open');
+                }
+
+                // The server refused the request's publish for lack of permission ({@see refuseRequestsTo()}). Replies
+                // collected by then answered a publish the server let through, and are returned.
+                if (isset($this->muxRefusals[$token])) {
+                    if ($messages !== []) {
+                        break;
+                    }
+
+                    throw $this->requestRefusedException($subject, $this->muxRefusals[$token]);
                 }
 
                 // The mux reply inbox was permission-rejected (the async -ERR was just read); no further
@@ -7698,6 +7790,14 @@ final class NatsConnection
                             }
                         }
                     }
+                }
+
+                // A permissions violation for a publish names the subject: the requests in flight to it reach no
+                // responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}). "Publish with
+                // Reply of" names a reply subject, never this connection's inbox, and is left alone.
+                $refusedSubject = self::subjectOfAPublishViolation($error);
+                if ($refusedSubject !== null) {
+                    $this->refuseRequestsTo($refusedSubject, $error);
                 }
 
                 // Non-fatal server error (e.g. a per-subscription permissions violation): surface it

@@ -18,6 +18,7 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
@@ -2739,7 +2740,10 @@ final class JetStreamContext
      *    to - a pull gets the 503 again at once, and this answers ServerGoingAway at once, without asking.
      *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays: a user
      *    allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful
-     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer.
+     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer. The
+     *    server refuses the question of such a user at once, with a permissions violation (read as soon as it comes
+     *    since client 2.30.0), and the connection is then watched until the timeout all the same, as a server going
+     *    away refuses it too: that user still tells a server going away from one that stays.
      *
      * The question waits for its answer only while that connection stays. The client keeps a request waiting for its
      * reply across a reconnect, up to its timeout, but the server that would have answered this one is gone, and an
@@ -2773,6 +2777,8 @@ final class JetStreamContext
 
             $subject = JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer;
             $giveUp = new DeferredCancellation();
+            // The question's own time, which a refusal of it still watches the connection for.
+            $questionTime = new TimeoutCancellation(($timeoutMs ?? $this->client->options()->requestTimeoutMs) / 1000);
             $question = $this->client->request($subject, '{}', $timeoutMs, $giveUp->getCancellation());
 
             while (true) {
@@ -2800,6 +2806,10 @@ final class JetStreamContext
                         return NoRespondersCause::ServerGoingAway;
                     }
 
+                    if ($failure instanceof PermissionViolationException) {
+                        return $this->watchTheConnectionUntil($generation, $questionTime);
+                    }
+
                     return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
                         ? NoRespondersCause::JetStreamError
                         : NoRespondersCause::NoAnswer;
@@ -2824,6 +2834,36 @@ final class JetStreamContext
 
             return NoRespondersCause::ConsumerFound;
         });
+    }
+
+    /**
+     * The cause of a 503 when the question was refused for lack of permission (a user who may pull but not ask for
+     * consumer info): the refusal comes at once, from a server that stays as from one going away, and tells nothing.
+     * So the connection is watched for the rest of the question's time, as while a question waits unanswered: a server
+     * going away closes it or announces lame duck mode, ServerGoingAway; one that stays keeps it, NoAnswer at the
+     * deadline. The watch reads the socket, as the question's wait did, since the client reads it only while something
+     * waits: without a read, neither the close nor the lame duck INFO would be seen. Before client 2.30.0 the refused
+     * question waited out its timeout, which watched the connection the same way.
+     */
+    private function watchTheConnectionUntil(int $generation, Cancellation $questionTime): NoRespondersCause
+    {
+        while (!$this->connectionLeftSince($generation)) {
+            if ($questionTime->isRequested()) {
+                return NoRespondersCause::NoAnswer;
+            }
+
+            try {
+                $this->client->readIncomingForOperation(new CompositeCancellation($questionTime, new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS)))->await();
+            } catch (CancelledException) {
+                // Nothing to read within the look, or the question's time is over: look again.
+            } catch (\Throwable) {
+                // A read that fails: the connection is gone, which the next look sees, or it stays, and a pause
+                // keeps the watch from spinning.
+                delay(self::NO_RESPONDERS_LOOK_SECONDS);
+            }
+        }
+
+        return NoRespondersCause::ServerGoingAway;
     }
 
     /**

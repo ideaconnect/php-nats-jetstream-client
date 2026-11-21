@@ -40,9 +40,9 @@ enum NoRespondersCause: string
 
     /**
      * Nothing answered within the timeout, on a connection that stays: a user allowed to pull but not to ask for
-     * consumer info (the server reports a permissions violation and answers nothing), a server too busy to answer, or a
-     * server whose graceful stop takes longer than the timeout, as it closes the connections only once it has stopped
-     * every consumer.
+     * consumer info (the server refuses the question with a permissions violation, and the connection is watched until
+     * the timeout all the same), a server too busy to answer, or a server whose graceful stop takes longer than the
+     * timeout, as it closes the connections only once it has stopped every consumer.
      */
     case NoAnswer = 'no_answer';
 }

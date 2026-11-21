@@ -8,3 +8,15 @@ Feature: Username and password authentication
   Scenario: Reject an invalid password
     When I connect with an invalid password
     Then the connection should be rejected
+
+  Scenario: A request the server refuses for a publish permission fails at once
+    Given a user who may not publish to "permissions.refused.>" is connected to the username and password server
+    When that user sends a request to "permissions.refused.echo"
+    Then it should fail at once with a permission violation for "permissions.refused.echo"
+    And a request from that user to a subject it may publish to should still be answered
+
+  Scenario: A JetStream API call the server refuses for a publish permission fails at once
+    Given a user who may not publish to "permissions.refused.>" is connected to the username and password server
+    When that user asks for the info of a consumer
+    Then it should fail at once with a permission violation for the consumer info subject
+    And that user can still read the stream's info

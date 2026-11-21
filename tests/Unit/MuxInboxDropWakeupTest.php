@@ -15,6 +15,7 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
@@ -49,7 +50,8 @@ use function Amp\delay;
  * Over `tests/Support/ReconnectingTransport.php` seen through `tests/Support/WatchedTransport.php`, whose onRead tells
  * the test when the operation's read has taken the socket: the PONG's write is held up until then and released by the
  * test, so the order of events decides, not time. Each regression test fails on the code before the fix, the request
- * ending only at its 3 s timeout; the guards pass on both.
+ * ending only at its 3 s timeout; the guards pass on both. A refusal of the request's publish for lack of permission
+ * ends a parked request the same way ({@see NatsConnection::refuseRequestsTo()}).
  */
 final class MuxInboxDropWakeupTest extends TestCase
 {
@@ -119,6 +121,48 @@ final class MuxInboxDropWakeupTest extends TestCase
                 self::assertLessThan(0.5, $this->secondsSince($start), 'the next request failed fast');
                 self::assertCount(1, $transport->controlLinesStartingWith('SUB _INBOX.'), 'the latch kept the next request from subscribing again');
             }
+        } finally {
+            $stop->cancel();
+            $loop->await();
+        }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function operations(): iterable
+    {
+        yield 'request()' => ['request'];
+        yield 'requestMany(max 1)' => ['requestMany'];
+    }
+
+    /**
+     * The same shape with a refusal of the request's publish: the -ERR the application's read brings is
+     * "Permissions Violation for Publish to "svc.held"", which names the request's subject, not the inbox. The request
+     * fails within 0.5 s of its 3 s timeout with a PermissionViolationException and leaves no wake-up behind; the
+     * inbox stays, so the next request is sent on it, without a new SUB, and gets its reply. The request used to wait
+     * out its timeout: the refusal ended nothing, the error listener alone heard of it.
+     */
+    #[DataProvider('operations')]
+    public function testARequestParkedOnTheSocketFailsAsSoonAsAnotherFibersReadBringsTheRefusalOfItsPublish(string $operation): void
+    {
+        [$transport, $watched, $client] = $this->connectForTheDrop();
+        [$stop, $loop] = $this->startReadLoop($client);
+        $this->awaitRead($watched);
+
+        try {
+            $start = hrtime(true);
+            $result = self::startRequest($operation, $client, 3_000);
+            $this->awaitPublished($transport);
+            $this->dropTheInboxWhileTheOperationReads($transport, $watched, "-ERR 'Permissions Violation for Publish to \"svc.held\"'\r\n");
+            [, $error] = self::settle($result);
+            $elapsed = $this->secondsSince($start);
+
+            self::assertInstanceOf(PermissionViolationException::class, $error, sprintf('%s ended after %.3f s with %s', $operation, $elapsed, self::describe($error)));
+            self::assertSame('svc.held', $error->getSubject());
+            self::assertLessThan(0.5, $elapsed, sprintf('%s failed after %.3f s, with a 3 s timeout', $operation, $elapsed));
+            self::assertSame([], self::muxWakes(self::connectionOf($client)), 'no wake-up is left behind for the request that failed');
+
+            self::assertSame('ok', $client->request('svc.echo', 'y', 2_000)->await()->payload);
+            self::assertCount(1, $transport->controlLinesStartingWith('SUB _INBOX.'), 'the inbox stayed: the next request was sent on it');
         } finally {
             $stop->cancel();
             $loop->await();
@@ -537,10 +581,10 @@ final class MuxInboxDropWakeupTest extends TestCase
         $gone = new DeferredCancellation();
         $rotatedAwayFrom = new DeferredCancellation();
         $current = new DeferredCancellation();
-        $register->invoke($connection, 'a', $noop, $waiting);
-        $register->invoke($connection, 'b', $noop, $gone);
+        $register->invoke($connection, 'a', $noop, $waiting, 'svc.a');
+        $register->invoke($connection, 'b', $noop, $gone, 'svc.b');
         $remove->invoke($connection, 'b');
-        $register->invoke($connection, 'c', $noop, $rotatedAwayFrom);
+        $register->invoke($connection, 'c', $noop, $rotatedAwayFrom, 'svc.c');
         $renew->invoke($connection, 'c', $current);
 
         $wake->invoke($connection);
@@ -552,7 +596,7 @@ final class MuxInboxDropWakeupTest extends TestCase
         self::assertCount(2, self::muxWakes($connection), 'the wake-ups stay registered until their requests remove them');
 
         $later = new DeferredCancellation();
-        $register->invoke($connection, 'd', $noop, $later);
+        $register->invoke($connection, 'd', $noop, $later, 'svc.d');
         self::assertFalse($later->isCancelled(), 'a wake-up registered after a drop waits for the next one');
         $wake->invoke($connection);
         self::assertTrue($later->isCancelled());

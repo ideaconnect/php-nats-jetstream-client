@@ -623,6 +623,10 @@ final class NatsClient
      * reconnect is in flight it first waits for it within the total timeout
      * ({@see NatsOptions::$waitForReconnect}).
      *
+     * A publish the server refuses for lack of permission ends the collection: with the replies collected
+     * so far, or, with none, with a {@see \IDCT\NATS\Exception\PermissionViolationException}, as
+     * nats.js ends such a request (2.30.0; it returned an empty list at the timeout before).
+     *
      * @param array<string,string>|null $headers Optional request headers (null = plain request).
      * @param int|null $maxResponses Stop after this many replies (null = time-bounded only).
      * @param int|null $totalTimeoutMs Overall budget in ms (null = configured request timeout).

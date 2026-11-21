@@ -15,6 +15,7 @@ use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
 
 /**
  * JetStreamContext::diagnoseNoResponders(): why a pull ended with status 503 (no responders), told by a CONSUMER.INFO
@@ -323,6 +324,69 @@ final class DiagnoseNoRespondersTest extends TestCase
         self::assertSame([1], self::questionsPerSession($transport, 1));
     }
 
+    /**
+     * A user allowed to pull but not to ask for consumer info: the server refuses the question at once, with a
+     * permissions violation, which client 2.30.0 reads as soon as it comes. On a connection that stays that is still
+     * NoAnswer at the timeout, not at the refusal: the refusal comes from a server going away as well.
+     */
+    #[DataProvider('reconnectModes')]
+    public function testAQuestionTheServerRefusesOnAConnectionThatStaysIsNoAnswerAtItsTimeout(bool $reconnect): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: $reconnect);
+        $transport->responder = self::refusing();
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', 300)->await();
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::NoAnswer, $cause);
+        self::assertGreaterThan(0.25, $elapsed, sprintf('the diagnosis ended after %.3f s, at the refusal, before its 0.3 s timeout', $elapsed));
+        self::assertLessThan(2.5, $elapsed, sprintf('the diagnosis took %.3f s: not the 0.3 s it was given', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame([1], self::questionsPerSession($transport, 1));
+    }
+
+    /** @return iterable<string, array{\Closure(ReconnectingTransport): void}> */
+    public static function serversGoingAwayAfterTheRefusal(): iterable
+    {
+        yield 'lame duck mode, announced after the refusal' => [static function (ReconnectingTransport $transport): void {
+            $transport->pushFrame(self::LAME_DUCK_INFO);
+        }];
+        yield 'a graceful stop, which closes the connection after the refusal' => [static function (ReconnectingTransport $transport): void {
+            $transport->dropConnection();
+        }];
+    }
+
+    /**
+     * The same user on a server going away: the refusal comes at once, and the server announces lame duck mode or
+     * closes the connection 150 ms later. The connection is watched, and read, after the refusal: ServerGoingAway,
+     * long before the 30 s timeout. Reading the refusal as NoAnswer at once, as client 2.30.0's first form did, read
+     * the 503 of a server going away as a missing consumer (ideaconnect/symfony-nats-messenger#106).
+     *
+     * @param \Closure(ReconnectingTransport): void $goAway
+     */
+    #[DataProvider('serversGoingAwayAfterTheRefusal')]
+    public function testAQuestionTheServerRefusesBeforeItGoesAwayIsServerGoingAway(\Closure $goAway): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: false, requestTimeoutMs: 30_000);
+        $transport->responder = self::refusing();
+        $transport->afterWrite = static function (string $bytes) use ($transport, $goAway): void {
+            if (str_contains($bytes, ' ' . self::QUESTION . ' ')) {
+                EventLoop::delay(0.15, static fn() => $goAway($transport));
+            }
+        };
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker')->await();
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::ServerGoingAway, $cause);
+        self::assertGreaterThan(0.1, $elapsed, sprintf('the diagnosis ended after %.3f s, before the server went away', $elapsed));
+        self::assertLessThan(2.5, $elapsed, sprintf('the diagnosis took %.3f s, with a 30 s timeout', $elapsed));
+    }
+
     /** @return iterable<string, array{string, string}> */
     public static function invalidNames(): iterable
     {
@@ -415,6 +479,19 @@ final class DiagnoseNoRespondersTest extends TestCase
 
             return $transport->replyFrame($replyTo, $answer);
         };
+    }
+
+    /**
+     * Refuses the question, as nats-server refuses a user who may not publish to its subject: an -ERR, and the connection
+     * kept open.
+     *
+     * @return \Closure(string, ?string, string): list<string>
+     */
+    private static function refusing(): \Closure
+    {
+        return static fn(string $subject): array => $subject === self::QUESTION
+            ? ["-ERR 'Permissions Violation for Publish to \"" . self::QUESTION . "\"'\r\n"]
+            : [];
     }
 
     /** Drops the connection right after the question was written on session $epoch, before any answer. */
