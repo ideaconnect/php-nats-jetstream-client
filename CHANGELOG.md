@@ -22,19 +22,35 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[bugfix]` A request whose publish the server refuses for lack of permission fails at once, instead of at the end of
   its timeout. nats-server answers a PUB to a subject the user may not publish to with
   `-ERR 'Permissions Violation for Publish to "<subject>"'` and keeps the connection open, and no reply ever comes:
-  `request()`, `requestWithHeaders()` and `requestMany()` waited out their timeout (10 s by default) and failed with a
-  `TimeoutException`. That covered every JetStream API call and JetStream publish: a `getConsumer()` by a user denied
-  `$JS.API.CONSUMER.INFO.>` took 5006 ms with a 5 s timeout (measured on nats-server 2.15.2), and a refused publish
-  looked like one whose acknowledgement was late, which may still have been stored. Every request in flight to the
-  refused subject now fails as soon as the `-ERR` is read, whichever fiber's read meets it, with the new
+  `request()` and `requestWithHeaders()` waited out their timeout (10 s by default) and failed with a
+  `TimeoutException`, and so did the JetStream API calls and JetStream publishes made through them. A `getConsumer()`
+  by a user denied `$JS.API.CONSUMER.INFO.>` took 5006 ms with a 5 s timeout (measured on nats-server 2.15.2), and a
+  refused publish looked like one whose acknowledgement was late, which may still have been stored. Every request in
+  flight to the refused subject now fails as soon as the `-ERR` is read, whichever fiber's read meets it, with the new
   `PermissionViolationException` (1 ms in the same measurement). A request to another subject is left alone, the
-  connection stays open, and the error listener still gets the `-ERR`. Found for ideaconnect/symfony-nats-messenger, whose
-  transport asks for consumer info when a delivery fails.
+  connection stays open, and the error listener still gets the `-ERR`. The subject is read as nats-server quotes it,
+  so one with an apostrophe, a backslash or a double quote is matched whole. Found for ideaconnect/symfony-nats-messenger,
+  whose transport asks for consumer info when a delivery fails.
+- `[behavior]` `requestMany()` to a refused subject throws the same `PermissionViolationException` when it has
+  collected no reply, where it returned an empty list at its timeout, as for a subject nobody answers. A refusal is not
+  "nobody answered": nats.js ends a request whose publish is refused with the permission error too. Replies collected
+  before the refusal are still returned.
+- `[bugfix]` `diagnoseNoResponders()` still tells a server going away from one that stays for a user who may pull but
+  not ask for consumer info. The server refuses that user's question at once, a server going away as well, so the
+  refusal alone would have made every such 503 `NoAnswer` at once, a missing consumer for the caller
+  (ideaconnect/symfony-nats-messenger#106). The connection is watched, and read, for the rest of the question's time,
+  as while an unanswered question waited before: `ServerGoingAway` when the server closes it or announces lame duck
+  mode, `NoAnswer` at the timeout.
+
+  A JetStream operation that publishes with an inbox of its own, `fetchBatch()` and the pull consumer, is not covered:
+  a refused pull still ends at its expiry with the 408 of an empty one. The refusal is matched by subject, so an `-ERR`
+  for an earlier publish to that subject, left unread, refuses a later request to it as well.
 
 ### Added
 
 - `[feature]` `IDCT\NATS\Exception\PermissionViolationException`, a `NatsException` (not a `ConnectionException`) whose
-  `subject` names the subject the server refused the publish to.
+  `getSubject()` names the subject the server refused the publish to. It takes an exception's own arguments first, as
+  `JetStreamException` does, and the subject last.
 
 ## [2.29.0] - 2026-11-12
 
