@@ -59,6 +59,9 @@ final class FeatureContext implements Context
     /** @var list<string> */
     private array $createdStreams = [];
 
+    /** @var list<string> Streams made on the username and password server, deleted after the scenario. */
+    private array $userPassStreams = [];
+
     /** @var array<string,Service> */
     private array $services = [];
 
@@ -132,6 +135,18 @@ final class FeatureContext implements Context
                 }
             }
         }
+
+        // The streams of the permission scenarios are on the username and password server, made by "local-user".
+        $owner = $this->clients['auth'] ?? null;
+        if ($owner !== null) {
+            foreach ($this->userPassStreams as $stream) {
+                try {
+                    $owner->jetStream()->deleteStream($stream)->await();
+                } catch (Throwable) {
+                }
+            }
+        }
+        $this->userPassStreams = [];
 
         $primary = $this->clients['primary'] ?? null;
         if ($primary !== null) {
@@ -3020,6 +3035,8 @@ final class FeatureContext implements Context
         $this->state->stream = $stream;
         $owner = $this->client('auth')->jetStream();
         $owner->createStream($stream, [strtolower($stream) . '.>'])->await();
+        // Deleted after the scenario, whichever of its steps fails.
+        $this->userPassStreams[] = $stream;
         $owner->createConsumer($stream, 'worker')->await();
 
         $this->refusedCall(fn(): mixed => $this->client('limited')->jetStream()->getConsumer($stream, 'worker')->await());
@@ -3072,6 +3089,8 @@ final class FeatureContext implements Context
                 $responder->publish($message->replyTo, 'pong')->ignore();
             }
         })->await();
+        // The SUB reaches the server before the other connection's request does.
+        $this->awaitSubscriptionsOnServer($responder);
 
         $stop = new DeferredCancellation();
         $pump = async(static function () use ($responder, $stop): void {
@@ -3104,14 +3123,7 @@ final class FeatureContext implements Context
     public function thatUserCanStillReadTheStreamsInfo(): void
     {
         $stream = $this->requireValue($this->state->stream, 'stream');
-        try {
-            $info = $this->client('limited')->jetStream()->getStream($stream)->await();
-        } finally {
-            try {
-                $this->client('auth')->jetStream()->deleteStream($stream)->await();
-            } catch (Throwable) {
-            }
-        }
+        $info = $this->client('limited')->jetStream()->getStream($stream)->await();
 
         if ($info->name !== $stream) {
             throw new RuntimeException('Expected the info of stream ' . $stream . ', got ' . $info->name);
