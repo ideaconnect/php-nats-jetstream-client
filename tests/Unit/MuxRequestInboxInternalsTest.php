@@ -51,10 +51,10 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $bCalls = 0;
         $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$aCalls): void {
             $aCalls++;
-        }, new DeferredCancellation());
+        }, new DeferredCancellation(), 'svc.echo');
         $this->invokePrivate($connection, 'registerMuxWaiter', 'b', function (NatsMessage $m) use (&$bCalls): void {
             $bCalls++;
-        }, new DeferredCancellation());
+        }, new DeferredCancellation(), 'svc.echo');
 
         $this->invokePrivate($connection, 'dispatchMuxReply', $this->message('_INBOX.base.a'));
 
@@ -71,7 +71,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $calls = 0;
         $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$calls): void {
             $calls++;
-        }, new DeferredCancellation());
+        }, new DeferredCancellation(), 'svc.echo');
         $this->invokePrivate($connection, 'removeMuxWaiter', 'a');
 
         // Late/duplicate reply for the now-removed token 'a', and a reply for a never-registered token.
@@ -92,7 +92,7 @@ final class MuxRequestInboxInternalsTest extends TestCase
         $calls = 0;
         $this->invokePrivate($connection, 'registerMuxWaiter', 'a', function (NatsMessage $m) use (&$calls): void {
             $calls++;
-        }, new DeferredCancellation());
+        }, new DeferredCancellation(), 'svc.echo');
 
         // Foreign base of the SAME length as muxBase, so the token-strip (strlen(base)+1) lines up on the
         // 'a' suffix: WITHOUT the prefix guard the reply would be mis-delivered to waiter 'a'; WITH it the

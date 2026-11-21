@@ -15,6 +15,27 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A request whose publish the server refuses for lack of permission fails at once, instead of at the end of
+  its timeout. nats-server answers a PUB to a subject the user may not publish to with
+  `-ERR 'Permissions Violation for Publish to "<subject>"'` and keeps the connection open, and no reply ever comes:
+  `request()`, `requestWithHeaders()` and `requestMany()` waited out their timeout (10 s by default) and failed with a
+  `TimeoutException`. That covered every JetStream API call and JetStream publish: a `getConsumer()` by a user denied
+  `$JS.API.CONSUMER.INFO.>` took 5006 ms with a 5 s timeout (measured on nats-server 2.15.2), and a refused publish
+  looked like one whose acknowledgement was late, which may still have been stored. Every request in flight to the
+  refused subject now fails as soon as the `-ERR` is read, whichever fiber's read meets it, with the new
+  `PermissionViolationException` (1 ms in the same measurement). A request to another subject is left alone, the
+  connection stays open, and the error listener still gets the `-ERR`. Found for ideaconnect/symfony-nats-messenger, whose
+  transport asks for consumer info when a delivery fails.
+
+### Added
+
+- `[feature]` `IDCT\NATS\Exception\PermissionViolationException`, a `NatsException` (not a `ConnectionException`) whose
+  `subject` names the subject the server refused the publish to.
+
 ## [2.29.0] - 2026-11-12
 
 ### Added

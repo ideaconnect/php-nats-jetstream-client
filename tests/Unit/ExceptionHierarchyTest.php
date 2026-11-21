@@ -8,6 +8,7 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\NatsThrowable;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Protocol\ProtocolCodec;
@@ -44,6 +45,11 @@ final class ExceptionHierarchyTest extends TestCase
         // #242: existing catch (ConnectionException) handlers still catch a subscription-limit failure.
         self::assertInstanceOf(NatsThrowable::class, $this->asThrowable(new SubscriptionLimitException('x')));
         self::assertInstanceOf(ConnectionException::class, $this->asThrowable(new SubscriptionLimitException('x')));
+        // A refused publish of a request is a NatsException, and not a ConnectionException: the connection is fine.
+        $refused = $this->asThrowable(new PermissionViolationException('svc.secret', 'x'));
+        self::assertInstanceOf(NatsThrowable::class, $refused);
+        self::assertInstanceOf(NatsException::class, $refused);
+        self::assertNotInstanceOf(ConnectionException::class, $refused);
     }
 
     public function testTransportExceptionsImplementMarkerWhileRemainingRuntimeExceptions(): void
