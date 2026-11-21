@@ -15,6 +15,41 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` With reconnect on, `diagnoseNoResponders()` for a user who may pull but not ask for consumer info keeps to
+  its timeout when the server goes away (#257). Since 2.30.0 the server's refusal of that user's question ends it at
+  once, and the connection is then watched for the rest of the question's time. The watch awaited its own read of the
+  socket, and a read that is the first to notice a lost connection, or the lame duck INFO of a server naming another
+  one, runs the reconnect or the failover itself and waits for all of it: the diagnosis returned `ServerGoingAway`
+  only once the reconnect was over, 3.0 s for a 1 s timeout with the next dial held 3 s, and in general as long as the
+  server stayed away, where 2.29.0 returned after 0.17 s. ideaconnect/symfony-nats-messenger calls it after a pull's
+  503, and with its `reconnect: true` such a worker's `get()` waited for the whole reconnect, deaf to
+  `messenger:stop-workers` and SIGTERM until it ended (ideaconnect/symfony-nats-messenger#131). The watch now keeps one
+  read in flight across its 20 ms looks, bounded by the question's time, and awaits it only until the next look: the
+  reconnect goes on in the read's fiber, and the look returns `ServerGoingAway` while the client is still reconnecting.
+  A read still waiting when the watch returns, on the socket or for a reconnect another fiber runs, ends with it.
+- `[bugfix]` `diagnoseNoResponders()` for the same user returns at its timeout over a transport whose idle read
+  returns at once (#256). The watch read again at once after a read that consumed nothing, so over a transport whose
+  `readLine()` returns `''` when nothing is there, as its contract allows - a custom `TransportInterface`, or the test
+  suite's `FakeTransport` in its default mode - it spun at full CPU, no timer of the process fired again, the
+  diagnosis's own timeout included, and it never returned. It now pauses 1 ms after such a read, as the client's other
+  wait loops do. The shipped socket and WebSocket transports wait in their read and were not affected.
+
+### Testing & CI
+
+- `[docs]` Six new cases in `DiagnoseNoRespondersTest` (#256, #257). The refused question with reconnect on, the server
+  closing the connection or announcing lame duck mode naming another server 150 ms after the refusal, the next dial
+  held until the diagnosis has returned: `ServerGoingAway` while the client is `Connecting`, and nothing asked on the
+  new connection. The refused question on a connection that stays, over `FakeTransport` with an idle read that waits
+  and with one that returns at once, the reads counted through the new `tests/Support/SpinBreakingTransport.php`,
+  which pauses every read past 10,000 so that a watch that spins ends at its timeout instead of hanging the suite.
+  Two more: a reconnect the watch's read started that fails once the watch has returned reports nothing unhandled,
+  and, a guard 2.30.0 passes too, the watch's read of the socket ends with the watch during an application close. 4 cases fail on 2.30.0, and
+  each half of the fix alone leaves the other half's cases failing.
+
 ## [2.30.0] - 2026-11-21
 
 ### Fixed
