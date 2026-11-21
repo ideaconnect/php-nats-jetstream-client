@@ -2777,7 +2777,8 @@ final class JetStreamContext
 
             $subject = JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer;
             $giveUp = new DeferredCancellation();
-            $deadline = hrtime(true) + ($timeoutMs ?? $this->client->options()->requestTimeoutMs) * 1_000_000;
+            // The question's own time, which a refusal of it still watches the connection for.
+            $questionTime = new TimeoutCancellation(($timeoutMs ?? $this->client->options()->requestTimeoutMs) / 1000);
             $question = $this->client->request($subject, '{}', $timeoutMs, $giveUp->getCancellation());
 
             while (true) {
@@ -2806,7 +2807,7 @@ final class JetStreamContext
                     }
 
                     if ($failure instanceof PermissionViolationException) {
-                        return $this->watchTheConnectionUntil($generation, $deadline);
+                        return $this->watchTheConnectionUntil($generation, $questionTime);
                     }
 
                     return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
@@ -2844,23 +2845,21 @@ final class JetStreamContext
      * waits: without a read, neither the close nor the lame duck INFO would be seen. Before client 2.30.0 the refused
      * question waited out its timeout, which watched the connection the same way.
      */
-    private function watchTheConnectionUntil(int $generation, int|float $deadline): NoRespondersCause
+    private function watchTheConnectionUntil(int $generation, Cancellation $questionTime): NoRespondersCause
     {
         while (!$this->connectionLeftSince($generation)) {
-            $left = ($deadline - hrtime(true)) / 1e9;
-            if ($left <= 0) {
+            if ($questionTime->isRequested()) {
                 return NoRespondersCause::NoAnswer;
             }
 
             try {
-                $this->client->readIncomingForOperation(new TimeoutCancellation(min($left, self::NO_RESPONDERS_LOOK_SECONDS)))->await();
+                $this->client->readIncomingForOperation(new CompositeCancellation($questionTime, new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS)))->await();
             } catch (CancelledException) {
-                // Nothing to read within the look: look at the connection again.
+                // Nothing to read within the look, or the question's time is over: look again.
             } catch (\Throwable) {
-                // A read that fails while the connection stays: pause, so that the watch does not spin.
-                if (!$this->connectionLeftSince($generation)) {
-                    delay(self::NO_RESPONDERS_LOOK_SECONDS);
-                }
+                // A read that fails: the connection is gone, which the next look sees, or it stays, and a pause
+                // keeps the watch from spinning.
+                delay(self::NO_RESPONDERS_LOOK_SECONDS);
             }
         }
 

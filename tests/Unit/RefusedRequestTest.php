@@ -74,8 +74,13 @@ final class RefusedRequestTest extends TestCase
 
             self::assertInstanceOf(PermissionViolationException::class, $failure, sprintf('%s, %s: %s', $operation, $form, self::describe($failure)));
             self::assertSame(self::REFUSED, $failure->getSubject());
-            self::assertStringContainsString('Permissions Violation for Publish to ' . ($quoted ? '"svc.secret"' : 'svc.secret'), $failure->getMessage());
-            self::assertStringContainsString('publish to "svc.secret"', $failure->getMessage(), 'the message names the permission needed');
+            self::assertSame(
+                'The server refused the request to "svc.secret": Permissions Violation for Publish to '
+                . ($quoted ? '"svc.secret"' : 'svc.secret') . '. No responder received it. Grant this connection\'s user'
+                . ' permission to publish to "svc.secret".',
+                $failure->getMessage(),
+                'the message carries the server\'s text, without its quotes, and names the permission needed',
+            );
             self::assertLessThan(2.5, $elapsed, sprintf('%s, %s: failed after %.3f s, with a 5 s timeout', $operation, $form, $elapsed));
             self::assertSame(ConnectionState::Open, $connection->state(), 'a refused publish leaves the connection open');
             self::assertNoRequestStateLeft($connection);

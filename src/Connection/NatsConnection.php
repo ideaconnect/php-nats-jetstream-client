@@ -5476,7 +5476,8 @@ final class NatsConnection
             }
 
             $this->muxRefusals[$token] = $error;
-            ($this->muxWakes[$token] ?? null)?->cancel();
+            // Registered with the subject, and renewed but never removed without it.
+            $this->muxWakes[$token]->cancel();
         }
     }
 

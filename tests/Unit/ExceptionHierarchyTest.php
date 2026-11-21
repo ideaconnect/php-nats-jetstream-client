@@ -61,6 +61,7 @@ final class ExceptionHierarchyTest extends TestCase
         $refused = new PermissionViolationException('refused', 3, null, 'svc.secret');
         self::assertSame('svc.secret', $refused->getSubject());
         self::assertSame(3, $refused->getCode());
+        self::assertSame(0, (new PermissionViolationException('refused'))->getCode(), 'the code is 0 unless given');
 
         $rebuilt = new ($refused::class)($refused->getMessage(), $refused->getCode(), $refused);
         self::assertSame('refused', $rebuilt->getMessage());
