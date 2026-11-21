@@ -517,6 +517,33 @@ final class DiagnoseNoRespondersTest extends TestCase
         self::assertSame(ConnectionState::Closed, $client->state());
     }
 
+    /**
+     * The refused question on a connection that stays, and 50 ms later an -ERR that fails the read that brings it and
+     * keeps the connection open (`Invalid Publish Subject`, for another publish of the application): the watch's read
+     * fails, the connection is still there, and the watch goes on until the question's 0.3 s are over: NoAnswer, the
+     * connection Open. A watch that took the failed read for the connection gone would make it ServerGoingAway at once.
+     */
+    public function testAFailedReadOfTheWatchOnAConnectionThatStaysIsStillNoAnswerAtItsTimeout(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: false);
+        $transport->responder = self::refusing();
+        $transport->afterWrite = static function (string $bytes) use ($transport): void {
+            if (str_contains($bytes, ' ' . self::QUESTION . ' ')) {
+                EventLoop::delay(0.05, static fn() => $transport->pushFrame("-ERR 'Invalid Publish Subject'\r\n"));
+            }
+        };
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', 300)->await();
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::NoAnswer, $cause);
+        self::assertGreaterThan(0.25, $elapsed, sprintf('the diagnosis ended after %.3f s, before its 0.3 s timeout', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame([1], self::questionsPerSession($transport, 1));
+    }
+
     /** @return iterable<string, array{bool}> */
     public static function idleReads(): iterable
     {

@@ -40,14 +40,15 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Testing & CI
 
-- `[docs]` Six new cases in `DiagnoseNoRespondersTest` (#256, #257). The refused question with reconnect on, the server
+- `[docs]` Seven new cases in `DiagnoseNoRespondersTest` (#256, #257). The refused question with reconnect on, the server
   closing the connection or announcing lame duck mode naming another server 150 ms after the refusal, the next dial
   held until the diagnosis has returned: `ServerGoingAway` while the client is `Connecting`, and nothing asked on the
   new connection. The refused question on a connection that stays, over `FakeTransport` with an idle read that waits
   and with one that returns at once, the reads counted through the new `tests/Support/SpinBreakingTransport.php`,
   which pauses every read past 10,000 so that a watch that spins ends at its timeout instead of hanging the suite.
-  Two more: a reconnect the watch's read started that fails once the watch has returned reports nothing unhandled,
-  and, a guard 2.30.0 passes too, the watch's read of the socket ends with the watch during an application close. 4 cases fail on 2.30.0, and
+  Three more: a reconnect the watch's read started that fails once the watch has returned reports nothing unhandled,
+  and two guards 2.30.0 passes too: the watch's read of the socket ends with the watch during an application close,
+  and a read of the watch that fails on a connection that stays leaves it NoAnswer at the timeout. 4 cases fail on 2.30.0, and
   each half of the fix alone leaves the other half's cases failing.
 
 ## [2.30.0] - 2026-11-21
