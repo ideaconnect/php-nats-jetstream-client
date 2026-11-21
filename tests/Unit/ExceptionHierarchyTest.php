@@ -46,10 +46,26 @@ final class ExceptionHierarchyTest extends TestCase
         self::assertInstanceOf(NatsThrowable::class, $this->asThrowable(new SubscriptionLimitException('x')));
         self::assertInstanceOf(ConnectionException::class, $this->asThrowable(new SubscriptionLimitException('x')));
         // A refused publish of a request is a NatsException, and not a ConnectionException: the connection is fine.
-        $refused = $this->asThrowable(new PermissionViolationException('svc.secret', 'x'));
+        $refused = $this->asThrowable(new PermissionViolationException('x', subject: 'svc.secret'));
         self::assertInstanceOf(NatsThrowable::class, $refused);
         self::assertInstanceOf(NatsException::class, $refused);
         self::assertNotInstanceOf(ConnectionException::class, $refused);
+    }
+
+    /**
+     * A refused publish takes an exception's own arguments first, as JetStreamException does, and its subject last: code
+     * that builds one again from the message, the code and the previous exception still can.
+     */
+    public function testAPermissionViolationTakesAnExceptionsArgumentsFirstAndItsSubjectLast(): void
+    {
+        $refused = new PermissionViolationException('refused', 3, null, 'svc.secret');
+        self::assertSame('svc.secret', $refused->getSubject());
+        self::assertSame(3, $refused->getCode());
+
+        $rebuilt = new ($refused::class)($refused->getMessage(), $refused->getCode(), $refused);
+        self::assertSame('refused', $rebuilt->getMessage());
+        self::assertSame($refused, $rebuilt->getPrevious());
+        self::assertSame('', $rebuilt->getSubject());
     }
 
     public function testTransportExceptionsImplementMarkerWhileRemainingRuntimeExceptions(): void

@@ -157,7 +157,7 @@ final class MuxInboxDropWakeupTest extends TestCase
             $elapsed = $this->secondsSince($start);
 
             self::assertInstanceOf(PermissionViolationException::class, $error, sprintf('%s ended after %.3f s with %s', $operation, $elapsed, self::describe($error)));
-            self::assertSame('svc.held', $error->subject);
+            self::assertSame('svc.held', $error->getSubject());
             self::assertLessThan(0.5, $elapsed, sprintf('%s failed after %.3f s, with a 3 s timeout', $operation, $elapsed));
             self::assertSame([], self::muxWakes(self::connectionOf($client)), 'no wake-up is left behind for the request that failed');
 

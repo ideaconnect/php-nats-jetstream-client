@@ -5481,15 +5481,30 @@ final class NatsConnection
     }
 
     /**
+     * The subject a "Permissions Violation for Publish to" -ERR names, or null for any other error. nats-server writes
+     * it with Go's %q, so it is in double quotes, with a backslash before a double quote or a backslash in it, and an
+     * apostrophe left as it is, although the whole text is in single quotes: -ERR 'Permissions Violation for Publish to
+     * "svc.o'brien"'. A subject without the quotes, as a server could write it, ends at a space or a quote.
+     */
+    private static function subjectOfAPublishViolation(string $error): ?string
+    {
+        if (preg_match('/permissions violation for publish to "((?:[^"\\\\]|\\\\.)*)"/i', $error, $quoted) === 1) {
+            return stripcslashes($quoted[1]);
+        }
+
+        return preg_match('/permissions violation for publish to ([^\s"\']+)/i', $error, $bare) === 1 ? $bare[1] : null;
+    }
+
+    /**
      * The error of a request whose publish the server refused for lack of permission ({@see refuseRequestsTo()}),
      * carrying the server's text and naming the permission needed.
      */
     private function requestRefusedException(string $subject, string $error): PermissionViolationException
     {
         return new PermissionViolationException(
-            $subject,
             'The server refused the request to "' . $subject . '": ' . trim($error, "' ") . '. No responder received it.'
             . ' Grant this connection\'s user permission to publish to "' . $subject . '".',
+            subject: $subject,
         );
     }
 
@@ -7776,11 +7791,12 @@ final class NatsConnection
                     }
                 }
 
-                // A permissions violation for a publish names the subject, quoted or bare: the requests in flight to
-                // it reach no responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}).
-                // "Publish with Reply of" names a reply subject, never this connection's inbox, and is left alone.
-                if (preg_match('/permissions violation for publish to "?([^\s"\']+)"?/i', $error, $publishMatch) === 1) {
-                    $this->refuseRequestsTo($publishMatch[1], $error);
+                // A permissions violation for a publish names the subject: the requests in flight to it reach no
+                // responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}). "Publish with
+                // Reply of" names a reply subject, never this connection's inbox, and is left alone.
+                $refusedSubject = self::subjectOfAPublishViolation($error);
+                if ($refusedSubject !== null) {
+                    $this->refuseRequestsTo($refusedSubject, $error);
                 }
 
                 // Non-fatal server error (e.g. a per-subscription permissions violation): surface it

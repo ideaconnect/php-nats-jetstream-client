@@ -73,13 +73,46 @@ final class RefusedRequestTest extends TestCase
             $elapsed = (hrtime(true) - $start) / 1e9;
 
             self::assertInstanceOf(PermissionViolationException::class, $failure, sprintf('%s, %s: %s', $operation, $form, self::describe($failure)));
-            self::assertSame(self::REFUSED, $failure->subject);
+            self::assertSame(self::REFUSED, $failure->getSubject());
             self::assertStringContainsString('Permissions Violation for Publish to ' . ($quoted ? '"svc.secret"' : 'svc.secret'), $failure->getMessage());
             self::assertStringContainsString('publish to "svc.secret"', $failure->getMessage(), 'the message names the permission needed');
             self::assertLessThan(2.5, $elapsed, sprintf('%s, %s: failed after %.3f s, with a 5 s timeout', $operation, $form, $elapsed));
             self::assertSame(ConnectionState::Open, $connection->state(), 'a refused publish leaves the connection open');
             self::assertNoRequestStateLeft($connection);
         }
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function subjectsGoQuotesWithACharacterOfItsQuoting(): iterable
+    {
+        yield 'an apostrophe, inside the single quotes of the -ERR' => ["svc.o'brien", 'svc.o'];
+        yield 'a backslash, which the quoting doubles' => ['svc.a\\b', 'svc.a'];
+        yield 'a double quote, which the quoting escapes' => ['svc.a"b', 'svc.a'];
+    }
+
+    /**
+     * nats-server quotes the subject with Go's %q, which escapes a double quote and a backslash and leaves an apostrophe,
+     * although the text of the -ERR is in single quotes. The refused request fails at once, and a request in flight to
+     * the subject before that character gets its reply. Reading the subject up to the first quote, as before, refused
+     * that other request for an apostrophe, and for each of them left the refused one to time out.
+     */
+    #[DataProvider('subjectsGoQuotesWithACharacterOfItsQuoting')]
+    public function testASubjectTheServerQuotesIsReadAsItsSubject(string $refused, string $prefix): void
+    {
+        $transport = self::server([$refused]);
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5_000), $transport));
+        $connection->connect()->await();
+
+        $other = $connection->request($prefix, 'x');
+        $other->ignore();
+        $start = hrtime(true);
+        $failure = self::failureOf($connection->request($refused, 'x'));
+
+        self::assertInstanceOf(PermissionViolationException::class, $failure, self::describe($failure));
+        self::assertSame($refused, $failure->getSubject());
+        self::assertLessThan(2.5, (hrtime(true) - $start) / 1e9, 'the refused request failed well before its 5 s timeout');
+        self::assertSame('ok', $other->await()->payload);
+        self::assertNoRequestStateLeft($connection);
     }
 
     /**
@@ -147,8 +180,8 @@ final class RefusedRequestTest extends TestCase
 
     /**
      * Every request in flight to the refused subject fails at the first -ERR that names it: permissions belong to the
-     * user, so the second publish is refused as well. Here the server answers only the first PUB, and both requests
-     * still fail at once.
+     * user, so the other publish is refused as well. Here the server answers the first PUB with nothing and the second
+     * with the one -ERR, written once both are on the wire, and both requests fail at once.
      */
     public function testEveryRequestInFlightToTheRefusedSubjectFails(): void
     {
@@ -234,7 +267,7 @@ final class RefusedRequestTest extends TestCase
         $failure = self::failureOf($call($client->jetStream()));
 
         self::assertInstanceOf(PermissionViolationException::class, $failure, self::describe($failure));
-        self::assertSame($subject, $failure->subject);
+        self::assertSame($subject, $failure->getSubject());
         self::assertLessThan(2.5, (hrtime(true) - $start) / 1e9, 'the call failed well before its 5 s timeout');
     }
 
@@ -269,7 +302,7 @@ final class RefusedRequestTest extends TestCase
 
             $subject = $parts[1] ?? '';
             if (in_array($subject, $refused, true)) {
-                return ["-ERR 'Permissions Violation for Publish to " . ($quoted ? '"' . $subject . '"' : $subject) . "'\r\n"];
+                return ["-ERR 'Permissions Violation for Publish to " . ($quoted ? self::goQuoted($subject) : $subject) . "'\r\n"];
             }
 
             $replyTo = $parts[2] ?? '';
@@ -283,6 +316,12 @@ final class RefusedRequestTest extends TestCase
         };
 
         return $transport;
+    }
+
+    /** The subject as nats-server writes it with Go's %q: in double quotes, a backslash before a quote or a backslash. */
+    private static function goQuoted(string $subject): string
+    {
+        return '"' . addcslashes($subject, '"\\') . '"';
     }
 
     /** @return Future<mixed> */
