@@ -15,6 +15,32 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A pull whose publish the server refuses for lack of permission fails at once (#260). nats-server answers
+  a pull to `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` by a user who may not publish there with
+  `-ERR 'Permissions Violation for Publish to "<subject>"'` and keeps the connection open, and no message or status
+  ever comes for it. `fetchBatch()` and `fetchNext()` publish with an inbox of their own, not through `request()`, so
+  2.30.0's refusal of requests did not reach them: they waited out their expiry plus a second and threw the
+  `JetStreamException` (408) of an empty pull, 2.003 s for a 1 s expiry on nats-server 2.14.2. A worker pulling in a
+  loop stayed idle for ever without an error: ideaconnect/symfony-nats-messenger reads that 408 as an empty batch, so
+  `messenger:consume` ran on (ideaconnect/symfony-nats-messenger#130). The connection now watches the pull's subject
+  while the fetch runs, and the fetch fails as soon as the `-ERR` is read, whichever fiber's read meets it, with the
+  `PermissionViolationException` a refused request throws, naming the subject. Messages delivered before the refusal
+  are returned, as at the deadline. A pull to another subject is left alone, the connection stays open, and the error
+  listener still gets the `-ERR`.
+
+  The pull consumer and `directGetBatch()` are not covered yet (#260): a refused pull of theirs still ends at its
+  expiry. The refusal is matched by subject, as for requests.
+
+### Upgrade notes
+
+- A refused `fetchBatch()` or `fetchNext()` throws `PermissionViolationException`, a `NatsException` and not a
+  `JetStreamException`. Code that catches `JetStreamException` around a pull to tell an empty pull (408) from other
+  outcomes no longer sees the refusal there: catch `PermissionViolationException`, or `NatsException`, as well.
+
 ## [2.30.1] - 2026-11-21
 
 ### Fixed
