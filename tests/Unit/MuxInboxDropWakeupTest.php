@@ -170,6 +170,44 @@ final class MuxInboxDropWakeupTest extends TestCase
     }
 
     /**
+     * The same shape for a pull (#260): fetchBatch() publishes to "$JS.API.CONSUMER.MSG.NEXT.S.C" with an inbox of its
+     * own, which nothing answers here, and the -ERR the application's read brings refuses that publish. The pull's
+     * read, parked on the socket, ends with it, and the fetch fails within 0.5 s of its 4 s budget with a
+     * PermissionViolationException naming the subject, leaving no watch behind. It used to end at the deadline as an
+     * empty pull, a JetStreamException(408): the refusal ended nothing, the error listener alone heard of it.
+     */
+    public function testAPullParkedOnTheSocketFailsAsSoonAsAnotherFibersReadBringsTheRefusalOfItsPublish(): void
+    {
+        [$transport, $watched, $client] = $this->connectForTheDrop();
+        // Nothing answers a pull.
+        $transport->responder = static fn(string $subject, ?string $replyTo): array => [];
+        [$stop, $loop] = $this->startReadLoop($client);
+        $this->awaitRead($watched);
+        $pull = '$JS.API.CONSUMER.MSG.NEXT.S.C';
+
+        try {
+            $start = hrtime(true);
+            $result = $client->jetStream()->fetchBatch('S', 'C', 1, 3_000)->map(self::payloads(...));
+            $result->ignore();
+            $this->waitUntil(static fn(): bool => $transport->controlLinesStartingWith('PUB ' . $pull . ' ') !== []);
+            $this->dropTheInboxWhileTheOperationReads($transport, $watched, "-ERR 'Permissions Violation for Publish to \"" . $pull . "\"'\r\n");
+            [, $error] = self::settle($result);
+            $elapsed = $this->secondsSince($start);
+
+            self::assertInstanceOf(PermissionViolationException::class, $error, sprintf('the pull ended after %.3f s with %s', $elapsed, self::describe($error)));
+            self::assertSame($pull, $error->getSubject());
+            self::assertLessThan(0.5, $elapsed, sprintf('the pull failed after %.3f s, with a 4 s budget', $elapsed));
+            foreach (['publishRefusalWatches', 'publishRefusals'] as $property) {
+                $state = (new \ReflectionProperty(NatsConnection::class, $property))->getValue(self::connectionOf($client));
+                self::assertSame([], $state, $property . ' is empty once the pull has ended');
+            }
+        } finally {
+            $stop->cancel();
+            $loop->await();
+        }
+    }
+
+    /**
      * A requestMany() that has collected a reply, read by the application's loop and delivered behind a handler that
      * held that delivery up, reads on for the next one behind the application's read. The permissions -ERR that rejects
      * the inbox then comes the same way: the request returns what it has at once, within 0.5 s of its 3 s timeout,

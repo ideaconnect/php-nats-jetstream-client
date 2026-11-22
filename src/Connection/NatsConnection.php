@@ -217,6 +217,21 @@ final class NatsConnection
      */
     private array $muxRefusals = [];
     /**
+     * The subject each pull in flight publishes to, keyed by the sid of the pull's own reply inbox
+     * ({@see watchPublishRefusal()}): a pull publishes with an inbox of its own, not through a request, so
+     * {@see refuseRequestsTo()} does not know it. Registered before the pull is published and removed when it ends.
+     *
+     * @var array<int, string>
+     */
+    private array $publishRefusalWatches = [];
+    /**
+     * The server's -ERR text for each watched pull whose publish the server refused for lack of permission, keyed like
+     * {@see $publishRefusalWatches}. Removed with the watch.
+     *
+     * @var array<int, string>
+     */
+    private array $publishRefusals = [];
+    /**
      * Strictly-increasing per-connection token counter. Guarantees pairwise-distinct request tokens
      * within an epoch by construction (never reset); the random $muxBase provides unguessability (#118).
      */
@@ -5482,6 +5497,66 @@ final class NatsConnection
     }
 
     /**
+     * Watches the publish of an operation that publishes with a reply inbox of its own, such as a pull
+     * ({@see \IDCT\NATS\JetStream\JetStreamContext::fetchBatch()}), for a refusal by the server for lack of permission: an -ERR
+     * 'Permissions Violation for Publish to "<subject>"' that names $subject, read by whichever fiber's read, records
+     * the server's text for $sid ({@see publishRefusalOf()}) and ends the reads of the operation waiting for a delivery
+     * to $sid, wherever they wait ({@see nextDeliveryTo()}), so that the operation looks at once instead of at its
+     * deadline (#260). Call before the publish, since the -ERR may be read before the publish returns, and end the watch
+     * with {@see unwatchPublishRefusal()} when the operation ends.
+     *
+     * The -ERR names the subject and not the publish, as for requests ({@see refuseRequestsTo()}): every watch on the
+     * subject is marked by it, whichever publish to the subject it answers.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     *
+     * @param int $sid The operation's own reply inbox, which keys the watch.
+     * @param string $subject The subject the operation publishes to.
+     */
+    public function watchPublishRefusal(int $sid, string $subject): void
+    {
+        $this->publishRefusalWatches[$sid] = $subject;
+    }
+
+    /**
+     * The server's -ERR text when it refused the publish watched for $sid ({@see watchPublishRefusal()}), or null while
+     * it has not. Set by the dispatch of an -ERR, which another fiber's read can make while the caller waits.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     */
+    public function publishRefusalOf(int $sid): ?string
+    {
+        return $this->publishRefusals[$sid] ?? null;
+    }
+
+    /**
+     * Ends the watch of {@see watchPublishRefusal()} for $sid, with the refusal it recorded, if any. Leaves nothing
+     * behind for an operation that has ended.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     */
+    public function unwatchPublishRefusal(int $sid): void
+    {
+        unset($this->publishRefusalWatches[$sid], $this->publishRefusals[$sid]);
+    }
+
+    /**
+     * Marks every watched publish to $subject as refused ({@see watchPublishRefusal()}) and wakes the operations reading
+     * for them. A watch on another subject is left alone. Called from the dispatch of the -ERR, so it must not suspend.
+     */
+    private function refuseWatchedPublishesTo(string $subject, string $error): void
+    {
+        foreach ($this->publishRefusalWatches as $sid => $watched) {
+            if ($watched !== $subject) {
+                continue;
+            }
+
+            $this->publishRefusals[$sid] = $error;
+            $this->wakeReadsWaitingFor($sid);
+        }
+    }
+
+    /**
      * The subject a "Permissions Violation for Publish to" -ERR names, or null for any other error. nats-server writes
      * it with Go's %q, so it is in double quotes, with a backslash before a double quote or a backslash in it, and an
      * apostrophe left as it is, although the whole text is in single quotes: -ERR 'Permissions Violation for Publish to
@@ -7793,11 +7868,13 @@ final class NatsConnection
                 }
 
                 // A permissions violation for a publish names the subject: the requests in flight to it reach no
-                // responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}). "Publish with
-                // Reply of" names a reply subject, never this connection's inbox, and is left alone.
+                // responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}), and so do the
+                // pulls in flight to it ({@see refuseWatchedPublishesTo()}, #260). "Publish with Reply of" names a reply
+                // subject, never this connection's inbox, and is left alone.
                 $refusedSubject = self::subjectOfAPublishViolation($error);
                 if ($refusedSubject !== null) {
                     $this->refuseRequestsTo($refusedSubject, $error);
+                    $this->refuseWatchedPublishesTo($refusedSubject, $error);
                 }
 
                 // Non-fatal server error (e.g. a per-subscription permissions violation): surface it

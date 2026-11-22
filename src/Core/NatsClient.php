@@ -258,6 +258,41 @@ final class NatsClient
     }
 
     /**
+     * Watches the publish of an operation that publishes with a reply inbox of its own (a pull) for a refusal by the
+     * server for lack of permission, keyed by that inbox's sid: once an -ERR refusing a publish to $subject is read, by
+     * whichever fiber's read, {@see publishRefusalOf()} returns its text and the operation's read for the sid ends
+     * ({@see NatsConnection::watchPublishRefusal()}, #260). End it with {@see unwatchPublishRefusal()}.
+     *
+     * @internal Low-level mechanism for the JetStream pulls; not part of the supported API.
+     */
+    public function watchPublishRefusal(int $sid, string $subject): void
+    {
+        $this->connection->watchPublishRefusal($sid, $subject);
+    }
+
+    /**
+     * The server's -ERR text when it refused the publish watched for $sid ({@see watchPublishRefusal()}), or null.
+     *
+     * @internal Low-level mechanism for the JetStream pulls; not part of the supported API.
+     *
+     * @phpstan-impure Set by the dispatch of an -ERR, which another fiber's read can make while the caller waits.
+     */
+    public function publishRefusalOf(int $sid): ?string
+    {
+        return $this->connection->publishRefusalOf($sid);
+    }
+
+    /**
+     * Ends the watch of {@see watchPublishRefusal()} for $sid.
+     *
+     * @internal Low-level mechanism for the JetStream pulls; not part of the supported API.
+     */
+    public function unwatchPublishRefusal(int $sid): void
+    {
+        $this->connection->unwatchPublishRefusal($sid);
+    }
+
+    /**
      * Registers a callback invoked when the server rejects the sid's subscription with an async
      * permissions -ERR, so a long-lived JetStream reply inbox (the pipelined pull inbox, #120) can
      * fail fast instead of spinning on silent deadline retires forever (#167's pull twin).

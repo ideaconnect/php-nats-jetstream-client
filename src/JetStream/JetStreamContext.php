@@ -2441,7 +2441,11 @@ final class JetStreamContext
      * One `$expiresMs + 1000` ms budget covers inbox setup, reconnect, publication, collection and
      * cleanup. A delayed send shortens the wire expiry to leave 100 ms for its response; an idle
      * heartbeat that no longer fits is omitted, together with its local heartbeat-miss check.
-     * An empty result at this deadline throws the usual JetStreamException with code 408.
+     * An empty result at this deadline throws the usual JetStreamException with code 408. A pull whose publish the
+     * server refuses for lack of permission (-ERR 'Permissions Violation for Publish to "$JS.API.CONSUMER.MSG.NEXT.
+     * <stream>.<consumer>"') fails at once with a {@see PermissionViolationException} naming that subject, which is not
+     * a JetStreamException, instead of ending as an empty pull at the deadline (#260); messages delivered before the
+     * refusal are returned.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
@@ -2562,6 +2566,12 @@ final class JetStreamContext
                 // explicit-ack consumer they redeliver late (skewed order, inflated num_delivered); with
                 // max_deliver=1 they are lost permanently. Memory stays bounded by the requested batch.
                 $this->client->markSubscriptionUnbounded($sid);
+                // Watched before the pull is published (#260): nats-server answers a pull the connection's user may not
+                // publish with -ERR 'Permissions Violation for Publish to "<subject>"' and keeps the connection open, so
+                // no message and no status can come for it. Whichever fiber's read meets the -ERR records it and ends
+                // this fetch's read, and the fetch fails at once instead of waiting out its deadline and ending as an
+                // empty pull (a 408).
+                $this->client->watchPublishRefusal($sid, $subject);
 
                 try {
                     // Rejected while this fiber waited for the SUB write: no pull is sent for a dead inbox, whose
@@ -2621,6 +2631,12 @@ final class JetStreamContext
                         // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
                         $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
 
+                        // The server refused the pull for lack of permission (#260): nothing can come for it any more.
+                        // A message delivered before is returned, as at the deadline; with none the fetch fails below.
+                        if ($this->client->publishRefusalOf($sid) !== null) {
+                            break;
+                        }
+
                         $nowNs = hrtime(true);
                         if ($budget->remainingNs() === 0 || $budget->cancellation()->isRequested()) {
                             break;
@@ -2679,6 +2695,8 @@ final class JetStreamContext
                         }
                     }
                 } finally {
+                    $refusal = $this->client->publishRefusalOf($sid);
+                    $this->client->unwatchPublishRefusal($sid);
                     $this->client->releaseSubscriptionWithin($sid, $budget->cancellation())->await();
                 }
 
@@ -2689,6 +2707,8 @@ final class JetStreamContext
                             $terminalStatus['code'],
                         );
                     }
+
+                    $this->throwIfPullRefused($subject, $refusal);
 
                     throw new JetStreamException('No messages received within timeout', 408);
                 }
@@ -5066,6 +5086,32 @@ final class JetStreamContext
         }
 
         return $options;
+    }
+
+    /**
+     * Fails a pull fetch whose publish the server refused for lack of permission (#260), as the connection recorded it
+     * ({@see NatsClient::watchPublishRefusal()}); nothing while it recorded none. The pull reached no consumer, so no
+     * message came for it, and a pull to the same subject is refused again on this connection until the user's
+     * permissions change. A {@see PermissionViolationException}, as for a refused request, and not a
+     * JetStreamException: a caller that reads the 408 of an empty pull as "nothing to do" must not take the refusal
+     * for one.
+     *
+     * @param string|null $serverError The -ERR text the connection recorded; null while the server has not refused.
+     * @param \Throwable|null $previous The error the fetch would have failed with otherwise, when there is one.
+     */
+    private function throwIfPullRefused(string $subject, ?string $serverError, ?\Throwable $previous = null): void
+    {
+        if ($serverError === null) {
+            return;
+        }
+
+        throw new PermissionViolationException(
+            'The server refused the pull to "' . $subject . '": ' . trim($serverError, "' ") . '. No message was delivered'
+            . ' for it. Grant this connection\'s user permission to publish to "' . $subject . '".',
+            0,
+            $previous,
+            $subject,
+        );
     }
 
     /**

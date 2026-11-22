@@ -17,9 +17,13 @@ namespace IDCT\NATS\Exception;
  * {@see TimeoutException}, and requestMany() returned an empty list. Not a {@see ConnectionException}: the connection is
  * fine, and reconnecting would not help. The -ERR still reaches the error listener as before.
  *
- * fetchBatch() and the pull consumer publish with an inbox of their own, and a refused pull still ends at its expiry.
+ * Thrown as well by fetchBatch() and fetchNext() (one that has received no message), whose pull to
+ * "$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>" the server refused, at once, where they used to end at their expiry
+ * with the {@see JetStreamException} (408) of an empty pull (#260). Not a JetStreamException, so a caller that reads a
+ * 408 as "nothing to fetch" does not take it for one. The pull consumer and directGetBatch() publish with an inbox of
+ * their own and are not covered: a refused pull of theirs still ends at its expiry.
  * The -ERR names the subject and not the publish: one left unread from an earlier refused publish to the subject
- * refuses a later request to it as well, whatever the server did with that request's own publish.
+ * refuses a later request or pull to it as well, whatever the server did with that request's own publish.
  */
 final class PermissionViolationException extends NatsException
 {
