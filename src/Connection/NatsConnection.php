@@ -232,6 +232,14 @@ final class NatsConnection
      */
     private array $publishRefusals = [];
     /**
+     * What to call once the publish watched for a sid is refused ({@see watchPublishRefusal()}), keyed like
+     * {@see $publishRefusalWatches}: a fetch's cancellation of its wait, so that it learns of the refusal while it
+     * waits for its own publish to complete (review of #264). Removed with the watch.
+     *
+     * @var array<int, \Closure(): void>
+     */
+    private array $publishRefusalCallbacks = [];
+    /**
      * Strictly-increasing per-connection token counter. Guarantees pairwise-distinct request tokens
      * within an epoch by construction (never reset); the random $muxBase provides unguessability (#118).
      */
@@ -5505,17 +5513,29 @@ final class NatsConnection
      * deadline (#260). Call before the publish, since the -ERR may be read before the publish returns, and end the watch
      * with {@see unwatchPublishRefusal()} when the operation ends.
      *
+     * $onRefused is called once, from that dispatch, when the refusal is recorded: for an operation that waits for
+     * something else than a delivery meanwhile, such as the completion of its own publish, whose bytes are on the wire
+     * while its writer is not resumed yet. A fetch passes the cancellation of its wait there, so that it learns of the
+     * refusal at once, wherever it waits (review of #264). It must not suspend; what it throws is dropped.
+     *
      * The -ERR names the subject and not the publish, as for requests ({@see refuseRequestsTo()}): every watch on the
-     * subject is marked by it, whichever publish to the subject it answers.
+     * subject is marked by it, whichever publish to the subject it answers, and the first such -ERR is the one recorded.
+     * The name is matched as the -ERR gives it: one the client cannot match to the subject it published to - an
+     * account's subject mapping, a name Go writes with \u escapes (#259) - marks nothing, and the operation ends as it
+     * would without the refusal.
      *
      * @internal For the library's own operations; not part of the supported API.
      *
      * @param int $sid The operation's own reply inbox, which keys the watch.
      * @param string $subject The subject the operation publishes to.
+     * @param (\Closure(): void)|null $onRefused Called once the refusal is recorded; must not suspend.
      */
-    public function watchPublishRefusal(int $sid, string $subject): void
+    public function watchPublishRefusal(int $sid, string $subject, ?\Closure $onRefused = null): void
     {
         $this->publishRefusalWatches[$sid] = $subject;
+        if ($onRefused !== null) {
+            $this->publishRefusalCallbacks[$sid] = $onRefused;
+        }
     }
 
     /**
@@ -5530,28 +5550,60 @@ final class NatsConnection
     }
 
     /**
-     * Ends the watch of {@see watchPublishRefusal()} for $sid, with the refusal it recorded, if any. Leaves nothing
-     * behind for an operation that has ended.
+     * Ends the watch of {@see watchPublishRefusal()} for $sid, with the refusal it recorded, if any, and its callback.
+     * Leaves nothing behind for an operation that has ended.
      *
      * @internal For the library's own operations; not part of the supported API.
      */
     public function unwatchPublishRefusal(int $sid): void
     {
-        unset($this->publishRefusalWatches[$sid], $this->publishRefusals[$sid]);
+        unset($this->publishRefusalWatches[$sid], $this->publishRefusals[$sid], $this->publishRefusalCallbacks[$sid]);
     }
 
     /**
-     * Marks every watched publish to $subject as refused ({@see watchPublishRefusal()}) and wakes the operations reading
-     * for them. A watch on another subject is left alone. Called from the dispatch of the -ERR, so it must not suspend.
+     * Delivers what an earlier or a concurrent read has queued for $sid and not reached, without reading, with the
+     * rules an operation's read delivers it with ({@see deliverQueuedForOwnSid()}): for an operation about to end on
+     * news that came in the same chunk as frames for its own subscription, such as a pull whose publish the server
+     * refused ({@see watchPublishRefusal()}). The read that queued the chunk can be held up in an earlier
+     * subscription's handler, which awaits, and the operation would otherwise release its subscription, and the
+     * queued frames with it, before they reached its handler: a message, or a terminal status, the server sent ahead
+     * of the -ERR (review of #264). Nothing when nothing is queued for $sid, when a delivery to $sid is under way
+     * further up some fiber's stack (that one delivers it), or when the queue is a disconnect()'s to discard
+     * ({@see leftoversBelongToAClose()}). An overflow or a handler failure of $sid is thrown, as an operation's read
+     * throws it.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     */
+    public function deliverWhatIsQueuedFor(int $sid): void
+    {
+        $this->deliverQueuedForOwnSid(
+            $sid,
+            reportOverflows: !$this->options->slowConsumerErrorsFailOperations,
+            reportHandlerFailures: !$this->options->handlerErrorsFailOperations,
+        );
+    }
+
+    /**
+     * Marks every watched publish to $subject as refused ({@see watchPublishRefusal()}), calls its callback and wakes
+     * the operations reading for them. A watch on another subject, or one already refused, is left alone. Called from
+     * the dispatch of the -ERR, so it must not suspend.
      */
     private function refuseWatchedPublishesTo(string $subject, string $error): void
     {
         foreach ($this->publishRefusalWatches as $sid => $watched) {
-            if ($watched !== $subject) {
+            if ($watched !== $subject || isset($this->publishRefusals[$sid])) {
                 continue;
             }
 
             $this->publishRefusals[$sid] = $error;
+            $onRefused = $this->publishRefusalCallbacks[$sid] ?? null;
+            if ($onRefused !== null) {
+                try {
+                    $onRefused();
+                } catch (\Throwable) {
+                    // A throwing callback must never break frame dispatch.
+                }
+            }
             $this->wakeReadsWaitingFor($sid);
         }
     }

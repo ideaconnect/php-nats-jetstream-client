@@ -2445,7 +2445,10 @@ final class JetStreamContext
      * server refuses for lack of permission (-ERR 'Permissions Violation for Publish to "$JS.API.CONSUMER.MSG.NEXT.
      * <stream>.<consumer>"') fails at once with a {@see PermissionViolationException} naming that subject, which is not
      * a JetStreamException, instead of ending as an empty pull at the deadline (#260); messages delivered before the
-     * refusal are returned.
+     * refusal are returned. Frames that came ahead of the -ERR and another fiber's read had not delivered yet are
+     * delivered first: their messages are returned, and a terminal status among them decides as it would without the
+     * refusal. A refusal whose subject the client cannot match to the pull's (an account's subject mapping, a name Go
+     * writes with \u escapes, #259) is not seen: the pull ends at the deadline as an empty one.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
@@ -2570,8 +2573,11 @@ final class JetStreamContext
                 // publish with -ERR 'Permissions Violation for Publish to "<subject>"' and keeps the connection open, so
                 // no message and no status can come for it. Whichever fiber's read meets the -ERR records it and ends
                 // this fetch's read, and the fetch fails at once instead of waiting out its deadline and ending as an
-                // empty pull (a 408).
-                $this->client->watchPublishRefusal($sid, $subject);
+                // empty pull (a 408). The refusal also cancels $finished, so that a fetch still waiting for its PUB to
+                // complete - the bytes on the wire, the writer not resumed yet - stops waiting too (review of #264).
+                $this->client->watchPublishRefusal($sid, $subject, static function () use ($finished): void {
+                    $finished->cancel();
+                });
 
                 try {
                     // Rejected while this fiber waited for the SUB write: no pull is sent for a dead inbox, whose
@@ -2611,7 +2617,9 @@ final class JetStreamContext
                         )->await();
                     } catch (TimeoutException $e) {
                         $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection, $e);
-                        if ($messages === [] && $terminalStatus === null) {
+                        // A refusal cancels the wait for the publish through $finished: it is settled below, once what
+                        // is queued for the inbox has been delivered, and is no empty pull.
+                        if ($messages === [] && $terminalStatus === null && $this->client->publishRefusalOf($sid) === null) {
                             throw new JetStreamException('No messages received within timeout', 408, $e);
                         }
                     } catch (ConnectionException $e) {
@@ -2631,9 +2639,14 @@ final class JetStreamContext
                         // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
                         $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
 
-                        // The server refused the pull for lack of permission (#260): nothing can come for it any more.
-                        // A message delivered before is returned, as at the deadline; with none the fetch fails below.
+                        // The server refused the pull for lack of permission (#260): nothing more can come for it. What
+                        // another fiber's read queued for the inbox ahead of the -ERR and has not delivered yet - held up
+                        // behind an earlier subscription's handler - is delivered first (review of #264): a message there
+                        // is returned, as at the deadline, and a terminal status decides as it would without the refusal.
+                        // With neither the fetch fails below.
                         if ($this->client->publishRefusalOf($sid) !== null) {
+                            $this->client->deliverWhatIsQueuedFor($sid);
+
                             break;
                         }
 
@@ -2697,7 +2710,10 @@ final class JetStreamContext
                 } finally {
                     $refusal = $this->client->publishRefusalOf($sid);
                     $this->client->unwatchPublishRefusal($sid);
-                    $this->client->releaseSubscriptionWithin($sid, $budget->cancellation())->await();
+                    // The inbox is released locally and its UNSUB sent. Once the server has refused the pull, the
+                    // fetch does not wait for the UNSUB's write to complete: it finishes in the background, and the
+                    // refusal, which cancelled $finished, ends the wait at once (review of #264).
+                    $this->client->releaseSubscriptionWithin($sid, $refusal === null ? $budget->cancellation() : $finished->getCancellation())->await();
                 }
 
                 if ($messages === []) {

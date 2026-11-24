@@ -197,7 +197,7 @@ final class MuxInboxDropWakeupTest extends TestCase
             self::assertInstanceOf(PermissionViolationException::class, $error, sprintf('the pull ended after %.3f s with %s', $elapsed, self::describe($error)));
             self::assertSame($pull, $error->getSubject());
             self::assertLessThan(0.5, $elapsed, sprintf('the pull failed after %.3f s, with a 4 s budget', $elapsed));
-            foreach (['publishRefusalWatches', 'publishRefusals'] as $property) {
+            foreach (['publishRefusalWatches', 'publishRefusals', 'publishRefusalCallbacks'] as $property) {
                 $state = (new \ReflectionProperty(NatsConnection::class, $property))->getValue(self::connectionOf($client));
                 self::assertSame([], $state, $property . ' is empty once the pull has ended');
             }
