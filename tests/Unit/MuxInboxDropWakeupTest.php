@@ -820,6 +820,8 @@ final class MuxInboxDropWakeupTest extends TestCase
      * An application loop that keeps a read on the socket, as a consumer's does, and reads on past whatever a read
      * throws: an -ERR the server keeps the connection open for fails the read that brings it. $onFailure, if given, is
      * called with what a read threw before the loop reads on. Stop it with the cancellation, then await the future.
+     * Owned by the test, with the cancellation as what ends it, so that a test that fails before it stops the loop
+     * still leaves nothing reading.
      *
      * @param (\Closure(\Throwable): void)|null $onFailure
      * @return array{DeferredCancellation, Future<void>}
@@ -842,7 +844,7 @@ final class MuxInboxDropWakeupTest extends TestCase
             }
         });
 
-        return [$stop, $loop];
+        return [$stop, $this->resources()->ownOperation($loop, $stop->cancel(...), 'application read loop')];
     }
 
     /** Waits until a read takes the socket of $watched. */

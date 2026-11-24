@@ -19,10 +19,12 @@ use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Tests\Support\CompletionHoldingTransport;
 use IDCT\NATS\Tests\Support\FakeTransport;
+use IDCT\NATS\Tests\Support\HeldFailingWriteTransport;
 use IDCT\NATS\Tests\Support\HeldUpDelivery;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\WatchedTransport;
+use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
@@ -302,6 +304,9 @@ final class RefusedPullTest extends TestCase
         // Nothing answers the pull: what comes for it comes in the chunk below.
         $server->responder = static fn(string $subject, ?string $replyTo): array => [];
         $gate = new HeldUpDelivery(5.0);
+        $this->resources()->onRelease(static function () use ($gate): void {
+            $gate->end('the test resource scope');
+        }, 'held handler');
         // Subscribed ahead of the fetch's inbox, so its sid is the lower one: the inbox's delivery waits behind its handler.
         $slowSid = $client->subscribe('slow', $gate->handler())->await();
         [$stop, $loop] = $this->startReadLoop($client);
@@ -364,6 +369,216 @@ final class RefusedPullTest extends TestCase
             $stop->cancel();
             $loop->await();
         }
+    }
+
+    /** @return iterable<string, array{string}> */
+    public static function refusalAroundAPing(): iterable
+    {
+        yield 'the -ERR ahead of the PING' => ['ahead'];
+        yield 'the -ERR behind the PING' => ['behind'];
+    }
+
+    /**
+     * The fetch's own read, the only reader, takes one chunk with the -ERR refusing the pull and a server PING, and
+     * the PONG answering that PING reaches the server with its completion held. The read records the refusal and
+     * stops waiting for the PONG's completion: the fetch fails with the refusal within 0.5 s of its 4 s budget while
+     * that completion is still held, and the PONG went out ahead of the fetch's UNSUB, in wire order. It used to wait
+     * in the dispatch for the PONG's completion, past its budget, and threw the refusal only once the write was let go
+     * (review of #264). Fails on the code before the fix with the fetch still pending when the hold ends.
+     */
+    #[DataProvider('refusalAroundAPing')]
+    public function testARefusedPullDoesNotWaitForThePongItsOwnReadOwesTheServer(string $order): void
+    {
+        [$server, , $holding, $client] = $this->connectOverTheScriptedServer();
+        // Nothing answers the pull: what comes for it comes in the chunk below.
+        $server->responder = static fn(string $subject, ?string $replyTo): array => [];
+
+        $fetch = $client->jetStream()->fetchBatch(self::STREAM, 'worker', 1, 3_000);
+        $fetch->ignore();
+        $this->waitUntil(static fn(): bool => $server->controlLinesStartingWith('PUB ' . self::PULL . ' ') !== []);
+        $holding->holdCompletionOfNextWriteContaining('PONG', 5.0);
+        $start = hrtime(true);
+        $server->pushFrame($order === 'ahead' ? self::refusal(self::PULL) . "PING\r\n" : "PING\r\n" . self::refusal(self::PULL));
+        [, $failure] = self::settle($fetch);
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        // Before the PONG's writer is let go.
+        self::assertSame(1, $holding->completionsHeld(), "the PONG's completion was still held when the fetch ended");
+        self::assertInstanceOf(PermissionViolationException::class, $failure, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($failure)));
+        self::assertSame(self::PULL, $failure->getSubject());
+        self::assertLessThan(0.5, $elapsed, sprintf('the fetch failed after %.3f s, with a 4 s budget', $elapsed));
+        self::assertNoWatchLeft($client);
+        $sid = self::fetchSid($server);
+        $this->waitUntil(static fn(): bool => in_array('UNSUB ' . $sid, $server->controlLines(), true));
+        $lines = $server->controlLines();
+        self::assertLessThan(
+            array_search('UNSUB ' . $sid, $lines, true),
+            array_search('PONG', $lines, true),
+            'the PONG went out ahead of the UNSUB the fetch wrote after it: ' . implode(' | ', $lines),
+        );
+
+        $holding->releaseHeldCompletions();
+        self::assertSame(ConnectionState::Open, $client->state(), 'a refused pull leaves the connection open');
+    }
+
+    /**
+     * The fetch's own read takes one chunk with a server PING, then a message and a 409 Consumer Deleted for the
+     * fetch's inbox, and the PONG answering the PING reaches the server with its completion held. The read queues the
+     * message and the 409 before it waits for the PONG. The application's read, the second reader, then brings the -ERR
+     * refusing the pull, which ends the fetch's wait for the PONG: while the PONG's completion is still held, the fetch
+     * of 5 returns the message and calls the terminal callback once with the 409 (review of #264). The frames behind
+     * the PING used to be queued only once the PONG's write completed: a fetch that stopped waiting for its read when
+     * the refusal came would have released its inbox without them, the message and the terminal status lost. Fails on
+     * the code before the fix with the fetch still pending when the hold ends.
+     */
+    public function testWhatTheFetchsReadBroughtInBehindAPingIsKeptWhenAnotherFibersReadBringsTheRefusal(): void
+    {
+        [$server, $watched, $holding, $client] = $this->connectOverTheScriptedServer();
+        $server->responder = static fn(string $subject, ?string $replyTo): array => [];
+        /** @var list<array{int, string}> $terminal */
+        $terminal = [];
+        $fetch = $client->jetStream()->fetchBatch(
+            self::STREAM,
+            'worker',
+            5,
+            3_000,
+            [],
+            static function (int $code, string $description) use (&$terminal): void {
+                $terminal[] = [$code, $description];
+            },
+        );
+        $fetch->ignore();
+        $this->waitUntil(static fn(): bool => $server->controlLinesStartingWith('PUB ' . self::PULL . ' ') !== []);
+        $replyTo = self::replySubjectOfThePull($server);
+        $inboxSid = (int) $server->sidFor($replyTo);
+
+        // The fetch's read, the only reader, takes the chunk; its dispatch answers the PING and queues the frames.
+        $holding->holdCompletionOfNextWriteContaining('PONG', 5.0);
+        $start = hrtime(true);
+        $server->pushFrame(
+            "PING\r\n"
+            . ReconnectingTransport::msgFrame($replyTo, $inboxSid, 'm-1', '$JS.ACK.ORDERS.worker.1.1.1.0.0')
+            . ReconnectingTransport::hmsgFrame($replyTo, $inboxSid, "NATS/1.0 409 Consumer Deleted\r\n\r\n", ''),
+        );
+        $this->waitUntil(static fn(): bool => $holding->completionsHeld() === 1);
+        self::assertFalse($fetch->isComplete(), 'the fetch waits for the PONG it owes the server');
+
+        // The application's read takes the socket, and the server's next chunk refuses the pull.
+        [, $loop] = $this->startReadLoop($client);
+        $this->awaitRead($watched);
+        $server->pushFrame(self::refusal(self::PULL));
+        [$messages, $failure] = self::settle($fetch);
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        // Before the PONG's writer is let go.
+        self::assertSame(1, $holding->completionsHeld(), "the PONG's completion was still held when the fetch ended");
+        self::assertNull($failure, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($failure)));
+        self::assertSame(['m-1'], self::payloads($messages));
+        self::assertSame([[409, 'Consumer Deleted']], $terminal, 'the terminal callback is called once, with the 409');
+        self::assertLessThan(0.5, $elapsed, sprintf('the fetch returned after %.3f s, with a 4 s budget', $elapsed));
+        self::assertNoWatchLeft($client);
+        self::assertFalse($loop->isComplete());
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function connectionsWhosePongFailsLate(): iterable
+    {
+        yield 'a connection left open' => [false];
+        yield 'a connection the user closed meanwhile' => [true];
+    }
+
+    /**
+     * The PONG the fetch's read owes the server is held back, and fails only after the fetch, which the refusal in the
+     * same chunk ended, stopped waiting for it. The connection notices the failure on its own: the error listener gets
+     * it, and the connection, with reconnect off, ends Closed, as when the read that met the PING saw the PONG fail
+     * (#171). With nobody left waiting for the write, the failure used to have nowhere to go (review of #264). Not for a
+     * connection the user closed meanwhile: its PONG went with it, and the listener hears nothing of it. Fails on the
+     * code before the fix, the fetch waiting for the held write.
+     */
+    #[DataProvider('connectionsWhosePongFailsLate')]
+    public function testAPongThatFailsAfterThePullStoppedWaitingForItEndsTheConnection(bool $closedMeanwhile): void
+    {
+        $server = new ReconnectingTransport();
+        $held = new HeldFailingWriteTransport($server);
+        /** @var list<\Throwable> $errors */
+        $errors = [];
+        $client = $this->own(new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 5_000,
+            reconnectEnabled: false,
+            errorListener: static function (\Throwable $error) use (&$errors): void {
+                $errors[] = $error;
+            },
+        ), $held));
+        $client->connect()->await();
+        $server->responder = static fn(string $subject, ?string $replyTo): array => [];
+        $pongError = new TransportClosedException('the socket would not take the PONG');
+        $this->resources()->onRelease(static function () use ($held, $pongError): void {
+            $held->failHeldWrite($pongError);
+        }, 'held PONG');
+
+        $fetch = $client->jetStream()->fetchBatch(self::STREAM, 'worker', 1, 3_000);
+        $fetch->ignore();
+        $this->waitUntil(static fn(): bool => $server->controlLinesStartingWith('PUB ' . self::PULL . ' ') !== []);
+        $held->holdNextWriteContaining('PONG');
+        $server->pushFrame(self::refusal(self::PULL) . "PING\r\n");
+        [, $failure] = self::settle($fetch);
+
+        self::assertTrue($held->writeHeld(), 'the PONG was still held back when the fetch ended');
+        self::assertInstanceOf(PermissionViolationException::class, $failure, self::describe($failure));
+        $stateWhenTheFetchEnded = $client->state();
+        self::assertSame(ConnectionState::Open, $stateWhenTheFetchEnded);
+
+        if ($closedMeanwhile) {
+            $client->disconnect()->await();
+        }
+        $held->failHeldWrite($pongError);
+        $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Closed);
+        // The failure's handling runs from queued callbacks: give them their turn.
+        delay(0.05);
+        if ($closedMeanwhile) {
+            self::assertNotContains($pongError, $errors, 'a PONG that failed with the closed connection is not reported');
+        } else {
+            self::assertContains($pongError, $errors, 'the error listener heard of the failed PONG');
+        }
+    }
+
+    /** @return iterable<string, array{array<string, mixed>, int, string}> */
+    public static function pullsWhoseRefusalIsNotMatched(): iterable
+    {
+        yield 'the defaults: an empty pull at its deadline' => [[], 408, 'No messages received within timeout'];
+        yield 'a 100 ms idle_heartbeat: two silent intervals' => [['idle_heartbeat' => 100_000_000], 0, 'missed idle heartbeats'];
+    }
+
+    /**
+     * The limit of #259 for pulls: an -ERR naming a subject the client cannot match to the pull's - here the subject an
+     * account mapping would show - refuses nothing, and the pull ends by its usual rules for one nothing answers: with
+     * the defaults as an empty pull, the JetStreamException (408), at its deadline; with an idle_heartbeat as the
+     * JetStreamException (code 0) for missed heartbeats, once two intervals pass with nothing, well before it. A guard
+     * of what the README, the changelog and fetchBatch() say (review of #264).
+     *
+     * @param array<string, mixed> $pull
+     */
+    #[DataProvider('pullsWhoseRefusalIsNotMatched')]
+    public function testAPullWhoseRefusalTheClientCannotMatchEndsByItsUsualRules(array $pull, int $code, string $message): void
+    {
+        $transport = self::server([], errorsBefore: [self::PULL => ['orders.mapped.next']]);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport));
+        $client->connect()->await();
+
+        $start = hrtime(true);
+        $failure = self::failureOf($client->jetStream()->fetchBatch(self::STREAM, 'worker', 1, 500, $pull));
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        self::assertInstanceOf(JetStreamException::class, $failure, self::describe($failure));
+        self::assertSame($code, $failure->getCode());
+        self::assertStringContainsString($message, $failure->getMessage());
+        if ($code === 0) {
+            self::assertLessThan(1.0, $elapsed, sprintf('the missed heartbeats ended the pull after %.3f s, with a 1.5 s budget', $elapsed));
+        } else {
+            self::assertGreaterThan(0.45, $elapsed, sprintf('the empty pull ended after %.3f s, at its deadline', $elapsed));
+        }
+        self::assertNoWatchLeft($client);
     }
 
     /**
@@ -431,7 +646,8 @@ final class RefusedPullTest extends TestCase
     /**
      * A client over the scripted server, seen through a WatchedTransport, which tells when a read takes the socket,
      * and a CompletionHoldingTransport, which holds a writer after its bytes reached the server. No heartbeat, and no
-     * reconnect: nothing writes or reads but the test's operations.
+     * reconnect: nothing writes or reads but the test's operations. The holds are let go when the test ends, whatever
+     * ended it.
      *
      * @return array{ReconnectingTransport, WatchedTransport, CompletionHoldingTransport, NatsClient}
      */
@@ -440,6 +656,7 @@ final class RefusedPullTest extends TestCase
         $server = new ReconnectingTransport();
         $watched = new WatchedTransport($server);
         $holding = new CompletionHoldingTransport($watched);
+        $this->resources()->onRelease($holding->releaseHeldCompletions(...), 'held write completions');
         $client = $this->own(new NatsClient(new NatsOptions(connectTimeoutMs: 500, requestTimeoutMs: 5_000, reconnectEnabled: false), $holding));
         $client->connect()->await();
 
@@ -448,7 +665,8 @@ final class RefusedPullTest extends TestCase
 
     /**
      * An application loop that keeps a read on the socket, as a consumer's does, and reads on past whatever a read
-     * throws. Stop it with the cancellation, then await the future.
+     * throws. Stop it with the cancellation, then await the future. Owned by the test, with the cancellation as what
+     * ends it, so that a test that fails before it stops the loop still leaves nothing reading.
      *
      * @return array{DeferredCancellation, Future<void>}
      */
@@ -467,7 +685,7 @@ final class RefusedPullTest extends TestCase
             }
         });
 
-        return [$stop, $loop];
+        return [$stop, $this->resources()->ownOperation($loop, $stop->cancel(...), 'application read loop')];
     }
 
     /** Waits until a read takes the socket of $watched. */
