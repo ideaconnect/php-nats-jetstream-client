@@ -35,12 +35,20 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   ahead of the `-ERR` and another fiber's read has not delivered yet, held up behind an earlier subscription's
   handler, is delivered first: a message there is returned, and a terminal status such as `409 Consumer Deleted` is
   the pull's result, as without the refusal. Once the refusal is known, the fetch releases its inbox without waiting
-  for the `UNSUB` to complete.
+  for the `UNSUB` to complete. Nor does it wait for the `PONG` its own read owes the server: a fetch whose read brings
+  in a chunk with a server `PING` answers it in wire order, queues the rest of the chunk, and waits for the `PONG`'s
+  write only until its deadline or the refusal, which another fiber's read may bring meanwhile; the messages and the
+  terminal status behind the `PING` are its result as usual. A `PONG` the socket then fails to take ends the
+  connection, as one that fails while the read waits does: the error listener hears of it and the connection
+  recovers, or closes with reconnect off. A fetch whose read waited for a `PONG` whose completion was held stayed
+  pending past its deadline.
 
   The pull consumer and `directGetBatch()` are not covered yet (#260): a refused pull of theirs still ends at its
   expiry. The refusal is matched by subject, as for requests, and the limit of #259 holds for pulls too: an `-ERR`
   naming a subject the client cannot match to the pull's, one the account maps to another subject, or a stream or
-  consumer name Go writes with `\u` escapes, refuses nothing, and the pull ends at its expiry as an empty one (408).
+  consumer name Go writes with `\u` escapes, refuses nothing, and the pull ends as one nothing answers: at its expiry
+  as an empty one (408) by default, or, with an `idle_heartbeat`, with the missed-heartbeat `JetStreamException`
+  (code 0) once two heartbeat intervals pass with nothing, about 200 ms for a 100 ms `idle_heartbeat`.
 
 ### Upgrade notes
 

@@ -2448,7 +2448,10 @@ final class JetStreamContext
      * refusal are returned. Frames that came ahead of the -ERR and another fiber's read had not delivered yet are
      * delivered first: their messages are returned, and a terminal status among them decides as it would without the
      * refusal. A refusal whose subject the client cannot match to the pull's (an account's subject mapping, a name Go
-     * writes with \u escapes, #259) is not seen: the pull ends at the deadline as an empty one.
+     * writes with \u escapes, #259) is not seen: the pull ends as one nothing answers, as an empty one at the deadline
+     * (the 408), or, with an `idle_heartbeat`, with the missed-heartbeat JetStreamException (code 0) once two intervals
+     * pass with nothing. A server PING that the fetch's own read brings in is answered without holding the fetch: it
+     * waits for the PONG's write only within its deadline, and a refusal another fiber's read brings ends that wait.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
@@ -2643,7 +2646,9 @@ final class JetStreamContext
                         // another fiber's read queued for the inbox ahead of the -ERR and has not delivered yet - held up
                         // behind an earlier subscription's handler - is delivered first (review of #264): a message there
                         // is returned, as at the deadline, and a terminal status decides as it would without the refusal.
-                        // With neither the fetch fails below.
+                        // With neither the fetch fails below. A refusal the client cannot match to the subject (#259) is
+                        // not recorded: the pull goes on as one nothing answers, to the heartbeat check below or its
+                        // deadline.
                         if ($this->client->publishRefusalOf($sid) !== null) {
                             $this->client->deliverWhatIsQueuedFor($sid);
 

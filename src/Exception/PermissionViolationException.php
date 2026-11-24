@@ -26,7 +26,9 @@ namespace IDCT\NATS\Exception;
  * refuses a later request or pull to it as well, whatever the server did with that request's own publish. It is
  * matched as the server writes it, so one the client cannot match to the subject it published to - one the account
  * maps to another subject, or one with a character Go writes as a \u escape (#259) - throws nothing: the request ends
- * with its TimeoutException and the pull with its 408, as before.
+ * with its TimeoutException, and the pull as one nothing answers, by default with its 408 at its expiry, or, with an
+ * idle_heartbeat, with the missed-heartbeat JetStreamException (code 0) once two heartbeat intervals pass with
+ * nothing, as before.
  */
 final class PermissionViolationException extends NatsException
 {
