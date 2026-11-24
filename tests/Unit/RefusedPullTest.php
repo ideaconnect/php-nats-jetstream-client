@@ -398,6 +398,37 @@ final class RefusedPullTest extends TestCase
     }
 
     /**
+     * Guard: a refusal callback that throws breaks neither the dispatch of the -ERR nor another watch on the subject:
+     * both refusals are recorded, the other callback is still called, the read that brought the -ERR returns as usual
+     * and the connection stays open. Fails with the callback's exception, from the read, without the guard around it.
+     */
+    public function testARefusalCallbackThatThrowsLeavesTheDispatchAndTheOtherWatchesAlone(): void
+    {
+        $transport = self::server([]);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport));
+        $client->connect()->await();
+        $calls = 0;
+        $client->watchPublishRefusal(901, self::PULL, static function (): void {
+            throw new \RuntimeException('a refusal callback that throws');
+        });
+        $client->watchPublishRefusal(902, self::PULL, static function () use (&$calls): void {
+            $calls++;
+        });
+
+        $transport->pushReadChunk(self::refusal(self::PULL));
+        self::assertGreaterThan(0, $client->processIncoming()->await());
+
+        self::assertNotNull($client->publishRefusalOf(901), 'the refusal is recorded for the watch whose callback threw');
+        self::assertNotNull($client->publishRefusalOf(902), 'and for the watch after it');
+        self::assertSame(1, $calls, 'the callback after the one that threw is called');
+        self::assertSame(ConnectionState::Open, $client->state());
+
+        $client->unwatchPublishRefusal(901);
+        $client->unwatchPublishRefusal(902);
+        self::assertNoWatchLeft($client);
+    }
+
+    /**
      * A client over the scripted server, seen through a WatchedTransport, which tells when a read takes the socket,
      * and a CompletionHoldingTransport, which holds a writer after its bytes reached the server. No heartbeat, and no
      * reconnect: nothing writes or reads but the test's operations.
