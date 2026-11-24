@@ -23,7 +23,10 @@ namespace IDCT\NATS\Exception;
  * 408 as "nothing to fetch" does not take it for one. The pull consumer and directGetBatch() publish with an inbox of
  * their own and are not covered: a refused pull of theirs still ends at its expiry.
  * The -ERR names the subject and not the publish: one left unread from an earlier refused publish to the subject
- * refuses a later request or pull to it as well, whatever the server did with that request's own publish.
+ * refuses a later request or pull to it as well, whatever the server did with that request's own publish. It is
+ * matched as the server writes it, so one the client cannot match to the subject it published to - one the account
+ * maps to another subject, or one with a character Go writes as a \u escape (#259) - throws nothing: the request ends
+ * with its TimeoutException and the pull with its 408, as before.
  */
 final class PermissionViolationException extends NatsException
 {

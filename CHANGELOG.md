@@ -30,10 +30,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   while the fetch runs, and the fetch fails as soon as the `-ERR` is read, whichever fiber's read meets it, with the
   `PermissionViolationException` a refused request throws, naming the subject. Messages delivered before the refusal
   are returned, as at the deadline. A pull to another subject is left alone, the connection stays open, and the error
-  listener still gets the `-ERR`.
+  listener still gets the `-ERR`. That holds wherever the fetch waits when the `-ERR` is read: in a read, or in its
+  own publish, whose bytes are on the wire while its writer is not resumed yet. What the server sent for the pull
+  ahead of the `-ERR` and another fiber's read has not delivered yet, held up behind an earlier subscription's
+  handler, is delivered first: a message there is returned, and a terminal status such as `409 Consumer Deleted` is
+  the pull's result, as without the refusal. Once the refusal is known, the fetch releases its inbox without waiting
+  for the `UNSUB` to complete.
 
   The pull consumer and `directGetBatch()` are not covered yet (#260): a refused pull of theirs still ends at its
-  expiry. The refusal is matched by subject, as for requests.
+  expiry. The refusal is matched by subject, as for requests, and the limit of #259 holds for pulls too: an `-ERR`
+  naming a subject the client cannot match to the pull's, one the account maps to another subject, or a stream or
+  consumer name Go writes with `\u` escapes, refuses nothing, and the pull ends at its expiry as an empty one (408).
 
 ### Upgrade notes
 
