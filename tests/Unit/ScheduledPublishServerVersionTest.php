@@ -10,6 +10,7 @@ use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Models\PubAck;
@@ -269,6 +270,25 @@ final class ScheduledPublishServerVersionTest extends TestCase
                 self::assertSame($message, $e->getMessage());
             }
         }
+    }
+
+    /**
+     * A call that needs 2.14 goes through the guarded request, which checks its subject as every request does: a
+     * schedule subject with an empty token fails with the ProtocolException before the reply inbox is subscribed or
+     * anything is published, on a 2.14 server that would take the schedule.
+     */
+    public function testAnInvalidScheduleSubjectIsRefusedBeforeAnyWriteOnA214Server(): void
+    {
+        [$client, $transport] = $this->connectedTo('2.14.0', self::ACK);
+
+        try {
+            $client->jetStream()->publishScheduled('schedules..tick', 'events.tick', 'p', Schedule::every(2))->await();
+            self::fail('expected the invalid subject to be refused');
+        } catch (ProtocolException $e) {
+            self::assertSame('Subject must not contain empty tokens', $e->getMessage());
+        }
+
+        self::assertCount(2, $transport->writes, 'nothing written after the CONNECT + PING handshake');
     }
 
     /**

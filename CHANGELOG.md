@@ -57,7 +57,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   (`$infoByEpoch`): each of those calls made while the client reconnects from 2.14 to 2.12 is refused by the 2.12
   session and no schedule reaches either server, each made while it reconnects from 2.12 to 2.14 is published once
   on the 2.14 session, and a schedule whose write fails on 2.14 and whose recovery lands on 2.12 is refused before
-  the retry. All 17 of these cases fail on the first version of the check, which read the INFO before the reconnect.
+  the retry. All 17 of these cases fail on the first version of the check, which read the INFO before the reconnect;
+  an invalid schedule subject on that guarded path is still refused before any write.
   `FeatureSupportTest` covers the new registry entries and the version comparison, and the integration test
   `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders` checks the pre-flight against the live
   fixture server (on 2.14+ it reads each schedule back from its own subject, so a schedule firing into the target
