@@ -17,6 +17,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- With `reconnectEnabled: true`, `maxReconnectAttempts: 0` now makes no reconnect attempt after a lost connection, as
+  documented (#268): the connection closes instead of dialling once more. Code that relied on that single retry should
+  set `maxReconnectAttempts: 1`, which makes exactly one attempt.
+
 ### Fixed
 
 - `[bugfix]` `maxReconnectAttempts: 0` disables reconnect retries after a lost connection too, as its docblock says
@@ -32,17 +38,30 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   instead of resolving into a reconnect buffer; an operation whose read notices the loss with
   `waitForReconnect: false` fails once the connection is Closed, with `Reconnect is disabled` rather than
   `Connection is not open`. A lame duck notice starts no failover: the connection stays until the server closes it.
-  nats.go reads its `MaxReconnect = 0` the same way. Strictly a `[bc-break]` for code that relied on the one attempt,
-  flagged `[bugfix]` per the note above: it corrects a documented contract. `maxReconnectAttempts: 1` still makes
-  exactly one attempt.
+  The count is global, for the whole server pool: at 0 no server of the pool is dialled. Strictly a `[bc-break]` for
+  code that relied on the one attempt (see the upgrade note), flagged `[bugfix]` per the note above: it corrects a
+  documented contract. `maxReconnectAttempts: 1` still makes exactly one attempt.
+- `[bugfix]` A heartbeat that gives up on a server that stopped answering its PINGs announces the close once. With
+  reconnect off, and so at `maxReconnectAttempts: 0` once that ended the same way (#268), the previous tick's PONG read,
+  still waiting when the tick that gave up closed the socket, then failed with the EOF of that close and closed the
+  connection a second time: the listener heard `Closed` twice, first with `The server did not answer the last PING`,
+  then with `Socket closed by peer (EOF)`. It showed with a `pingIntervalSeconds` below 2 s, where that read waits as
+  long as the interval (50 ms at least), so the next tick comes while it still waits. A heartbeat PING write that fails
+  after another read has ended the connection does not close it again either. A heartbeat read or write that fails on
+  a connection opened since still ends that one.
 
 ### Testing & CI
 
 - `[docs]` New `ZeroReconnectAttemptsTest` (#268): over the scripted server, which accepts every dial, a failed read,
-  a failed publish, a failed SUB, missed pings, a lame duck notice naming another server, and a request's read meeting
-  a lost connection or a fatal `-ERR` with `waitForReconnect: false`, each with reconnect off and with reconnect on at
-  0 attempts, the same outcome expected: no dial, Closed, one `Closed` event with the cause. The 7 cases at 0 attempts
-  fail on 2.30.1; two more pin exactly one dial at 1 attempt, for a lost connection and for a lame duck failover.
+  a failed publish, a failed SUB, a lame duck notice naming another server, and a request's read meeting a lost
+  connection or a fatal `-ERR` with `waitForReconnect: false`, each with reconnect off and with reconnect on at 0
+  attempts, the same outcome expected: no dial, Closed, one `Closed` event with the cause. These 6 cases fail on 2.30.1
+  at 0 attempts; two more pin exactly one dial at 1 attempt, for a lost connection and for a lame duck failover. The
+  heartbeat cases, run the same two ways, keep the previous tick's PONG read waiting across the close made for missed
+  pings, run directly and on the heartbeat's own 20 ms timer, and stall a PING write across a close another read makes:
+  one `Closed`, with the first cause, and no dial once that read or write has failed. These three fail on 2.30.1 with
+  reconnect off too. Two more check that a heartbeat read or write that finds a connection opened since lost still
+  ends it.
   `NatsConnection_3MutationTest::testPerformRecoveryMakesAtLeastOneAttemptWhenMaxIsZero`, which pinned the one
   attempt, is now `testPerformRecoveryMakesNoAttemptWhenMaxIsZero`.
 
