@@ -10,9 +10,12 @@ namespace IDCT\NATS\Exception;
  *
  * It is a {@see JetStreamException}, so existing `catch (JetStreamException)` handlers still catch it;
  * catch this type specifically to detect "feature not available on this server version" distinctly.
- * Detection is usually reactive - derived from the server's own error response - except where a
- * late failure would leave partial state: atomic batch `commit()` pre-flights the INFO-advertised
- * server version so nothing is published to a server that cannot honor batch semantics (#152).
+ * A server older than a version-gated stream/consumer config field drops the field unless it runs in
+ * strict mode (the default from 2.12), so the stream and consumer create/update calls check the
+ * INFO-advertised server version before sending (nothing was sent) and the returned config after it
+ * (the server has already created or updated the stream or consumer without the feature), #266.
+ * Atomic batch `commit()` pre-flights the version the same way, so nothing is published to a server
+ * that cannot honor batch semantics (#152). A strict server's `unknown field` rejection maps here too.
  */
 final class UnsupportedFeatureException extends JetStreamException
 {

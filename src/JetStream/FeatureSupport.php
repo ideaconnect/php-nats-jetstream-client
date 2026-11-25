@@ -8,18 +8,29 @@ use IDCT\NATS\Exception\UnsupportedFeatureException;
 
 /**
  * Maps version-gated JetStream features (stream/consumer config fields) to the minimum NATS server
- * version that provides them, and turns a server "unknown field" rejection into a clear
+ * version that provides them, and turns a server that cannot honor such a field into a clear
  * {@see UnsupportedFeatureException}.
  *
- * This is reactive: the library does not probe the server version before each request. Instead, when a
- * request fails, the central API error path consults this map so the caller gets an actionable message
- * ("feature X requires NATS Y") instead of an opaque `unknown field "X"`.
+ * A server that predates a field does not, by default, reject it: nats-server rejects unknown JSON
+ * fields only in strict mode, which 2.10 does not have, 2.11 has only with `jetstream { strict: true }`,
+ * and 2.12 turns on by default. A default 2.10 or 2.11 server drops the field and creates or updates
+ * the stream or consumer without the feature (#266). The stream and consumer create/update calls of
+ * {@see JetStreamContext} therefore check twice:
+ *
+ * - before the request, {@see assertSupportedBy()} compares the fields the config asks for with the
+ *   connected server's INFO-advertised version, and fails before anything is sent;
+ * - after it, {@see assertHonored()} checks that the config the server returned still carries each of
+ *   those fields (an unparseable version, or a JetStream API answered by an older server than the
+ *   connected one), and fails naming the field the server dropped.
+ *
+ * A strict server's own `unknown field "X"` rejection is mapped as well ({@see unsupportedFromApiError()}).
  */
 final class FeatureSupport
 {
     /**
-     * Minimum NATS server version per version-gated config field / feature key. A modern server accepts
-     * the field; an older one rejects an unknown stream/consumer config field with `unknown field "X"`.
+     * Minimum NATS server version per version-gated config field / feature key. An older server does
+     * not know the field: by default it ignores it, and only in strict mode does it reject it with
+     * `unknown field "X"`.
      *
      * @var array<string,string>
      */
@@ -44,13 +55,112 @@ final class FeatureSupport
     }
 
     /**
+     * The version-gated fields a stream or consumer config asks for, in {@see REQUIREMENTS} order: each
+     * field the config sets to something other than its default. `null`, `false`, a number of 0 or
+     * less, `''`, `'none'` (the default priority policy) and an empty array ask for nothing, since a
+     * server without the field behaves as one that has it at that value.
+     *
+     * @param array<string,mixed> $config
+     * @return list<string>
+     */
+    public static function requestedFields(array $config): array
+    {
+        $requested = [];
+        foreach (array_keys(self::REQUIREMENTS) as $field) {
+            if (array_key_exists($field, $config) && self::asksForFeature($config[$field])) {
+                $requested[] = $field;
+            }
+        }
+
+        return $requested;
+    }
+
+    /**
+     * Pre-flight of a stream or consumer create/update (#266): throws an {@see UnsupportedFeatureException}
+     * for the first field of $config that asks for a feature the connected server's version is too old
+     * for, before anything is sent. The version is the INFO-advertised one, compared on its numeric
+     * `major.minor` prefix as the atomic batch pre-flight does ({@see BatchPublisher::commit()}); in a
+     * cluster it stands for the servers that will hold the stream. An unknown or unparseable version (a
+     * proxy, a custom build) passes, and {@see assertHonored()} checks the reply instead.
+     *
+     * @param array<string,mixed> $config The config about to be sent.
+     * @param string              $target What the request sets up, e.g. `stream` or `consumer`.
+     */
+    public static function assertSupportedBy(array $config, ?string $serverVersion, string $target): void
+    {
+        $version = self::versionComponents($serverVersion);
+        if ($version === null) {
+            return;
+        }
+
+        foreach (self::requestedFields($config) as $field) {
+            $required = self::REQUIREMENTS[$field];
+            if (!self::isOlderThan($version, $required)) {
+                continue;
+            }
+
+            throw new UnsupportedFeatureException(
+                $field,
+                $required,
+                $serverVersion,
+                sprintf(
+                    'The "%s" feature requires NATS server %s+, but the connected server reports %s (nothing was sent: an older server ignores the field and would set up the %s without it)',
+                    $field,
+                    $required,
+                    $serverVersion,
+                    $target,
+                ),
+            );
+        }
+    }
+
+    /**
+     * Reply check of a stream or consumer create/update (#266): throws an {@see UnsupportedFeatureException}
+     * for the first field of $requested that asks for a feature the config the server returned does not
+     * carry. The server ignored a field it does not know, so the stream or consumer exists without the
+     * feature by then; $outcome says what was done (e.g. `created stream "ORDERS"`). A reply without a
+     * config object is not checked.
+     *
+     * @param array<string,mixed> $requested The config that was sent.
+     * @param mixed               $returned  The `config` object of the server's reply.
+     */
+    public static function assertHonored(array $requested, mixed $returned, ?string $serverVersion, string $outcome): void
+    {
+        if (!is_array($returned)) {
+            return;
+        }
+
+        foreach (self::requestedFields($requested) as $field) {
+            if (array_key_exists($field, $returned) && self::asksForFeature($returned[$field])) {
+                continue;
+            }
+
+            $required = self::REQUIREMENTS[$field];
+
+            throw new UnsupportedFeatureException(
+                $field,
+                $required,
+                $serverVersion,
+                sprintf(
+                    'The "%s" feature requires NATS server %s+, and the server (connected server reports %s) ignored the field: it has %s without it',
+                    $field,
+                    $required,
+                    ($serverVersion !== null && $serverVersion !== '') ? $serverVersion : 'unknown',
+                    $outcome,
+                ),
+            );
+        }
+    }
+
+    /**
      * If a JetStream API error reports an unknown config field that maps to a known version-gated
      * feature, returns an {@see UnsupportedFeatureException} to throw; otherwise null (so the caller
      * raises the ordinary error).
      */
     public static function unsupportedFromApiError(string $description, int $code, ?string $serverVersion, ?int $errCode = null): ?UnsupportedFeatureException
     {
-        // A strict-JSON server rejects an unrecognized stream/consumer config field as: unknown field "X"
+        // A strict-JSON server (2.12+ by default, 2.11 with `jetstream { strict: true }`) rejects an
+        // unrecognized stream/consumer config field as: unknown field "X"
         if (preg_match('/unknown field ["\']([^"\']+)["\']/i', $description, $matches) !== 1) {
             return null;
         }
@@ -77,5 +187,53 @@ final class FeatureSupport
             $code,
             errCode: $errCode,
         );
+    }
+
+    /**
+     * Whether a config value asks for its feature: anything but the field's default.
+     */
+    private static function asksForFeature(mixed $value): bool
+    {
+        if (is_int($value) || is_float($value)) {
+            return $value > 0;
+        }
+
+        if (is_string($value)) {
+            return $value !== '' && $value !== 'none';
+        }
+
+        if (is_array($value)) {
+            return $value !== [];
+        }
+
+        return $value !== null && $value !== false;
+    }
+
+    /**
+     * Whether a parsed server version is below a `major.minor` requirement.
+     *
+     * @param array{int,int} $version
+     */
+    private static function isOlderThan(array $version, string $required): bool
+    {
+        [$major, $minor] = array_map('intval', explode('.', $required, 2));
+
+        return $version[0] < $major || ($version[0] === $major && $version[1] < $minor);
+    }
+
+    /**
+     * Numeric [major, minor] prefix of an INFO-advertised server version, or null when the string has
+     * no leading number (proxies and custom builds advertise arbitrary strings). Pre-release tags are
+     * ignored, as in {@see BatchPublisher}.
+     *
+     * @return array{int,int}|null
+     */
+    private static function versionComponents(?string $version): ?array
+    {
+        if ($version === null || preg_match('/^v?(\d+)(?:\.(\d+))?/', $version, $match) !== 1) {
+            return null;
+        }
+
+        return [(int) $match[1], (int) ($match[2] ?? 0)];
     }
 }

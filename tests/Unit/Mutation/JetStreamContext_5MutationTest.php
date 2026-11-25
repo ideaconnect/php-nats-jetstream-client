@@ -425,7 +425,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     public function testFilterSubjectsAreReindexedToArray(): void
     {
         // kills UnwrapArrayValues @ 1799
-        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC"}}';
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","filter_subjects":["orders.eu.>"]}}';
 
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $this->muxReplies($transport, [
@@ -451,7 +451,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     public function testApplyFilterSubjectsReturnsFullConfig(): void
     {
         // kills ArrayOneItem @ 1801
-        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC"}}';
+        $createPayload = '{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","filter_subjects":["orders.eu.>"]}}';
 
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $this->muxReplies($transport, [
