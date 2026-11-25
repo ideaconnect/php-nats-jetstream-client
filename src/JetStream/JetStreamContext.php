@@ -5335,6 +5335,13 @@ final class JetStreamContext
      * lacks it, or the reply carries no config ({@see FeatureSupport::assertSupportedBy()},
      * {@see FeatureSupport::assertHonored()}).
      *
+     * The pre-flight reads the INFO of the connection when the call is made, not in the step that writes
+     * the frame as {@see publishScheduled()} does (#267): a call made while the client fails over is
+     * checked against the version of the connection being replaced. The reply check covers the direction
+     * that matters, a failover to an older server, which takes the request, drops the field and has its
+     * reply refused (reporting its own version); a failover to a newer server is refused before the
+     * request, and the call can be made again once connected.
+     *
      * @param array<string,mixed> $config The full request body.
      */
     private function requestStreamChange(string $subject, string $name, array $config): StreamInfo

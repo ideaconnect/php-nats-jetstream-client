@@ -147,7 +147,10 @@ depends on the feature:
   field ask for nothing; a negative `subject_delete_marker_ttl` is invalid, not off, and does ask):
   - when the advertised version parses as older than the field's minimum, the call throws an
     `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) before
-    anything is sent (`... nothing was sent ...`);
+    anything is sent (`... nothing was sent ...`). The version is the one of the connection when the
+    call is made: a call made while the client fails over is checked against the server being
+    replaced, so a failover to a newer server can refuse it (make it again once connected), and a
+    failover to an older server is caught by the reply check below;
   - when the server's reply does not confirm a requested field (a version the client cannot parse,
     such as a proxy or a custom build, or a mixed-version cluster where an older server answers the
     JetStream API), the call throws an `UnsupportedFeatureException` naming the field. The request

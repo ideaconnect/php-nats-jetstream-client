@@ -91,6 +91,12 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   unparseable version, the case where that path still runs. `testScheduleFeaturesAreNotConfigFields` checks that
   the `schedule_*` keys are never read as config fields, by `requestedFields()`, the two checks or the mapping of a
   strict server's rejection.
+- `[docs]` New `GatedConfigFieldServerVersionOnReconnectTest`: over `tests/Support/ReconnectingTransport.php`, a
+  `createStream()` with `allow_msg_ttl` made while the client fails over from 2.11.0 to 2.10.29 passes the
+  pre-flight, goes to the 2.10.29 server once and is refused by the reply check, reporting 2.10.29; made while it
+  fails over from 2.10.29 to 2.11.0 it is refused by the pre-flight on the replaced connection's version, and no
+  create reaches either server. The pre-flight reads the INFO when the call is made, unlike `publishScheduled()`'s
+  check in the step that writes the frame (#267); the `requestStreamChange()` docblock and the README say so.
 
 ## [2.31.1] - 2026-11-25
 
