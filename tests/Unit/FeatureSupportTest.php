@@ -131,6 +131,40 @@ final class FeatureSupportTest extends TestCase
     }
 
     /**
+     * Verifies only config fields are read from a config: the schedule_* keys of REQUIREMENTS are
+     * scheduler features of publishScheduled(), not config fields, so a config carrying them asks for
+     * nothing, the pre-flight on a 2.10 server and the reply check let it through, and a strict
+     * server's "unknown field" rejection of one is not mapped to a 2.14 requirement. Every config field
+     * of REQUIREMENTS is still read (#266).
+     */
+    public function testScheduleFeaturesAreNotConfigFields(): void
+    {
+        $scheduleKeys = [
+            'schedule_every' => true,
+            'schedule_cron' => '0 0 * * * *',
+            'schedule_source' => 'orders.latest',
+            'schedule_time_zone' => 'Europe/Warsaw',
+            'schedule_rollup' => 'sub',
+        ];
+
+        self::assertSame([], FeatureSupport::requestedFields($scheduleKeys));
+        self::assertSame(['allow_msg_schedules'], FeatureSupport::requestedFields($scheduleKeys + ['allow_msg_schedules' => true]));
+        self::assertSame(
+            ['filter_subjects', 'allow_msg_ttl', 'subject_delete_marker_ttl', 'priority_groups', 'priority_policy', 'priority_timeout', 'allow_msg_schedules', 'allow_atomic', 'allow_msg_counter'],
+            FeatureSupport::requestedFields(array_fill_keys(array_keys(FeatureSupport::REQUIREMENTS), true)),
+        );
+
+        FeatureSupport::assertSupportedBy($scheduleKeys, '2.10.29', 'stream');
+        FeatureSupport::assertHonored($scheduleKeys, null, '2.10.29', 'stream "S"');
+        self::assertNull(FeatureSupport::unsupportedFromApiError('invalid JSON: json: unknown field "schedule_every"', 400, '2.12.0'));
+
+        // The registry still answers for them.
+        self::assertSame('2.14', FeatureSupport::requiredVersion('schedule_every'));
+        self::assertSame('2.14', FeatureSupport::REQUIREMENTS['schedule_rollup']);
+        $this->addToAssertionCount(2);
+    }
+
+    /**
      * Verifies a gated field set to its default asks for nothing, and every other value asks for its
      * feature, listed in REQUIREMENTS order (#266).
      */

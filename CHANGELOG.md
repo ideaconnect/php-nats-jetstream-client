@@ -19,7 +19,8 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Upgrade notes
 
-- A stream or consumer create/update that sets a version-gated field (`FeatureSupport::REQUIREMENTS`) against a
+- A stream or consumer create/update that sets a version-gated config field (the config fields of
+  `FeatureSupport::REQUIREMENTS`; `FeatureSupport::requestedFields()` lists the ones a config asks for) against a
   server too old for it now throws an `UnsupportedFeatureException` (#266). Code that set such a field "just in
   case" against a 2.10 or 2.11 server used to get the stream or consumer without the feature; set the field only
   when the servers support it, or catch the exception. Only the default turns a field off (`false`, `0`, `'none'`,
@@ -36,10 +37,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Fixed
 
-- `[bugfix]` A stream or consumer that sets a version-gated config field (`FeatureSupport::REQUIREMENTS`:
-  `allow_msg_ttl`, `subject_delete_marker_ttl`, `allow_msg_counter`, `allow_msg_schedules`, `allow_atomic`,
-  `filter_subjects`, `priority_groups`, `priority_policy`, `priority_timeout`) on a server older than the field now
-  fails with the documented `UnsupportedFeatureException` instead of succeeding without the feature (#266). The
+- `[bugfix]` A stream or consumer that sets a version-gated config field (the config fields of
+  `FeatureSupport::REQUIREMENTS`: `allow_msg_ttl`, `subject_delete_marker_ttl`, `allow_msg_counter`,
+  `allow_msg_schedules`, `allow_atomic`, `filter_subjects`, `priority_groups`, `priority_policy`, `priority_timeout`;
+  not the `schedule_*` scheduler features) on a server older than the field now fails with the documented
+  `UnsupportedFeatureException` instead of succeeding without the feature (#266). The
   README and `FeatureSupport` said such a server rejects the unknown field, but nats-server rejects unknown fields
   only in strict mode: 2.10 never does, 2.11 only with `jetstream { strict: true }`, and 2.12 is the first line where
   strict is the default. A default 2.10 or 2.11 server dropped the field, `createStream()` returned a normal
@@ -56,6 +58,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   leaves its state unknown. `createOrUpdateStream()` does not retry such a failure as an update. A strict server's
   own `unknown field` rejection is still mapped as before; on a 2.11 strict server the pre-flight now answers
   first, so that exception's code is 0 and its message the pre-flight's.
+- `[bugfix]` A strict server's `unknown field "schedule_every"` rejection (or one naming another `schedule_*` key) is
+  no longer turned into an `UnsupportedFeatureException` that asks for NATS 2.14 (#266). Since 2.31.0 these keys are
+  in `FeatureSupport::REQUIREMENTS` as scheduler features of `publishScheduled()`, not config fields: a strict server
+  rejects a stream or consumer config carrying one whatever its version, so the rejection is now the ordinary
+  `JetStreamException` with the server's description. `requiredVersion()` still reports 2.14 for these keys.
 
 ### Testing & CI
 
@@ -70,7 +77,9 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   fields at their defaults on 2.10, and a request for no gated feature that still accepts a reply without a
   config). The fake replies of seven existing tests that send a gated field now echo it, as nats-server does, and
   `testUnsupportedFeatureRaisesTypedExceptionWithServerVersion` maps a strict server's rejection behind an
-  unparseable version, the case where that path still runs.
+  unparseable version, the case where that path still runs. `testScheduleFeaturesAreNotConfigFields` checks that
+  the `schedule_*` keys are never read as config fields, by `requestedFields()`, the two checks or the mapping of a
+  strict server's rejection.
 
 ## [2.31.1] - 2026-11-25
 

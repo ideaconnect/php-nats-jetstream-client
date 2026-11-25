@@ -29,17 +29,24 @@ use IDCT\NATS\Exception\UnsupportedFeatureException;
 final class FeatureSupport
 {
     /**
-     * Minimum NATS server version per version-gated config field / feature key. An older server does
-     * not know the field: by default it ignores it, and only in strict mode does it reject it with
-     * `unknown field "X"`.
-     *
-     * The `schedule_*` keys are not config fields but scheduler features of `publishScheduled()` (ADR-51)
-     * that came after the first scheduler release: nats-server 2.12 accepts only `@at` schedules, and the
-     * recurring patterns and the source, time-zone and rollup headers arrived in 2.14.0 (#267).
+     * Minimum NATS server version per version-gated feature key: the stream/consumer config fields
+     * ({@see CONFIG_FIELDS}), then the scheduler features of `publishScheduled()`
+     * ({@see SCHEDULE_FEATURES}), which are not config fields. {@see requiredVersion()} answers for
+     * both; only the config fields are read from a config ({@see requestedFields()}) or mapped from a
+     * strict server's `unknown field "X"` rejection ({@see unsupportedFromApiError()}).
      *
      * @var array<string,string>
      */
-    public const REQUIREMENTS = [
+    public const REQUIREMENTS = self::CONFIG_FIELDS + self::SCHEDULE_FEATURES;
+
+    /**
+     * Minimum NATS server version per version-gated stream/consumer config field. An older server does
+     * not know the field: by default it ignores it, and only in strict mode does it reject it with
+     * `unknown field "X"`.
+     *
+     * @var array<string,string>
+     */
+    private const CONFIG_FIELDS = [
         'filter_subjects' => '2.10',
         'allow_msg_ttl' => '2.11',
         'subject_delete_marker_ttl' => '2.11',
@@ -49,6 +56,17 @@ final class FeatureSupport
         'allow_msg_schedules' => '2.12',
         'allow_atomic' => '2.12',
         'allow_msg_counter' => '2.12',
+    ];
+
+    /**
+     * Minimum NATS server version per scheduler feature of `publishScheduled()` (ADR-51) that came after
+     * the first scheduler release: nats-server 2.12 accepts only `@at` schedules, and the recurring
+     * patterns and the source, time-zone and rollup headers arrived in 2.14.0 (#267). These keys are
+     * not config fields: no stream or consumer config carries them.
+     *
+     * @var array<string,string>
+     */
+    private const SCHEDULE_FEATURES = [
         // An "@every <duration>" schedule.
         'schedule_every' => '2.14',
         // A 6-field cron schedule or a predefined alias (@hourly, @daily, ...).
@@ -84,12 +102,13 @@ final class FeatureSupport
 
     /**
      * The version-gated fields a stream or consumer config asks for, in {@see REQUIREMENTS} order: each
-     * field the config sets to something other than its default. `null`, `false`, `0`, `''`, `'none'`
-     * (the default priority policy) and an empty array ask for nothing, since a server without the
-     * field behaves as one that has it at that value. A negative number asks for nothing either,
-     * except for a field where it is invalid ({@see NEGATIVE_IS_A_REQUEST}): a negative
-     * `subject_delete_marker_ttl` is not the default, and a server without the field would drop it
-     * without a word.
+     * config field ({@see CONFIG_FIELDS}) the config sets to something other than its default. The
+     * `schedule_*` scheduler features are not config fields, so a config key of that name asks for
+     * nothing. `null`, `false`, `0`, `''`, `'none'` (the default priority policy) and an empty array
+     * ask for nothing, since a server without the field behaves as one that has it at that value. A
+     * negative number asks for nothing either, except for a field where it is invalid
+     * ({@see NEGATIVE_IS_A_REQUEST}): a negative `subject_delete_marker_ttl` is not the default, and a
+     * server without the field would drop it without a word.
      *
      * @param array<string,mixed> $config
      * @return list<string>
@@ -97,7 +116,7 @@ final class FeatureSupport
     public static function requestedFields(array $config): array
     {
         $requested = [];
-        foreach (array_keys(self::REQUIREMENTS) as $field) {
+        foreach (array_keys(self::CONFIG_FIELDS) as $field) {
             if (array_key_exists($field, $config) && self::asksForFeature($field, $config[$field])) {
                 $requested[] = $field;
             }
@@ -244,8 +263,9 @@ final class FeatureSupport
 
     /**
      * If a JetStream API error reports an unknown config field that maps to a known version-gated
-     * feature, returns an {@see UnsupportedFeatureException} to throw; otherwise null (so the caller
-     * raises the ordinary error).
+     * config field ({@see CONFIG_FIELDS}), returns an {@see UnsupportedFeatureException} to throw;
+     * otherwise null (so the caller raises the ordinary error). A `schedule_*` key is not a config
+     * field: a strict server rejects it in a config whatever its version, so it is not mapped.
      */
     public static function unsupportedFromApiError(string $description, int $code, ?string $serverVersion, ?int $errCode = null): ?UnsupportedFeatureException
     {
@@ -256,7 +276,7 @@ final class FeatureSupport
         }
 
         $field = $matches[1];
-        $required = self::requiredVersion($field);
+        $required = self::CONFIG_FIELDS[$field] ?? null;
         if ($required === null) {
             return null;
         }

@@ -270,8 +270,8 @@ final class JetStreamContext
     /**
      * Creates or updates a stream using a minimal configuration payload.
      *
-     * Version-gated `$options` ({@see FeatureSupport::REQUIREMENTS}, e.g. `allow_msg_ttl` 2.11+,
-     * `allow_msg_counter` 2.12+) set to anything but their default fail with an
+     * Version-gated `$options` (the config fields of {@see FeatureSupport::REQUIREMENTS}, e.g.
+     * `allow_msg_ttl` 2.11+, `allow_msg_counter` 2.12+) set to anything but their default fail with an
      * UnsupportedFeatureException against a server too old for them: before the request when the
      * connected server's version is known to be older, after it when the server's reply does not
      * confirm the field (the returned config lacks it, or the reply carries no config), since an older

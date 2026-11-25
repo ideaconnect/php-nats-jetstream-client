@@ -214,7 +214,7 @@ try {
 }
 ```
 
-You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`). `FeatureSupport::serverIsOlderThan($client->serverInfo()?->version, '2.14')` tells whether the connected server advertises an older version (an unparseable version is never older). `FeatureSupport::requestedFields($config)` lists the version-gated fields a stream or consumer config asks for.
+You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`). `FeatureSupport::serverIsOlderThan($client->serverInfo()?->version, '2.14')` tells whether the connected server advertises an older version (an unparseable version is never older). `FeatureSupport::requestedFields($config)` lists the version-gated fields a stream or consumer config asks for (config fields only: the `schedule_*` scheduler features are never among them).
 
 ## PHP Support Policy
 
