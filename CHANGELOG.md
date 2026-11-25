@@ -35,6 +35,17 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - On a 2.11 server in strict mode the pre-flight now answers before the server's own `unknown field` rejection, so
   that exception's code is 0 (was 400) and its message is the pre-flight's.
 
+### Added
+
+- `[feature]` `FeatureSupport::requestedFields($config)` lists the version-gated config fields a stream or consumer
+  config asks for, in `REQUIREMENTS` order (#266): each such field set to anything but its default (`null`, `false`,
+  `0`, `''`, `'none'`, `[]` and a missing field ask for nothing; a negative `subject_delete_marker_ttl` asks). These
+  are the fields the stream and consumer calls check, so code can tell before a request which fields, and with
+  `requiredVersion()` which server version, a config needs. Only config fields are listed, never the `schedule_*`
+  scheduler features. The two checks themselves, `FeatureSupport::assertSupportedBy()` and
+  `FeatureSupport::assertHonored()`, are public for `JetStreamContext` and marked `@internal`: not part of the
+  supported API.
+
 ### Fixed
 
 - `[bugfix]` A stream or consumer that sets a version-gated config field (the config fields of

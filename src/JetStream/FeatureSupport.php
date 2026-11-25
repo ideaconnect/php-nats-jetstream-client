@@ -134,6 +134,9 @@ final class FeatureSupport
      * stream. An unknown or unparseable version (a proxy, a custom build) is never older, so it passes,
      * and {@see assertHonored()} checks the reply instead.
      *
+     * @internal For the stream and consumer create/update calls of {@see JetStreamContext} (#266); not part of
+     *           the supported API.
+     *
      * @param array<string,mixed> $config The config about to be sent.
      * @param string              $target What the request sets up, e.g. `stream` or `consumer`.
      */
@@ -172,6 +175,9 @@ final class FeatureSupport
      *   feature, and the state of $target is unknown.
      *
      * A request that asks for no version-gated feature is not checked.
+     *
+     * @internal For the stream and consumer create/update calls of {@see JetStreamContext} (#266); not part of
+     *           the supported API.
      *
      * @param array<string,mixed> $requested The config that was sent.
      * @param mixed               $returned  The `config` object of the server's reply.
