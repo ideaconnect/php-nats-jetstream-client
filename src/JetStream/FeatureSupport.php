@@ -21,7 +21,8 @@ use IDCT\NATS\Exception\UnsupportedFeatureException;
  *   connected server's INFO-advertised version, and fails before anything is sent;
  * - after it, {@see assertHonored()} checks that the config the server returned still carries each of
  *   those fields (an unparseable version, or a JetStream API answered by an older server than the
- *   connected one), and fails naming the field the server dropped.
+ *   connected one), and fails naming the field the server dropped, or saying the reply carries no
+ *   config to confirm it.
  *
  * A strict server's own `unknown field "X"` rejection is mapped as well ({@see unsupportedFromApiError()}).
  */
@@ -47,6 +48,19 @@ final class FeatureSupport
     ];
 
     /**
+     * Numeric fields whose negative value is not "off" but invalid, so it asks for the feature: a server
+     * that knows the field rejects it (2.11.17: `subject delete marker TTL must not be negative`), and
+     * one that does not would drop it without a word. A negative `priority_timeout` is not listed: a
+     * 2.12+ server treats it as unset (0, or the two-minute default for a pinned client), so it asks
+     * for nothing, like 0.
+     *
+     * @var array<string,true>
+     */
+    private const NEGATIVE_IS_A_REQUEST = [
+        'subject_delete_marker_ttl' => true,
+    ];
+
+    /**
      * Returns the minimum NATS server version for a feature/config field, or null if not version-gated.
      */
     public static function requiredVersion(string $feature): ?string
@@ -56,9 +70,12 @@ final class FeatureSupport
 
     /**
      * The version-gated fields a stream or consumer config asks for, in {@see REQUIREMENTS} order: each
-     * field the config sets to something other than its default. `null`, `false`, a number of 0 or
-     * less, `''`, `'none'` (the default priority policy) and an empty array ask for nothing, since a
-     * server without the field behaves as one that has it at that value.
+     * field the config sets to something other than its default. `null`, `false`, `0`, `''`, `'none'`
+     * (the default priority policy) and an empty array ask for nothing, since a server without the
+     * field behaves as one that has it at that value. A negative number asks for nothing either,
+     * except for a field where it is invalid ({@see NEGATIVE_IS_A_REQUEST}): a negative
+     * `subject_delete_marker_ttl` is not the default, and a server without the field would drop it
+     * without a word.
      *
      * @param array<string,mixed> $config
      * @return list<string>
@@ -67,7 +84,7 @@ final class FeatureSupport
     {
         $requested = [];
         foreach (array_keys(self::REQUIREMENTS) as $field) {
-            if (array_key_exists($field, $config) && self::asksForFeature($config[$field])) {
+            if (array_key_exists($field, $config) && self::asksForFeature($field, $config[$field])) {
                 $requested[] = $field;
             }
         }
@@ -116,22 +133,50 @@ final class FeatureSupport
 
     /**
      * Reply check of a stream or consumer create/update (#266): throws an {@see UnsupportedFeatureException}
-     * for the first field of $requested that asks for a feature the config the server returned does not
-     * carry. The server ignored a field it does not know, so the stream or consumer exists without the
-     * feature by then; $outcome says what was done (e.g. `created stream "ORDERS"`). A reply without a
-     * config object is not checked.
+     * for the first field of $requested that asks for a feature the server's reply does not confirm. The
+     * request has been sent by then, so the message says only what the reply shows about $target:
+     *
+     * - the returned config lacks the field, or carries it at its default: the server ignored the field
+     *   and $target exists without the feature. That does not make it new: a create returns an existing
+     *   stream or consumer whose config matches the request, and dropping the field can make it match;
+     * - the reply carries no config object (missing, null, empty or a list): nothing confirms the
+     *   feature, and the state of $target is unknown.
+     *
+     * A request that asks for no version-gated feature is not checked.
      *
      * @param array<string,mixed> $requested The config that was sent.
      * @param mixed               $returned  The `config` object of the server's reply.
+     * @param string              $target    What the request set up, e.g. `stream "ORDERS"`.
      */
-    public static function assertHonored(array $requested, mixed $returned, ?string $serverVersion, string $outcome): void
+    public static function assertHonored(array $requested, mixed $returned, ?string $serverVersion, string $target): void
     {
-        if (!is_array($returned)) {
+        $fields = self::requestedFields($requested);
+        if ($fields === []) {
             return;
         }
 
-        foreach (self::requestedFields($requested) as $field) {
-            if (array_key_exists($field, $returned) && self::asksForFeature($returned[$field])) {
+        $reported = ($serverVersion !== null && $serverVersion !== '') ? $serverVersion : 'unknown';
+
+        if (!is_array($returned) || array_is_list($returned)) {
+            $field = $fields[0];
+            $required = self::REQUIREMENTS[$field];
+
+            throw new UnsupportedFeatureException(
+                $field,
+                $required,
+                $serverVersion,
+                sprintf(
+                    'The "%s" feature requires NATS server %s+, and the server\'s reply (connected server reports %s) carries no config to confirm it: the request was sent and the state of %s is unknown (inspect it before changing or deleting it)',
+                    $field,
+                    $required,
+                    $reported,
+                    $target,
+                ),
+            );
+        }
+
+        foreach ($fields as $field) {
+            if (array_key_exists($field, $returned) && self::asksForFeature($field, $returned[$field])) {
                 continue;
             }
 
@@ -142,11 +187,11 @@ final class FeatureSupport
                 $required,
                 $serverVersion,
                 sprintf(
-                    'The "%s" feature requires NATS server %s+, and the server (connected server reports %s) ignored the field: it has %s without it',
+                    'The "%s" feature requires NATS server %s+, and the server (connected server reports %s) ignored the field: %s exists without it (it may have existed before this request: inspect it before changing or deleting it)',
                     $field,
                     $required,
-                    ($serverVersion !== null && $serverVersion !== '') ? $serverVersion : 'unknown',
-                    $outcome,
+                    $reported,
+                    $target,
                 ),
             );
         }
@@ -190,12 +235,14 @@ final class FeatureSupport
     }
 
     /**
-     * Whether a config value asks for its feature: anything but the field's default.
+     * Whether a config value asks for its feature: anything but the field's default. A number asks when
+     * it is positive, or negative for a field where a negative value is invalid
+     * ({@see NEGATIVE_IS_A_REQUEST}).
      */
-    private static function asksForFeature(mixed $value): bool
+    private static function asksForFeature(string $field, mixed $value): bool
     {
         if (is_int($value) || is_float($value)) {
-            return $value > 0;
+            return $value > 0 || ($value < 0 && isset(self::NEGATIVE_IS_A_REQUEST[$field]));
         }
 
         if (is_string($value)) {

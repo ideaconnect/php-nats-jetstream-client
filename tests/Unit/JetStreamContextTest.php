@@ -2053,7 +2053,7 @@ final class JetStreamContextTest extends TestCase
     /**
      * Verifies that on a server whose version cannot be parsed, a stream create whose returned config
      * lacks a requested gated field fails with an UnsupportedFeatureException naming the field and saying
-     * the stream was created without it (#266).
+     * only what the reply shows: the stream exists without it, and may have existed before (#266).
      */
     public function testCreateStreamFailsWhenReplyDropsGatedFieldOnUnparseableVersion(): void
     {
@@ -2069,7 +2069,7 @@ final class JetStreamContextTest extends TestCase
             self::assertSame('2.12', $e->requiredVersion);
             self::assertSame('synadia-custom', $e->serverVersion);
             self::assertSame(
-                'The "allow_msg_counter" feature requires NATS server 2.12+, and the server (connected server reports synadia-custom) ignored the field: it has created stream "CNT" without it',
+                'The "allow_msg_counter" feature requires NATS server 2.12+, and the server (connected server reports synadia-custom) ignored the field: stream "CNT" exists without it (it may have existed before this request: inspect it before changing or deleting it)',
                 $e->getMessage(),
             );
         }
@@ -2078,8 +2078,7 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies the reply check covers addStream() and updateStream(), the latter saying the stream was
-     * updated (#266).
+     * Verifies the reply check covers addStream() and updateStream() (#266).
      */
     public function testAddAndUpdateStreamFailWhenReplyDropsGatedField(): void
     {
@@ -2093,7 +2092,7 @@ final class JetStreamContextTest extends TestCase
             self::fail('Expected UnsupportedFeatureException');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('allow_msg_ttl', $e->feature);
-            self::assertStringEndsWith('it has created stream "TTL" without it', $e->getMessage());
+            self::assertStringContainsString('ignored the field: stream "TTL" exists without it', $e->getMessage());
         }
 
         try {
@@ -2101,8 +2100,121 @@ final class JetStreamContextTest extends TestCase
             self::fail('Expected UnsupportedFeatureException');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('allow_msg_ttl', $e->feature);
-            self::assertStringEndsWith('it has updated stream "TTL" without it', $e->getMessage());
+            self::assertStringContainsString('ignored the field: stream "TTL" exists without it', $e->getMessage());
         }
+    }
+
+    /**
+     * @return iterable<string,array{string,\Closure(JetStreamContext):\Amp\Future<mixed>,string,string}>
+     */
+    public static function gatedRequestsAnsweredWithoutAConfig(): iterable
+    {
+        yield 'createStream, no config' => ['{"state":{"messages":0}}', static fn(JetStreamContext $js) => $js->createStream('CNT', ['cnt.>'], ['allow_msg_counter' => true]), 'allow_msg_counter', 'stream "CNT"'];
+        yield 'createStream, config null' => ['{"config":null,"state":{"messages":0}}', static fn(JetStreamContext $js) => $js->createStream('CNT', ['cnt.>'], ['allow_msg_counter' => true]), 'allow_msg_counter', 'stream "CNT"'];
+        yield 'addStream, empty config' => ['{"config":{}}', static fn(JetStreamContext $js) => $js->addStream(StreamConfiguration::create('TTL')->subjects('ttl.>')->set('allow_msg_ttl', true)), 'allow_msg_ttl', 'stream "TTL"'];
+        yield 'updateStream, no config' => ['{"state":{"messages":3}}', static fn(JetStreamContext $js) => $js->updateStream('TTL', ['subjects' => ['ttl.>'], 'subject_delete_marker_ttl' => -1]), 'subject_delete_marker_ttl', 'stream "TTL"'];
+        yield 'createConsumer, no config' => ['{"stream_name":"ORDERS","name":"PROC"}', static fn(JetStreamContext $js) => $js->createConsumer('ORDERS', 'PROC', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow']), 'priority_groups', 'consumer "PROC" on stream "ORDERS"'];
+        yield 'createConsumer, no name and no config' => ['{"stream_name":"ORDERS"}', static fn(JetStreamContext $js) => $js->createConsumer('ORDERS', 'PROC', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow']), 'priority_groups', 'consumer "PROC" on stream "ORDERS"'];
+        yield 'createEphemeralConsumer, no name and config null' => ['{"stream_name":"ORDERS","config":null}', static fn(JetStreamContext $js) => $js->createEphemeralConsumer('ORDERS', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), 'filter_subjects', 'the consumer on stream "ORDERS"'];
+    }
+
+    /**
+     * Verifies a stream or consumer call that asks for a gated feature fails when the server's reply
+     * carries no config (missing, null or empty): nothing confirms the feature, so the exception says
+     * the request was sent and the state of the stream or consumer is unknown, after exactly one API
+     * request (#266).
+     *
+     * @param \Closure(JetStreamContext):\Amp\Future<mixed> $call
+     */
+    #[DataProvider('gatedRequestsAnsweredWithoutAConfig')]
+    public function testGatedRequestFailsWhenReplyCarriesNoConfig(string $reply, \Closure $call, string $feature, string $target): void
+    {
+        [$js, $transport] = $this->jetStreamOnServer('synadia-custom', [$reply]);
+
+        try {
+            $call($js)->await();
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame($feature, $e->feature);
+            self::assertSame('synadia-custom', $e->serverVersion);
+            self::assertStringContainsString(
+                sprintf('carries no config to confirm it: the request was sent and the state of %s is unknown (inspect it before changing or deleting it)', $target),
+                $e->getMessage(),
+            );
+        }
+
+        self::assertCount(1, self::jsApiWrites($transport));
+    }
+
+    /**
+     * Verifies a negative subject_delete_marker_ttl is a request for the feature, not "markers off": a
+     * 2.10 server is refused before anything is sent, and an old responder behind an unparseable
+     * version that drops it fails the reply check. Zero still asks for nothing (#266).
+     */
+    public function testNegativeMarkerTtlCannotSilentlyPassAnOldServer(): void
+    {
+        [$js, $transport] = $this->jetStreamOnServer('2.10.29');
+
+        try {
+            $js->createStream('NEG', ['neg.>'], ['subject_delete_marker_ttl' => -1])->await();
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('subject_delete_marker_ttl', $e->feature);
+            self::assertStringContainsString('nothing was sent', $e->getMessage());
+        }
+        self::assertSame([], self::jsApiWrites($transport));
+
+        [$js, $transport] = $this->jetStreamOnServer('synadia-custom', [
+            '{"config":{"name":"NEG","subjects":["neg.>"]}}',
+            '{"config":{"name":"ZERO","subjects":["zero.>"]}}',
+        ]);
+
+        try {
+            $js->createStream('NEG', ['neg.>'], ['subject_delete_marker_ttl' => -1])->await();
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('subject_delete_marker_ttl', $e->feature);
+            self::assertStringContainsString('ignored the field: stream "NEG" exists without it', $e->getMessage());
+        }
+
+        $info = $js->createStream('ZERO', ['zero.>'], ['subject_delete_marker_ttl' => 0])->await();
+        self::assertSame('ZERO', $info->name);
+        self::assertCount(2, self::jsApiWrites($transport));
+    }
+
+    /**
+     * Verifies a negative priority_timeout is not a request for the feature: 2.12.15 answers an overflow
+     * consumer's -1 with a config that has no priority_timeout (it treats a negative value as unset),
+     * and that create succeeds. Guard against reading every negative number as a request (#266).
+     */
+    public function testNegativePriorityTimeoutIsNotARequestForTheFeature(): void
+    {
+        [$js, $transport] = $this->jetStreamOnServer('2.12.15', [
+            '{"stream_name":"ORDERS","name":"OVF","config":{"durable_name":"OVF","ack_policy":"explicit","priority_groups":["g1"],"priority_policy":"overflow"}}',
+        ]);
+
+        $consumer = $js->createConsumer('ORDERS', 'OVF', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow', 'priority_timeout' => -1])->await();
+
+        self::assertSame('OVF', $consumer->name);
+        self::assertCount(1, self::jsApiWrites($transport));
+    }
+
+    /**
+     * Verifies a request that asks for no gated feature still accepts a reply without a config, as
+     * before #266: the reply check only judges requests for a feature.
+     */
+    public function testRequestForNoGatedFeatureAcceptsReplyWithoutConfig(): void
+    {
+        [$js] = $this->jetStreamOnServer('synadia-custom', [
+            '{"state":{"messages":0}}',
+            '{"stream_name":"PLAIN","name":"PROC"}',
+        ]);
+
+        $info = $js->createStream('PLAIN', ['plain.>'], ['allow_msg_ttl' => false, 'subject_delete_marker_ttl' => 0])->await();
+        self::assertSame('', $info->name);
+
+        $consumer = $js->createConsumer('PLAIN', 'PROC', null, ['max_deliver' => 3, 'priority_timeout' => 0])->await();
+        self::assertSame('PROC', $consumer->name);
     }
 
     /**
@@ -2166,7 +2278,7 @@ final class JetStreamContextTest extends TestCase
             self::assertSame('priority_groups', $e->feature);
             self::assertSame('2.11', $e->requiredVersion);
             self::assertSame(
-                'The "priority_groups" feature requires NATS server 2.11+, and the server (connected server reports synadia-custom) ignored the field: it has created or updated consumer "PROC" on stream "ORDERS" without it',
+                'The "priority_groups" feature requires NATS server 2.11+, and the server (connected server reports synadia-custom) ignored the field: consumer "PROC" on stream "ORDERS" exists without it (it may have existed before this request: inspect it before changing or deleting it)',
                 $e->getMessage(),
             );
         }
@@ -2176,7 +2288,25 @@ final class JetStreamContextTest extends TestCase
             self::fail('Expected UnsupportedFeatureException');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('filter_subjects', $e->feature);
-            self::assertStringEndsWith('it has created or updated consumer "eph1" on stream "ORDERS" without it', $e->getMessage());
+            self::assertStringContainsString('ignored the field: consumer "eph1" on stream "ORDERS" exists without it', $e->getMessage());
+        }
+    }
+
+    /**
+     * Verifies the reply check names the consumer the reply describes, not the one the request asked
+     * for, when the two differ: the message reports what the reply shows (#266).
+     */
+    public function testConsumerReplyCheckNamesTheConsumerTheReplyDescribes(): void
+    {
+        [$js] = $this->jetStreamOnServer('synadia-custom', [
+            '{"stream_name":"ORDERS","name":"PROC-AS-STORED","config":{"durable_name":"PROC-AS-STORED","ack_policy":"explicit"}}',
+        ]);
+
+        try {
+            $js->createConsumer('ORDERS', 'PROC', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow'])->await();
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertStringContainsString('consumer "PROC-AS-STORED" on stream "ORDERS" exists without it', $e->getMessage());
         }
     }
 

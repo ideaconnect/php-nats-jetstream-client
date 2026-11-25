@@ -108,12 +108,26 @@ final class FeatureSupportTest extends TestCase
     }
 
     /**
+     * Verifies a negative subject_delete_marker_ttl asks for its feature: it is an invalid value, not
+     * "markers off", and a server without the field would drop it without a word; 0 still asks for
+     * nothing. A negative priority_timeout asks for nothing, like 0: 2.12.15 and 2.15.1 treat it as
+     * unset (#266).
+     */
+    public function testNegativeMarkerTtlAsksForItsFeature(): void
+    {
+        self::assertSame(['subject_delete_marker_ttl'], FeatureSupport::requestedFields(['subject_delete_marker_ttl' => -1]));
+        self::assertSame(['subject_delete_marker_ttl'], FeatureSupport::requestedFields(['subject_delete_marker_ttl' => -0.5]));
+        self::assertSame([], FeatureSupport::requestedFields(['subject_delete_marker_ttl' => 0, 'priority_timeout' => -1]));
+    }
+
+    /**
      * @return iterable<string,array{array<string,mixed>,string,string,string}>
      */
     public static function tooOldServers(): iterable
     {
         yield 'allow_msg_ttl on 2.10' => [['allow_msg_ttl' => true], '2.10.29', 'allow_msg_ttl', '2.11'];
         yield 'subject_delete_marker_ttl on 2.10' => [['subject_delete_marker_ttl' => 60_000_000_000], '2.10.29', 'subject_delete_marker_ttl', '2.11'];
+        yield 'negative subject_delete_marker_ttl on 2.10' => [['subject_delete_marker_ttl' => -1], '2.10.29', 'subject_delete_marker_ttl', '2.11'];
         yield 'allow_msg_counter on 2.11' => [['allow_msg_counter' => true], '2.11.17', 'allow_msg_counter', '2.12'];
         yield 'allow_msg_schedules on 2.11' => [['allow_msg_schedules' => true], '2.11.17', 'allow_msg_schedules', '2.12'];
         yield 'allow_atomic on 2.11' => [['allow_atomic' => true], '2.11.17', 'allow_atomic', '2.12'];
@@ -187,7 +201,8 @@ final class FeatureSupportTest extends TestCase
 
     /**
      * Verifies the reply check names the first requested field the returned config lacks or carries
-     * at its default, says what the server has already done, and reports the server's version (#266).
+     * at its default, says only what the reply shows (the target exists without the field, and may
+     * have existed before the request), and reports the server's version (#266).
      */
     public function testAssertHonoredRefusesConfigThatLacksRequestedField(): void
     {
@@ -196,54 +211,125 @@ final class FeatureSupportTest extends TestCase
                 ['allow_msg_ttl' => true, 'allow_msg_counter' => true],
                 ['name' => 'C', 'allow_msg_ttl' => true],
                 'synadia-custom',
-                'created stream "C"',
+                'stream "C"',
             );
             self::fail('Expected UnsupportedFeatureException');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('allow_msg_counter', $e->feature);
             self::assertSame('2.12', $e->requiredVersion);
             self::assertSame('synadia-custom', $e->serverVersion);
+            self::assertSame(0, $e->getCode());
             self::assertSame(
-                'The "allow_msg_counter" feature requires NATS server 2.12+, and the server (connected server reports synadia-custom) ignored the field: it has created stream "C" without it',
+                'The "allow_msg_counter" feature requires NATS server 2.12+, and the server (connected server reports synadia-custom) ignored the field: stream "C" exists without it (it may have existed before this request: inspect it before changing or deleting it)',
                 $e->getMessage(),
             );
         }
 
         try {
             // 2.11 encodes allow_msg_ttl without omitempty: a dropped request comes back as false.
-            FeatureSupport::assertHonored(['allow_msg_ttl' => true], ['allow_msg_ttl' => false], null, 'updated stream "T"');
+            FeatureSupport::assertHonored(['allow_msg_ttl' => true], ['name' => 'T', 'allow_msg_ttl' => false], null, 'stream "T"');
             self::fail('Expected UnsupportedFeatureException');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('allow_msg_ttl', $e->feature);
             self::assertNull($e->serverVersion);
             self::assertStringContainsString('(connected server reports unknown)', $e->getMessage());
-            self::assertStringEndsWith('it has updated stream "T" without it', $e->getMessage());
+            self::assertStringContainsString('stream "T" exists without it', $e->getMessage());
         }
 
         try {
-            FeatureSupport::assertHonored(['priority_groups' => ['g1']], [], '', 'created or updated consumer "P" on stream "S"');
+            FeatureSupport::assertHonored(['priority_groups' => ['g1']], ['durable_name' => 'P'], '', 'consumer "P" on stream "S"');
             self::fail('Expected UnsupportedFeatureException');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame('priority_groups', $e->feature);
             self::assertStringContainsString('(connected server reports unknown)', $e->getMessage());
+            self::assertStringContainsString('consumer "P" on stream "S" exists without it', $e->getMessage());
         }
     }
 
     /**
-     * Verifies the reply check passes a config that echoes every requested field, requests that ask
-     * for nothing, and a reply without a config object (#266).
+     * Verifies a negative subject_delete_marker_ttl cannot pass an old responder that dropped it: the
+     * reply check refuses a config without it, as for any other request for the feature (#266).
      */
-    public function testAssertHonoredPassesEchoedFieldsAndRepliesItCannotJudge(): void
+    public function testAssertHonoredRefusesDroppedNegativeMarkerTtl(): void
+    {
+        try {
+            FeatureSupport::assertHonored(['subject_delete_marker_ttl' => -1], ['name' => 'M'], 'synadia-custom', 'stream "M"');
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('subject_delete_marker_ttl', $e->feature);
+            self::assertSame('2.11', $e->requiredVersion);
+            self::assertStringContainsString('stream "M" exists without it', $e->getMessage());
+        }
+    }
+
+    /**
+     * @return iterable<string,array{mixed}>
+     */
+    public static function repliesWithoutAConfig(): iterable
+    {
+        // The call sites pass `$response['config'] ?? null`, so a missing config arrives as null.
+        yield 'missing or null' => [null];
+        yield 'empty object' => [[]];
+        yield 'a list' => [[true]];
+        yield 'a string' => ['allow_msg_counter'];
+        yield 'a number' => [1];
+    }
+
+    /**
+     * Verifies a reply without a config object fails a request for a gated feature: nothing confirms
+     * the feature, so the check says the request was sent and the target's state is unknown, instead
+     * of treating less evidence as success (#266).
+     */
+    #[DataProvider('repliesWithoutAConfig')]
+    public function testAssertHonoredRefusesReplyWithoutConfig(mixed $returned): void
+    {
+        try {
+            FeatureSupport::assertHonored(['allow_msg_ttl' => false, 'allow_msg_counter' => true], $returned, 'synadia-custom', 'stream "C"');
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('allow_msg_counter', $e->feature);
+            self::assertSame('2.12', $e->requiredVersion);
+            self::assertSame('synadia-custom', $e->serverVersion);
+            self::assertSame(0, $e->getCode());
+            self::assertSame(
+                'The "allow_msg_counter" feature requires NATS server 2.12+, and the server\'s reply (connected server reports synadia-custom) carries no config to confirm it: the request was sent and the state of stream "C" is unknown (inspect it before changing or deleting it)',
+                $e->getMessage(),
+            );
+        }
+
+        try {
+            FeatureSupport::assertHonored(['priority_groups' => ['g1']], $returned, null, 'the consumer on stream "S"');
+            self::fail('Expected UnsupportedFeatureException');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('priority_groups', $e->feature);
+            self::assertStringContainsString('(connected server reports unknown)', $e->getMessage());
+            self::assertStringContainsString('the state of the consumer on stream "S" is unknown', $e->getMessage());
+        }
+    }
+
+    /**
+     * Verifies the reply check passes a config that echoes every requested field, and leaves a request
+     * that asks for no gated feature alone, whatever the reply carries: among them a negative
+     * priority_timeout, which 2.12.15 drops from an overflow consumer's config (#266).
+     */
+    public function testAssertHonoredPassesEchoedFieldsAndRequestsForNothing(): void
     {
         FeatureSupport::assertHonored(
             ['allow_msg_ttl' => true, 'subject_delete_marker_ttl' => 60_000_000_000, 'filter_subjects' => ['a.>', 'b.>']],
             ['filter_subjects' => ['a.>', 'b.>'], 'allow_msg_ttl' => true, 'subject_delete_marker_ttl' => 60_000_000_000],
             '2.12.0',
-            'created stream "S"',
+            'stream "S"',
         );
-        FeatureSupport::assertHonored(['allow_msg_ttl' => false, 'max_msgs' => 5], [], '2.10.29', 'created stream "S"');
-        FeatureSupport::assertHonored(['allow_msg_counter' => true], null, 'synadia-custom', 'created stream "S"');
+        FeatureSupport::assertHonored(
+            ['priority_groups' => ['g1'], 'priority_policy' => 'overflow', 'priority_timeout' => -1],
+            ['durable_name' => 'P', 'priority_groups' => ['g1'], 'priority_policy' => 'overflow'],
+            '2.12.15',
+            'consumer "P" on stream "S"',
+        );
+        FeatureSupport::assertHonored(['allow_msg_ttl' => false, 'max_msgs' => 5], [], '2.10.29', 'stream "S"');
+        FeatureSupport::assertHonored(['subject_delete_marker_ttl' => 0, 'max_msgs' => 5], ['name' => 'S'], '2.10.29', 'stream "S"');
+        FeatureSupport::assertHonored(['max_msgs' => 5], null, 'synadia-custom', 'stream "S"');
 
-        $this->addToAssertionCount(3);
+        $this->addToAssertionCount(5);
     }
 }
