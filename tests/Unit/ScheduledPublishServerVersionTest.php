@@ -5,6 +5,8 @@ declare(strict_types=1);
 namespace IDCT\NATS\Tests\Unit;
 
 use Amp\Future;
+use Amp\TimeoutCancellation;
+use IDCT\NATS\Connection\Enum\ConnectionState;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
@@ -13,9 +15,12 @@ use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\Models\PubAck;
 use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Tests\Support\FakeTransport;
-use IDCT\NATS\Tests\Support\OwnsTestResources;
+use IDCT\NATS\Tests\Support\ReconnectingTransport;
+use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+
+use function Amp\delay;
 
 /**
  * publishScheduled() and the server version (#267). nats-server 2.12 accepts only "@at" schedules: it
@@ -24,18 +29,25 @@ use PHPUnit\Framework\TestCase;
  * Those arrived in 2.14.0, with Nats-Schedule-Time-Zone. A server advertising a parseable version
  * older than 2.14 therefore gets an UnsupportedFeatureException before anything is written; 2.14+ and
  * an unparseable version get the publish as before.
+ *
+ * The version is the one of the server the schedule is written to: a call made while a reconnect is under way, or
+ * whose first write fails and is retried after the recovery, is checked against the INFO of the session that takes
+ * the frame, not the one it replaces (over tests/Support/ReconnectingTransport.php, whose sessions greet with the
+ * versions under test).
  */
 final class ScheduledPublishServerVersionTest extends TestCase
 {
-    use OwnsTestResources;
+    use ReconnectScenarios;
 
     private const AT = '@at 2030-01-01T00:00:00Z';
+
+    private const ACK = '{"stream":"SCHED","seq":5,"duplicate":false}';
 
     protected function tearDown(): void
     {
         // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
         // closes what is left and checks that nothing goes on running into the next test.
-        $this->releaseOwnedResources();
+        $this->closeOpenedConnections();
     }
 
     /**
@@ -257,6 +269,125 @@ final class ScheduledPublishServerVersionTest extends TestCase
                 self::assertSame($message, $e->getMessage());
             }
         }
+    }
+
+    /**
+     * A call made while the client reconnects from a 2.14 server to a 2.12 one waits for the new connection and is
+     * refused there, by the 2.12 INFO of the session that would take the frame: no schedule reaches either server.
+     * The check used to read the INFO of the connection being replaced, so the 2.12 server got the schedule and
+     * could acknowledge it without its source or rollup.
+     *
+     * @param \Closure(JetStreamContext): Future<PubAck> $call
+     */
+    #[DataProvider('callsNeeding214')]
+    public function testACallWaitingForAReconnectToAnOlderServerIsRefusedThere(\Closure $call, string $feature): void
+    {
+        [$client, $transport, $recovery] = $this->reconnectingFromTo('2.14.0', '2.12.0');
+
+        $publish = $this->issuedWhileTheReconnectIsHeld($client, $transport, $call);
+
+        try {
+            $publish->await(new TimeoutCancellation(2));
+            self::fail('expected an UnsupportedFeatureException from the 2.12 session');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame($feature, $e->feature);
+            self::assertSame('2.14', $e->requiredVersion);
+            self::assertSame('2.12.0', $e->serverVersion);
+            self::assertStringEndsWith('(connected server 2.12.0; nothing was published)', $e->getMessage());
+        }
+
+        $recovery->await(new TimeoutCancellation(2));
+        self::assertSame(1, $transport->epoch(), 'the client reconnected once');
+        self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick'), 'no schedule reached either server');
+    }
+
+    /**
+     * A call made while the client reconnects from a 2.12 server to a 2.14 one is not refused by the 2.12 INFO the
+     * connection being replaced left behind: it waits for the new connection and is published there, once.
+     *
+     * @param \Closure(JetStreamContext): Future<PubAck> $call
+     */
+    #[DataProvider('callsNeeding214')]
+    public function testACallWaitingForAReconnectToANewerServerIsPublishedThere(\Closure $call): void
+    {
+        [$client, $transport, $recovery] = $this->reconnectingFromTo('2.12.0', '2.14.0');
+
+        $publish = $this->issuedWhileTheReconnectIsHeld($client, $transport, $call);
+        $ack = $publish->await(new TimeoutCancellation(2));
+
+        self::assertSame(5, $ack->seq);
+        $recovery->await(new TimeoutCancellation(2));
+        self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick', 0), 'nothing went to the 2.12 server');
+        self::assertCount(1, $transport->controlLinesStartingWith('HPUB schedules.tick', 1), 'one schedule went to the 2.14 server');
+    }
+
+    /**
+     * The check runs again before the retry that follows a failed write: a schedule whose write fails on the 2.14
+     * server it was checked against, and whose recovery lands on a 2.12 server, is refused there, before the retry
+     * writes it. The retry used to send it to the 2.12 server.
+     */
+    public function testARetryAfterAFailedWriteIsCheckedAgainstTheServerItWouldGoTo(): void
+    {
+        $transport = new ReconnectingTransport();
+        $transport->infoByEpoch = [0 => ReconnectingTransport::infoWithVersion('2.14.0'), 1 => ReconnectingTransport::infoWithVersion('2.12.0')];
+        $transport->responder = self::acking($transport);
+        $client = $this->connectClient($transport);
+        $transport->failNextWriteContaining('HPUB schedules.tick');
+
+        try {
+            $client->jetStream()->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, source: 'sensors.temperature')
+                ->await(new TimeoutCancellation(2));
+            self::fail('expected an UnsupportedFeatureException from the 2.12 session');
+        } catch (UnsupportedFeatureException $e) {
+            self::assertSame('schedule_source', $e->feature);
+            self::assertSame('2.12.0', $e->serverVersion);
+        }
+
+        self::assertSame(1, $transport->epoch(), 'the failed write reconnected once');
+        self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick'), 'the retry wrote nothing');
+    }
+
+    /**
+     * A client connected to a server advertising $from whose connection is lost, with the recovery's dial held: the
+     * session it reconnects to advertises $to. Returns the client, the transport and the recovery's reader.
+     *
+     * @return array{NatsClient, ReconnectingTransport, Future<int>}
+     */
+    private function reconnectingFromTo(string $from, string $to): array
+    {
+        $transport = new ReconnectingTransport();
+        $transport->infoByEpoch = [0 => ReconnectingTransport::infoWithVersion($from), 1 => ReconnectingTransport::infoWithVersion($to)];
+        $transport->responder = self::acking($transport);
+        $client = $this->connectClient($transport);
+        self::assertSame($from, $client->serverInfo()?->version);
+        $recovery = $this->startRecoveryHeldMidDial($client, $transport);
+
+        return [$client, $transport, $recovery];
+    }
+
+    /**
+     * Issues $call while the recovery's dial is held, gives it time to reach its wait for the new connection, then lets
+     * the dial go.
+     *
+     * @param \Closure(JetStreamContext): Future<PubAck> $call
+     * @return Future<PubAck>
+     */
+    private function issuedWhileTheReconnectIsHeld(NatsClient $client, ReconnectingTransport $transport, \Closure $call): Future
+    {
+        $publish = $call($client->jetStream());
+        $publish->ignore();
+        delay(0.05);
+        self::assertSame(ConnectionState::Connecting, $client->state(), 'the call was made while the client reconnected');
+        self::assertFalse($publish->isComplete(), 'the call waits for the new connection');
+        $transport->releaseDial();
+
+        return $publish;
+    }
+
+    /** Answers every request with {@see ACK} on its reply subject. */
+    private static function acking(ReconnectingTransport $transport): \Closure
+    {
+        return static fn(string $subject, ?string $replyTo): array => $replyTo === null ? [] : $transport->replyFrame($replyTo, self::ACK);
     }
 
     /**
