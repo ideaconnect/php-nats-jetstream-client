@@ -15,6 +15,37 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` `maxReconnectAttempts: 0` disables reconnect retries after a lost connection too, as its docblock says
+  (#268). The initial connect already read 0 as no attempt, but the recovery after a lost connection ran
+  `max(1, maxReconnectAttempts)` attempts: with `reconnectEnabled: true, maxReconnectAttempts: 0` a dropped connection
+  waited out one backoff, dialled once more and, when that dial succeeded, carried on with its subscriptions
+  replayed, possibly on another server of the pool, and a lame duck notice naming another server started a failover.
+  A worker that a supervisor should restart on connection loss, or a CLI tool that sets 0 to fail fast, got one more
+  dial after every drop instead. At 0 the connection now ends as it does with reconnect off, on every path that
+  notices the loss (a failed read or write, missed pings, a connection-ending frame): Closed, the `Closed` event
+  carrying the cause, and `Reconnect is disabled` with the cause as its previous for the operation that noticed it
+  (the server's own error for a fatal `-ERR`). A plain publish whose write fails then fails, as with reconnect off,
+  instead of resolving into a reconnect buffer; an operation whose read notices the loss with
+  `waitForReconnect: false` fails once the connection is Closed, with `Reconnect is disabled` rather than
+  `Connection is not open`. A lame duck notice starts no failover: the connection stays until the server closes it.
+  nats.go reads its `MaxReconnect = 0` the same way. Strictly a `[bc-break]` for code that relied on the one attempt,
+  flagged `[bugfix]` per the note above: it corrects a documented contract. `maxReconnectAttempts: 1` still makes
+  exactly one attempt.
+
+### Testing & CI
+
+- `[docs]` New `ZeroReconnectAttemptsTest` (#268): over the scripted server, which accepts every dial, a failed read,
+  a failed publish, a failed SUB, missed pings, a lame duck notice naming another server, and a request's read meeting
+  a lost connection or a fatal `-ERR` with `waitForReconnect: false`, each with reconnect off and with reconnect on at
+  0 attempts, the same outcome expected: no dial, Closed, one `Closed` event with the cause. The 7 cases at 0 attempts
+  fail on 2.30.1; two more pin exactly one dial at 1 attempt, for a lost connection and for a lame duck failover.
+  `NatsConnection_3MutationTest::testPerformRecoveryMakesAtLeastOneAttemptWhenMaxIsZero`, which pinned the one
+  attempt, is now `testPerformRecoveryMakesNoAttemptWhenMaxIsZero`.
+
 ## [2.30.1] - 2026-11-21
 
 ### Fixed

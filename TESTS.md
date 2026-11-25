@@ -1351,7 +1351,7 @@ The event-loop registration count of the no-spin tests (#184): `tests/Support/Lo
 - `testRecoveryClosesTransportBeforeReconnect` - Asserts recovery closes the dead transport before dialling again, with the reconnect succeeding and the connection returning to Open.
 - `testRetryInitialConnectClosesTransportBetweenAttempts` - Asserts retryInitialConnect closes the transport before each retry attempt, with the successful retry leaving the connection Open.
 - `testPerformRecoveryCancelsPingTimer` - Asserts recovery cancels the active ping watchdog before reconnecting, so a recovery that exhausts every attempt leaves no armed timer behind.
-- `testPerformRecoveryMakesAtLeastOneAttemptWhenMaxIsZero` - Asserts recovery reached from a read failure still makes exactly one reconnect attempt when maxReconnectAttempts is 0.
+- `testPerformRecoveryMakesNoAttemptWhenMaxIsZero` - With reconnect enabled and maxReconnectAttempts 0, asserts recovery reached from a read failure makes no reconnect attempt and closes the connection with "Reconnect is disabled", the read's error its previous (#268). It used to pin max(1, 0) = 1 attempt.
 - `testPerformRecoveryAttemptCountIsExactWhenMaxIsOne` - Asserts recovery makes exactly one reconnect attempt when maxReconnectAttempts is 1, never two.
 
 ### tests/Unit/Mutation/NatsConnection_4MutationTest.php
@@ -3455,6 +3455,18 @@ Operations issued while a reconnect is in flight wait for it within one budget (
 - `testHandshakeToleratesEmptyCompressionParameter` - Asserts empty permessage-deflate parameters (";;" from sloppy serialization) are skipped rather than treated as unacceptable, with the real parameters still validated and compression active afterwards.
 - `testConnectEstablishesTlsForWssAndReportsTlsActive` - Against a self-signed local TLS server followed by the scripted HTTP upgrade, asserts wss:// establishes TLS during connect() and tlsActive() reports true (the success arm complementing testConnectCallsSetupTlsOnWssAndThrowsWhenServerIsPlainTcp).
 - `testDialStoppedDuringTheRetryPauseEndsAtOnce` - The same for a ws:// dial to a refused port, with the stop placed the same way (#176): Amp's retry connector runs over `tests/Support/StopsDialOnRefusalConnector.php`, so the refused first attempt stops the dial at the start of the 2 s retry pause, however late timers fire. It fails with CancelledException less than 1 s after the stop, where a dial held by the pause ends about 2 s or more after it. The default connector is restored afterwards.
+
+### tests/Unit/ZeroReconnectAttemptsTest.php
+`maxReconnectAttempts: 0` disables reconnect retries, as documented (#268): over the scripted server in `tests/Support/ReconnectingTransport.php`, which accepts every dial, each case marked "both" runs with reconnect off and with reconnect on at 0 attempts and expects the same outcome. The recovery after a lost connection used to make max(1, 0) = 1 attempt, so at 0 attempts the connection came back; the 7 "both" cases fail on 2.30.1 for 0 attempts only.
+- `testAConnectionLostOnAFailedReadMakesNoDialAndClosesWithTheCause` - Both: a processIncoming() whose read hits EOF fails with "Reconnect is disabled", the EOF its previous; the connection is Closed, the listener hears Connected then one Closed carrying the EOF, and no second dial is made.
+- `testAPublishWhoseWriteFailsMakesNoDialAndFailsWithTheCause` - Both: a plain publish whose write fails is not handed to a reconnect buffer nothing would flush: it fails with "Reconnect is disabled", the write's error its previous, and the frame reaches no server.
+- `testASubscribeWhoseWriteFailsMakesNoDialAndFailsWithTheCause` - Both: the same for a subscribe whose SUB write fails.
+- `testMissedPingsMakeNoDialAndCloseWithTheCause` - Both: a heartbeat tick that finds the PING budget spent (maxPingsOut 1, run directly) closes the connection with no dial, the Closed event carrying "The server did not answer the last PING".
+- `testALameDuckNoticeNamingAnotherServerStartsNoFailover` - Both: a lame duck INFO naming another server emits DiscoveredServers and LameDuck and makes no failover dial; the connection stays Open on the leaving server until it closes the socket, and then ends Closed with no dial.
+- `testARequestWhoseReadFindsTheConnectionLostWithWaitingDisabledFailsOnceItIsClosed` - Both, with waitForReconnect off and a 0.2 s transport close: a request whose own read finds the connection lost waits for the recovery that closes it and fails with "Reconnect is disabled" once the listener has heard Closed, rather than at once with "Connection is not open".
+- `testARequestWhoseReadMeetsAFatalErrWithWaitingDisabledFailsOnceItIsClosed` - Both, the same set-up: a request whose read meets -ERR 'Stale Connection' fails with the server's error once the connection is Closed and announced.
+- `testWithOneAttemptALostConnectionIsDialledOnceAndReopens` - Reconnect on, 1 attempt: a lost connection is dialled exactly once more and reopens (Connected, Disconnected, Reconnected).
+- `testWithOneAttemptALameDuckNoticeFailsOverWithOneDial` - Reconnect on, 1 attempt: the lame duck INFO fails over with exactly one dial, onto the new connection.
 
 ## Integration Tests (`tests/Integration/`)
 
