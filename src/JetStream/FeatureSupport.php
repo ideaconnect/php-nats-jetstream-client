@@ -109,24 +109,20 @@ final class FeatureSupport
     /**
      * Pre-flight of a stream or consumer create/update (#266): throws an {@see UnsupportedFeatureException}
      * for the first field of $config that asks for a feature the connected server's version is too old
-     * for, before anything is sent. The version is the INFO-advertised one, compared on its numeric
-     * `major.minor` prefix as the atomic batch pre-flight does ({@see BatchPublisher::commit()}); in a
-     * cluster it stands for the servers that will hold the stream. An unknown or unparseable version (a
-     * proxy, a custom build) passes, and {@see assertHonored()} checks the reply instead.
+     * for, before anything is sent. The version is the INFO-advertised one, compared by
+     * {@see serverIsOlderThan()} on its numeric `major.minor` prefix as the atomic batch pre-flight does
+     * ({@see BatchPublisher::commit()}); in a cluster it stands for the servers that will hold the
+     * stream. An unknown or unparseable version (a proxy, a custom build) is never older, so it passes,
+     * and {@see assertHonored()} checks the reply instead.
      *
      * @param array<string,mixed> $config The config about to be sent.
      * @param string              $target What the request sets up, e.g. `stream` or `consumer`.
      */
     public static function assertSupportedBy(array $config, ?string $serverVersion, string $target): void
     {
-        $version = self::versionComponents($serverVersion);
-        if ($version === null) {
-            return;
-        }
-
         foreach (self::requestedFields($config) as $field) {
             $required = self::REQUIREMENTS[$field];
-            if (!self::isOlderThan($version, $required)) {
+            if (!self::serverIsOlderThan($serverVersion, $required)) {
                 continue;
             }
 
@@ -303,33 +299,5 @@ final class FeatureSupport
         }
 
         return $value !== null && $value !== false;
-    }
-
-    /**
-     * Whether a parsed server version is below a `major.minor` requirement.
-     *
-     * @param array{int,int} $version
-     */
-    private static function isOlderThan(array $version, string $required): bool
-    {
-        [$major, $minor] = array_map('intval', explode('.', $required));
-
-        return $version[0] < $major || ($version[0] === $major && $version[1] < $minor);
-    }
-
-    /**
-     * Numeric [major, minor] prefix of an INFO-advertised server version, or null when the string has
-     * no leading number (proxies and custom builds advertise arbitrary strings). Pre-release tags are
-     * ignored, as in {@see BatchPublisher}.
-     *
-     * @return array{int,int}|null
-     */
-    private static function versionComponents(?string $version): ?array
-    {
-        if ($version === null || preg_match('/^v?(\d+)(?:\.(\d+))?/', $version, $match) !== 1) {
-            return null;
-        }
-
-        return [(int) $match[1], (int) ($match[2] ?? 0)];
     }
 }
