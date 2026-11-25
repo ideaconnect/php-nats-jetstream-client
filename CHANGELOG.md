@@ -15,6 +15,51 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Added
+
+- `[feature]` `FeatureSupport::requiredVersion()` reports 2.14 for `schedule_every`, `schedule_cron`,
+  `schedule_source`, `schedule_time_zone` and `schedule_rollup`, and `FeatureSupport::serverIsOlderThan()` compares an
+  INFO-advertised version with a required `major.minor` the way the atomic batch pre-flight does (numeric prefix,
+  pre-release tags ignored, an unparseable version is never older).
+
+### Fixed
+
+- `[bugfix]` `publishScheduled()` refuses what the connected server cannot schedule, before anything is published
+  (#267). The README's version table and the docblocks said that `@every`, 6-field cron and the predefined aliases
+  need NATS 2.12, but the 2.12 scheduler runs only one-off `@at` schedules: the recurring patterns arrived in
+  nats-server 2.14.0, together with the `Nats-Schedule-Source`, `Nats-Schedule-Time-Zone` and `Nats-Schedule-Rollup`
+  headers (ADR-51 revisions 3 to 7). On 2.12 a `Schedule::every()`, `Schedule::cron()` or `Schedule::predefined()`
+  schedule failed with an opaque `JetStreamException (code 400): message schedules pattern is invalid`, and the
+  `source` and `rollup` arguments of an `@at` schedule were sent and dropped by the server without an error. When the
+  INFO-advertised server version parses as older than 2.14, these calls now throw an `UnsupportedFeatureException`
+  (a `JetStreamException`, so existing handlers still catch it) with the feature `schedule_every`, `schedule_cron`,
+  `schedule_source` or `schedule_rollup`, required version 2.14 and the server's version, and nothing is written. A
+  time zone is only accepted with a cron schedule, so the cron check covers it. A plain `@at` schedule (with or
+  without a TTL) is still published on 2.12, and every call is published as before on 2.14+ or when the version does
+  not parse (a proxy, a custom build). Behavior change: an `@at` schedule with `source` or `rollup` on a pre-2.14
+  server used to be stored without them and now fails; it never did what it asked for.
+
+### Testing & CI
+
+- New `ScheduledPublishServerVersionTest`: every call that needs 2.14 is refused before any write on servers
+  advertising 2.12.15, 2.12.0, v2.12.0, 2.11.4, 1.99.0, 2.13.9 and "2", and published on 2.14.0, 2.14.0-beta.1,
+  v2.14.10, 2.15.3, 3.0.0, an unparseable version or none; a plain `@at` schedule is still published on 2.12; a time
+  zone on an `@at` schedule and a malformed expression keep their own errors; the refusal messages are pinned.
+  `FeatureSupportTest` covers the new registry entries and the version comparison, and the integration test
+  `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders` checks the pre-flight against the live
+  fixture server. The unit tests that sent `@every`, cron or alias schedules to a fake 2.12 server now advertise
+  2.14, or send an `@at` schedule where the schedule kind was not the point.
+
+### Documentation
+
+- `[docs]` The README's scheduling note, the version table (one row for `@at` at 2.12, one for the recurring
+  schedules, `timeZone`, `source` and `rollup` at 2.14), the `publishScheduled()` docblock and the `Schedule`
+  builders' docblocks state the right versions. The `$rollup` docblock described `Nats-Schedule-Rollup: sub` as "one
+  active schedule per subject"; ADR-51 defines it as a rollup on the message the schedule produces (one schedule per
+  schedule subject is the scheduler's own rule), and the `$source` docblock now says what the header does.
+
 ## [2.30.1] - 2026-11-21
 
 ### Fixed
