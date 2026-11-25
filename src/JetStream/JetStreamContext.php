@@ -22,6 +22,7 @@ use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
@@ -2095,10 +2096,16 @@ final class JetStreamContext
      * @param bool $resendOnReconnect Whether the frame goes out once more when the connection it went out on is
      *        replaced before the reply came (#249): a publish() with a Nats-Msg-Id, under
      *        {@see \IDCT\NATS\Connection\NatsOptions::$resendJetStreamPublishOnReconnect}.
+     * @param (\Closure():void)|null $beforeWrite Called before each attempt to write the frame, once the connection it
+     *        goes out on is open (#267, {@see NatsClient::requestWithHeadersGuarded()}); needs $headers.
      */
-    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false): NatsMessage
+    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false, ?\Closure $beforeWrite = null): NatsMessage
     {
         try {
+            if ($beforeWrite !== null && $headers !== null) {
+                return $this->client->requestWithHeadersGuarded($subject, $payload, $headers, $beforeWrite)->await();
+            }
+
             if ($resendOnReconnect && $headers !== null) {
                 return $this->client->requestResendingOnReconnect($subject, $payload, $headers, self::isDuplicateMessageInProcess(...))->await();
             }
@@ -2238,18 +2245,33 @@ final class JetStreamContext
     }
 
     /**
-     * Publishes a scheduled message using the NATS 2.12 scheduler headers (ADR-51). The target stream
+     * Publishes a scheduled message using the NATS message scheduler headers (ADR-51). The target stream
      * must be created with `allow_msg_schedules` enabled (and `allow_msg_ttl` when a schedule TTL is
-     * used). The schedule expression may be `@at <RFC3339>`, `@every <duration>`, or a 6-field cron
-     * expression - build it with the {@see Schedule} helper.
+     * used). The schedule expression may be `@at <RFC3339>`, `@every <duration>`, a 6-field cron
+     * expression or a predefined alias (`@daily`, `@hourly`, ...) - build it with the {@see Schedule} helper.
      *
-     * Requires NATS server 2.12+.
+     * Requires NATS server 2.12+ for a one-off `@at` schedule (with an optional TTL), and 2.14+ for
+     * everything else: `@every`, cron and the predefined aliases, and the `$source`, `$timeZone` and
+     * `$rollup` headers. A 2.12 server rejects the recurring patterns with an opaque 400 ("message
+     * schedules pattern is invalid") and ignores the three headers without an error, so when the
+     * INFO-advertised server version parses as older than 2.14 this throws an
+     * {@see \IDCT\NATS\Exception\UnsupportedFeatureException} before anything is published (#267). An
+     * unparseable version (a proxy, a custom build) is published as is, and the server decides. The version is
+     * the one of the server that takes the frame: a call made while the client reconnects waits for the new
+     * connection and is checked against that server, and so is the retry after a failed write.
      *
-     * @param string      $schedule    Schedule expression (@at / @every / cron).
+     * @param string      $schedule    Schedule expression (@at / @every / cron / predefined alias).
      * @param string|null $scheduleTtl Optional Nats-Schedule-TTL (requires `allow_msg_ttl` on the stream).
-     * @param string|null $source      Optional Nats-Schedule-Source identifier.
-     * @param string|null $timeZone    Optional IANA time zone, valid for cron schedules only.
-     * @param bool        $rollup      When true, emits Nats-Schedule-Rollup: sub (one active schedule per subject).
+     * @param string|null $source      Optional Nats-Schedule-Source: a subject (no wildcards) whose last
+     *                                 message the schedule publishes to the target instead of $payload;
+     *                                 $payload and its headers are the fallback when that subject has no
+     *                                 message. The server wants it inside the stream and apart from the
+     *                                 target and the schedule subject (2.14+).
+     * @param string|null $timeZone    Optional IANA time zone, valid for cron schedules only (2.14+).
+     * @param bool        $rollup      When true, emits Nats-Schedule-Rollup: sub, which sets a subject
+     *                                 rollup on the message the schedule produces, so the target subject
+     *                                 keeps only that latest message (2.14+). One schedule per schedule
+     *                                 subject is the scheduler's own rule, with or without it.
      * @return Future<PubAck>
      */
     public function publishScheduled(
@@ -2270,6 +2292,16 @@ final class JetStreamContext
 
             if ($timeZone !== null && $timeZone !== '' && !$this->isCronSchedule($schedule)) {
                 throw new JetStreamException('Nats-Schedule-Time-Zone is only valid for cron schedule expressions');
+            }
+
+            $need = $this->scheduleNeedingANewerServer($schedule, $source, $rollup);
+            // What only a newer server schedules is checked against the server the frame goes to (#267): at once when
+            // the connection is open, so an older server gets nothing at all, and again in the step that writes the
+            // frame, against the INFO of the server that takes it - after a reconnect the call waited for, and before
+            // the retry that follows a failed write. A call made while the client reconnects is not judged by the
+            // INFO of the connection being replaced.
+            if ($need !== null && $this->client->state() === ConnectionState::Open) {
+                $this->refuseOnAnOlderServer($need);
             }
 
             $headers = [
@@ -2293,7 +2325,11 @@ final class JetStreamContext
                 $headers['Nats-Schedule-Rollup'] = 'sub';
             }
 
-            return $this->parsePublishAck($this->jsRequest($scheduleSubject, $payload, $headers));
+            $beforeWrite = $need === null ? null : function () use ($need): void {
+                $this->refuseOnAnOlderServer($need);
+            };
+
+            return $this->parsePublishAck($this->jsRequest($scheduleSubject, $payload, $headers, beforeWrite: $beforeWrite));
         });
     }
 
@@ -4581,6 +4617,60 @@ final class JetStreamContext
     private function isCronSchedule(string $schedule): bool
     {
         return preg_match('/^@(?:at|every)\s/', trim($schedule)) !== 1;
+    }
+
+    /**
+     * What of a scheduled publish needs a newer server than the first scheduler release (#267), or null when nothing
+     * does. nats-server 2.12 accepts only `@at` schedules (with Nats-Schedule-TTL and Nats-Schedule-Target): it
+     * rejects `@every`, cron and the predefined aliases with an opaque 400 ("message schedules pattern is invalid"),
+     * and it stores an `@at` schedule while dropping Nats-Schedule-Source and Nats-Schedule-Rollup without an error.
+     * A time zone needs no check of its own: it is only accepted with a cron-class schedule, which this already names.
+     * The pattern is named before the headers.
+     *
+     * @param string $schedule The trimmed expression, already validated.
+     * @return array{string, string, string}|null The feature, what needs it, and what older servers do with it.
+     */
+    private function scheduleNeedingANewerServer(string $schedule, ?string $source, bool $rollup): ?array
+    {
+        return match (true) {
+            $this->isCronSchedule($schedule) => ['schedule_cron', 'The schedule "' . $schedule . '"', 'accept only "@at" schedules'],
+            str_starts_with($schedule, '@every') => ['schedule_every', 'The schedule "' . $schedule . '"', 'accept only "@at" schedules'],
+            $source !== null && $source !== '' => ['schedule_source', 'Nats-Schedule-Source (the source argument)', 'ignore it'],
+            $rollup => ['schedule_rollup', 'Nats-Schedule-Rollup (the rollup argument)', 'ignore it'],
+            default => null,
+        };
+    }
+
+    /**
+     * Fails before anything reaches the wire when the server the client is connected to right now advertises a version
+     * that parses as older than the one $need asks for (#267). An unparseable version (a proxy, a custom build)
+     * publishes as before and leaves the decision to the server. Called by publishScheduled() at once on an open
+     * connection, and in the step that writes the frame, so it reads the INFO of the server that takes it. Does not
+     * suspend.
+     *
+     * @param array{string, string, string} $need What {@see scheduleNeedingANewerServer()} found.
+     */
+    private function refuseOnAnOlderServer(array $need): void
+    {
+        [$feature, $what, $olderServers] = $need;
+        $required = FeatureSupport::REQUIREMENTS[$feature];
+        $serverVersion = $this->serverVersion();
+        if (!FeatureSupport::serverIsOlderThan($serverVersion, $required)) {
+            return;
+        }
+
+        throw new UnsupportedFeatureException(
+            $feature,
+            $required,
+            $serverVersion,
+            sprintf(
+                '%s requires NATS server %s+; older servers %s (connected server %s; nothing was published)',
+                $what,
+                $required,
+                $olderServers,
+                $serverVersion,
+            ),
+        );
     }
 
     /**

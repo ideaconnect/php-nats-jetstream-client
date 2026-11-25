@@ -68,6 +68,15 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
 {
     public const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
+    /**
+     * The INFO a session greets with, by its epoch (0 for the first dial; see {@see epoch()}): another server behind
+     * the same address after a reconnect, an older or a newer nats-server (#267). A session not listed greets with
+     * {@see INFO}. Build an entry with {@see infoWithVersion()}.
+     *
+     * @var array<int, string>
+     */
+    public array $infoByEpoch = [];
+
     /** @var list<string> Every dial attempt, refused ones included. */
     public array $connectCalls = [];
 
@@ -219,6 +228,12 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
         $this->sessionEnd = new DeferredCancellation();
     }
 
+    /** The {@see INFO} line with another server version, for {@see $infoByEpoch}. */
+    public static function infoWithVersion(string $version): string
+    {
+        return str_replace('"version":"2.12.0"', '"version":' . json_encode($version, JSON_THROW_ON_ERROR), self::INFO);
+    }
+
     public function connect(string $dsn, int $timeoutMs, ?Cancellation $cancellation = null): Future
     {
         return async(function () use ($dsn, $timeoutMs, $cancellation): void {
@@ -254,7 +269,7 @@ final class ReconnectingTransport implements CancellableDialTransportInterface
             $this->sessionEnd = new DeferredCancellation();
             $this->acceptedSoFar = null;
             $this->epoch++;
-            $this->reads = [self::INFO];
+            $this->reads = [$this->infoByEpoch[$this->epoch] ?? self::INFO];
             $this->sessionLive = true;
             $this->silent = false;
             $this->handshakePending = true;
