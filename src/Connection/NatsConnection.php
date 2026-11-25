@@ -1163,7 +1163,8 @@ final class NatsConnection
         // A recovery nobody waits for fails on its own terms: the connection closes, and says so.
         $recovery->ignore();
 
-        if ($this->options->reconnectEnabled && !$this->options->waitForReconnect) {
+        // With reconnect off, or no attempt allowed (#268), the read waits for the recovery that closes the connection.
+        if ($this->reconnectsAfterLoss() && !$this->options->waitForReconnect) {
             return;
         }
 
@@ -1209,8 +1210,9 @@ final class NatsConnection
      *
      * @throws CancelledException When $waitCancellation fires first, or had fired by the time the read's error was
      *         reported; the read tells the deadline from the wake-up.
-     * @throws ConnectionException When the recovery gives up, or closes the connection because reconnect is off;
-     *         at once, with $readError as its previous, when waiting for a reconnect is disabled.
+     * @throws ConnectionException When the recovery gives up, or closes the connection because reconnect is off (or
+     *         allows no attempt, #268); at once, with $readError as its previous, when waiting for a reconnect is
+     *         disabled and there is a reconnect to wait for.
      */
     private function recoverAfterFailedOperationRead(int $generation, \Throwable $readError, ?Cancellation $waitCancellation): void
     {
@@ -1245,8 +1247,9 @@ final class NatsConnection
         // the PONG the recovery's first attempt fails or the closed connection, depending on how long the
         // transport's close took. Not when the operation's wait ended while the read's error was reported:
         // what it waits for came meanwhile, in a delivery still under way, or its deadline passed, and the read
-        // tells which from the cancellation.
-        if ($this->options->reconnectEnabled && !$this->options->waitForReconnect) {
+        // tells which from the cancellation. Reconnect off, or no attempt allowed (#268): the operation waits for the
+        // recovery, which closes the connection and fails with "Reconnect is disabled".
+        if ($this->reconnectsAfterLoss() && !$this->options->waitForReconnect) {
             $waitCancellation?->throwIfRequested();
 
             throw new ConnectionException('Connection is not open', 0, $readError);
@@ -1279,7 +1282,7 @@ final class NatsConnection
         } catch (\Throwable $e) {
             $this->abandonConnectIfClosed($e);
 
-            if ($this->options->reconnectEnabled && $this->options->maxReconnectAttempts > 0) {
+            if ($this->reconnectsAfterLoss()) {
                 // ownedByConnect: this hand-off runs inside the connect fiber while $connecting is
                 // still set - it is the one recovery request the in-flight-connect guard must admit.
                 $this->recoverConnection(ownedByConnect: true);
@@ -2603,20 +2606,20 @@ final class NatsConnection
                 // accepted there, while the recovery runs in a fiber of its own (#244). It used to run the whole
                 // recovery inline and send again afterwards: with the default policy the caller of a plain
                 // publish() or ack() waited about 100 s for a server that did not come back.
-                if ($beforeWrite === null && $this->options->reconnectEnabled) {
+                if ($beforeWrite === null && $this->reconnectsAfterLoss()) {
                     $this->handOverFailedPublish($frame, $generation, $closes, $writeError);
 
                     return;
                 }
 
                 // A guarded publish ({@see publishGuarded()}, #206), whose guard must run again after the replay,
-                // and a publish with reconnect off, whose recovery only closes the connection and fails it with
-                // "Reconnect is disabled" (#172), recover inline and send again on the fresh socket. The re-send
-                // stays AFTER recovery (it is NOT seeded into the flush): the post-recovery delivery drain runs
-                // before the retry write (#144), and the frame lands after any frames other publishers buffered
-                // during the outage, the buffered-before-direct ordering #148/#165 make global. Per-publisher
-                // order still holds: this publish() does not return until the frame is (re-)written, so the same
-                // publisher's next frame follows it on the wire.
+                // and a publish with reconnect off or no reconnect attempt allowed (#268), whose recovery only closes
+                // the connection and fails it with "Reconnect is disabled" (#172), recover inline and send again on
+                // the fresh socket. The re-send stays AFTER recovery (it is NOT seeded into the flush): the
+                // post-recovery delivery drain runs before the retry write (#144), and the frame lands after any
+                // frames other publishers buffered during the outage, the buffered-before-direct ordering #148/#165
+                // make global. Per-publisher order still holds: this publish() does not return until the frame is
+                // (re-)written, so the same publisher's next frame follows it on the wire.
                 $this->recoverConnection(failedGeneration: $generation, cause: $writeError);
 
                 // The connection may have moved on while the reconnect announced it: the listener, or what it
@@ -5146,6 +5149,39 @@ final class NatsConnection
     }
 
     /**
+     * @internal The request of a JetStream publishScheduled() whose schedule needs a newer server than the oldest one
+     *           with a scheduler (#267); not part of the supported API.
+     *
+     * Sends as {@see requestWithHeaders()} does, with the same single budget and reconnect wait, and calls $beforeWrite
+     * before each attempt to write the frame, in the step that writes it: once the connection the frame is to go out
+     * on is open, after any wait for a reconnect, and again before the retry that follows a failed write's recovery.
+     * {@see serverInfo()} is then the INFO of the server that takes the frame, not of the connection a reconnect
+     * replaced. The guard refuses the send by throwing: the request then fails with its exception, the frame not
+     * written. It is never written again after a later reconnect, as {@see requestResendingOnReconnect()} writes it.
+     *
+     * @param array<string,string> $headers
+     * @param \Closure():void $beforeWrite Must not suspend.
+     * @param Cancellation|null $cancellation Optional external cancellation token.
+     * @return Future<NatsMessage>
+     */
+    public function requestWithHeadersGuarded(
+        string $subject,
+        string $payload,
+        array $headers,
+        \Closure $beforeWrite,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future {
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
+
+        return async(function () use ($subject, $payload, $headers, $beforeWrite, $timeoutMs, $cancellation, $issuedDuringRecovery): NatsMessage {
+            $this->validateSubjectCached($subject);
+
+            return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation, $issuedDuringRecovery, beforeWrite: $beforeWrite);
+        });
+    }
+
+    /**
      * Establishes the per-connection mux request inbox on first use: one wildcard subscription
      * "<base>.*" whose handler ({@see dispatchMuxReply()}) routes every reply to its per-token waiter.
      * Idempotent - a no-op once established, so it survives reconnect (muxSid/muxBase are retained until
@@ -5777,6 +5813,8 @@ final class NatsConnection
      *
      * @param array<string,string>|null $headers
      * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
+     * @param (\Closure():void)|null $beforeWrite A guarded request's guard ({@see requestWithHeadersGuarded()}, #267),
+     *        called after the reply inbox check before each attempt, in the step that writes the frame.
      * @return int|null The {@see $connectionGeneration} of the connection the frame went out on.
      */
     private function publishRequestWithin(
@@ -5790,6 +5828,7 @@ final class NatsConnection
         bool $issuedDuringRecovery,
         int $closes,
         int $muxGeneration,
+        ?\Closure $beforeWrite = null,
     ): ?int {
         $frame = $this->encodePublishFrame($subject, $payload, $headers, $replyTo);
         try {
@@ -5797,7 +5836,10 @@ final class NatsConnection
                 static fn(): array => [$frame, $payload],
                 $budget,
                 $issuedDuringRecovery,
-                fn() => $this->throwUnlessMuxInstalled($closes, $muxGeneration, $lifetime),
+                function () use ($closes, $muxGeneration, $lifetime, $beforeWrite): void {
+                    $this->throwUnlessMuxInstalled($closes, $muxGeneration, $lifetime);
+                    $beforeWrite?->__invoke();
+                },
                 duringDrainDelivery: true,
             );
         } catch (CancelledException) {
@@ -5916,6 +5958,9 @@ final class NatsConnection
      * @param (\Closure(NatsMessage):bool)|null $isInterimReply Given for a request that writes its frame once more when
      *        the connection it went out on is replaced before its reply came ({@see requestResendingOnReconnect()},
      *        #249): whether a reply that comes once the frame went out again leaves the request waiting.
+     * @param (\Closure():void)|null $beforeWrite Given for a guarded request ({@see requestWithHeadersGuarded()}, #267):
+     *        called before each attempt to write the frame, in the step that writes it; what it throws ends the request.
+     *        Never given with $isInterimReply: the resend after a reconnect does not call it.
      */
     private function requestInternal(
         string $subject,
@@ -5925,6 +5970,7 @@ final class NatsConnection
         ?Cancellation $cancellation,
         bool $issuedDuringRecovery = false,
         ?\Closure $isInterimReply = null,
+        ?\Closure $beforeWrite = null,
     ): NatsMessage {
         $deadlineMs = $timeoutMs ?? $this->options->requestTimeoutMs;
         if ($deadlineMs <= 0) {
@@ -5985,7 +6031,7 @@ final class NatsConnection
         }, $replyArrived, $subject);
 
         try {
-            $sentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
+            $sentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration, $beforeWrite);
 
             while (true) {
                 // Completion is checked BEFORE the deadline so a reply delivered in the same tick the
@@ -6885,7 +6931,8 @@ final class NatsConnection
      */
     private function retryInitialConnect(): bool
     {
-        $maxAttempts = max(1, $this->options->maxReconnectAttempts);
+        // At least 1: performConnect() calls this only when maxReconnectAttempts is above 0.
+        $maxAttempts = $this->options->maxReconnectAttempts;
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
             // Cut short, like the reconnect backoff, by a disconnect() issued meanwhile - which then wins.
@@ -6938,6 +6985,19 @@ final class NatsConnection
     }
 
     /**
+     * Whether a lost connection is reconnected: reconnect is on and allows at least one attempt. With
+     * {@see NatsOptions::$maxReconnectAttempts} at 0 it is not, as that option documents: the connection then ends
+     * the way it does with reconnect off, on every path that notices the loss (a failed read or write, the
+     * heartbeat, a connection-ending frame), and a lame duck notice starts no failover (#268). The recovery used to
+     * make one attempt at 0 all the same, while the initial connect already read 0 as none. The option counts the
+     * attempts of the whole pool, not of each server: at 0 no server of the pool is dialled.
+     */
+    private function reconnectsAfterLoss(): bool
+    {
+        return $this->options->reconnectEnabled && $this->options->maxReconnectAttempts > 0;
+    }
+
+    /**
      * Performs the actual reconnect + subscription replay, serialized by {@see recoverConnection()}.
      *
      * @param \Throwable|null $cause The error that ended the connection, chained to "Reconnect is disabled".
@@ -6956,7 +7016,8 @@ final class NatsConnection
             return null;
         }
 
-        if (!$this->options->reconnectEnabled) {
+        // Reconnect off, or no attempt allowed (maxReconnectAttempts 0, #268): the connection ends here, the same way.
+        if (!$this->reconnectsAfterLoss()) {
             $this->markClosedForGood();
             // Terminal close: same invariant as the exhaustion/auth paths - release the socket and
             // runtime state so a later manual connect() starts clean (#127/#133, missed here: #146).
@@ -7003,7 +7064,8 @@ final class NatsConnection
             $this->emitEvent(ConnectionEvent::Disconnected);
         }
 
-        $maxAttempts = max(1, $this->options->maxReconnectAttempts);
+        // At least 1: with 0 the connection ended above, as documented, where it used to make one attempt (#268).
+        $maxAttempts = $this->options->maxReconnectAttempts;
         $lastError = null;
 
         for ($attempt = 1; $attempt <= $maxAttempts; $attempt++) {
@@ -8351,12 +8413,15 @@ final class NatsConnection
      * paths of pingTimerTick().
      *
      * @param \Throwable $cause Why the heartbeat gave up on the connection (#172).
+     * @param int $closes The {@see $terminalCloses} when the tick began.
      */
-    private function recoverFromHeartbeatFailure(int $generation, \Throwable $cause): void
+    private function recoverFromHeartbeatFailure(int $generation, int $closes, \Throwable $cause): void
     {
         // The failure came from a connection since replaced (the application closed and reopened it while
-        // this tick's PING write was suspended): the new connection, and its own heartbeat, are healthy.
-        if ($generation !== $this->connectionGeneration) {
+        // this tick's PING write was suspended): the new connection, and its own heartbeat, are healthy. Or
+        // from one that ended while the write was suspended, its end announced already: with reconnect off or
+        // no reconnect attempt allowed (#268), recovering closed it a second time and announced a second Closed.
+        if ($generation !== $this->connectionGeneration || $closes !== $this->terminalCloses) {
             return;
         }
 
@@ -8378,12 +8443,13 @@ final class NatsConnection
         }
 
         // The connection this tick checks: its PING write and PONG read suspend, and the application may
-        // close and reopen the connection meanwhile.
+        // close and reopen the connection meanwhile, or another fiber end it.
         $generation = $this->connectionGeneration;
+        $closes = $this->terminalCloses;
         $this->outstandingPings++;
 
         if ($this->outstandingPings > $this->options->maxPingsOut) {
-            $this->recoverFromHeartbeatFailure($generation, new ConnectionException(
+            $this->recoverFromHeartbeatFailure($generation, $closes, new ConnectionException(
                 match ($this->options->maxPingsOut) {
                     0 => 'The heartbeat allows no unanswered PING (maxPingsOut is 0)',
                     1 => 'The server did not answer the last PING',
@@ -8406,7 +8472,7 @@ final class NatsConnection
             // The PING never hit the wire: drop its slot so correlation stays aligned (the
             // recovery below clears the rest on the epoch change anyway).
             $this->discardPongSlot($slot);
-            $this->recoverFromHeartbeatFailure($generation, $pingError);
+            $this->recoverFromHeartbeatFailure($generation, $closes, $pingError);
 
             return;
         }
@@ -8519,6 +8585,15 @@ final class NatsConnection
         }
 
         if ($closedError !== null) {
+            // The connection this read was on ended while it waited, and its end was announced: typically the next
+            // tick gave up on an unanswered PING and closed the socket under this read, whose EOF is that close's own.
+            // Recovering here closed the connection a second time, with reconnect off or no reconnect attempt allowed
+            // (#268), and announced a second Closed carrying that EOF. A connection opened since is not this read's:
+            // its own reads report its loss.
+            if ($this->terminalCloses !== $closes) {
+                return;
+            }
+
             try {
                 $this->recoverConnection(failedGeneration: $generation, cause: $closedError);
             } catch (\Throwable) {
@@ -8808,8 +8883,9 @@ final class NatsConnection
 
             // The server is draining and will close this connection; proactively fail over to another
             // pool member now (rather than waiting for the eventual EOF) when reconnect is enabled and
-            // more than one endpoint is available to move to (#47).
-            if ($this->options->reconnectEnabled && count($this->serverPool()) > 1) {
+            // more than one endpoint is available to move to (#47). Not with maxReconnectAttempts 0, which
+            // allows no reconnect: the connection stays until the server closes it (#268).
+            if ($this->reconnectsAfterLoss() && count($this->serverPool()) > 1) {
                 // The read of one of the library's operations does not run it: it waits for it within the operation's
                 // own wait (#191). Not under close-intent, where the failover would not run: no mark is left for it.
                 if ($failOverInItsOwnFiber && !$this->closing) {

@@ -28,7 +28,9 @@ final class NatsOptions
       * @param int $requestTimeoutMs Default request/reply timeout in milliseconds when no per-request timeout is provided.
       * @param bool $reconnectEnabled Enables automatic reconnect and subscription replay after transport loss.
       * @param int $maxReconnectAttempts Maximum reconnect attempts before failing the connection lifecycle.
-      *                                  Set `0` to disable reconnect retries.
+      *                                  Set `0` to disable reconnect retries: a lost connection then makes no
+      *                                  attempt and closes as with {@see $reconnectEnabled} off, and a lame duck
+      *                                  notice starts no failover (#268).
       * @param int $reconnectDelayMs Base reconnect delay in milliseconds before exponential backoff and jitter.
       * @param int $reconnectMaxDelayMs Upper bound in milliseconds for reconnect backoff growth.
       * @param int $reconnectJitterMs Random jitter range in milliseconds added to reconnect delays to avoid thundering herd.

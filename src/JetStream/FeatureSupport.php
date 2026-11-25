@@ -33,6 +33,10 @@ final class FeatureSupport
      * not know the field: by default it ignores it, and only in strict mode does it reject it with
      * `unknown field "X"`.
      *
+     * The `schedule_*` keys are not config fields but scheduler features of `publishScheduled()` (ADR-51)
+     * that came after the first scheduler release: nats-server 2.12 accepts only `@at` schedules, and the
+     * recurring patterns and the source, time-zone and rollup headers arrived in 2.14.0 (#267).
+     *
      * @var array<string,string>
      */
     public const REQUIREMENTS = [
@@ -45,6 +49,16 @@ final class FeatureSupport
         'allow_msg_schedules' => '2.12',
         'allow_atomic' => '2.12',
         'allow_msg_counter' => '2.12',
+        // An "@every <duration>" schedule.
+        'schedule_every' => '2.14',
+        // A 6-field cron schedule or a predefined alias (@hourly, @daily, ...).
+        'schedule_cron' => '2.14',
+        // The Nats-Schedule-Source header.
+        'schedule_source' => '2.14',
+        // The Nats-Schedule-Time-Zone header (cron schedules only).
+        'schedule_time_zone' => '2.14',
+        // The Nats-Schedule-Rollup header.
+        'schedule_rollup' => '2.14',
     ];
 
     /**
@@ -195,6 +209,41 @@ final class FeatureSupport
                 ),
             );
         }
+    }
+
+    /**
+     * Whether an INFO-advertised server version is known to be older than $required (a "major.minor"
+     * such as "2.14"). Only the numeric major.minor prefix counts: pre-release tags are ignored (a
+     * 2.14.0-beta server counts as 2.14), matching the {@see BatchPublisher} comparison. A missing or
+     * unparseable version (proxies, custom builds) is never "older": the caller then leaves the
+     * decision to the server.
+     *
+     * @throws \InvalidArgumentException When $required has no numeric major.minor prefix.
+     */
+    public static function serverIsOlderThan(?string $serverVersion, string $required): bool
+    {
+        $minimum = self::majorMinor($required)
+            ?? throw new \InvalidArgumentException('Required version "' . $required . '" has no numeric major.minor prefix');
+        $server = self::majorMinor($serverVersion);
+        if ($server === null) {
+            return false;
+        }
+
+        return $server[0] < $minimum[0] || ($server[0] === $minimum[0] && $server[1] < $minimum[1]);
+    }
+
+    /**
+     * Numeric [major, minor] prefix of a version string, or null when it has no leading number.
+     *
+     * @return array{int,int}|null
+     */
+    private static function majorMinor(?string $version): ?array
+    {
+        if ($version === null || preg_match('/^v?(\d+)(?:\.(\d+))?/', $version, $match) !== 1) {
+            return null;
+        }
+
+        return [(int) $match[1], (int) ($match[2] ?? 0)];
     }
 
     /**

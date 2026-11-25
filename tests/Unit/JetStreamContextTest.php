@@ -2418,14 +2418,14 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies a recurring "@every" schedule emits the scheduler headers, including the optional
-     * source and rollup headers.
+     * source and rollup headers, on a server that has them (2.14+).
      */
     public function testPublishScheduledEveryWithSourceAndRollup(): void
     {
         $ackPayload = '{"stream":"SCHED","seq":9,"duplicate":false}';
 
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.14.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
         $this->muxReplies($transport, [
@@ -2452,14 +2452,14 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies a cron schedule emits the cron expression plus the time-zone header.
+     * Verifies a cron schedule emits the cron expression plus the time-zone header (2.14+ server).
      */
     public function testPublishScheduledCronWithTimeZone(): void
     {
         $ackPayload = '{"stream":"SCHED","seq":10,"duplicate":false}';
 
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.14.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
         $this->muxReplies($transport, [
@@ -2482,14 +2482,14 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies a predefined alias schedule (ADR-51) reaches the wire and may carry a time zone.
+     * Verifies a predefined alias schedule (ADR-51) reaches the wire and may carry a time zone (2.14+ server).
      */
     public function testPublishScheduledPredefinedAlias(): void
     {
         $ackPayload = '{"stream":"SCHED","seq":11,"duplicate":false}';
 
         $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.14.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
         $this->muxReplies($transport, [

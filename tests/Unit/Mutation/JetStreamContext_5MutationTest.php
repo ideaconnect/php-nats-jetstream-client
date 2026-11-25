@@ -31,6 +31,9 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
 
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
+    /** A server with the recurring schedules and their headers (#267): cron-class schedules are refused on 2.12. */
+    private const INFO_2_14 = 'INFO {"server_id":"S1","server_name":"n1","version":"2.14.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+
     /**
      * Post-#118 the request inbox is MUXED: request()/requestJson() no longer subscribe a fresh inbox
      * per call; instead ONE long-lived wildcard "<base>.*" (sid 1 for a request-first test) serves every
@@ -162,7 +165,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
         // kills UnwrapTrim @ 1658
         $ack = '{"stream":"SCHED","seq":1,"duplicate":false}';
 
-        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $transport = new FakeTransport([self::INFO_2_14, "PONG\r\n"]);
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
@@ -302,7 +305,7 @@ final class JetStreamContext_5MutationTest extends \PHPUnit\Framework\TestCase
     {
         // kills PregMatchRemoveCaret @ 1696
         $ack = '{"stream":"SCHED","seq":2,"duplicate":false}';
-        $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
+        $transport = new FakeTransport([self::INFO_2_14, "PONG\r\n"]);
         $this->muxReplies($transport, [
             sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($ack), $ack),
         ]);
