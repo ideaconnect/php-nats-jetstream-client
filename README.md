@@ -124,7 +124,7 @@ Current functionality includes:
 - Stream mirroring and sourcing configuration helpers (`StreamSource`)
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
 
-Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+).
+Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+). NATS 2.12 runs only one-off `@at` schedules (with an optional TTL); `@every`, cron, the aliases and the `source`, `timeZone` and `rollup` arguments of `publishScheduled()` need NATS 2.14+, and on an older server `publishScheduled()` throws an `UnsupportedFeatureException` before anything is published (see [NATS Server Version Requirements](#nats-server-version-requirements)).
 
 ## NATS Server Version Requirements
 
@@ -144,6 +144,16 @@ reactive - there is no per-request version probe - and depends on the feature:
   acknowledges the batch start as a plain publish; `commit()` detects that reply shape and throws
   an `UnsupportedFeatureException` (`... treated the batch as plain publishes`) instead of silently
   storing the batch message-by-message.
+- **Recurring schedules and the newer scheduler headers**: when the server's advertised version
+  parses as older than 2.14, `publishScheduled()` with an `@every`, cron or alias schedule, or with
+  `source` or `rollup`, fails fast before anything reaches the wire (`... nothing was published`), with
+  the feature `schedule_every`, `schedule_cron`, `schedule_source` or `schedule_rollup`. A 2.12 server
+  would answer the recurring schedules with an opaque 400 (`message schedules pattern is invalid`) and
+  store an `@at` schedule without its source or rollup. (A `timeZone` is only accepted with a cron
+  schedule, so the cron check covers it.) When the version cannot be parsed, the call is published as
+  is and the server decides. The version checked is the one of the server that takes the frame: a
+  call made while the client reconnects waits for the new connection and is checked against its
+  server's INFO, and the retry after a failed write is checked again.
 - **Other data-path calls** (for example `publish(..., ttl:)` or `directGetBatch()`) against a server
   or stream without the feature surface a plain `JetStreamException` built from the server's error
   response - or the server may silently ignore an unknown header - so consult the table before
@@ -157,7 +167,8 @@ reactive - there is no per-request version probe - and depends on the feature:
 | Subject delete markers | KV/Object Store `watch()`/`get()` (handled automatically) | 2.11 | `subject_delete_marker_ttl`, `Nats-Marker-Reason` |
 | Pull priority groups | `fetchBatch(..., $pull)`, `PullConsumerIterator::setGroup/setPriority/...`, `unpinConsumer()` | 2.11 (`prioritized` 2.12) | `priority_groups`/`priority_policy`, `Nats-Pin-Id` |
 | Batched / multi Direct Get | `directGetBatch()`, `directGetLastForSubjects()` | 2.11 | `allow_direct` |
-| Scheduled publishing (`@every`/cron/aliases) | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.12 | `allow_msg_schedules`, `Nats-Schedule*` |
+| Scheduled publishing, one-off `@at` | `publishScheduled()` (with `scheduleTtl`), `Schedule::at/atTimestamp` | 2.12 | `allow_msg_schedules`, `Nats-Schedule`, `Nats-Schedule-Target`, `Nats-Schedule-TTL` |
+| Scheduled publishing, recurring (`@every`/cron/aliases), `timeZone`, `source`, `rollup` | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.14 | `allow_msg_schedules`, `Nats-Schedule-Time-Zone`, `Nats-Schedule-Source`, `Nats-Schedule-Rollup` |
 | Atomic batch publish | `batch()` -> `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
 | Distributed counter CRDT | `incrementCounter()`, `counterValue()` | 2.12 | `allow_msg_counter`, `Nats-Incr` |
 | Publish de-duplication | `publish(..., msgId:)` | 2.2 | `Nats-Msg-Id` |
@@ -173,7 +184,7 @@ try {
 }
 ```
 
-You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`.
+You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`). `FeatureSupport::serverIsOlderThan($client->serverInfo()?->version, '2.14')` tells whether the connected server advertises an older version (an unparseable version is never older).
 
 ## PHP Support Policy
 
@@ -809,9 +820,9 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/scheduled-publish.php`](examples/scheduled-publish.php)
 
-_Verified by: [ScheduleTest](tests/Unit/ScheduleTest.php), [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testPublishScheduled`, `testPublishScheduledOmitsTtlWhenNotProvided`, `testPublishScheduledRejectsUnsupportedPattern`); [JetStreamIntegrationTest](tests/Integration/JetStreamIntegrationTest.php) (`testJetStreamScheduledPublish`, `testJetStreamScheduledPublishWithPerMessageTtl`, `testJetStreamScheduledPublishRejectsUnsupportedPatterns`); [features/jetstream-data/scheduled_publish.feature](features/jetstream-data/scheduled_publish.feature)._
+_Verified by: [ScheduleTest](tests/Unit/ScheduleTest.php), [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testPublishScheduled`, `testPublishScheduledOmitsTtlWhenNotProvided`, `testPublishScheduledRejectsUnsupportedPattern`), [ScheduledPublishServerVersionTest](tests/Unit/ScheduledPublishServerVersionTest.php); [JetStreamIntegrationTest](tests/Integration/JetStreamIntegrationTest.php) (`testJetStreamScheduledPublish`, `testJetStreamScheduledPublishWithPerMessageTtl`, `testJetStreamScheduledPublishRejectsUnsupportedPatterns`, `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders`); [features/jetstream-data/scheduled_publish.feature](features/jetstream-data/scheduled_publish.feature)._
 
-Prerequisites: the backing stream must be created with `allow_msg_schedules: true`, and because this example sets `scheduleTtl`, also `allow_msg_ttl: true`. The stream's subject list must cover both the schedule subject and the target subject. Without these flags the server rejects the publish with `message schedules is disabled` or `per-message TTL is disabled`.
+Prerequisites: the backing stream must be created with `allow_msg_schedules: true`, and because this example sets `scheduleTtl`, also `allow_msg_ttl: true`. The stream's subject list must cover both the schedule subject and the target subject. Without these flags the server rejects the publish with `message schedules is disabled` or `per-message TTL is disabled`. This one-off `@at` schedule runs on NATS 2.12+; a recurring one (`Schedule::every()`, `cron()`, `predefined()`) and the `source`, `timeZone` and `rollup` arguments need NATS 2.14+.
 
 ```php
 <?php

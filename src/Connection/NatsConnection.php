@@ -5146,6 +5146,39 @@ final class NatsConnection
     }
 
     /**
+     * @internal The request of a JetStream publishScheduled() whose schedule needs a newer server than the oldest one
+     *           with a scheduler (#267); not part of the supported API.
+     *
+     * Sends as {@see requestWithHeaders()} does, with the same single budget and reconnect wait, and calls $beforeWrite
+     * before each attempt to write the frame, in the step that writes it: once the connection the frame is to go out
+     * on is open, after any wait for a reconnect, and again before the retry that follows a failed write's recovery.
+     * {@see serverInfo()} is then the INFO of the server that takes the frame, not of the connection a reconnect
+     * replaced. The guard refuses the send by throwing: the request then fails with its exception, the frame not
+     * written. It is never written again after a later reconnect, as {@see requestResendingOnReconnect()} writes it.
+     *
+     * @param array<string,string> $headers
+     * @param \Closure():void $beforeWrite Must not suspend.
+     * @param Cancellation|null $cancellation Optional external cancellation token.
+     * @return Future<NatsMessage>
+     */
+    public function requestWithHeadersGuarded(
+        string $subject,
+        string $payload,
+        array $headers,
+        \Closure $beforeWrite,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future {
+        $issuedDuringRecovery = $this->operationIsIssuedDuringRecovery();
+
+        return async(function () use ($subject, $payload, $headers, $beforeWrite, $timeoutMs, $cancellation, $issuedDuringRecovery): NatsMessage {
+            $this->validateSubjectCached($subject);
+
+            return $this->requestInternal($subject, $payload, $headers, $timeoutMs, $cancellation, $issuedDuringRecovery, beforeWrite: $beforeWrite);
+        });
+    }
+
+    /**
      * Establishes the per-connection mux request inbox on first use: one wildcard subscription
      * "<base>.*" whose handler ({@see dispatchMuxReply()}) routes every reply to its per-token waiter.
      * Idempotent - a no-op once established, so it survives reconnect (muxSid/muxBase are retained until
@@ -5777,6 +5810,8 @@ final class NatsConnection
      *
      * @param array<string,string>|null $headers
      * @param bool $issuedDuringRecovery Whether the operation was issued inside the active recovery fiber.
+     * @param (\Closure():void)|null $beforeWrite A guarded request's guard ({@see requestWithHeadersGuarded()}, #267),
+     *        called after the reply inbox check before each attempt, in the step that writes the frame.
      * @return int|null The {@see $connectionGeneration} of the connection the frame went out on.
      */
     private function publishRequestWithin(
@@ -5790,6 +5825,7 @@ final class NatsConnection
         bool $issuedDuringRecovery,
         int $closes,
         int $muxGeneration,
+        ?\Closure $beforeWrite = null,
     ): ?int {
         $frame = $this->encodePublishFrame($subject, $payload, $headers, $replyTo);
         try {
@@ -5797,7 +5833,10 @@ final class NatsConnection
                 static fn(): array => [$frame, $payload],
                 $budget,
                 $issuedDuringRecovery,
-                fn() => $this->throwUnlessMuxInstalled($closes, $muxGeneration, $lifetime),
+                function () use ($closes, $muxGeneration, $lifetime, $beforeWrite): void {
+                    $this->throwUnlessMuxInstalled($closes, $muxGeneration, $lifetime);
+                    $beforeWrite?->__invoke();
+                },
                 duringDrainDelivery: true,
             );
         } catch (CancelledException) {
@@ -5916,6 +5955,9 @@ final class NatsConnection
      * @param (\Closure(NatsMessage):bool)|null $isInterimReply Given for a request that writes its frame once more when
      *        the connection it went out on is replaced before its reply came ({@see requestResendingOnReconnect()},
      *        #249): whether a reply that comes once the frame went out again leaves the request waiting.
+     * @param (\Closure():void)|null $beforeWrite Given for a guarded request ({@see requestWithHeadersGuarded()}, #267):
+     *        called before each attempt to write the frame, in the step that writes it; what it throws ends the request.
+     *        Never given with $isInterimReply: the resend after a reconnect does not call it.
      */
     private function requestInternal(
         string $subject,
@@ -5925,6 +5967,7 @@ final class NatsConnection
         ?Cancellation $cancellation,
         bool $issuedDuringRecovery = false,
         ?\Closure $isInterimReply = null,
+        ?\Closure $beforeWrite = null,
     ): NatsMessage {
         $deadlineMs = $timeoutMs ?? $this->options->requestTimeoutMs;
         if ($deadlineMs <= 0) {
@@ -5985,7 +6028,7 @@ final class NatsConnection
         }, $replyArrived, $subject);
 
         try {
-            $sentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration);
+            $sentOn = $this->publishRequestWithin($subject, $payload, $headers, $replyTo, $waitCancellation, $cancellation, $lifetime, $issuedDuringRecovery, $closes, $muxGeneration, $beforeWrite);
 
             while (true) {
                 // Completion is checked BEFORE the deadline so a reply delivered in the same tick the

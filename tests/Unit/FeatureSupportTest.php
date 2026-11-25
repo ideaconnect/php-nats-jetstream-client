@@ -7,6 +7,7 @@ namespace IDCT\NATS\Tests\Unit;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\FeatureSupport;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 final class FeatureSupportTest extends TestCase
@@ -70,5 +71,62 @@ final class FeatureSupportTest extends TestCase
         self::assertInstanceOf(UnsupportedFeatureException::class, $e);
         self::assertNull($e->serverVersion);
         self::assertStringContainsString('reports unknown', $e->getMessage());
+    }
+
+    /**
+     * Verifies the scheduler features that came after the first scheduler release report 2.14 (#267).
+     */
+    public function testRequiredVersionOfTheScheduleFeatures(): void
+    {
+        self::assertSame('2.12', FeatureSupport::requiredVersion('allow_msg_schedules'));
+
+        foreach (['schedule_every', 'schedule_cron', 'schedule_source', 'schedule_time_zone', 'schedule_rollup'] as $feature) {
+            self::assertSame('2.14', FeatureSupport::requiredVersion($feature), $feature);
+        }
+    }
+
+    /**
+     * @return iterable<string, array{string|null, string, bool}>
+     */
+    public static function serverVersions(): iterable
+    {
+        yield 'older minor' => ['2.12.15', '2.14', true];
+        yield 'one minor below' => ['2.13.9', '2.14', true];
+        yield 'same minor' => ['2.14.0', '2.14', false];
+        yield 'same minor, later patch' => ['2.14.10', '2.14', false];
+        yield 'same minor, pre-release' => ['2.14.0-beta.1', '2.14', false];
+        yield 'newer minor' => ['2.15.3', '2.14', false];
+        yield 'older major, higher minor' => ['1.99.0', '2.14', true];
+        yield 'newer major, lower minor' => ['3.0.0', '2.14', false];
+        yield 'v prefix, older' => ['v2.12.0', '2.14', true];
+        yield 'v prefix, same' => ['v2.14.0', '2.14', false];
+        yield 'major only, older' => ['2', '2.1', true];
+        yield 'major only, same' => ['2', '2.0', false];
+        yield 'requirement without minor' => ['1.9.0', '2', true];
+        yield 'not starting with a number' => ['release-2.12.0', '2.14', false];
+        yield 'custom build' => ['custom-build', '2.14', false];
+        yield 'empty' => ['', '2.14', false];
+        yield 'none' => [null, '2.14', false];
+    }
+
+    /**
+     * Verifies the version comparison reads the numeric major.minor prefix, ignores pre-release tags and never
+     * calls an unparseable or missing version older.
+     */
+    #[DataProvider('serverVersions')]
+    public function testServerIsOlderThan(?string $serverVersion, string $required, bool $older): void
+    {
+        self::assertSame($older, FeatureSupport::serverIsOlderThan($serverVersion, $required));
+    }
+
+    /**
+     * Verifies a requirement without a numeric prefix is a programming error, not a silent "not older".
+     */
+    public function testServerIsOlderThanRejectsAnUnparseableRequirement(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Required version "latest" has no numeric major.minor prefix');
+
+        FeatureSupport::serverIsOlderThan('2.12.0', 'latest');
     }
 }

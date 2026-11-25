@@ -9,12 +9,17 @@ use DateTimeInterface;
 use DateTimeZone;
 
 /**
- * Helper for building scheduler expressions accepted by current NATS behavior.
+ * Helper for building scheduler expressions (ADR-51) for {@see JetStreamContext::publishScheduled()}.
+ *
+ * Server versions: a one-off `@at` schedule ({@see at()}, {@see atTimestamp()}) needs NATS server 2.12+;
+ * the recurring forms ({@see every()}, {@see cron()}, {@see predefined()}) need 2.14+. On an older server
+ * `publishScheduled()` throws an {@see \IDCT\NATS\Exception\UnsupportedFeatureException} for them before
+ * anything is published (#267).
  */
 final class Schedule
 {
     /**
-     * Formats a schedule expression accepted by current NATS scheduler behavior.
+     * Formats a one-off "@at <RFC3339 UTC>" schedule expression. Needs NATS server 2.12+.
      */
     public static function at(DateTimeInterface $when): string
     {
@@ -25,7 +30,7 @@ final class Schedule
     }
 
     /**
-     * Formats a schedule expression from a Unix timestamp.
+     * Formats a one-off "@at" schedule expression from a Unix timestamp. Needs NATS server 2.12+.
      */
     public static function atTimestamp(int $timestamp): string
     {
@@ -38,7 +43,8 @@ final class Schedule
     /**
      * Formats a recurring "@every <interval>" schedule. Accepts an integer number of seconds or a
      * Go-style duration string (e.g. "1h", "30m", "1h30m"). The server applies the schedule starting
-     * from the publish time and re-delivers on each interval.
+     * from the publish time and re-delivers on each interval; it rejects intervals shorter than 1s.
+     * Needs NATS server 2.14+ (2.12 accepts only "@at").
      */
     public static function every(int|string $interval): string
     {
@@ -61,7 +67,8 @@ final class Schedule
     /**
      * Validates and returns a 6-field (seconds-resolution) cron schedule expression as accepted by
      * the NATS scheduler, e.g. "0 0 * * * *" (every hour on the hour). The fields are
-     * second minute hour day-of-month month day-of-week.
+     * second minute hour day-of-month month day-of-week. Needs NATS server 2.14+ (2.12 accepts only
+     * "@at"), as does the time zone a cron schedule may carry.
      */
     public static function cron(string $expression): string
     {
@@ -80,7 +87,7 @@ final class Schedule
     /**
      * Returns one of the predefined NATS scheduler aliases (ADR-51): hourly, daily, weekly, monthly,
      * yearly, annually, or midnight (with or without a leading "@"). These are cron-class schedules
-     * and may carry a time zone.
+     * and may carry a time zone. Needs NATS server 2.14+ (2.12 accepts only "@at").
      */
     public static function predefined(string $alias): string
     {
