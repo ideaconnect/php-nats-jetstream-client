@@ -2451,7 +2451,10 @@ final class JetStreamContext
      * writes with \u escapes, #259) is not seen: the pull ends as one nothing answers, as an empty one at the deadline
      * (the 408), or, with an `idle_heartbeat`, with the missed-heartbeat JetStreamException (code 0) once two intervals
      * pass with nothing. A server PING that the fetch's own read brings in is answered without holding the fetch: it
-     * waits for the PONG's write only within its deadline, and a refusal another fiber's read brings ends that wait.
+     * waits for the PONG's write only within its deadline, and a refusal another fiber's read brings ends that wait;
+     * the same holds while drain() runs, the PONG then the drain's to finish. A read without an operation of its own
+     * (processIncoming(), a serving loop's) whose chunk carries a delivery for the pull queues it ahead of the PONG it
+     * owes, so the pull's message or terminal status is not left behind that PONG when the refusal comes.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,

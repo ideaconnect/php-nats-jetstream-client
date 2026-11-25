@@ -38,10 +38,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   for the `UNSUB` to complete. Nor does it wait for the `PONG` its own read owes the server: a fetch whose read brings
   in a chunk with a server `PING` answers it in wire order, queues the rest of the chunk, and waits for the `PONG`'s
   write only until its deadline or the refusal, which another fiber's read may bring meanwhile; the messages and the
-  terminal status behind the `PING` are its result as usual. A `PONG` the socket then fails to take ends the
-  connection, as one that fails while the read waits does: the error listener hears of it and the connection
-  recovers, or closes with reconnect off. A fetch whose read waited for a `PONG` whose completion was held stayed
-  pending past its deadline.
+  terminal status behind the `PING` are its result as usual. So does a fetch whose read meets a server `PING` while
+  `drain()` runs: the `PONG` stays bounded by the drain's budget and is the drain's to finish, and the fetch no longer
+  waits for it past its own deadline. A read that has no operation of its own, your `processIncoming()`, a serving
+  loop's or the heartbeat's, and whose chunk carries a message or a status for a pull in flight, answers a `PING`
+  among them in wire order too and queues the rest of the chunk before it waits for the `PONG`, so a pull refused
+  meanwhile by an `-ERR` the fetch's read brings still gets that message or that status, where it lost the message,
+  and never reported the status, while that `PONG`'s completion was held. A `PONG` the socket then fails to take ends
+  the connection, as one that fails while the read waits does: the error listener hears of it and the connection
+  recovers, or closes with reconnect off; not once the connection has closed meanwhile, on its own (an EOF, a fatal
+  `-ERR`) or by `disconnect()`, whose close is announced once. A chunk with both a failed `PONG` and a fatal `-ERR`
+  still fails the read with the one that came first, the other reported. A fetch whose read waited for a `PONG` whose
+  completion was held stayed pending past its deadline.
 
   The pull consumer and `directGetBatch()` are not covered yet (#260): a refused pull of theirs still ends at its
   expiry. The refusal is matched by subject, as for requests, and the limit of #259 holds for pulls too: an `-ERR`
