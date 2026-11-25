@@ -17,6 +17,7 @@ use IDCT\NATS\Tests\Support\LifecycleRecorder;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
 use IDCT\NATS\Transport\TransportClosedException;
+use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 use function Amp\delay;
@@ -252,6 +253,84 @@ final class ConnectionEndingFrameTest extends TestCase
         }
 
         self::assertSame(ConnectionState::Closed, $connection->state());
+    }
+
+    /** @return iterable<string, array{string, string}> */
+    public static function aFailedPongAndAFatalErrInOneChunk(): iterable
+    {
+        yield "a request's read: the PING ahead of the -ERR" => ['request', 'ping first'];
+        yield "a request's read: the -ERR ahead of the PING" => ['request', 'err first'];
+        yield "the application's read of a chunk with a pull's delivery: the PING ahead of the -ERR" => ['application', 'ping first'];
+        yield "the application's read of a chunk with a pull's delivery: the -ERR ahead of the PING" => ['application', 'err first'];
+    }
+
+    /**
+     * One chunk with a server PING whose PONG the socket will not take and a fatal -ERR: both end the connection, and
+     * the read fails with the one that came first in wire order, the other reported through the error listener; the
+     * connection closes once, reconnect off. The PONG of a read with a wake-up (a request's here), or of one whose
+     * chunk carries a delivery for a pull in flight (the application's, the pull's inbox watched), is written in a
+     * fiber of its own, and its failure is learnt only once the frames behind its PING are handled (review of #264).
+     * It is ranked at its PING (third review of #264): ranked where it was learnt, the PING ahead of the -ERR threw the
+     * -ERR and reported the PONG's failure, where the PONG written in place had thrown its own failure. Fails on the
+     * code before the fix for the request's read, the PING ahead of the -ERR.
+     */
+    #[DataProvider('aFailedPongAndAFatalErrInOneChunk')]
+    public function testAFailedPongAndAFatalErrInOneChunkFailTheReadWithTheFirstInWireOrder(string $reader, string $order): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->own(new NatsConnection(
+            new NatsOptions(
+                connectTimeoutMs: 500,
+                requestTimeoutMs: 3_000,
+                reconnectEnabled: false,
+                pingIntervalSeconds: 0,
+                connectionListener: $recorder->connectionListener(),
+                errorListener: $recorder->errorListener(),
+            ),
+            $transport,
+        ));
+        $this->opened[] = $connection;
+        $connection->connect()->await();
+        $transport->failNextWriteContaining('PONG');
+
+        $failure = null;
+        if ($reader === 'request') {
+            // The request's read, the only reader, takes the chunk that answers the request.
+            $chunk = $order === 'ping first' ? "PING\r\n" . self::STALE : self::STALE . "PING\r\n";
+            $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => [$chunk];
+            try {
+                $connection->request('svc', 'one')->await(new TimeoutCancellation(5));
+            } catch (\Throwable $e) {
+                $failure = $e;
+            }
+        } else {
+            $pull = '$JS.API.CONSUMER.MSG.NEXT.S.C';
+            $inbox = '_INBOX.JS.FETCH.pull';
+            $sid = $connection->subscribe($inbox, static function (): void {})->await();
+            $connection->watchPublishRefusal($sid, $pull);
+            $delivery = ReconnectingTransport::msgFrame($inbox, $sid, 'm-1');
+            $transport->pushFrame($order === 'ping first' ? "PING\r\n" . $delivery . self::STALE : self::STALE . $delivery . "PING\r\n");
+            try {
+                $connection->processIncoming()->await(new TimeoutCancellation(5));
+            } catch (\Throwable $e) {
+                $failure = $e;
+            } finally {
+                $connection->unwatchPublishRefusal($sid);
+            }
+        }
+
+        if ($order === 'ping first') {
+            self::assertInstanceOf(TransportClosedException::class, $failure, $failure === null ? 'no failure' : $failure::class . ': ' . $failure->getMessage());
+            self::assertSame('The connection is gone', $failure->getMessage());
+            self::assertNotSame([], $recorder->errorsContaining('Stale Connection'), 'the -ERR is reported');
+        } else {
+            self::assertInstanceOf(ConnectionException::class, $failure, $failure === null ? 'no failure' : $failure::class . ': ' . $failure->getMessage());
+            self::assertSame("Server sent error frame: 'Stale Connection'", $failure->getMessage());
+            self::assertContains('The connection is gone', $recorder->errors, "the PONG's failure is reported");
+        }
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame(1, $recorder->closedEvents(), 'closed once');
     }
 
     /**
