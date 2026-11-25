@@ -144,15 +144,20 @@ depends on the feature:
   of plain messages, a schedule that never fires). The stream calls (`createStream()`, `addStream()`,
   `updateStream()`, `createOrUpdateStream()`) and the consumer create calls therefore check twice,
   for every such field set to anything but its default (`false`, `0`, `'none'`, `[]` and a missing
-  field ask for nothing):
+  field ask for nothing; a negative `subject_delete_marker_ttl` is invalid, not off, and does ask):
   - when the advertised version parses as older than the field's minimum, the call throws an
     `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) before
     anything is sent (`... nothing was sent ...`);
-  - when the config the server returns lacks a requested field (a version the client cannot parse,
+  - when the server's reply does not confirm a requested field (a version the client cannot parse,
     such as a proxy or a custom build, or a mixed-version cluster where an older server answers the
-    JetStream API), the call throws an `UnsupportedFeatureException` naming the field. The server has
-    already created or updated the stream or consumer without it by then (`... it has created stream
-    "X" without it`): delete it, or update it once the servers support the feature.
+    JetStream API), the call throws an `UnsupportedFeatureException` naming the field. The request
+    was sent by then, and the message says only what the reply shows. A returned config without the
+    field means the stream or consumer exists without it (`... stream "X" exists without it ...`).
+    That does not make it new: a create returns an existing stream or consumer whose config matches
+    the request, and the dropped field can make it match, so it may hold messages from before the
+    call. A reply without a config confirms nothing (`... the state of stream "X" is unknown ...`).
+    Either way, inspect it (`getStream()`, `getConsumer()`) before you change or delete it, and do
+    not delete it as a rollback.
 
   A strict server's own `unknown field "X"` rejection is mapped to the same exception. Each carries
   the feature name, the required version, and the version the server reported.
