@@ -55,11 +55,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 - `[docs]` New `ZeroReconnectAttemptsTest` (#268): over the scripted server, which accepts every dial, a failed read,
   a failed publish, a failed SUB, a lame duck notice naming another server, and a request's read meeting a lost
   connection or a fatal `-ERR` with `waitForReconnect: false`, each with reconnect off and with reconnect on at 0
-  attempts, the same outcome expected: no dial, Closed, one `Closed` event with the cause. These 6 cases fail on 2.30.1
+  attempts, the same outcome expected: no dial, Closed, one `Closed` event with the cause. These 6 cases fail on 2.31.0
   at 0 attempts; two more pin exactly one dial at 1 attempt, for a lost connection and for a lame duck failover. The
   heartbeat cases, run the same two ways, keep the previous tick's PONG read waiting across the close made for missed
   pings, run directly and on the heartbeat's own 20 ms timer, and stall a PING write across a close another read makes:
-  one `Closed`, with the first cause, and no dial once that read or write has failed. These three fail on 2.30.1 with
+  one `Closed`, with the first cause, and no dial once that read or write has failed. These three fail on 2.31.0 with
   reconnect off too. Two more check that a heartbeat read or write that finds a connection opened since lost still
   ends it.
   `NatsConnection_3MutationTest::testPerformRecoveryMakesAtLeastOneAttemptWhenMaxIsZero`, which pinned the one

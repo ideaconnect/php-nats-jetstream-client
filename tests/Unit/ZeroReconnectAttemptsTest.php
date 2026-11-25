@@ -109,7 +109,7 @@ final class ZeroReconnectAttemptsTest extends TestCase
      * and announces that once. The previous tick's bounded PONG read is still waiting on the socket when the tick that
      * gives up closes it: that read then fails with the EOF of the client's own close, on a connection already ended
      * and announced, and must neither announce a second Closed (with that EOF as its cause) nor start a recovery. Up
-     * to 2.30.1 it announced that second Closed with reconnect off, and at 0 attempts too once those ended alike.
+     * to 2.31.0 it announced that second Closed with reconnect off, and at 0 attempts too once those ended alike.
      */
     #[DataProvider('noReconnect')]
     public function testMissedPingsMakeNoDialAndCloseOnceWithTheCause(bool $reconnectEnabled, int $maxReconnectAttempts): void
