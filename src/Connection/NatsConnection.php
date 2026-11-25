@@ -6946,8 +6946,8 @@ final class NatsConnection
      * {@see NatsOptions::$maxReconnectAttempts} at 0 it is not, as that option documents: the connection then ends
      * the way it does with reconnect off, on every path that notices the loss (a failed read or write, the
      * heartbeat, a connection-ending frame), and a lame duck notice starts no failover (#268). The recovery used to
-     * make one attempt at 0 all the same, while the initial connect already read 0 as none. nats.go reads its
-     * MaxReconnect of 0 the same way.
+     * make one attempt at 0 all the same, while the initial connect already read 0 as none. The option counts the
+     * attempts of the whole pool, not of each server: at 0 no server of the pool is dialled.
      */
     private function reconnectsAfterLoss(): bool
     {
@@ -8370,12 +8370,15 @@ final class NatsConnection
      * paths of pingTimerTick().
      *
      * @param \Throwable $cause Why the heartbeat gave up on the connection (#172).
+     * @param int $closes The {@see $terminalCloses} when the tick began.
      */
-    private function recoverFromHeartbeatFailure(int $generation, \Throwable $cause): void
+    private function recoverFromHeartbeatFailure(int $generation, int $closes, \Throwable $cause): void
     {
         // The failure came from a connection since replaced (the application closed and reopened it while
-        // this tick's PING write was suspended): the new connection, and its own heartbeat, are healthy.
-        if ($generation !== $this->connectionGeneration) {
+        // this tick's PING write was suspended): the new connection, and its own heartbeat, are healthy. Or
+        // from one that ended while the write was suspended, its end announced already: with reconnect off or
+        // no reconnect attempt allowed (#268), recovering closed it a second time and announced a second Closed.
+        if ($generation !== $this->connectionGeneration || $closes !== $this->terminalCloses) {
             return;
         }
 
@@ -8397,12 +8400,13 @@ final class NatsConnection
         }
 
         // The connection this tick checks: its PING write and PONG read suspend, and the application may
-        // close and reopen the connection meanwhile.
+        // close and reopen the connection meanwhile, or another fiber end it.
         $generation = $this->connectionGeneration;
+        $closes = $this->terminalCloses;
         $this->outstandingPings++;
 
         if ($this->outstandingPings > $this->options->maxPingsOut) {
-            $this->recoverFromHeartbeatFailure($generation, new ConnectionException(
+            $this->recoverFromHeartbeatFailure($generation, $closes, new ConnectionException(
                 match ($this->options->maxPingsOut) {
                     0 => 'The heartbeat allows no unanswered PING (maxPingsOut is 0)',
                     1 => 'The server did not answer the last PING',
@@ -8425,7 +8429,7 @@ final class NatsConnection
             // The PING never hit the wire: drop its slot so correlation stays aligned (the
             // recovery below clears the rest on the epoch change anyway).
             $this->discardPongSlot($slot);
-            $this->recoverFromHeartbeatFailure($generation, $pingError);
+            $this->recoverFromHeartbeatFailure($generation, $closes, $pingError);
 
             return;
         }
@@ -8538,6 +8542,15 @@ final class NatsConnection
         }
 
         if ($closedError !== null) {
+            // The connection this read was on ended while it waited, and its end was announced: typically the next
+            // tick gave up on an unanswered PING and closed the socket under this read, whose EOF is that close's own.
+            // Recovering here closed the connection a second time, with reconnect off or no reconnect attempt allowed
+            // (#268), and announced a second Closed carrying that EOF. A connection opened since is not this read's:
+            // its own reads report its loss.
+            if ($this->terminalCloses !== $closes) {
+                return;
+            }
+
             try {
                 $this->recoverConnection(failedGeneration: $generation, cause: $closedError);
             } catch (\Throwable) {

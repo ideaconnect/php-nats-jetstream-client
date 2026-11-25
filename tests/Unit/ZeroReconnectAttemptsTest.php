@@ -16,16 +16,21 @@ use IDCT\NATS\Transport\TransportClosedException;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
+use function Amp\async;
+use function Amp\delay;
+
 /**
  * `maxReconnectAttempts: 0` disables reconnect retries, as NatsOptions documents (#268): a lost connection makes no
  * reconnect attempt and ends as it does with reconnect off - Closed, the Closed event carrying the cause, and
  * "Reconnect is disabled" with the cause as its previous for the operation that waits for it - and a lame duck notice
  * naming another server starts no failover. The initial connect already read 0 that way; the recovery after a lost
  * connection made max(1, 0) = 1 attempt: one more backoff and dial after every drop, the connection carrying on with
- * its subscriptions replayed when that dial succeeded. nats.go reads its MaxReconnect of 0 as no reconnect attempt too.
+ * its subscriptions replayed when that dial succeeded. The option is global, for the whole server pool: at 0 no server
+ * of the pool is dialled, the others included.
  *
  * Each case runs with reconnect off and with reconnect on at 0 attempts, and expects the same outcome. The scripted
- * server accepts every dial, so an attempt made anyway would reopen the connection.
+ * server accepts every dial, so an attempt made anyway would reopen the connection. The heartbeat cases also hold
+ * the connection to one Closed event when a PONG read or a PING write of the heartbeat outlives the close.
  */
 final class ZeroReconnectAttemptsTest extends TestCase
 {
@@ -100,23 +105,128 @@ final class ZeroReconnectAttemptsTest extends TestCase
     }
 
     /**
-     * The heartbeat that gives up on a server which stopped answering its PINGs ends the connection, with its reason.
-     * The tick is run directly, as in {@see ReconnectDisabledCauseTest}: with the timer, the next tick's bounded PONG
-     * read can still be pending when the recovery closes the socket, and with reconnect off that read's EOF announces
-     * a second Closed on main as well, a separate matter.
+     * The heartbeat that gives up on a server which stopped answering its PINGs ends the connection, with its reason,
+     * and announces that once. The previous tick's bounded PONG read is still waiting on the socket when the tick that
+     * gives up closes it: that read then fails with the EOF of the client's own close, on a connection already ended
+     * and announced, and must neither announce a second Closed (with that EOF as its cause) nor start a recovery. Up
+     * to 2.30.1 it announced that second Closed with reconnect off, and at 0 attempts too once those ended alike.
      */
     #[DataProvider('noReconnect')]
-    public function testMissedPingsMakeNoDialAndCloseWithTheCause(bool $reconnectEnabled, int $maxReconnectAttempts): void
+    public function testMissedPingsMakeNoDialAndCloseOnceWithTheCause(bool $reconnectEnabled, int $maxReconnectAttempts): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->open($transport, $recorder, $reconnectEnabled, $maxReconnectAttempts, maxPingsOut: 1);
+        $readsPendingAtClose = $this->recordReadsPendingAtClose($connection, $transport);
+        $transport->silence();
+
+        // The first tick sends its PING and waits for the PONG the silent server never sends.
+        $firstTick = async(fn() => $this->tick($connection));
+        $this->waitUntil(fn(): bool => $this->readInProgress($connection));
+
+        // The next tick finds that PING unanswered and gives up on the connection while the read still waits.
+        $this->tick($connection);
+        // The first tick's read has failed on the closed socket meanwhile, and whatever it started is over.
+        $firstTick->await();
+
+        self::assertSame([true], $readsPendingAtClose->getArrayCopy(), 'the PONG read was pending when the socket was closed');
+        self::assertFalse($this->readInProgress($connection));
+        $this->assertClosedWithoutADial($connection, $transport, $recorder, 'The server did not answer the last PING');
+    }
+
+    /**
+     * The same with the heartbeat's own timer, as an application runs it: every tick reads for its PONG for up to
+     * 50 ms, so the tick that gives up 20 ms after the last PING closes the socket under that tick's read.
+     */
+    #[DataProvider('noReconnect')]
+    public function testAHeartbeatTimerThatGivesUpMakesNoDialAndClosesOnceWithTheCause(bool $reconnectEnabled, int $maxReconnectAttempts): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->open($transport, $recorder, $reconnectEnabled, $maxReconnectAttempts, maxPingsOut: 1, pingIntervalSeconds: 0.02);
+        $readsPendingAtClose = $this->recordReadsPendingAtClose($connection, $transport);
+        $transport->silence();
+
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Closed);
+        $this->waitUntil(fn(): bool => !$this->readInProgress($connection));
+        // Past the longest the read could still wait (50 ms), and a few timer intervals on.
+        delay(0.15);
+
+        self::assertSame(true, $readsPendingAtClose[0] ?? null, 'the PONG read was pending when the socket was closed');
+        $this->assertClosedWithoutADial($connection, $transport, $recorder, 'The server did not answer the last PING');
+    }
+
+    /**
+     * The same for a tick whose PING write is still suspended when another fiber's read finds the connection lost and
+     * ends it: the write then fails on the ended connection, which the heartbeat leaves alone.
+     */
+    #[DataProvider('noReconnect')]
+    public function testAPingWriteThatFailsAfterTheConnectionEndedMakesNoSecondClose(bool $reconnectEnabled, int $maxReconnectAttempts): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->open($transport, $recorder, $reconnectEnabled, $maxReconnectAttempts, maxPingsOut: 1);
+        // Held past the end of its session, and failed only then: a transport whose close leaves a pending write to
+        // fail later, as TransportInterface allows.
+        $transport->stallNextWriteContaining('PING', 5.0, outlivesSession: true);
+        $tick = async(fn() => $this->tick($connection));
+        $this->waitUntil(static fn(): bool => $transport->writesStalled() === 1);
+
+        $transport->dropConnection();
+        $this->reconnectDisabledError(static fn() => $connection->processIncoming()->await());
+        $transport->releaseStalledWrites();
+        $tick->await();
+
+        $this->assertClosedWithoutADial($connection, $transport, $recorder, 'Socket closed by peer (EOF)');
+    }
+
+    /**
+     * A heartbeat read that fails is ignored only for the connection that ended while it waited: the connection a
+     * later connect() opens is still ended by a heartbeat read that finds it lost, and the Closed event says why.
+     */
+    #[DataProvider('noReconnect')]
+    public function testAHeartbeatReadThatFindsTheNextConnectionLostStillEndsIt(bool $reconnectEnabled, int $maxReconnectAttempts): void
     {
         $transport = new ReconnectingTransport();
         $recorder = new LifecycleRecorder();
         $connection = $this->open($transport, $recorder, $reconnectEnabled, $maxReconnectAttempts, maxPingsOut: 1);
         $transport->silence();
-        (new \ReflectionProperty(NatsConnection::class, 'outstandingPings'))->setValue($connection, 1);
+        $firstTick = async(fn() => $this->tick($connection));
+        $this->waitUntil(fn(): bool => $this->readInProgress($connection));
+        $this->tick($connection);
+        $firstTick->await();
 
-        (new \ReflectionMethod($connection, 'pingTimerTick'))->invoke($connection);
+        $connection->connect()->await();
+        $transport->silence();
+        $tick = async(fn() => $this->tick($connection));
+        $this->waitUntil(fn(): bool => $this->readInProgress($connection));
+        $transport->dropConnection();
+        $tick->await();
 
-        $this->assertClosedWithoutADial($connection, $transport, $recorder, 'The server did not answer the last PING');
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Closed, ConnectionEvent::Connected, ConnectionEvent::Closed], $recorder->events);
+        self::assertSame(['The server did not answer the last PING', 'Socket closed by peer (EOF)'], $recorder->closedErrors);
+        self::assertCount(2, $transport->connectCalls, 'the second connect(), and no reconnect dial');
+    }
+
+    /** And by a PING write that finds it lost. */
+    #[DataProvider('noReconnect')]
+    public function testAPingWriteThatFindsTheNextConnectionLostStillEndsIt(bool $reconnectEnabled, int $maxReconnectAttempts): void
+    {
+        $transport = new ReconnectingTransport();
+        $recorder = new LifecycleRecorder();
+        $connection = $this->open($transport, $recorder, $reconnectEnabled, $maxReconnectAttempts, maxPingsOut: 1);
+        $transport->dropConnection();
+        $this->reconnectDisabledError(static fn() => $connection->processIncoming()->await());
+
+        $connection->connect()->await();
+        $transport->failNextWriteContaining('PING');
+        $this->tick($connection);
+
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Closed, ConnectionEvent::Connected, ConnectionEvent::Closed], $recorder->events);
+        self::assertSame(['Socket closed by peer (EOF)', 'The connection is gone'], $recorder->closedErrors);
+        self::assertCount(2, $transport->connectCalls, 'the second connect(), and no reconnect dial');
     }
 
     /**
@@ -239,6 +349,7 @@ final class ZeroReconnectAttemptsTest extends TestCase
         int $maxReconnectAttempts,
         int $maxPingsOut = 2,
         bool $waitForReconnect = true,
+        int|float $pingIntervalSeconds = 0,
     ): NatsConnection {
         $connection = $this->own(new NatsConnection(
             new NatsOptions(
@@ -249,7 +360,7 @@ final class ZeroReconnectAttemptsTest extends TestCase
                 reconnectDelayMs: 5,
                 reconnectMaxDelayMs: 20,
                 reconnectJitterMs: 0,
-                pingIntervalSeconds: 0,
+                pingIntervalSeconds: $pingIntervalSeconds,
                 maxPingsOut: $maxPingsOut,
                 connectionListener: $recorder->connectionListener(),
                 errorListener: $recorder->errorListener(),
@@ -293,5 +404,30 @@ final class ZeroReconnectAttemptsTest extends TestCase
         }
 
         self::fail('expected ConnectionException: Reconnect is disabled');
+    }
+
+    /** One heartbeat tick, as the heartbeat's timer runs it. */
+    private function tick(NatsConnection $connection): void
+    {
+        (new \ReflectionMethod($connection, 'pingTimerTick'))->invoke($connection);
+    }
+
+    private function readInProgress(NatsConnection $connection): bool
+    {
+        return (bool) (new \ReflectionProperty(NatsConnection::class, 'readInProgress'))->getValue($connection);
+    }
+
+    /**
+     * Whether a read was waiting on the socket each time the transport was asked to close it.
+     *
+     * @return \ArrayObject<int, bool>
+     */
+    private function recordReadsPendingAtClose(NatsConnection $connection, ReconnectingTransport $transport): \ArrayObject
+    {
+        /** @var \ArrayObject<int, bool> $pending */
+        $pending = new \ArrayObject();
+        $transport->beforeClose = fn() => $pending->append($this->readInProgress($connection));
+
+        return $pending;
     }
 }
