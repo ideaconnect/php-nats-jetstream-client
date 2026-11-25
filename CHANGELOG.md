@@ -15,6 +15,41 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Fixed
+
+- `[bugfix]` A stream or consumer that sets a version-gated config field (`FeatureSupport::REQUIREMENTS`:
+  `allow_msg_ttl`, `subject_delete_marker_ttl`, `allow_msg_counter`, `allow_msg_schedules`, `allow_atomic`,
+  `filter_subjects`, `priority_groups`, `priority_policy`, `priority_timeout`) on a server older than the field now
+  fails with the documented `UnsupportedFeatureException` instead of succeeding without the feature (#266). The
+  README and `FeatureSupport` said such a server rejects the unknown field, but nats-server rejects unknown fields
+  only in strict mode: 2.10 never does, 2.11 only with `jetstream { strict: true }`, and 2.12 is the first line where
+  strict is the default. A default 2.10 or 2.11 server dropped the field, `createStream()` returned a normal
+  `StreamInfo`, and the data path then misbehaved without a word: a `publish(..., ttl:)` message never expired,
+  `incrementCounter()` stored a plain message and then failed with `Counter response did not include a value`, and
+  `publishScheduled()` stored a message no scheduler would fire. `createStream()`, `addStream()`, `updateStream()`,
+  `createOrUpdateStream()` and the five consumer create calls now check twice, for each such field set to anything
+  but its default (`false`, `0`, `'none'`, `[]` and a missing field ask for nothing). Before the request, when the
+  server's INFO version parses as older than the field's minimum, the call fails and nothing is sent. After it, when
+  the config the server returned lacks a requested field (a version the client cannot parse, or a mixed-version
+  cluster where an older server answers the JetStream API), the call fails naming the field and saying the server
+  has already created or updated the stream or consumer without it. `createOrUpdateStream()` does not retry such a
+  failure as an update. A strict server's own `unknown field` rejection is still mapped as before; on a 2.11 strict
+  server the pre-flight now answers first, so that exception's code is 0 and its message the pre-flight's.
+
+### Testing & CI
+
+- `[docs]` New cases in `FeatureSupportTest` (which values ask for a feature; the pre-flight over the version forms
+  INFO advertises, with a two-segment, a `v`-prefixed, a pre-release and a 3.0 version; the reply check over a
+  missing field, a field echoed as its default, and a reply without a config) and in `JetStreamContextTest` (every
+  stream and consumer create/update call refused on a too-old server with no JetStream API request on the wire; the
+  reply check on `createStream()`, `addStream()`, `updateStream()`, `createOrUpdateStream()`, `createConsumer()` and
+  `createEphemeralConsumer()`; a new enough server that echoes the fields, and fields at their defaults on 2.10). The
+  fake replies of seven existing tests that send a gated field now echo it, as nats-server does, and
+  `testUnsupportedFeatureRaisesTypedExceptionWithServerVersion` maps a strict server's rejection behind an
+  unparseable version, the case where that path still runs.
+
 ## [2.30.1] - 2026-11-21
 
 ### Fixed
