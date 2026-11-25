@@ -270,6 +270,15 @@ final class JetStreamContext
     /**
      * Creates or updates a stream using a minimal configuration payload.
      *
+     * Version-gated `$options` (the config fields of {@see FeatureSupport::REQUIREMENTS}, e.g.
+     * `allow_msg_ttl` 2.11+, `allow_msg_counter` 2.12+) set to anything but their default fail with an
+     * UnsupportedFeatureException against a server too old for them: before the request when the
+     * connected server's version is known to be older, after it when the server's reply does not
+     * confirm the field (the returned config lacks it, or the reply carries no config), since an older
+     * server drops a field it does not know instead of rejecting it (#266). A negative
+     * `subject_delete_marker_ttl` is invalid rather than off, so it counts as a request for the feature.
+     * The same holds for {@see addStream()} and {@see updateStream()}.
+     *
      * @param list<string> $subjects
      * @param array<string,mixed> $options Additional stream config fields.
      * @return Future<StreamInfo>
@@ -293,9 +302,7 @@ final class JetStreamContext
                 'subjects' => $subjects,
             ]);
 
-            $response = $this->requestJson(JetStreamApi::STREAM_CREATE_PREFIX . $name, $payload);
-
-            return StreamInfo::fromArray($response);
+            return $this->requestStreamChange(JetStreamApi::STREAM_CREATE_PREFIX . $name, $name, $payload);
         });
     }
 
@@ -309,11 +316,11 @@ final class JetStreamContext
     {
         self::assertValidJsName($config->name(), 'stream');
 
-        return async(function () use ($config): StreamInfo {
-            $response = $this->requestJson(JetStreamApi::STREAM_CREATE_PREFIX . $config->name(), $config->toArray());
-
-            return StreamInfo::fromArray($response);
-        });
+        return async(fn(): StreamInfo => $this->requestStreamChange(
+            JetStreamApi::STREAM_CREATE_PREFIX . $config->name(),
+            $config->name(),
+            $config->toArray(),
+        ));
     }
 
     /**
@@ -329,9 +336,7 @@ final class JetStreamContext
         return async(function () use ($name, $config): StreamInfo {
             $payload = array_merge($config, ['name' => $name]);
 
-            $response = $this->requestJson(JetStreamApi::STREAM_UPDATE_PREFIX . $name, $payload);
-
-            return StreamInfo::fromArray($response);
+            return $this->requestStreamChange(JetStreamApi::STREAM_UPDATE_PREFIX . $name, $name, $payload);
         });
     }
 
@@ -1008,7 +1013,10 @@ final class JetStreamContext
      * Creates or updates a durable consumer for a stream.
      *
      * Version-gated `$options`: `filter_subjects` requires NATS 2.10+, `priority_groups`/
-     * `priority_policy` require 2.11+. An older server rejects these with an UnsupportedFeatureException.
+     * `priority_policy` require 2.11+. Against an older server the call fails with an
+     * UnsupportedFeatureException: before the request when the server's version is known to be older,
+     * after it when the server's reply does not confirm the field (the returned config lacks it, or the
+     * reply carries no config; an older server drops the field, #266).
      *
      * @param array<string,mixed> $options Additional consumer config fields (max_deliver, ack_wait, etc.).
      * @return Future<ConsumerInfo>
@@ -1024,12 +1032,11 @@ final class JetStreamContext
             $config = $this->applyFilterSubjects($config, $filterSubject);
             $this->assertValidPriorityConfig($config);
 
-            $response = $this->requestJson(
+            return $this->requestConsumerChange(
                 JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
-                ['stream_name' => $stream, 'config' => $config],
+                $stream,
+                $config,
             );
-
-            return ConsumerInfo::fromArray($response);
         });
     }
 
@@ -1051,9 +1058,7 @@ final class JetStreamContext
             $name = $config->getName();
             $subject = JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . ($name !== null ? '.' . $name : '');
 
-            $response = $this->requestJson($subject, ['stream_name' => $stream, 'config' => $config->toArray()]);
-
-            return ConsumerInfo::fromArray($response);
+            return $this->requestConsumerChange($subject, $stream, $config->toArray());
         });
     }
 
@@ -1107,12 +1112,7 @@ final class JetStreamContext
             $config = $this->applyFilterSubjects($config, $filterSubject);
             $this->assertValidPriorityConfig($config);
 
-            $response = $this->requestJson(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream,
-                ['stream_name' => $stream, 'config' => $config],
-            );
-
-            return ConsumerInfo::fromArray($response);
+            return $this->requestConsumerChange(JetStreamApi::CONSUMER_CREATE_PREFIX . $stream, $stream, $config);
         });
     }
 
@@ -1138,12 +1138,11 @@ final class JetStreamContext
             $config['deliver_subject'] = $deliverSubject;
             $config = $this->applyFilterSubjects($config, $filterSubject);
 
-            $response = $this->requestJson(
+            return $this->requestConsumerChange(
                 JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
-                ['stream_name' => $stream, 'config' => $config],
+                $stream,
+                $config,
             );
-
-            return ConsumerInfo::fromArray($response);
         });
     }
 
@@ -1174,12 +1173,7 @@ final class JetStreamContext
                 $config['inactive_threshold'] = self::EPHEMERAL_INACTIVE_THRESHOLD_NS;
             }
 
-            $response = $this->requestJson(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream,
-                ['stream_name' => $stream, 'config' => $config],
-            );
-
-            return ConsumerInfo::fromArray($response);
+            return $this->requestConsumerChange(JetStreamApi::CONSUMER_CREATE_PREFIX . $stream, $stream, $config);
         });
     }
 
@@ -5325,12 +5319,72 @@ final class JetStreamContext
     /**
      * Raises a JetStream API error, upgrading it to an {@see \IDCT\NATS\Exception\UnsupportedFeatureException}
      * when the server's response shows the failure is a version-gated feature this server is too old for
-     * (e.g. an `unknown field "allow_atomic"` rejection). Reactive only - no per-request version probe.
+     * (e.g. a strict server's `unknown field "allow_atomic"` rejection).
      */
     private function throwApiError(string $description, int $code, ?int $errCode = null): never
     {
         throw FeatureSupport::unsupportedFromApiError($description, $code, $this->serverVersion(), $errCode)
             ?? new JetStreamException($description, $code, null, $errCode);
+    }
+
+    /**
+     * Sends a stream create or update request and returns the server's answer. A server older than a
+     * version-gated field of $config does not reject the field by default, it drops it (#266), so the
+     * request is refused before it is sent when the connected server's version is too old for such a
+     * field, and fails after it when the server's reply does not confirm the field: the returned config
+     * lacks it, or the reply carries no config ({@see FeatureSupport::assertSupportedBy()},
+     * {@see FeatureSupport::assertHonored()}).
+     *
+     * The pre-flight reads the INFO of the connection when the call is made, not in the step that writes
+     * the frame as {@see publishScheduled()} does (#267): a call made while the client fails over is
+     * checked against the version of the connection being replaced. The reply check covers the direction
+     * that matters, a failover to an older server, which takes the request, drops the field and has its
+     * reply refused (reporting its own version); a failover to a newer server is refused before the
+     * request, and the call can be made again once connected.
+     *
+     * @param array<string,mixed> $config The full request body.
+     */
+    private function requestStreamChange(string $subject, string $name, array $config): StreamInfo
+    {
+        FeatureSupport::assertSupportedBy($config, $this->serverVersion(), 'stream');
+
+        $response = $this->requestJson($subject, $config);
+
+        FeatureSupport::assertHonored(
+            $config,
+            $response['config'] ?? null,
+            $this->serverVersion(),
+            sprintf('stream "%s"', $name),
+        );
+
+        return StreamInfo::fromArray($response);
+    }
+
+    /**
+     * Sends a consumer create (create-or-update) request with the checks of {@see requestStreamChange()}
+     * for the version-gated consumer fields (`filter_subjects`, `priority_*`, #266).
+     *
+     * @param array<string,mixed> $config The consumer config.
+     */
+    private function requestConsumerChange(string $subject, string $stream, array $config): ConsumerInfo
+    {
+        FeatureSupport::assertSupportedBy($config, $this->serverVersion(), 'consumer');
+
+        $response = $this->requestJson($subject, ['stream_name' => $stream, 'config' => $config]);
+
+        // The consumer's name comes from the reply, which describes what exists, else from the request's
+        // durable name; an ephemeral consumer whose reply carries no name is described by its stream.
+        $name = $response['name'] ?? $config['durable_name'] ?? null;
+        FeatureSupport::assertHonored(
+            $config,
+            $response['config'] ?? null,
+            $this->serverVersion(),
+            is_string($name) && $name !== ''
+                ? sprintf('consumer "%s" on stream "%s"', $name, $stream)
+                : sprintf('the consumer on stream "%s"', $stream),
+        );
+
+        return ConsumerInfo::fromArray($response);
     }
 
     /**

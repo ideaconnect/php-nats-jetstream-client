@@ -15,6 +15,89 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.32.0] - 2026-11-25
+
+### Upgrade notes
+
+- A stream or consumer create/update that sets a version-gated config field (the config fields of
+  `FeatureSupport::REQUIREMENTS`; `FeatureSupport::requestedFields()` lists the ones a config asks for) against a
+  server too old for it now throws an `UnsupportedFeatureException` (#266). Code that set such a field "just in
+  case" against a 2.10 or 2.11 server used to get the stream or consumer without the feature; set the field only
+  when the servers support it, or catch the exception. Only the default turns a field off (`false`, `0`, `'none'`,
+  `[]`, or leaving it out). A negative `subject_delete_marker_ttl` is not "off" but invalid (a 2.11+ server rejects
+  it), so it counts as a request for the feature; a negative `priority_timeout` still asks for nothing, since a
+  2.12+ server treats it as unset.
+- When the exception comes from the reply check (its message says `... exists without it ...` or `... the state of
+  ... is unknown ...`, not `nothing was sent`), the request reached the server. Do not treat the stream or consumer
+  as one this call created, and do not delete it as a rollback: a create returns an existing stream or consumer
+  whose config matches the request, and the dropped field can make it match, so it may hold messages from before
+  the call. Inspect it first (`getStream()`, `getConsumer()`), then decide whether to update, keep or delete it.
+- On a 2.11 server in strict mode the pre-flight now answers before the server's own `unknown field` rejection, so
+  that exception's code is 0 (was 400) and its message is the pre-flight's.
+
+### Added
+
+- `[feature]` `FeatureSupport::requestedFields($config)` lists the version-gated config fields a stream or consumer
+  config asks for, in `REQUIREMENTS` order (#266): each such field set to anything but its default (`null`, `false`,
+  `0`, `''`, `'none'`, `[]` and a missing field ask for nothing; a negative `subject_delete_marker_ttl` asks). These
+  are the fields the stream and consumer calls check, so code can tell before a request which fields, and with
+  `requiredVersion()` which server version, a config needs. Only config fields are listed, never the `schedule_*`
+  scheduler features. The two checks themselves, `FeatureSupport::assertSupportedBy()` and
+  `FeatureSupport::assertHonored()`, are public for `JetStreamContext` and marked `@internal`: not part of the
+  supported API.
+
+### Fixed
+
+- `[bugfix]` A stream or consumer that sets a version-gated config field (the config fields of
+  `FeatureSupport::REQUIREMENTS`: `allow_msg_ttl`, `subject_delete_marker_ttl`, `allow_msg_counter`,
+  `allow_msg_schedules`, `allow_atomic`, `filter_subjects`, `priority_groups`, `priority_policy`, `priority_timeout`;
+  not the `schedule_*` scheduler features) on a server older than the field now fails with the documented
+  `UnsupportedFeatureException` instead of succeeding without the feature (#266). The
+  README and `FeatureSupport` said such a server rejects the unknown field, but nats-server rejects unknown fields
+  only in strict mode: 2.10 never does, 2.11 only with `jetstream { strict: true }`, and 2.12 is the first line where
+  strict is the default. A default 2.10 or 2.11 server dropped the field, `createStream()` returned a normal
+  `StreamInfo`, and the data path then misbehaved without a word: a `publish(..., ttl:)` message never expired,
+  `incrementCounter()` stored a plain message and then failed with `Counter response did not include a value`, and
+  `publishScheduled()` stored a message no scheduler would fire. `createStream()`, `addStream()`, `updateStream()`,
+  `createOrUpdateStream()` and the five consumer create calls now check twice, for each such field set to anything
+  but its default (`false`, `0`, `'none'`, `[]` and a missing field ask for nothing; a negative
+  `subject_delete_marker_ttl` asks). Before the request, when the server's INFO version parses as older than the
+  field's minimum, the call fails and nothing is sent. After it, when the server's reply does not confirm a
+  requested field (a version the client cannot parse, or a mixed-version cluster where an older server answers the
+  JetStream API), the call fails naming the field and saying only what the reply shows: a returned config without
+  the field means the stream or consumer exists without it, and a reply without a config (missing, null or empty)
+  leaves its state unknown. `createOrUpdateStream()` does not retry such a failure as an update. A strict server's
+  own `unknown field` rejection is still mapped as before; on a 2.11 strict server the pre-flight now answers
+  first, so that exception's code is 0 and its message the pre-flight's.
+- `[bugfix]` A strict server's `unknown field "schedule_every"` rejection (or one naming another `schedule_*` key) is
+  no longer turned into an `UnsupportedFeatureException` that asks for NATS 2.14 (#266). Since 2.31.0 these keys are
+  in `FeatureSupport::REQUIREMENTS` as scheduler features of `publishScheduled()`, not config fields: a strict server
+  rejects a stream or consumer config carrying one whatever its version, so the rejection is now the ordinary
+  `JetStreamException` with the server's description. `requiredVersion()` still reports 2.14 for these keys.
+
+### Testing & CI
+
+- `[docs]` New cases in `FeatureSupportTest` (which values ask for a feature, a negative marker TTL included; the
+  pre-flight over the version forms INFO advertises, with a two-segment, a `v`-prefixed, a pre-release and a 3.0
+  version; the reply check over a missing field, a field echoed as its default, a dropped negative marker TTL, and
+  replies without a config: missing, null, empty, a list or a scalar) and in `JetStreamContextTest` (every
+  stream and consumer create/update call refused on a too-old server with no JetStream API request on the wire; the
+  reply check on `createStream()`, `addStream()`, `updateStream()`, `createOrUpdateStream()`, `createConsumer()` and
+  `createEphemeralConsumer()`, for a config without the field and for a reply without a config; a negative
+  `subject_delete_marker_ttl` on 2.10 and behind an old responder; a new enough server that echoes the fields,
+  fields at their defaults on 2.10, and a request for no gated feature that still accepts a reply without a
+  config). The fake replies of seven existing tests that send a gated field now echo it, as nats-server does, and
+  `testUnsupportedFeatureRaisesTypedExceptionWithServerVersion` maps a strict server's rejection behind an
+  unparseable version, the case where that path still runs. `testScheduleFeaturesAreNotConfigFields` checks that
+  the `schedule_*` keys are never read as config fields, by `requestedFields()`, the two checks or the mapping of a
+  strict server's rejection.
+- `[docs]` New `GatedConfigFieldServerVersionOnReconnectTest`: over `tests/Support/ReconnectingTransport.php`, a
+  `createStream()` with `allow_msg_ttl` made while the client fails over from 2.11.0 to 2.10.29 passes the
+  pre-flight, goes to the 2.10.29 server once and is refused by the reply check, reporting 2.10.29; made while it
+  fails over from 2.10.29 to 2.11.0 it is refused by the pre-flight on the replaced connection's version, and no
+  create reaches either server. The pre-flight reads the INFO when the call is made, unlike `publishScheduled()`'s
+  check in the step that writes the frame (#267); the `requestStreamChange()` docblock and the README say so.
+
 ## [2.31.1] - 2026-11-25
 
 ### Upgrade notes

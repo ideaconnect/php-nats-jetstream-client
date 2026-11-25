@@ -131,13 +131,39 @@ Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and 
 Core NATS (publish/subscribe, request/reply, headers, services) works against any server. JetStream
 consumer management requires NATS 2.9+: all consumer helpers use the named `CONSUMER.CREATE` API
 introduced in 2.9, with no fallback to the legacy `DURABLE.CREATE` form. Some features depend on
-even newer NATS server versions; the table below lists the minimum version per feature. Detection is
-reactive - there is no per-request version probe - and depends on the feature:
+even newer NATS server versions; the table below lists the minimum version per feature. The client
+reads the version the server advertises in its INFO handshake (no extra request), and detection
+depends on the feature:
 
-- **Version-gated stream/consumer config fields** (for example creating a stream with `allow_atomic`
-  or `allow_msg_schedules`): an older server rejects the unknown field and the request fails fast
-  with an `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`)
-  carrying the feature name, the required version, and the version the server reported.
+- **Version-gated stream/consumer config fields** (the `Server config` column below, for example
+  creating a stream with `allow_msg_ttl` or `allow_msg_counter`): a server older than the field does
+  not reject it by default. nats-server rejects unknown fields only in strict mode, which 2.10 does
+  not have, 2.11 has only with `jetstream { strict: true }`, and 2.12 turns on by default. A default
+  2.10 or 2.11 server drops the field and creates the stream without the feature, so the data path
+  then misbehaves silently (a `publish(..., ttl:)` message that never expires, a counter subject full
+  of plain messages, a schedule that never fires). The stream calls (`createStream()`, `addStream()`,
+  `updateStream()`, `createOrUpdateStream()`) and the consumer create calls therefore check twice,
+  for every such field set to anything but its default (`false`, `0`, `'none'`, `[]` and a missing
+  field ask for nothing; a negative `subject_delete_marker_ttl` is invalid, not off, and does ask):
+  - when the advertised version parses as older than the field's minimum, the call throws an
+    `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) before
+    anything is sent (`... nothing was sent ...`). The version is the one of the connection when the
+    call is made: a call made while the client fails over is checked against the server being
+    replaced, so a failover to a newer server can refuse it (make it again once connected), and a
+    failover to an older server is caught by the reply check below;
+  - when the server's reply does not confirm a requested field (a version the client cannot parse,
+    such as a proxy or a custom build, or a mixed-version cluster where an older server answers the
+    JetStream API), the call throws an `UnsupportedFeatureException` naming the field. The request
+    was sent by then, and the message says only what the reply shows. A returned config without the
+    field means the stream or consumer exists without it (`... stream "X" exists without it ...`).
+    That does not make it new: a create returns an existing stream or consumer whose config matches
+    the request, and the dropped field can make it match, so it may hold messages from before the
+    call. A reply without a config confirms nothing (`... the state of stream "X" is unknown ...`).
+    Either way, inspect it (`getStream()`, `getConsumer()`) before you change or delete it, and do
+    not delete it as a rollback.
+
+  A strict server's own `unknown field "X"` rejection is mapped to the same exception. Each carries
+  the feature name, the required version, and the version the server reported.
 - **Atomic batch publish**: when the server's advertised version parses as older than 2.12,
   `commit()` fails fast before anything reaches the wire (`... nothing was published`). When the
   version cannot be parsed (a proxy, a custom build, or a mixed-version cluster), the old server
@@ -182,9 +208,16 @@ try {
     // e.g. "Atomic batch publish requires NATS server 2.12+ (connected server 2.10.5; nothing was published)"
     echo "{$e->feature} needs NATS {$e->requiredVersion}; server is {$e->serverVersion}\n";
 }
+
+try {
+    $js->createStream('EVENTS', ['events.>'], ['allow_msg_ttl' => true])->await();
+} catch (UnsupportedFeatureException $e) {
+    // e.g. 'The "allow_msg_ttl" feature requires NATS server 2.11+, but the connected server reports 2.10.29
+    // (nothing was sent: an older server ignores the field and would set up the stream without it)'
+}
 ```
 
-You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`). `FeatureSupport::serverIsOlderThan($client->serverInfo()?->version, '2.14')` tells whether the connected server advertises an older version (an unparseable version is never older).
+You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`). `FeatureSupport::serverIsOlderThan($client->serverInfo()?->version, '2.14')` tells whether the connected server advertises an older version (an unparseable version is never older). `FeatureSupport::requestedFields($config)` lists the version-gated fields a stream or consumer config asks for (config fields only: the `schedule_*` scheduler features are never among them).
 
 ## PHP Support Policy
 
@@ -869,7 +902,7 @@ _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`test
 
 Distributed counters are an atomic, conflict-free (CRDT) increment subject backed by a JetStream stream. `incrementCounter()` applies a signed delta and returns the new total; `counterValue()` reads the current total via Direct Get (returning `"0"` when nothing is stored yet).
 
-Requires NATS server 2.12+, and the backing stream must be created with `allow_msg_counter: true` (and `allow_direct: true`, since `counterValue()` reads via Direct Get). On a pre-2.12 server, `createStream()` with the counter flag fails fast with an `UnsupportedFeatureException` (the server rejects the unknown config field). A stream created without the flag causes the increment request to be rejected, surfaced as a `JetStreamException`.
+Requires NATS server 2.12+, and the backing stream must be created with `allow_msg_counter: true` (and `allow_direct: true`, since `counterValue()` reads via Direct Get). On a pre-2.12 server, `createStream()` with the counter flag fails fast with an `UnsupportedFeatureException`: before the request when the server advertises its version, otherwise when the returned config shows the server dropped the flag (a default 2.10 or 2.11 server ignores the unknown field instead of rejecting it). A stream created without the flag causes the increment request to be rejected, surfaced as a `JetStreamException`.
 
 The delta is passed as an integer **string** (e.g. `"+5"`, `"-3"`, `"10"`); a malformed delta is rejected before dispatch. Counter totals are likewise returned as **strings** so values beyond `PHP_INT_MAX` are preserved exactly rather than truncated to a float.
 
