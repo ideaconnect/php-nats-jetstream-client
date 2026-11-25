@@ -216,7 +216,7 @@ final class FeatureSupport
      */
     private static function isOlderThan(array $version, string $required): bool
     {
-        [$major, $minor] = array_map('intval', explode('.', $required, 2));
+        [$major, $minor] = array_map('intval', explode('.', $required));
 
         return $version[0] < $major || ($version[0] === $major && $version[1] < $minor);
     }

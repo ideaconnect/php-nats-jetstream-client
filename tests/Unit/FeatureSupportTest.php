@@ -164,6 +164,8 @@ final class FeatureSupportTest extends TestCase
         yield 'every field on 2.12' => [['filter_subjects' => ['a.>'], 'allow_msg_counter' => true, 'priority_groups' => ['g1']], 'v2.12.1'];
         yield 'a 3.0 server' => [['allow_msg_counter' => true], '3.0.0'];
         yield 'unparseable version' => [['allow_msg_counter' => true], 'synadia-custom'];
+        // The version must start with its number: "release-1.5" is a custom build, not a 1.5 server.
+        yield 'number not at the start' => [['allow_msg_ttl' => true], 'release-1.5'];
         yield 'empty version' => [['allow_msg_counter' => true], ''];
         yield 'no version' => [['allow_msg_counter' => true], null];
         yield 'defaults on 2.10' => [['allow_msg_ttl' => false, 'subject_delete_marker_ttl' => 0, 'allow_atomic' => false, 'priority_policy' => 'none'], '2.10.29'];
