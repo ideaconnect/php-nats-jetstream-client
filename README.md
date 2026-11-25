@@ -151,7 +151,9 @@ reactive - there is no per-request version probe - and depends on the feature:
   would answer the recurring schedules with an opaque 400 (`message schedules pattern is invalid`) and
   store an `@at` schedule without its source or rollup. (A `timeZone` is only accepted with a cron
   schedule, so the cron check covers it.) When the version cannot be parsed, the call is published as
-  is and the server decides.
+  is and the server decides. The version checked is the one of the server that takes the frame: a
+  call made while the client reconnects waits for the new connection and is checked against its
+  server's INFO, and the retry after a failed write is checked again.
 - **Other data-path calls** (for example `publish(..., ttl:)` or `directGetBatch()`) against a server
   or stream without the feature surface a plain `JetStreamException` built from the server's error
   response - or the server may silently ignore an unknown header - so consult the table before

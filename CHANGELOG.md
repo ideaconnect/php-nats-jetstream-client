@@ -39,18 +39,30 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   time zone is only accepted with a cron schedule, so the cron check covers it. A plain `@at` schedule (with or
   without a TTL) is still published on 2.12, and every call is published as before on 2.14+ or when the version does
   not parse (a proxy, a custom build). Behavior change: an `@at` schedule with `source` or `rollup` on a pre-2.14
-  server used to be stored without them and now fails; it never did what it asked for.
+  server used to be stored without them and now fails; it never did what it asked for. The version checked is the
+  one of the server that takes the frame: on an open connection the call is checked at once, and it is checked again
+  in the step that writes the frame (`NatsClient::requestWithHeadersGuarded()`, `@internal`), once a reconnect the
+  call waited for is over and before the retry that follows a failed write. A call made while the client fails over
+  from a 2.14 server to a 2.12 one is refused there instead of being stored without its source or rollup, and one
+  made while it fails over from 2.12 to 2.14 is published there instead of being refused by the INFO of the
+  connection being replaced.
 
 ### Testing & CI
 
 - New `ScheduledPublishServerVersionTest`: every call that needs 2.14 is refused before any write on servers
   advertising 2.12.15, 2.12.0, v2.12.0, 2.11.4, 1.99.0, 2.13.9 and "2", and published on 2.14.0, 2.14.0-beta.1,
   v2.14.10, 2.15.3, 3.0.0, an unparseable version or none; a plain `@at` schedule is still published on 2.12; a time
-  zone on an `@at` schedule and a malformed expression keep their own errors; the refusal messages are pinned.
+  zone on an `@at` schedule and a malformed expression keep their own errors; the refusal messages are pinned. Over
+  `tests/Support/ReconnectingTransport.php`, whose sessions can now greet with different versions
+  (`$infoByEpoch`): each of those calls made while the client reconnects from 2.14 to 2.12 is refused by the 2.12
+  session and no schedule reaches either server, each made while it reconnects from 2.12 to 2.14 is published once
+  on the 2.14 session, and a schedule whose write fails on 2.14 and whose recovery lands on 2.12 is refused before
+  the retry. All 17 of these cases fail on the first version of the check, which read the INFO before the reconnect.
   `FeatureSupportTest` covers the new registry entries and the version comparison, and the integration test
   `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders` checks the pre-flight against the live
-  fixture server. The unit tests that sent `@every`, cron or alias schedules to a fake 2.12 server now advertise
-  2.14, or send an `@at` schedule where the schedule kind was not the point.
+  fixture server (on 2.14+ it reads each schedule back from its own subject, so a schedule firing into the target
+  subject during the test cannot change the count). The unit tests that sent `@every`, cron or alias schedules to a
+  fake 2.12 server now advertise 2.14, or send an `@at` schedule where the schedule kind was not the point.
 
 ### Documentation
 
