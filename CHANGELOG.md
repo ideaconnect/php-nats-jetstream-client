@@ -15,6 +15,45 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Added
+
+- `[feature]` JetStream domains and API prefixes (#273): `NatsClient::jetStream(domain: 'hub')` returns a context
+  whose JetStream API requests go to `$JS.hub.API.` instead of `$JS.API.` (nats.go `jetstream.NewWithDomain()`), and
+  `jetStream(apiPrefix: 'JS.from-a.API')` one whose requests go to the prefix an account imports another account's
+  JetStream API under (nats.go `jetstream.NewWithAPIPrefix()`; a trailing `.` is added when missing). A client
+  connected to a leaf node can now use the hub's JetStream: before, every JetStream, KV and Object Store call went to
+  `$JS.API.`, which a leaf node without JetStream answers with no responders. Every API request of the context uses
+  its prefix (streams, consumers, account info, message get/delete, Direct Get, pulls, pause/unpin, and the requests
+  of its KV and Object Store buckets); a JetStream publish and the Object Store's chunk and meta publishes go to their
+  own subjects, acks and flow-control replies to the server's reply subject. KV writes go through the prefix
+  (`$JS.hub.API.$KV.<bucket>.<key>`, nats.go useJSPfx parity): nats-server maps it back to `$KV.<bucket>.<key>`, while
+  a plain `$KV.` publish from a leaf node gets no responders. A KV mirror of a bucket in another domain keeps writing
+  through that origin's API. An invalid domain (empty, or with `.`, `*`, `>`, whitespace or a control character), an
+  invalid prefix (empty, an empty token, a wildcard or whitespace) and a domain together with a prefix throw a
+  `JetStreamException` before any request. One context is kept per prefix, and `jetStream()` without arguments is
+  unchanged. Also new: `JetStreamContext::apiPrefix()`, `JetStreamContext::apiSubject()`, the `domain` and `apiPrefix`
+  constructor arguments of `JetStreamContext`, and `JetStreamApi::DEFAULT_PREFIX`, `domainPrefix()`,
+  `normalizePrefix()`, `resolvePrefix()` and `withPrefix()`.
+
+### Testing & CI
+
+- `[docs]` New `JetStreamDomainTest` over `tests/Support/PrefixedJetStreamServer.php`, a scripted server that answers
+  the JetStream API under one prefix only, maps a prefixed KV write to its `$KV.` subject and gives the no-responders
+  status to every other `$JS.` subject, as a leaf node of another domain does: every API call (45 of them, KV and
+  Object Store included) sends its request under the context's prefix for the default prefix, the domain `hub` and
+  the prefix `$JS.from-a.API`, and none elsewhere; a stream create, a consumer create, a JetStream publish, a pull
+  with its ack, a KV put/get (and its STREAM.MSG.GET fallback) and an Object Store put work through each prefix;
+  KV mirror writes; the validation of domains and prefixes; one context per prefix.
+- `[docs]` New `nats-hub` (JetStream with `jetstream { domain: hub }`, port 14230) and `nats-leaf` (no JetStream,
+  connected to the hub, port 14231) fixtures in `docker-compose.yml` (`build/nats/hub.conf`, `build/nats/leaf.conf`);
+  `scripts/wait-for-nats-services.sh` also waits until the leaf node's connection to the hub is up. New
+  `JetStreamDomainIntegrationTest`, through the leaf node: the default context gets no responders and the domain
+  context the hub's account info; a stream and a consumer used end to end (publish, pull, ackSync); a KV bucket
+  (put, get, update, delete, keys, read back on the hub; a plain `$KV.` write from the leaf node gets no responders);
+  a multi-chunk Object Store object written and read back. It skips when the leaf node is not running.
+
 ## [2.32.0] - 2026-11-25
 
 ### Upgrade notes
