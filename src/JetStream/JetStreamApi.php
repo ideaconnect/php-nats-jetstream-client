@@ -30,6 +30,8 @@ final class JetStreamApi
     public const CONSUMER_DELETE_PREFIX = '$JS.API.CONSUMER.DELETE.';
     public const CONSUMER_PAUSE_PREFIX = '$JS.API.CONSUMER.PAUSE.';
     public const CONSUMER_UNPIN_PREFIX = '$JS.API.CONSUMER.UNPIN.';
+    /** Consumer delivery state reset (ADR-60, NATS server 2.14+): `$JS.API.CONSUMER.RESET.<stream>.<consumer>`. */
+    public const CONSUMER_RESET_PREFIX = '$JS.API.CONSUMER.RESET.';
     public const CONSUMER_LIST_PREFIX = '$JS.API.CONSUMER.LIST.';
     public const CONSUMER_MSG_NEXT_PREFIX = '$JS.API.CONSUMER.MSG.NEXT.';
     public const STREAM_PURGE_PREFIX = '$JS.API.STREAM.PURGE.';

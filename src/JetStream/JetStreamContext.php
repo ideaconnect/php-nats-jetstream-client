@@ -1269,9 +1269,11 @@ final class JetStreamContext
      * (nats.go ErrConsumerSequenceMismatch parity); a delivery that advances the local sequence
      * re-arms the signal. A sequence REGRESSION (heartbeat or delivery below the tracked max)
      * means the consumer was replaced server-side (delete + recreate resets cseq to 1 - within
-     * one instance cseq only advances, and redeliveries get fresh cseqs), so the tracker REBASES
-     * to the new instance instead of masking its real gaps behind the stale high-water mark
-     * (2nd-round review; nats.go fires on any ldseq != dseq).
+     * one instance cseq only advances, and redeliveries get fresh cseqs) or reset (ADR-60
+     * `$JS.API.CONSUMER.RESET`, by this client's {@see resetConsumer()} or by another one: cseq
+     * starts again at 1 too), so the tracker REBASES to the new numbering instead of masking its
+     * real gaps behind the stale high-water mark (2nd-round review; nats.go fires on any
+     * ldseq != dseq). Delivery goes on either way.
      *
      * @param callable(NatsMessage):void $handler
      * @return \Closure(NatsMessage):void
@@ -1313,7 +1315,7 @@ final class JetStreamContext
                             // this instance is >= the rebased value) - and re-arm the gap signal so
                             // a real gap in the NEW instance is reported against ITS numbering.
                             $this->emitClientError(new JetStreamException(sprintf(
-                                'Push consumer %s on stream "%s": consumer sequence mismatch - the server reports last delivered sequence %d below the %d already seen this session; the consumer appears to have been replaced (sequence regressed), rebasing gap detection to the new instance (ADR-9)',
+                                'Push consumer %s on stream "%s": consumer sequence mismatch - the server reports last delivered sequence %d below the %d already seen this session; the consumer appears to have been replaced or reset (sequence regressed), rebasing gap detection to the new instance (ADR-9)',
                                 $consumerLabel,
                                 $stream,
                                 $lastDelivered,
@@ -1840,10 +1842,15 @@ final class JetStreamContext
                     // check needs no per-frame consumer-name scoping (#122). If the server delivered
                     // past what we processed in order, deliveries at the tail were missed and no
                     // further message will expose the gap on its own; recreate proactively from the
-                    // last in-order point (#86). The headers were already parsed by
-                    // handlePushControlMessage (out-param) - do not re-parse the block (#139).
+                    // last in-order point (#86). A report BELOW it is what a reset of the consumer
+                    // produces (ADR-60 `$JS.API.CONSUMER.RESET`, e.g. from the CLI: the consumer
+                    // sequence starts again at 1): recreate from the last in-order point as well,
+                    // since a reset forward past the stream's tail would otherwise hold every new
+                    // message back until the stream reached the reset sequence. The headers were
+                    // already parsed by handlePushControlMessage (out-param) - do not re-parse the
+                    // block (#139).
                     $lastDelivered = $this->heartbeatLastConsumerSeq($controlHeaders ?? []);
-                    if ($lastDelivered !== null && $lastDelivered > $expectedConsumerSeq - 1) {
+                    if ($lastDelivered !== null && $lastDelivered !== $expectedConsumerSeq - 1) {
                         $recreate();
                     }
 
@@ -1887,8 +1894,9 @@ final class JetStreamContext
                 }
 
                 if ($metadata->consumerSequence !== $expectedConsumerSeq) {
-                    // A push was missed (the consumer delivery sequence skipped): recreate just after
-                    // the last in-order message and DISCARD this out-of-order message.
+                    // A push was missed (the consumer delivery sequence skipped), or the consumer was
+                    // reset (ADR-60: the sequence starts again at 1): recreate just after the last
+                    // in-order message and DISCARD this out-of-order message.
                     $recreate();
 
                     return;
@@ -2103,6 +2111,84 @@ final class JetStreamContext
             );
 
             return (bool) ($response['success'] ?? true);
+        });
+    }
+
+    /**
+     * Resets a consumer's delivery state (ADR-60, `$JS.API.CONSUMER.RESET`, NATS server 2.14+), as an
+     * alternative to deleting and recreating it to replay messages or to move past a range that cannot be
+     * processed: the consumer keeps its name, its config and the clients bound to it.
+     *
+     * The pending and redelivery state is dropped and the consumer sequence starts again at 1. Where the
+     * delivery goes on from depends on $sequence:
+     *
+     * - null (an empty request) or 0: just above the consumer's ack floor. Messages delivered but not
+     *   acknowledged are delivered again; acknowledged ones are not.
+     * - above 0: from the first message at or after that stream sequence, backward or forward (a sequence
+     *   past the stream's last message waits for it). The server allows it only for a consumer with
+     *   `deliver_policy` `all`, `by_start_sequence` (not below its `opt_start_seq`) or `by_start_time` (not
+     *   before its `opt_start_time`); anything else is refused with 400 and err_code 10204
+     *   ({@see ApiErrCode::CONSUMER_INVALID_RESET}), thrown as a {@see JetStreamException} carrying both.
+     *
+     * Running consumes keep receiving, with consumer sequences starting again at 1: a pull consume and a
+     * push subscription carry on, and an ordered consumer recreates itself from its last in-order message
+     * ({@see subscribeOrderedConsumer()}), so a reset made by another client (the CLI, an operator) does not
+     * break them either.
+     *
+     * Older servers do not answer the request: on a server advertising a version before 2.14 the call fails
+     * with an {@see UnsupportedFeatureException} (feature `consumer_reset`) before anything is sent; when the
+     * version does not parse, the request is sent and an older server lets it time out. The reset is
+     * answered by the consumer itself, so a consumer or stream that does not exist gets no answer on 2.14
+     * either: the call fails with the request timeout, not with a "consumer not found" error.
+     *
+     * @param int|null $sequence The stream sequence to deliver from; null or 0 resets to the ack floor.
+     * @return Future<ConsumerInfo> The consumer as the reset left it (`delivered`, `ack_floor`, `num_pending`
+     *         in its raw payload), with {@see ConsumerInfo::$resetSequence} set to the stream sequence the next
+     *         delivery starts from.
+     *
+     * @throws JetStreamException When the stream or consumer name is invalid (nothing is sent).
+     * @throws \InvalidArgumentException When $sequence is negative (nothing is sent).
+     */
+    public function resetConsumer(string $stream, string $consumer, ?int $sequence = null): Future
+    {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
+        if ($sequence !== null && $sequence < 0) {
+            throw new \InvalidArgumentException('The sequence of resetConsumer() must not be negative (null or 0 resets the consumer to its ack floor)');
+        }
+
+        return async(function () use ($stream, $consumer, $sequence): ConsumerInfo {
+            $serverVersion = $this->serverVersion();
+            $required = FeatureSupport::REQUIREMENTS['consumer_reset'];
+            if (FeatureSupport::serverIsOlderThan($serverVersion, $required)) {
+                throw new UnsupportedFeatureException(
+                    'consumer_reset',
+                    $required,
+                    $serverVersion,
+                    sprintf(
+                        'Consumer reset requires NATS server %s+; older servers do not answer it (connected server %s; nothing was sent)',
+                        $required,
+                        $serverVersion,
+                    ),
+                );
+            }
+
+            $response = $this->requestJson(
+                JetStreamApi::CONSUMER_RESET_PREFIX . $stream . '.' . $consumer,
+                $sequence === null ? [] : ['seq' => $sequence],
+            );
+
+            if (!is_array($response['config'] ?? null)) {
+                // nats.go ErrConsumerResetResponseEmpty: an answer that is neither an error nor a consumer.
+                throw new JetStreamException(sprintf(
+                    'The reset reply for consumer "%s" on stream "%s" carries no consumer info: the reset may or may not have taken effect',
+                    $consumer,
+                    $stream,
+                ));
+            }
+
+            return ConsumerInfo::fromArray($response);
         });
     }
 
