@@ -11,9 +11,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\TimeoutException;
-use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\ApiErrCode;
-use IDCT\NATS\JetStream\FeatureSupport;
 use IDCT\NATS\JetStream\JetStreamContext;
 use PHPUnit\Framework\TestCase;
 
@@ -21,15 +19,19 @@ use function Amp\delay;
 
 /**
  * The consumer delivery state reset of ADR-60 (#274) against a live server. nats-server 2.14 added
- * `$JS.API.CONSUMER.RESET`; the fixture stack runs 2.12, so there only the pre-flight refusal runs and the rest is
- * skipped. Point NATS_URL at a 2.14+ server to run them (e.g. `docker run -p 24222:4222 nats:2.14-alpine -js` and
- * `NATS_URL=nats://127.0.0.1:24222`).
+ * `$JS.API.CONSUMER.RESET`; the fixture stack runs 2.12, so there only the timeout of a server without it runs and
+ * the rest is skipped. Point NATS_URL at a 2.14+ server to run them (e.g. `docker run -p 24222:4222 nats:2.14-alpine
+ * -js` and `NATS_URL=nats://127.0.0.1:24222`). Which tests run is decided by the API level `$JS.API.INFO` reports
+ * (ADR-44), not by the INFO version.
  *
  * The consume tests reset the consumer from a second client, as an operator or the CLI would.
  */
 final class ConsumerResetIntegrationTest extends TestCase
 {
     use IntegrationTestBootstrap;
+
+    /** The JetStream API level of nats-server 2.14, the first with the consumer reset API. */
+    private const RESET_API_LEVEL = 4;
 
     /** @var list<NatsClient> */
     private array $clients = [];
@@ -55,29 +57,30 @@ final class ConsumerResetIntegrationTest extends TestCase
     }
 
     /**
-     * A server before 2.14 does not answer the reset: the client refuses it before sending, naming the feature.
+     * A server before 2.14 does not answer the reset: the request is sent whatever version INFO reports (ADR-44,
+     * #272), the call fails with the request timeout, and the consumer is untouched. The server is judged by the API
+     * level `$JS.API.INFO` reports (below 4 before 2.14), not by its INFO version.
      */
-    public function testAResetIsRefusedBeforeSendingOnAServerBefore214(): void
+    public function testAResetTimesOutOnAServerBefore214(): void
     {
         $this->requireIntegrationEnabled();
 
         $client = $this->client();
-        $version = $client->serverInfo()?->version;
-        if (!FeatureSupport::serverIsOlderThan($version, '2.14')) {
-            self::markTestSkipped(sprintf('The server (%s) offers the consumer reset API.', (string) $version));
+        $js = $client->jetStream();
+        $apiLevel = $js->accountInfo()->await()->apiLevel;
+        if ($apiLevel !== null && $apiLevel >= self::RESET_API_LEVEL) {
+            self::markTestSkipped(sprintf('The server (API level %d) offers the consumer reset API.', $apiLevel));
         }
 
-        $js = $client->jetStream();
         $stream = $this->stream($js, 3);
         $js->createConsumer($stream, 'worker', null, ['ack_policy' => 'explicit'])->await();
 
         try {
-            $js->resetConsumer($stream, 'worker', 2)->await();
-            self::fail('expected the reset to be refused on ' . (string) $version);
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame('consumer_reset', $e->feature);
-            self::assertSame('2.14', $e->requiredVersion);
-            self::assertSame($version, $e->serverVersion);
+            // A short request timeout for the reset only: the setup above keeps the default.
+            $this->client(1_000)->jetStream()->resetConsumer($stream, 'worker', 2)->await();
+            self::fail(sprintf('expected the reset to time out on %s', (string) $client->serverInfo()?->version));
+        } catch (TimeoutException) {
+            // A server without the reset API does not answer it.
         }
 
         self::assertSame('m-1', $js->fetchNext($stream, 'worker', 2_000)->await()->payload, 'the consumer is untouched');
@@ -287,7 +290,7 @@ final class ConsumerResetIntegrationTest extends TestCase
         return $client;
     }
 
-    /** A connected client, the test skipped unless the server offers the reset API (2.14+). */
+    /** A connected client, the test skipped unless the server offers the reset API (2.14+, API level 4). */
     private function clientWithResetApi(int $requestTimeoutMs = 5_000): NatsClient
     {
         $this->requireIntegrationEnabled();
@@ -296,9 +299,13 @@ final class ConsumerResetIntegrationTest extends TestCase
             $this->client();
         }
 
-        $version = $this->clients[0]->serverInfo()?->version;
-        if (FeatureSupport::serverIsOlderThan($version, '2.14')) {
-            self::markTestSkipped(sprintf('The consumer reset API needs NATS server 2.14+; the server reports %s.', (string) $version));
+        $apiLevel = $this->clients[0]->jetStream()->accountInfo()->await()->apiLevel;
+        if ($apiLevel === null || $apiLevel < self::RESET_API_LEVEL) {
+            self::markTestSkipped(sprintf(
+                'The consumer reset API needs NATS server 2.14+ (API level %d); the server reports %s.',
+                self::RESET_API_LEVEL,
+                $apiLevel === null ? 'no API level' : 'API level ' . $apiLevel,
+            ));
         }
 
         return $requestTimeoutMs === 5_000 ? $this->clients[0] : $this->client($requestTimeoutMs);

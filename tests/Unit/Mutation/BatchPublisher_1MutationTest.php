@@ -14,7 +14,7 @@ use PHPUnit\Framework\TestCase;
 /**
  * Second mutation-killing chunk for {@see \IDCT\NATS\JetStream\BatchPublisher}. Each method pins the
  * exact observable behaviour that one surviving Infection mutant would change, focused on the absence of
- * a version pre-flight (ADR-44, #272; up to 2.32.0 commit() had the #152 one), the reply-shape detection
+ * a version pre-flight (ADR-44, #272; up to 2.33.0 commit() had the #152 one), the reply-shape detection
  * (#130), and the diagnostic each failure surfaces. See the per-method docblocks naming the exact mutant killed.
  */
 final class BatchPublisher_1MutationTest extends TestCase
@@ -143,7 +143,7 @@ final class BatchPublisher_1MutationTest extends TestCase
     /**
      * No INFO version decides: a 1.x major, an unanchored "release-1.5", a v-prefixed "v2.12.0" and a pre-2.12
      * "2.11.4" all get the batch on the wire, and it commits when the JetStream API that answers serves atomic
-     * batches. Up to 2.32.0 the #152 pre-flight refused the 1.x and 2.11.4 ones before any write; a pre-flight
+     * batches. Up to 2.33.0 the #152 pre-flight refused the 1.x and 2.11.4 ones before any write; a pre-flight
      * brought back (any version comparison in commit()) fails this test. Pinned by: every message is written and
      * commit() returns the batch ack.
      */

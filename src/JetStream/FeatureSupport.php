@@ -80,13 +80,18 @@ final class FeatureSupport
     ];
 
     /**
-     * Minimum NATS server version per JetStream API call that came after the API's first release. An
-     * older server does not reject such a request: nothing answers it, and the call times out. These
-     * keys are not config fields either.
+     * Minimum NATS server version per JetStream API call (or request form) that came after the API's first
+     * release. An older server does not reject such a request with an error of its own: it does not answer
+     * the consumer reset at all, so the call times out, and it answers a batched Direct Get as it would a
+     * plain one (ADR-31), which {@see JetStreamContext::directGetBatch()} reads from the reply. These keys
+     * are not config fields either.
      *
      * @var array<string,string>
      */
     private const API_FEATURES = [
+        // Batched Direct Get (`batch`, `multi_last`; ADR-31), JetStreamContext::directGetBatch() and
+        // directGetLastForSubjects().
+        'direct_get_batch' => '2.11',
         // $JS.API.CONSUMER.RESET (ADR-60), JetStreamContext::resetConsumer().
         'consumer_reset' => '2.14',
     ];

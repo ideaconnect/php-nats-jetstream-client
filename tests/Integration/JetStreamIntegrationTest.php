@@ -607,7 +607,7 @@ final class JetStreamIntegrationTest extends TestCase
      * 400 "message schedules pattern is invalid" and stores an "@at" schedule while ignoring Nats-Schedule-Source and
      * Nats-Schedule-Rollup; a level-4+ server (2.14+) accepts and stores all four. Each stored schedule is read back
      * from its own schedule subject (a whole-stream count would also take in a message a schedule fired into the target
-     * subject meanwhile). Up to 2.32.0 the client refused all four calls on a 2.12 INFO version (#267).
+     * subject meanwhile). Up to 2.33.0 the client refused all four calls on a 2.12 INFO version (#267).
      */
     public function testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders(): void
     {

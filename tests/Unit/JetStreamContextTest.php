@@ -2052,9 +2052,9 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * One case per call that sets a version-gated field or uses a feature that came after 2.10/2.11: the stream and
-     * consumer calls with each gated config field, the scheduler features of 2.14 and an atomic batch commit (2.12),
-     * each with the replies of a JetStream API that serves it, as a newer meta leader or stream host does, and the
-     * request line that must reach the server (#272).
+     * consumer calls with each gated config field, the scheduler features of 2.14, an atomic batch commit (2.12) and
+     * a consumer reset (2.14), each with the replies of a JetStream API that serves it, as a newer meta leader or
+     * stream host does, and the request line that must reach the server (#272).
      *
      * @return iterable<string,array{\Closure(JetStreamContext):\Amp\Future<mixed>,list<string>,string}>
      */
@@ -2078,14 +2078,15 @@ final class JetStreamContextTest extends TestCase
         yield 'publishScheduled @at with a source' => [static fn(JetStreamContext $js) => $js->publishScheduled('schedules.tick', 'events.tick', 'p', '@at 2030-01-01T00:00:00Z', source: 'sensors.temperature'), ['{"stream":"SCHED","seq":1}'], 'HPUB schedules.tick '];
         yield 'publishScheduled @at with rollup' => [static fn(JetStreamContext $js) => $js->publishScheduled('schedules.tick', 'events.tick', 'p', '@at 2030-01-01T00:00:00Z', rollup: true), ['{"stream":"SCHED","seq":1}'], 'HPUB schedules.tick '];
         yield 'atomic batch commit' => [static fn(JetStreamContext $js) => $js->batch('b1')->add('atom.a', '1')->add('atom.b', '2')->commit(), ['', '{"stream":"ATOM","seq":2,"batch":"b1","count":2}'], 'HPUB atom.a '];
+        yield 'resetConsumer to a sequence' => [static fn(JetStreamContext $js) => $js->resetConsumer('ORDERS', 'PROC', 42), ['{"type":"io.nats.jetstream.api.v1.consumer_reset_response","stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","deliver_policy":"all","ack_policy":"explicit"},"reset_seq":42}'], 'PUB $JS.API.CONSUMER.RESET.ORDERS.PROC '];
     }
 
     /**
      * Verifies no request depends on the server version INFO reports (ADR-44 revision 4, #272): with a connected
      * server whose INFO reports 2.10.29 or 2.11.17 while the JetStream API answers as a newer server (the meta
      * leader or the stream's host in a cluster under a rolling upgrade), every call is sent and succeeds, and the
-     * bytes written are the same as when INFO reports 2.14.10. Up to 2.32.0 each of these calls was refused before
-     * anything was sent.
+     * bytes written are the same as when INFO reports 2.14.10. Up to 2.33.0 each of these calls but the four
+     * filter_subjects ones was refused before anything was sent.
      *
      * @param \Closure(JetStreamContext):\Amp\Future<mixed> $call
      * @param list<string>                                  $replies

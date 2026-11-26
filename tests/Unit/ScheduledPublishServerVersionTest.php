@@ -29,7 +29,7 @@ use function Amp\delay;
  * stores an "@at" schedule while ignoring Nats-Schedule-Source and Nats-Schedule-Rollup. Those arrived in 2.14.0, with
  * Nats-Schedule-Time-Zone.
  *
- * From 2.31.0 to 2.32.0 the call refused what needs 2.14 when the connected server's INFO version parsed as older. ADR-44
+ * From 2.31.0 to 2.33.0 the call refused what needs 2.14 when the connected server's INFO version parsed as older. ADR-44
  * (revision 4) forbids that: the schedule is stored by the server that hosts the stream, which in a cluster during a
  * rolling upgrade may run a newer release than the one the client is connected to. Every call is now published
  * whatever the INFO version, and the server that stores the schedule decides: its 400 reaches the caller as an ordinary

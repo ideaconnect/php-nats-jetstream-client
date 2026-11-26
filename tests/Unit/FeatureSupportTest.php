@@ -163,6 +163,22 @@ final class FeatureSupportTest extends TestCase
     }
 
     /**
+     * Verifies the JetStream API features are in the registry, so every feature name an UnsupportedFeatureException
+     * of the library carries has its version there (`direct_get_batch` 2.11, #272; `consumer_reset` 2.14, #274), and
+     * that neither is a config field: a config carrying them asks for nothing, and a strict server's "unknown field"
+     * rejection of one is not mapped.
+     */
+    public function testApiFeaturesAreInTheRegistryButAreNotConfigFields(): void
+    {
+        self::assertSame('2.11', FeatureSupport::requiredVersion('direct_get_batch'));
+        self::assertSame('2.14', FeatureSupport::requiredVersion('consumer_reset'));
+
+        self::assertSame([], FeatureSupport::requestedFields(['direct_get_batch' => true, 'consumer_reset' => true]));
+        self::assertNull(FeatureSupport::unsupportedFromApiError('invalid JSON: json: unknown field "direct_get_batch"', 400, '2.12.0'));
+        self::assertNull(FeatureSupport::unsupportedFromApiError('invalid JSON: json: unknown field "consumer_reset"', 400, '2.12.0'));
+    }
+
+    /**
      * Verifies the INFO-version pre-flight of the stream and consumer calls is gone (ADR-44, #272): FeatureSupport
      * keeps the reply check and the strict-server mapping, and nothing that compares a config with a server version.
      */

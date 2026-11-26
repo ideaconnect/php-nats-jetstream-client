@@ -2124,11 +2124,11 @@ final class JetStreamContext
      * ({@see subscribeOrderedConsumer()}), so a reset made by another client (the CLI, an operator) does not
      * break them either.
      *
-     * Older servers do not answer the request: on a server advertising a version before 2.14 the call fails
-     * with an {@see UnsupportedFeatureException} (feature `consumer_reset`) before anything is sent; when the
-     * version does not parse, the request is sent and an older server lets it time out. The reset is
-     * answered by the consumer itself, so a consumer or stream that does not exist gets no answer on 2.14
-     * either: the call fails with the request timeout, not with a "consumer not found" error.
+     * The request is sent whatever version the connected server reports in INFO (ADR-44, #272): the consumer
+     * is answered by the server that hosts it, which may run another release. A server before 2.14 does not
+     * answer it at all, so there the call fails with the request timeout (a {@see TimeoutException}). The
+     * reset is answered by the consumer itself, so a consumer or stream that does not exist gets no answer on
+     * 2.14 either: the call fails with the request timeout, not with a "consumer not found" error.
      *
      * @param int|null $sequence The stream sequence to deliver from; null or 0 resets to the ack floor.
      * @return Future<ConsumerInfo> The consumer as the reset left it (`delivered`, `ack_floor`, `num_pending`
@@ -2148,21 +2148,6 @@ final class JetStreamContext
         }
 
         return async(function () use ($stream, $consumer, $sequence): ConsumerInfo {
-            $serverVersion = $this->serverVersion();
-            $required = FeatureSupport::REQUIREMENTS['consumer_reset'];
-            if (FeatureSupport::serverIsOlderThan($serverVersion, $required)) {
-                throw new UnsupportedFeatureException(
-                    'consumer_reset',
-                    $required,
-                    $serverVersion,
-                    sprintf(
-                        'Consumer reset requires NATS server %s+; older servers do not answer it (connected server %s; nothing was sent)',
-                        $required,
-                        $serverVersion,
-                    ),
-                );
-            }
-
             $response = $this->requestJson(
                 JetStreamApi::CONSUMER_RESET_PREFIX . $stream . '.' . $consumer,
                 $sequence === null ? [] : ['seq' => $sequence],
@@ -5082,16 +5067,18 @@ final class JetStreamContext
     {
         $serverVersion = $this->serverVersion();
         $reported = ($serverVersion !== null && $serverVersion !== '') ? $serverVersion : 'unknown';
+        $required = FeatureSupport::REQUIREMENTS['direct_get_batch'];
         $answer = $error === null
             ? 'a single message without Nats-Num-Pending'
             : sprintf('%d %s', $error['code'], $error['description']);
 
         return new UnsupportedFeatureException(
             'direct_get_batch',
-            '2.11',
+            $required,
             $serverVersion,
             sprintf(
-                'Batched Direct Get requires NATS server 2.11+, and the server answered the batch request for stream "%s" with %s (connected server reports %s)',
+                'Batched Direct Get requires NATS server %s+, and the server answered the batch request for stream "%s" with %s (connected server reports %s)',
+                $required,
                 $stream,
                 $answer,
                 $reported,
