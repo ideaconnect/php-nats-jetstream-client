@@ -2175,7 +2175,7 @@ final class JetStreamContext
             }
 
             $response = $this->requestJson(
-                JetStreamApi::CONSUMER_RESET_PREFIX . $stream . '.' . $consumer,
+                $this->apiSubject(JetStreamApi::CONSUMER_RESET_PREFIX) . $stream . '.' . $consumer,
                 $sequence === null ? [] : ['seq' => $sequence],
             );
 

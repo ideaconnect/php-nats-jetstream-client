@@ -7,6 +7,7 @@ namespace IDCT\NATS\Tests\Unit;
 use Amp\Future;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
@@ -54,9 +55,11 @@ final class JetStreamDomainTest extends TestCase
     }
 
     /**
-     * Each JetStream API call, KV and Object Store calls included, with the API subject it must send (after the prefix).
+     * Each JetStream API call, KV and Object Store calls included, with the API subject it must send (after the prefix)
+     * and, for a call a server version check gates, the version the scripted server must advertise for the call to be
+     * sent at all ({@see PrefixedJetStreamServer::VERSION} otherwise).
      *
-     * @return iterable<string, array{\Closure(JetStreamContext): Future<mixed>, string}>
+     * @return iterable<string, array{0: \Closure(JetStreamContext): Future<mixed>, 1: string, 2?: string}>
      */
     public static function apiCalls(): iterable
     {
@@ -90,7 +93,14 @@ final class JetStreamDomainTest extends TestCase
         yield 'pauseConsumer' => [static fn(JetStreamContext $js): Future => $js->pauseConsumer('ORDERS', 'worker', '2030-01-01T00:00:00Z'), 'CONSUMER.PAUSE.ORDERS.worker'];
         yield 'resumeConsumer' => [static fn(JetStreamContext $js): Future => $js->resumeConsumer('ORDERS', 'worker'), 'CONSUMER.PAUSE.ORDERS.worker'];
         yield 'unpinConsumer' => [static fn(JetStreamContext $js): Future => $js->unpinConsumer('ORDERS', 'worker', 'jobs'), 'CONSUMER.UNPIN.ORDERS.worker'];
+        yield 'resetConsumer' => [static fn(JetStreamContext $js): Future => $js->resetConsumer('ORDERS', 'worker'), 'CONSUMER.RESET.ORDERS.worker', '2.14.0'];
         yield 'fetchBatch' => [static fn(JetStreamContext $js): Future => $js->fetchBatch('ORDERS', 'worker', 1, 300), 'CONSUMER.MSG.NEXT.ORDERS.worker'];
+        yield 'pullConsumer handle' => [
+            static fn(JetStreamContext $js): Future => $js->pullConsumer('ORDERS', 'worker')
+                ->setBatching(1)->setDepth(1)->setExpiresMs(300)->setIterations(1)
+                ->handle(static function (): void {}),
+            'CONSUMER.MSG.NEXT.ORDERS.worker',
+        ];
         yield 'diagnoseNoResponders' => [static fn(JetStreamContext $js): Future => $js->diagnoseNoResponders('ORDERS', 'worker', 500), 'CONSUMER.INFO.ORDERS.worker'];
         yield 'keyValueBucketNames' => [static fn(JetStreamContext $js): Future => $js->keyValueBucketNames(), 'STREAM.NAMES'];
         yield 'objectStoreBucketNames' => [static fn(JetStreamContext $js): Future => $js->objectStoreBucketNames(), 'STREAM.NAMES'];
@@ -108,13 +118,20 @@ final class JetStreamDomainTest extends TestCase
     }
 
     /**
-     * @return iterable<string, array{?string, ?string, string, \Closure(JetStreamContext): Future<mixed>, string}>
+     * @return iterable<string, array{?string, ?string, string, \Closure(JetStreamContext): Future<mixed>, string, string}>
      */
     public static function routedApiCalls(): iterable
     {
         foreach (self::prefixes() as $prefixLabel => [$domain, $apiPrefix, $expectedPrefix]) {
-            foreach (self::apiCalls() as $callLabel => [$call, $suffix]) {
-                yield $prefixLabel . ' / ' . $callLabel => [$domain, $apiPrefix, $expectedPrefix, $call, $suffix];
+            foreach (self::apiCalls() as $callLabel => $apiCall) {
+                yield $prefixLabel . ' / ' . $callLabel => [
+                    $domain,
+                    $apiPrefix,
+                    $expectedPrefix,
+                    $apiCall[0],
+                    $apiCall[1],
+                    $apiCall[2] ?? PrefixedJetStreamServer::VERSION,
+                ];
             }
         }
     }
@@ -133,8 +150,9 @@ final class JetStreamDomainTest extends TestCase
         string $expectedPrefix,
         \Closure $call,
         string $suffix,
+        string $serverVersion,
     ): void {
-        [$client, $server] = $this->connect($expectedPrefix);
+        [$client, $server] = $this->connect($expectedPrefix, serverVersion: $serverVersion);
 
         try {
             $call($client->jetStream($domain, $apiPrefix))->await();
@@ -147,11 +165,12 @@ final class JetStreamDomainTest extends TestCase
 
     /**
      * The flow of the issue's "done when", over the scripted server: a stream and a consumer are created, a message
-     * is published, pulled and acknowledged, a KV bucket is created, written and read, and an Object Store bucket is
-     * created and written. The API requests use the context's prefix; the JetStream publish and the Object Store's
-     * chunk and meta publishes go to their plain subjects; a KV write goes through the API prefix when there is one
-     * (`$JS.hub.API.$KV.cfg.color`, nats.go useJSPfx parity: a plain `$KV.` publish from a leaf node gets no
-     * responders); the ack goes to the delivered `$JS.ACK` reply as it is.
+     * is published, pulled and acknowledged, a second one is consumed by a pull consume (`pullConsumer()->handle()`),
+     * a KV bucket is created, written and read, and an Object Store bucket is created and written. The API requests use
+     * the context's prefix; the JetStream publish and the Object Store's chunk and meta publishes go to their plain
+     * subjects; a KV write goes through the API prefix when there is one (`$JS.hub.API.$KV.cfg.color`, nats.go useJSPfx
+     * parity: a plain `$KV.` publish from a leaf node gets no responders); the ack goes to the delivered `$JS.ACK`
+     * reply as it is.
      */
     #[DataProvider('prefixes')]
     public function testStreamsConsumersPullsKvAndObjectStoreWorkThroughTheContextsPrefix(
@@ -172,6 +191,16 @@ final class JetStreamDomainTest extends TestCase
         self::assertCount(1, $messages);
         self::assertSame('{"id":1}', $messages[0]->payload);
         $js->ack($messages[0])->await();
+
+        $js->publish('orders.shipped', '{"id":2}')->await();
+        $handled = [];
+        $consumed = $js->pullConsumer('ORDERS', 'worker')
+            ->setBatching(1)->setDepth(1)->setExpiresMs(1000)->setIterations(1)
+            ->handle(static function (NatsMessage $message) use (&$handled): void {
+                $handled[] = $message->payload;
+            })->await();
+        self::assertSame(1, $consumed);
+        self::assertSame(['{"id":2}'], $handled);
 
         $kv = $js->keyValue('cfg');
         $kv->create()->await();
@@ -220,6 +249,32 @@ final class JetStreamDomainTest extends TestCase
         $subjects = $server->publishedSubjects();
         self::assertContains($expectedPrefix . 'DIRECT.GET.KV_cfg', $subjects);
         self::assertContains($expectedPrefix . 'STREAM.MSG.GET.KV_cfg', $subjects);
+        self::assertSame([], self::apiRequestsOutside($expectedPrefix, $subjects));
+    }
+
+    /**
+     * A KV handle bound to an existing bucket (`bind()`, not `create()`) writes through the context's prefix too:
+     * `bind()` clears the handle's mirror state, and a bucket that is no mirror keeps the context's prefix in front of
+     * its `$KV.` write (`$JS.hub.API.$KV.cfg.color`), which a leaf node would otherwise answer with no responders.
+     */
+    #[DataProvider('prefixes')]
+    public function testKvBucketBoundToAnExistingBucketWritesThroughTheContextsPrefix(
+        ?string $domain,
+        ?string $apiPrefix,
+        string $expectedPrefix,
+    ): void {
+        [$client, $server] = $this->connect($expectedPrefix);
+        $js = $client->jetStream($domain, $apiPrefix);
+        $js->keyValue('cfg')->create()->await();
+
+        $bound = $js->keyValue('cfg')->bind()->await();
+        $bound->put('color', 'blue')->await();
+
+        self::assertSame('blue', $bound->get('color')->await()?->value);
+        $subjects = $server->publishedSubjects();
+        self::assertContains($expectedPrefix . 'STREAM.INFO.KV_cfg', $subjects);
+        $kvWrite = $expectedPrefix === JetStreamApi::DEFAULT_PREFIX ? '$KV.cfg.color' : $expectedPrefix . '$KV.cfg.color';
+        self::assertContains($kvWrite, $subjects);
         self::assertSame([], self::apiRequestsOutside($expectedPrefix, $subjects));
     }
 
@@ -378,14 +433,15 @@ final class JetStreamDomainTest extends TestCase
     }
 
     /**
-     * A client connected over a {@see FakeTransport} to a {@see PrefixedJetStreamServer} answering under $apiPrefix.
+     * A client connected over a {@see FakeTransport} to a {@see PrefixedJetStreamServer} answering under $apiPrefix
+     * and advertising $serverVersion.
      *
      * @return array{NatsClient, PrefixedJetStreamServer}
      */
-    private function connect(string $apiPrefix, bool $directGet = true): array
+    private function connect(string $apiPrefix, bool $directGet = true, string $serverVersion = PrefixedJetStreamServer::VERSION): array
     {
         $server = new PrefixedJetStreamServer($apiPrefix, $directGet);
-        $transport = new FakeTransport([PrefixedJetStreamServer::INFO]);
+        $transport = new FakeTransport([PrefixedJetStreamServer::info($serverVersion)]);
         $server->install($transport);
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();

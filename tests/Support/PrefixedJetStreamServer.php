@@ -17,14 +17,17 @@ namespace IDCT\NATS\Tests\Support;
  *   - a publish to a stream's own subjects (`orders.created`, `$O.files.C.<nuid>`) is stored and acknowledged with a
  *     PubAck, and anything else with a reply gets 503.
  *
- * It answers every PING with a PONG (so give the transport only the {@see INFO} line), delivers a reply on the
+ * It answers every PING with a PONG (so give the transport only the {@see info()} line), delivers a reply on the
  * subscription matching its reply subject (the client's muxed request inbox or a pull inbox), and records every
  * publish the client writes in {@see $published}. With `$directGet` false it answers Direct Get with 503, as for a
  * stream without `allow_direct`.
  */
 final class PrefixedJetStreamServer
 {
-    public const INFO = 'INFO {"server_id":"S1","server_name":"leaf","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
+    /** The server version its INFO advertises unless a test asks for another one ({@see info()}). */
+    public const VERSION = '2.12.0';
+
+    private const INFO_FORMAT = 'INFO {"server_id":"S1","server_name":"leaf","version":"%s","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     private const DEFAULT_PREFIX = '$JS.API.';
 
@@ -49,6 +52,15 @@ final class PrefixedJetStreamServer
     private array $lastSequence = [];
 
     public function __construct(private readonly string $apiPrefix, private readonly bool $directGet = true) {}
+
+    /**
+     * The INFO line the server greets the client with, advertising $version: a call a version check gates (the
+     * consumer reset needs 2.14) is refused before anything is sent unless the version allows it.
+     */
+    public static function info(string $version = self::VERSION): string
+    {
+        return sprintf(self::INFO_FORMAT, $version);
+    }
 
     public function install(FakeTransport $transport): void
     {

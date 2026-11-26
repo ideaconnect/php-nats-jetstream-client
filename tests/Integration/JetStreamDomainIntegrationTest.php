@@ -6,6 +6,7 @@ namespace IDCT\NATS\Tests\Integration;
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\JetStream\JetStreamContext;
@@ -62,8 +63,9 @@ final class JetStreamDomainIntegrationTest extends TestCase
     /**
      * Through the leaf node: a stream and a durable consumer are created on the hub, a message published to the
      * stream's plain subject is acknowledged by the hub's domain, pulled back and acknowledged (ackSync, so the hub
-     * confirms it), and the consumer has nothing left to deliver or to wait for an ack on. A client connected to the
-     * hub directly sees the same stream.
+     * confirms it), a second one is consumed by a pull consume (`pullConsumer()->handle()`, whose pulls go under the
+     * domain too) and acknowledged, and the consumer has nothing left to deliver or to wait for an ack on. A client
+     * connected to the hub directly sees the same stream.
      */
     public function testAStreamAndAConsumerOnTheHubAreUsedThroughTheLeafNode(): void
     {
@@ -90,12 +92,23 @@ final class JetStreamDomainIntegrationTest extends TestCase
             self::assertSame(1, $js->messageMetadata($messages[0])->streamSequence);
             $js->ackSync($messages[0])->await();
 
+            $js->publish($subject, '{"id":2}')->await();
+            $handled = [];
+            $consumed = $js->pullConsumer($stream, 'reader')
+                ->setBatching(1)->setDepth(1)->setExpiresMs(3000)->setIterations(1)
+                ->handle(static function (NatsMessage $message, JetStreamContext $context) use (&$handled): void {
+                    $handled[] = $message->payload;
+                    $context->ackSync($message)->await();
+                })->await();
+            self::assertSame(1, $consumed);
+            self::assertSame(['{"id":2}'], $handled);
+
             $consumer = $js->getConsumer($stream, 'reader')->await();
             self::assertSame(0, (int) ($consumer->raw['num_ack_pending'] ?? -1));
             self::assertSame(0, (int) ($consumer->raw['num_pending'] ?? -1));
 
             $hub = $this->connect($this->integrationHubServerUrl());
-            self::assertSame(1, $hub->jetStream()->getStream($stream)->await()->raw['state']['messages'] ?? null);
+            self::assertSame(2, $hub->jetStream()->getStream($stream)->await()->raw['state']['messages'] ?? null);
         } finally {
             $js->deleteStream($stream)->await();
         }
