@@ -27,6 +27,13 @@ final class ApiErrCode
     public const STREAM_DUPLICATE_MESSAGE_CONFLICT = 10158;
 
     /**
+     * `400 invalid reset: ...` (nats-server `JSConsumerInvalidResetErr`, NATS 2.14+): a consumer reset to a sequence the
+     * consumer's config does not allow (a `deliver_policy` other than `all`, `by_start_sequence` or `by_start_time`, or a
+     * sequence before the consumer's start). nats.go `JSErrCodeConsumerInvalidReset`.
+     */
+    public const CONSUMER_INVALID_RESET = 10204;
+
+    /**
      * Extracts `err_code` from a decoded error envelope, or null when absent (a server predating the
      * field). A zero is treated as absent: real servers never emit `err_code: 0` (Go omitempty), so
      * it can only come from a malformed proxy - taking it as authoritative would disable the

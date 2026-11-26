@@ -31,13 +31,14 @@ final class FeatureSupport
     /**
      * Minimum NATS server version per version-gated feature key: the stream/consumer config fields
      * ({@see CONFIG_FIELDS}), then the scheduler features of `publishScheduled()`
-     * ({@see SCHEDULE_FEATURES}), which are not config fields. {@see requiredVersion()} answers for
-     * both; only the config fields are read from a config ({@see requestedFields()}) or mapped from a
-     * strict server's `unknown field "X"` rejection ({@see unsupportedFromApiError()}).
+     * ({@see SCHEDULE_FEATURES}), then the JetStream API calls an older server does not answer
+     * ({@see API_FEATURES}); neither of the last two is a config field. {@see requiredVersion()} answers
+     * for all of them; only the config fields are read from a config ({@see requestedFields()}) or mapped
+     * from a strict server's `unknown field "X"` rejection ({@see unsupportedFromApiError()}).
      *
      * @var array<string,string>
      */
-    public const REQUIREMENTS = self::CONFIG_FIELDS + self::SCHEDULE_FEATURES;
+    public const REQUIREMENTS = self::CONFIG_FIELDS + self::SCHEDULE_FEATURES + self::API_FEATURES;
 
     /**
      * Minimum NATS server version per version-gated stream/consumer config field. An older server does
@@ -77,6 +78,18 @@ final class FeatureSupport
         'schedule_time_zone' => '2.14',
         // The Nats-Schedule-Rollup header.
         'schedule_rollup' => '2.14',
+    ];
+
+    /**
+     * Minimum NATS server version per JetStream API call that came after the API's first release. An
+     * older server does not reject such a request: nothing answers it, and the call times out. These
+     * keys are not config fields either.
+     *
+     * @var array<string,string>
+     */
+    private const API_FEATURES = [
+        // $JS.API.CONSUMER.RESET (ADR-60), JetStreamContext::resetConsumer().
+        'consumer_reset' => '2.14',
     ];
 
     /**

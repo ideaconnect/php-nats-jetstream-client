@@ -55,6 +55,7 @@ Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
 - [Graceful Drain](#graceful-drain)
 - [Ordered Consumer](#ordered-consumer)
 - [Consumer Pause/Resume](#consumer-pauseresume)
+- [Consumer Reset](#consumer-reset)
 - [Fetch Batch](#fetch-batch)
 - [Stream Purge and List](#stream-purge-and-list)
 - [Consumer List](#consumer-list)
@@ -101,6 +102,7 @@ Current functionality includes:
 - JetStream push consumers with heartbeat/flow-control handling
 - JetStream ordered consumers with automatic sequence tracking and gap recovery
 - JetStream consumer pause/resume
+- JetStream consumer delivery state reset (`resetConsumer()`, ADR-60, NATS 2.14+), and consumes that carry on when another client resets their consumer
 - JetStream publish ACK
 - JetStream stream message get by sequence - both the regular `STREAM.MSG.GET` request and the Direct Get API (`directGetStreamMessage()` / `directGetLastMessageForSubject()`)
 - JetStream atomic (all-or-nothing) batch publish (`batch()` -> `BatchPublisher`, ADR-50; requires `allow_atomic`, NATS 2.12+)
@@ -180,6 +182,11 @@ depends on the feature:
   is and the server decides. The version checked is the one of the server that takes the frame: a
   call made while the client reconnects waits for the new connection and is checked against its
   server's INFO, and the retry after a failed write is checked again.
+- **Consumer reset**: a server before 2.14 does not answer `$JS.API.CONSUMER.RESET` at all, so when
+  the advertised version parses as older than 2.14, `resetConsumer()` fails fast with the feature
+  `consumer_reset` before anything is sent (`... nothing was sent`) instead of waiting out the
+  request timeout. When the version cannot be parsed, the request is sent and an older server lets it
+  time out (a `TimeoutException`).
 - **Other data-path calls** (for example `publish(..., ttl:)` or `directGetBatch()`) against a server
   or stream without the feature surface a plain `JetStreamException` built from the server's error
   response - or the server may silently ignore an unknown header - so consult the table before
@@ -196,6 +203,7 @@ depends on the feature:
 | Scheduled publishing, one-off `@at` | `publishScheduled()` (with `scheduleTtl`), `Schedule::at/atTimestamp` | 2.12 | `allow_msg_schedules`, `Nats-Schedule`, `Nats-Schedule-Target`, `Nats-Schedule-TTL` |
 | Scheduled publishing, recurring (`@every`/cron/aliases), `timeZone`, `source`, `rollup` | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.14 | `allow_msg_schedules`, `Nats-Schedule-Time-Zone`, `Nats-Schedule-Source`, `Nats-Schedule-Rollup` |
 | Atomic batch publish | `batch()` -> `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
+| Consumer delivery state reset (ADR-60) | `resetConsumer()` | 2.14 | `$JS.API.CONSUMER.RESET` |
 | Distributed counter CRDT | `incrementCounter()`, `counterValue()` | 2.12 | `allow_msg_counter`, `Nats-Incr` |
 | Publish de-duplication | `publish(..., msgId:)` | 2.2 | `Nats-Msg-Id` |
 
@@ -1647,6 +1655,56 @@ $js->deleteStream('ORDERS')->await();
 $client->disconnect()->await();
 ```
 
+### Consumer Reset
+
+_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (a 2.14+ server; against the 2.12 fixture stack only the pre-flight refusal runs)._
+
+`resetConsumer($stream, $consumer, $sequence)` resets a consumer's delivery state through `$JS.API.CONSUMER.RESET` (ADR-60, NATS 2.14+), to replay messages or to move past a range that cannot be processed without deleting and recreating the consumer: it keeps its name, its config and the clients bound to it. The pending and redelivery state is dropped and the consumer sequence starts again at 1.
+
+- Without a sequence (or with `0`) delivery goes on just above the consumer's ack floor: messages delivered but not acknowledged are delivered again.
+- With a sequence above 0 the next message delivered is the first one at or after that stream sequence, backward or forward. The server allows it only for a `deliver_policy` of `all`, `by_start_sequence` (not below `opt_start_seq`) or `by_start_time` (not before `opt_start_time`); anything else fails with a `JetStreamException` carrying code 400 and err_code 10204 (`ApiErrCode::CONSUMER_INVALID_RESET`).
+
+The call resolves to the `ConsumerInfo` the server answers with (config, `delivered`, `ack_floor` and `num_pending` in `raw`) and `resetSequence`, the stream sequence the next delivery starts from. A negative sequence or an invalid name is refused before anything is sent, and a server before 2.14 gets nothing either (see [NATS Server Version Requirements](#nats-server-version-requirements)). The consumer itself answers its reset, so a consumer or stream that does not exist gets no answer: the call fails with the request timeout, not with a "consumer not found" error.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\ApiErrCode;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+$js->createStream('ORDERS', ['orders.>'])->await();
+$js->createConsumer('ORDERS', 'PROC', 'orders.created', ['ack_policy' => 'explicit'])->await();
+$js->createConsumer('ORDERS', 'ONLY_NEW', 'orders.created', ['ack_policy' => 'explicit', 'deliver_policy' => 'new'])->await();
+
+// Replay from stream sequence 42 after a bug fix.
+$info = $js->resetConsumer('ORDERS', 'PROC', 42)->await();
+echo "next delivery from stream sequence {$info->resetSequence}\n";
+
+// Back to just above the ack floor: everything not acknowledged is delivered again.
+$js->resetConsumer('ORDERS', 'PROC')->await();
+
+try {
+    // A consumer that delivers only new messages cannot be moved to a sequence.
+    $js->resetConsumer('ORDERS', 'ONLY_NEW', 1)->await();
+} catch (JetStreamException $e) {
+    if ($e->getErrCode() === ApiErrCode::CONSUMER_INVALID_RESET) {
+        echo "the consumer's config does not allow that sequence: {$e->getMessage()}\n";
+    }
+}
+
+$client->disconnect()->await();
+```
+
+A reset made by another client (the `nats` CLI, an operator) does not break the consumes bound to the consumer: a pull consume and a push subscription keep delivering with consumer sequences starting again at 1, and an ordered consumer recreates itself from its last in-order message (see [Ordered Consumer Gap Recovery](#ordered-consumer-gap-recovery)).
+
 ### Fetch Batch
 
 > 📄 **Runnable example:** [`examples/fetch-batch.php`](examples/fetch-batch.php)
@@ -2470,13 +2528,15 @@ _Verified by: [HandlerFailureDuringOperationTest](tests/Unit/HandlerFailureDurin
 
 ### Ordered Consumer Gap Recovery
 
-_Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testSubscribeOrderedConsumerRecreatesOnSequenceGap`, `testSubscribeOrderedConsumerDeliversFilteredMessagesWithoutSpuriousRecreate`); [JetStreamIntegrationTest::testJetStreamOrderedConsumerWithFilteredSubjectAfterPriorMessages](tests/Integration/JetStreamIntegrationTest.php)._
+_Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testSubscribeOrderedConsumerRecreatesOnSequenceGap`, `testSubscribeOrderedConsumerDeliversFilteredMessagesWithoutSpuriousRecreate`); [ConsumerResetTest](tests/Unit/ConsumerResetTest.php) (`testAnOrderedConsumerResetBackwardRecreatesItselfWithoutADuplicate`, `testAnOrderedConsumerResetForwardWhileIdleRecreatesItselfWithoutAGap`); [JetStreamIntegrationTest::testJetStreamOrderedConsumerWithFilteredSubjectAfterPriorMessages](tests/Integration/JetStreamIntegrationTest.php); [ConsumerResetIntegrationTest::testAnOrderedConsumerRecreatesItselfAfterAnotherClientResetsItsConsumer](tests/Integration/ConsumerResetIntegrationTest.php) (2.14+)._
 
 `subscribeOrderedConsumer()` tracks the JetStream **consumer** delivery sequence (which is contiguous per delivery, even for a filtered consumer over a stream that also carries non-matching subjects). If a push is missed - the consumer sequence skips - the consumer is transparently deleted and recreated starting just after the last in-order message; the out-of-order message that exposed the gap is **discarded** (not forwarded), and the recreated consumer replays the missing range in order. Delivery to your callback therefore stays in order and gap-free, with no duplicates and no recreate storm. If the restart point has been pruned/expired, recovery resumes from the next available message. If the recreate itself fails (for example the stream was deleted or a leadership change is in progress), the error is contained to this ordered consumer rather than disrupting delivery to other subscriptions on the connection.
 
+A reset of the ordered consumer's consumer by another client (ADR-60 `$JS.API.CONSUMER.RESET`, for example from the `nats` CLI) is recovered the same way: its consumer sequence starts again at 1, so the next delivery, or while it is idle the next idle heartbeat (whose `Nats-Last-Consumer` then falls below what was delivered), recreates it from the last in-order message. A reset backward delivers no duplicate, and a reset forward past the stream's tail does not hold new messages back.
+
 A separate idle-heartbeat watchdog covers the case the sequence-gap logic cannot: because the gap check only runs when a frame arrives, a consumer that is reaped (for example after an `inactive_threshold` lapse or a server-side ordered-consumer restart) and then stops delivering entirely would otherwise leave a live subscription to a deliver inbox nothing will ever publish to again - no data, no heartbeat, no error, forever. The ordered consumer requests a periodic `idle_heartbeat`, and if no frame (data, heartbeat, or flow-control) arrives for two intervals the watchdog transparently recreates it from the last in-order point - the same recovery the gap path uses - firing at most once per silence episode. Tune the interval with the optional `idleHeartbeatNs` argument to `subscribeOrderedConsumer()`. If the recreate collides with a connection drop it is deferred rather than treated as terminal: the watchdog retries it with a fresh attempt budget once the connection is open again, so a reconnect blip does not kill the consumer.
 
-A caller-owned push consumer created with `idle_heartbeat` is watched too, but because the library cannot recreate a consumer it does not own, a stall there surfaces a descriptive "not active" error through the `errorListener` instead. Those consumers also get the ADR-9 heartbeat gap check: each idle heartbeat's `Nats-Last-Consumer` is compared against the sequence delivered locally, and a mismatch (including a consumer replaced server-side, which resets the sequence) is reported once per episode through the `errorListener` and the logger.
+A caller-owned push consumer created with `idle_heartbeat` is watched too, but because the library cannot recreate a consumer it does not own, a stall there surfaces a descriptive "not active" error through the `errorListener` instead. Those consumers also get the ADR-9 heartbeat gap check: each idle heartbeat's `Nats-Last-Consumer` is compared against the sequence delivered locally, and a mismatch (including a consumer replaced server-side or reset by another client, which restarts the sequence at 1) is reported once per episode through the `errorListener` and the logger; delivery goes on, and the check follows the new numbering.
 
 The same watchdog protects KV **and Object Store** watches, which both ride ordered consumers and request a default `idle_heartbeat` (tunable via `KeyWatchOptions::$idleHeartbeat` and `ObjectStoreWatchOptions::$idleHeartbeat`), so a slow-consumer drop, a reconnect window, or a reaped watch consumer is replayed from the last seen revision instead of becoming a silent permanent gap. Stop a watch (or any ordered consumer) with `JetStreamContext::stopOrderedConsumer($sid)`, which resolves the current subscription even after recreates rotated it; a plain `unsubscribe()` only works until the first recreate.
 

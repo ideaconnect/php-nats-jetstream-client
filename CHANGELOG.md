@@ -15,6 +15,43 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [2.33.0] - 2026-11-26
+
+### Added
+
+- `[feature]` `JetStreamContext::resetConsumer($stream, $consumer, ?int $sequence = null)` resets a consumer's delivery
+  state through `$JS.API.CONSUMER.RESET` (ADR-60, NATS server 2.14+; nats.go `ResetConsumer()` /
+  `ResetConsumerToSequence()`), so a durable consumer can replay messages or move past a range that cannot be
+  processed without being deleted and recreated (#274). Without a sequence (or with 0) delivery goes on just above the
+  consumer's ack floor; with one it goes on from the first message at or after that stream sequence. The consumer
+  sequence starts again at 1. It resolves to the `ConsumerInfo` of the server's reply, whose new `resetSequence`
+  property is the stream sequence the next delivery starts from (`reset_seq`; null on every other reply). A sequence
+  the consumer's config does not allow (`deliver_policy` other than `all`, `by_start_sequence` or `by_start_time`, or
+  one before the consumer's start) fails with a `JetStreamException` carrying code 400 and err_code 10204, the new
+  `ApiErrCode::CONSUMER_INVALID_RESET`. A negative sequence (`InvalidArgumentException`) and an invalid name are
+  refused before anything is sent. Also new: `JetStreamApi::CONSUMER_RESET_PREFIX`, and the `consumer_reset` key of
+  `FeatureSupport::REQUIREMENTS` (2.14).
+- A server before 2.14 does not answer the reset at all: on a server advertising such a version `resetConsumer()`
+  fails at once with an `UnsupportedFeatureException` (`consumer_reset`, `... nothing was sent`) instead of waiting
+  out the request timeout. The consumer itself answers its reset, so a consumer or stream that does not exist gets no
+  answer either, on 2.14 too: the call fails with the request timeout, not with "consumer not found".
+
+### Fixed
+
+- `[bugfix]` An ordered consumer (and so a KV or Object Store watch) whose consumer another client resets while it
+  is idle, forward past the stream's tail (a `$JS.API.CONSUMER.RESET` with a sequence, on a 2.14 server), held every
+  new message back until the stream reached the reset sequence, possibly for good (#274). Its idle heartbeat checked
+  only for a `Nats-Last-Consumer` above what it had delivered; one below it, which a reset produces, now
+  recreates the consumer from the last in-order message as well. A reset backward, or one followed by a delivery, was
+  already recovered by the delivery's consumer sequence going back to 1.
+
+### Changed
+
+- The push consumer's sequence-regression report now reads `... the consumer appears to have been replaced or reset
+  (sequence regressed) ...` (was `... replaced (sequence regressed) ...`): a reset by another client, the CLI for
+  example, restarts the consumer sequence at 1 too (#274). It is still reported once per episode through the error
+  listener, and delivery goes on.
+
 ## [2.32.0] - 2026-11-25
 
 ### Upgrade notes
