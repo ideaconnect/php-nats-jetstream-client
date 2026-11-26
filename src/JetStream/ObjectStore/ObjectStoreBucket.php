@@ -9,6 +9,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\ApiErrCode;
 use IDCT\NATS\JetStream\DecodesApiErrors;
 use IDCT\NATS\JetStream\JetStreamApi;
@@ -1034,21 +1035,22 @@ final class ObjectStoreBucket
 
             // Fast path (#110): one batched multi_last Direct Get (ADR-31) returns the latest meta record
             // of every object in a single request/reply, instead of one Direct Get round-trip per object.
-            // Gated on server support (batched Direct Get needs NATS 2.11+); older servers take the
-            // per-subject fan-out below. The returned objects and deleted-filtering are identical.
+            // It is always tried (#272): the reply, not the connected server's version, shows whether the
+            // server that answers serves batched Direct Get (ADR-44). The returned objects and
+            // deleted-filtering of both paths are identical.
             $infos = null;
-            if ($this->jetStream->supportsBatchedDirectGet()) {
-                try {
-                    /** @var list<?ObjectInfo> $infos */
-                    $infos = $this->listBatched($subjects);
-                } catch (JetStreamException $e) {
-                    if ($e->getCode() !== 503) {
-                        throw $e;
-                    }
-                    // The STREAM (not the server) lacks Direct Get - allow_direct disabled / legacy
-                    // interop bucket, invisible to the server-version gate. Fall through to the
-                    // per-subject fan-out, whose lookups fall back to the leader STREAM.MSG.GET.
+            try {
+                /** @var list<?ObjectInfo> $infos */
+                $infos = $this->listBatched($subjects);
+            } catch (UnsupportedFeatureException) {
+                // The reply shows the server does not serve batched Direct Get (before 2.11). Fall through to
+                // the per-subject fan-out, which every server with Direct Get answers.
+            } catch (JetStreamException $e) {
+                if ($e->getCode() !== 503) {
+                    throw $e;
                 }
+                // The STREAM lacks Direct Get - allow_direct disabled / legacy interop bucket. Fall through
+                // to the per-subject fan-out, whose lookups fall back to the leader STREAM.MSG.GET.
             }
 
             if ($infos === null) {
@@ -1108,7 +1110,8 @@ final class ObjectStoreBucket
      * before the caller's deleted-filtering: each reply body is the raw meta JSON (as with a single
      * Direct Get), the revision is read off the Nats-Sequence header, a nameless/malformed record is
      * dropped, and objects with no stored record are simply absent from the batch reply (mirroring the
-     * fan-out's 404-skip). Only reached when {@see JetStreamContext::supportsBatchedDirectGet()}.
+     * fan-out's 404-skip). Tried first by list(), which takes the fan-out when this throws the
+     * {@see UnsupportedFeatureException} of a server without batched Direct Get.
      *
      * @param list<string> $subjects
      * @return list<ObjectInfo>

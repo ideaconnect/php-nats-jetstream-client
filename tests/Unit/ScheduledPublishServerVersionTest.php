@@ -24,17 +24,18 @@ use PHPUnit\Framework\TestCase;
 use function Amp\delay;
 
 /**
- * publishScheduled() and the server version (#267). nats-server 2.12 accepts only "@at" schedules: it
- * rejects "@every", cron and the predefined aliases with an opaque 400 ("message schedules pattern is
- * invalid"), and stores an "@at" schedule while ignoring Nats-Schedule-Source and Nats-Schedule-Rollup.
- * Those arrived in 2.14.0, with Nats-Schedule-Time-Zone. A server advertising a parseable version
- * older than 2.14 therefore gets an UnsupportedFeatureException before anything is written; 2.14+ and
- * an unparseable version get the publish as before.
+ * publishScheduled() and the server version (#267, #272). nats-server 2.12 accepts only "@at" schedules: it rejects
+ * "@every", cron and the predefined aliases with a 400 ("message schedules pattern is invalid", err_code 10189), and
+ * stores an "@at" schedule while ignoring Nats-Schedule-Source and Nats-Schedule-Rollup. Those arrived in 2.14.0, with
+ * Nats-Schedule-Time-Zone.
  *
- * The version is the one of the server the schedule is written to: a call made while a reconnect is under way, or
- * whose first write fails and is retried after the recovery, is checked against the INFO of the session that takes
- * the frame, not the one it replaces (over tests/Support/ReconnectingTransport.php, whose sessions greet with the
- * versions under test).
+ * From 2.31.0 to 2.32.0 the call refused what needs 2.14 when the connected server's INFO version parsed as older. ADR-44
+ * (revision 4) forbids that: the schedule is stored by the server that hosts the stream, which in a cluster during a
+ * rolling upgrade may run a newer release than the one the client is connected to. Every call is now published
+ * whatever the INFO version, and the server that stores the schedule decides: its 400 reaches the caller as an ordinary
+ * JetStreamException. A call made while the client reconnects, or retried after a failed write, goes to the new
+ * session whatever either session's version (over tests/Support/ReconnectingTransport.php, whose sessions greet with
+ * the versions under test).
  */
 final class ScheduledPublishServerVersionTest extends TestCase
 {
@@ -44,6 +45,9 @@ final class ScheduledPublishServerVersionTest extends TestCase
 
     private const ACK = '{"stream":"SCHED","seq":5,"duplicate":false}';
 
+    /** What a 2.12.15 server answers a recurring schedule with (seen live, #272). */
+    private const PATTERN_INVALID = '{"error":{"code":400,"err_code":10189,"description":"message schedules pattern is invalid"}}';
+
     protected function tearDown(): void
     {
         // Every client and connection a test makes is registered as it is constructed (#183), weakly: the shutdown
@@ -52,126 +56,116 @@ final class ScheduledPublishServerVersionTest extends TestCase
     }
 
     /**
-     * The calls that need a 2.14 server, each with the feature the refusal must name.
+     * The calls that need a 2.14 server.
      *
-     * @return iterable<string, array{\Closure(JetStreamContext): Future<PubAck>, string}>
+     * @return iterable<string, array{\Closure(JetStreamContext): Future<PubAck>}>
      */
     public static function callsNeeding214(): iterable
     {
         yield 'an @every schedule' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::every(2)),
-            'schedule_every',
         ];
         yield 'a cron schedule' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::cron('0 0 * * * *')),
-            'schedule_cron',
         ];
         yield 'a cron schedule with a time zone' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::cron('0 0 * * * *'), timeZone: 'Europe/Amsterdam'),
-            'schedule_cron',
         ];
         yield 'a predefined alias' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::predefined('hourly')),
-            'schedule_cron',
         ];
         yield 'an @at schedule with a source' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, source: 'sensors.temperature'),
-            'schedule_source',
         ];
         yield 'an @at schedule with rollup' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, rollup: true),
-            'schedule_rollup',
         ];
         yield 'an @at schedule with a source and rollup' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, source: 'sensors.temperature', rollup: true),
-            'schedule_source',
         ];
         yield 'an @every schedule with a source' => [
             static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::every('1m'), source: 'sensors.temperature'),
-            'schedule_every',
         ];
     }
 
     /**
-     * On a server advertising 2.12.15 (or anything parseable below 2.14), every call that needs 2.14 fails with
-     * an UnsupportedFeatureException naming the feature, 2.14 and the server's version, and nothing is written
-     * after the CONNECT + PING handshake.
+     * Every call that needs 2.14 is published, once, whatever version the connected server's INFO reports: older ones
+     * (2.10.29 and 2.11.17 as in a rolling upgrade, 2.12.x, a bare major), 2.14 and later, pre-release tags, an
+     * unparseable version and none at all. The acknowledgement of the server that stores it is returned (#272).
      *
      * @param \Closure(JetStreamContext): Future<PubAck> $call
      */
     #[DataProvider('callsNeeding214')]
-    public function testCallsNeeding214AreRefusedBeforeAnyWriteOnAnOlderServer(\Closure $call, string $feature): void
+    public function testCallsNeeding214ArePublishedWhateverTheInfoVersion(\Closure $call): void
     {
-        foreach (['2.12.15', '2.12.0', 'v2.12.0', '2.11.4', '1.99.0', '2.13.9', '2'] as $version) {
-            [$client, $transport] = $this->connectedTo($version);
-
-            try {
-                $call($client->jetStream())->await();
-                self::fail(sprintf('expected an UnsupportedFeatureException on %s', $version));
-            } catch (UnsupportedFeatureException $e) {
-                self::assertSame($feature, $e->feature, $version);
-                self::assertSame('2.14', $e->requiredVersion, $version);
-                self::assertSame($version, $e->serverVersion);
-                self::assertSame(0, $e->getCode(), $version);
-                self::assertNull($e->getErrCode(), $version);
-                self::assertStringEndsWith(sprintf('(connected server %s; nothing was published)', $version), $e->getMessage());
-            }
-
-            self::assertCount(2, $transport->writes, sprintf('nothing may be written on %s', $version));
-        }
-    }
-
-    /**
-     * Every call is published unchanged when the server advertises 2.14 or later (pre-release tags count as
-     * their version), and when the version does not parse (a proxy, a custom build, none at all): then the
-     * server decides, as before.
-     *
-     * @param \Closure(JetStreamContext): Future<PubAck> $call
-     */
-    #[DataProvider('callsNeeding214')]
-    public function testCallsNeeding214ArePublishedOnA214ServerOrAnUnparseableVersion(\Closure $call): void
-    {
-        foreach (['2.14.0', '2.14.0-beta.1', 'v2.14.10', '2.15.3', '3.0.0', 'custom-build', 'release-2.12.0', null] as $version) {
-            [$client, $transport] = $this->connectedTo($version, '{"stream":"SCHED","seq":5,"duplicate":false}');
+        $versions = ['2.10.29', '2.11.17', '2.12.15', '2.12.0', 'v2.12.0', '1.99.0', '2.13.9', '2', '2.14.0', '2.14.0-beta.1', 'v2.14.10', '3.0.0', 'custom-build', null];
+        foreach ($versions as $version) {
+            [$client, $transport] = $this->connectedTo($version, self::ACK);
 
             $ack = $call($client->jetStream())->await();
 
             self::assertSame('SCHED', $ack->stream, (string) $version);
             self::assertSame(5, $ack->seq, (string) $version);
+            self::assertCount(4, $transport->writes, sprintf('CONNECT + PING, the inbox SUB, one schedule on %s', $version));
             self::assertStringStartsWith('HPUB schedules.tick _INBOX.', $transport->writes[3], (string) $version);
             self::assertStringContainsString('Nats-Schedule-Target:events.tick', $transport->writes[3], (string) $version);
         }
     }
 
     /**
-     * The headers of each call reach a 2.14 server as they did before the version check.
+     * Every header of a call reaches the server as it is, on a connected server whose INFO reports 2.12.15 as on one
+     * that reports 2.14.0: the INFO version changes and drops nothing (ADR-44, #272).
      */
-    public function testA214ServerGetsTheSameHeadersAsBefore(): void
+    public function testEveryHeaderIsSentWhateverTheInfoVersion(): void
     {
-        [$client, $transport] = $this->connectedTo('2.14.0', '{"stream":"SCHED","seq":5,"duplicate":false}');
+        foreach (['2.12.15', '2.14.0'] as $version) {
+            [$client, $transport] = $this->connectedTo($version, self::ACK);
 
-        $client->jetStream()->publishScheduled(
-            'schedules.tick',
-            'events.tick',
-            'p',
-            Schedule::cron('0 0 * * * *'),
-            scheduleTtl: '5m',
-            source: 'sensors.temperature',
-            timeZone: 'Europe/Amsterdam',
-            rollup: true,
-        )->await();
+            $client->jetStream()->publishScheduled(
+                'schedules.tick',
+                'events.tick',
+                'p',
+                Schedule::cron('0 0 * * * *'),
+                scheduleTtl: '5m',
+                source: 'sensors.temperature',
+                timeZone: 'Europe/Amsterdam',
+                rollup: true,
+            )->await();
 
-        $frame = $transport->writes[3];
-        self::assertStringContainsString('Nats-Schedule:0 0 * * * *', $frame);
-        self::assertStringContainsString('Nats-Schedule-TTL:5m', $frame);
-        self::assertStringContainsString('Nats-Schedule-Source:sensors.temperature', $frame);
-        self::assertStringContainsString('Nats-Schedule-Time-Zone:Europe/Amsterdam', $frame);
-        self::assertStringContainsString('Nats-Schedule-Rollup:sub', $frame);
+            $frame = $transport->writes[3];
+            self::assertStringContainsString('Nats-Schedule:0 0 * * * *', $frame, $version);
+            self::assertStringContainsString('Nats-Schedule-TTL:5m', $frame, $version);
+            self::assertStringContainsString('Nats-Schedule-Source:sensors.temperature', $frame, $version);
+            self::assertStringContainsString('Nats-Schedule-Time-Zone:Europe/Amsterdam', $frame, $version);
+            self::assertStringContainsString('Nats-Schedule-Rollup:sub', $frame, $version);
+        }
     }
 
     /**
-     * A plain "@at" schedule - with a TTL, an empty source or rollup off - needs only 2.12 and is still published
-     * there.
+     * A recurring schedule that reaches a 2.12 server is refused by that server: its 400 (err_code 10189) is the
+     * caller's JetStreamException, not an UnsupportedFeatureException of the client's making, and the schedule went
+     * out once. A server's answer decides, not the client's reading of a version (#272).
+     */
+    public function testA212ServersRejectionOfARecurringScheduleIsTheServersOwnError(): void
+    {
+        [$client, $transport] = $this->connectedTo('2.12.15', self::PATTERN_INVALID);
+
+        try {
+            $client->jetStream()->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::every('5m'))->await();
+            self::fail('expected the server\'s 400');
+        } catch (JetStreamException $e) {
+            self::assertNotInstanceOf(UnsupportedFeatureException::class, $e);
+            self::assertSame('message schedules pattern is invalid', $e->getMessage());
+            self::assertSame(400, $e->getCode());
+            self::assertSame(10189, $e->getErrCode());
+        }
+
+        self::assertCount(1, array_filter($transport->writes, static fn(string $write): bool => str_starts_with($write, 'HPUB schedules.tick ')));
+    }
+
+    /**
+     * A plain "@at" schedule - with a TTL, an empty source or rollup off - is published on a 2.12 server without the
+     * 2.14 headers.
      */
     public function testPlainAtScheduleIsStillPublishedOnA212Server(): void
     {
@@ -195,8 +189,8 @@ final class ScheduledPublishServerVersionTest extends TestCase
     }
 
     /**
-     * A time zone with an "@at" schedule is wrong on every server, so a 2.12 server still gets the cron-only
-     * error rather than a request to upgrade.
+     * A time zone with an "@at" schedule is wrong on every server, so it is still refused before anything is written:
+     * a check of the arguments, not of a version.
      */
     public function testTimeZoneOnAnAtScheduleStillFailsTheCronOnlyCheckOnA212Server(): void
     {
@@ -214,7 +208,7 @@ final class ScheduledPublishServerVersionTest extends TestCase
     }
 
     /**
-     * A malformed expression is reported as such on a 2.12 server, not as a version problem.
+     * A malformed expression is still refused before anything is written, as malformed.
      */
     public function testMalformedScheduleIsStillReportedAsMalformedOnA212Server(): void
     {
@@ -232,54 +226,12 @@ final class ScheduledPublishServerVersionTest extends TestCase
     }
 
     /**
-     * The exact refusal messages: the schedule itself for a recurring pattern, the header and the argument for a
-     * header, the required version, what older servers do with it, and the connected server's version.
+     * A schedule subject with an empty token fails with the ProtocolException every request raises, before the reply
+     * inbox is subscribed or anything is published.
      */
-    public function testRefusalMessagesAreExact(): void
+    public function testAnInvalidScheduleSubjectIsRefusedBeforeAnyWrite(): void
     {
-        $cases = [
-            [
-                static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', '  @every 2s  '),
-                'The schedule "@every 2s" requires NATS server 2.14+; older servers accept only "@at" schedules'
-                    . ' (connected server 2.12.15; nothing was published)',
-            ],
-            [
-                static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', '@daily'),
-                'The schedule "@daily" requires NATS server 2.14+; older servers accept only "@at" schedules'
-                    . ' (connected server 2.12.15; nothing was published)',
-            ],
-            [
-                static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, source: 'sensors.temperature'),
-                'Nats-Schedule-Source (the source argument) requires NATS server 2.14+; older servers ignore it'
-                    . ' (connected server 2.12.15; nothing was published)',
-            ],
-            [
-                static fn(JetStreamContext $js): Future => $js->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, rollup: true),
-                'Nats-Schedule-Rollup (the rollup argument) requires NATS server 2.14+; older servers ignore it'
-                    . ' (connected server 2.12.15; nothing was published)',
-            ],
-        ];
-
-        foreach ($cases as [$call, $message]) {
-            [$client] = $this->connectedTo('2.12.15');
-
-            try {
-                $call($client->jetStream())->await();
-                self::fail('expected an UnsupportedFeatureException: ' . $message);
-            } catch (UnsupportedFeatureException $e) {
-                self::assertSame($message, $e->getMessage());
-            }
-        }
-    }
-
-    /**
-     * A call that needs 2.14 goes through the guarded request, which checks its subject as every request does: a
-     * schedule subject with an empty token fails with the ProtocolException before the reply inbox is subscribed or
-     * anything is published, on a 2.14 server that would take the schedule.
-     */
-    public function testAnInvalidScheduleSubjectIsRefusedBeforeAnyWriteOnA214Server(): void
-    {
-        [$client, $transport] = $this->connectedTo('2.14.0', self::ACK);
+        [$client, $transport] = $this->connectedTo('2.12.15', self::ACK);
 
         try {
             $client->jetStream()->publishScheduled('schedules..tick', 'events.tick', 'p', Schedule::every(2))->await();
@@ -292,61 +244,47 @@ final class ScheduledPublishServerVersionTest extends TestCase
     }
 
     /**
-     * A call made while the client reconnects from a 2.14 server to a 2.12 one waits for the new connection and is
-     * refused there, by the 2.12 INFO of the session that would take the frame: no schedule reaches either server.
-     * The check used to read the INFO of the connection being replaced, so the 2.12 server got the schedule and
-     * could acknowledge it without its source or rollup.
+     * @return iterable<string, array{string, string}>
+     */
+    public static function failovers(): iterable
+    {
+        yield 'from 2.14 to 2.12' => ['2.14.0', '2.12.0'];
+        yield 'from 2.12 to 2.14' => ['2.12.0', '2.14.0'];
+        yield 'from 2.11 to 2.10' => ['2.11.17', '2.10.29'];
+    }
+
+    /**
+     * A call that needs 2.14, made while the client reconnects, waits for the new connection and is published there,
+     * once, whatever version either session reports; nothing goes to the session being replaced. Before #272 a call
+     * reconnecting to a server that reported 2.12 was refused there.
      *
      * @param \Closure(JetStreamContext): Future<PubAck> $call
      */
     #[DataProvider('callsNeeding214')]
-    public function testACallWaitingForAReconnectToAnOlderServerIsRefusedThere(\Closure $call, string $feature): void
+    public function testACallWaitingForAReconnectIsPublishedOnTheNewConnectionWhateverItsVersion(\Closure $call): void
     {
-        [$client, $transport, $recovery] = $this->reconnectingFromTo('2.14.0', '2.12.0');
+        foreach (self::failovers() as $label => [$from, $to]) {
+            [$client, $transport, $recovery] = $this->reconnectingFromTo($from, $to);
 
-        $publish = $this->issuedWhileTheReconnectIsHeld($client, $transport, $call);
+            $publish = $this->issuedWhileTheReconnectIsHeld($client, $transport, $call);
+            $ack = $publish->await(new TimeoutCancellation(2));
 
-        try {
-            $publish->await(new TimeoutCancellation(2));
-            self::fail('expected an UnsupportedFeatureException from the 2.12 session');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame($feature, $e->feature);
-            self::assertSame('2.14', $e->requiredVersion);
-            self::assertSame('2.12.0', $e->serverVersion);
-            self::assertStringEndsWith('(connected server 2.12.0; nothing was published)', $e->getMessage());
+            self::assertSame(5, $ack->seq, $label);
+            $recovery->await(new TimeoutCancellation(2));
+            self::assertSame(1, $transport->epoch(), $label . ': the client reconnected once');
+            self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick', 0), $label . ': nothing went to the replaced session');
+            self::assertCount(1, $transport->controlLinesStartingWith('HPUB schedules.tick', 1), $label . ': one schedule went to the new session');
+
+            $client->disconnect()->await();
         }
-
-        $recovery->await(new TimeoutCancellation(2));
-        self::assertSame(1, $transport->epoch(), 'the client reconnected once');
-        self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick'), 'no schedule reached either server');
     }
 
     /**
-     * A call made while the client reconnects from a 2.12 server to a 2.14 one is not refused by the 2.12 INFO the
-     * connection being replaced left behind: it waits for the new connection and is published there, once.
-     *
-     * @param \Closure(JetStreamContext): Future<PubAck> $call
+     * A schedule whose write fails on the session that reports 2.14, and whose recovery lands on one that reports
+     * 2.12, is written there by the retry, once, and its acknowledgement returned. The retry is not judged by the new
+     * session's version: before #272 it was refused there.
      */
-    #[DataProvider('callsNeeding214')]
-    public function testACallWaitingForAReconnectToANewerServerIsPublishedThere(\Closure $call): void
-    {
-        [$client, $transport, $recovery] = $this->reconnectingFromTo('2.12.0', '2.14.0');
-
-        $publish = $this->issuedWhileTheReconnectIsHeld($client, $transport, $call);
-        $ack = $publish->await(new TimeoutCancellation(2));
-
-        self::assertSame(5, $ack->seq);
-        $recovery->await(new TimeoutCancellation(2));
-        self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick', 0), 'nothing went to the 2.12 server');
-        self::assertCount(1, $transport->controlLinesStartingWith('HPUB schedules.tick', 1), 'one schedule went to the 2.14 server');
-    }
-
-    /**
-     * The check runs again before the retry that follows a failed write: a schedule whose write fails on the 2.14
-     * server it was checked against, and whose recovery lands on a 2.12 server, is refused there, before the retry
-     * writes it. The retry used to send it to the 2.12 server.
-     */
-    public function testARetryAfterAFailedWriteIsCheckedAgainstTheServerItWouldGoTo(): void
+    public function testARetryAfterAFailedWriteGoesToTheNewSessionWhateverItsVersion(): void
     {
         $transport = new ReconnectingTransport();
         $transport->infoByEpoch = [0 => ReconnectingTransport::infoWithVersion('2.14.0'), 1 => ReconnectingTransport::infoWithVersion('2.12.0')];
@@ -354,17 +292,12 @@ final class ScheduledPublishServerVersionTest extends TestCase
         $client = $this->connectClient($transport);
         $transport->failNextWriteContaining('HPUB schedules.tick');
 
-        try {
-            $client->jetStream()->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, source: 'sensors.temperature')
-                ->await(new TimeoutCancellation(2));
-            self::fail('expected an UnsupportedFeatureException from the 2.12 session');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame('schedule_source', $e->feature);
-            self::assertSame('2.12.0', $e->serverVersion);
-        }
+        $ack = $client->jetStream()->publishScheduled('schedules.tick', 'events.tick', 'p', self::AT, source: 'sensors.temperature')
+            ->await(new TimeoutCancellation(2));
 
+        self::assertSame(5, $ack->seq);
         self::assertSame(1, $transport->epoch(), 'the failed write reconnected once');
-        self::assertSame([], $transport->controlLinesStartingWith('HPUB schedules.tick'), 'the retry wrote nothing');
+        self::assertCount(1, $transport->controlLinesStartingWith('HPUB schedules.tick', 1), 'the retry wrote the schedule on the new session, once');
     }
 
     /**

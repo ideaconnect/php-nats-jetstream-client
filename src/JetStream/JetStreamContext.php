@@ -119,11 +119,10 @@ final class JetStreamContext
      * `allow_atomic` enabled. Pass a batch id (1..64 chars) to use your own, or omit it for a
      * generated one.
      *
-     * Requires NATS server 2.12+: `commit()` pre-flights the INFO-advertised server version and
-     * throws an UnsupportedFeatureException before anything is published to an older server (#152).
-     * A batch-incapable server that slips past that gate (unparseable version, mixed-version
-     * cluster) acknowledges the batch start/commit as plain publishes; `commit()` detects that and
-     * throws instead of silently storing the batch message-by-message (#130).
+     * Requires NATS server 2.12+. `commit()` does not read the server version (ADR-44, #272): a
+     * batch-incapable server (before 2.12) acknowledges the batch start/commit as plain publishes, and
+     * `commit()` detects that from the reply and throws an UnsupportedFeatureException instead of
+     * silently storing the batch message-by-message (#130). The start message is stored by then.
      */
     public function batch(?string $batchId = null): BatchPublisher
     {
@@ -272,12 +271,11 @@ final class JetStreamContext
      *
      * Version-gated `$options` (the config fields of {@see FeatureSupport::REQUIREMENTS}, e.g.
      * `allow_msg_ttl` 2.11+, `allow_msg_counter` 2.12+) set to anything but their default fail with an
-     * UnsupportedFeatureException against a server too old for them: before the request when the
-     * connected server's version is known to be older, after it when the server's reply does not
-     * confirm the field (the returned config lacks it, or the reply carries no config), since an older
-     * server drops a field it does not know instead of rejecting it (#266). A negative
-     * `subject_delete_marker_ttl` is invalid rather than off, so it counts as a request for the feature.
-     * The same holds for {@see addStream()} and {@see updateStream()}.
+     * UnsupportedFeatureException when the server's reply does not confirm the field (the returned config
+     * lacks it, or the reply carries no config), since an older server drops a field it does not know
+     * instead of rejecting it (#266). The request is always sent: the connected server's version decides
+     * nothing (ADR-44, #272). A negative `subject_delete_marker_ttl` is invalid rather than off, so it
+     * counts as a request for the feature. The same holds for {@see addStream()} and {@see updateStream()}.
      *
      * @param list<string> $subjects
      * @param array<string,mixed> $options Additional stream config fields.
@@ -709,7 +707,8 @@ final class JetStreamContext
     /**
      * Fetches the latest message for each of several subjects using batched Direct Get requests (ADR-31
      * `multi_last`), instead of one Direct Get per subject. Requires the stream to be created with
-     * `allow_direct` and a server that supports batched Direct Get (NATS 2.11+).
+     * `allow_direct` and a server that supports batched Direct Get (NATS 2.11+); on an older server the call
+     * fails with the {@see UnsupportedFeatureException} of {@see directGetBatch()}.
      *
      * The exact-subject list is split into chunks bounded by the server's 1024-result cap and by the
      * negotiated `max_payload`, and one batched request is issued per chunk (sequentially): a bucket
@@ -833,7 +832,12 @@ final class JetStreamContext
      * setup and covers reconnect and SUB/PUB backpressure. Each reply renews it, including replies
      * dispatched by another reader while publication is pending; an incomplete batch stalls with an error.
      *
-     * Requires NATS server 2.11+ and a stream created with `allow_direct`.
+     * Requires NATS server 2.11+ and a stream created with `allow_direct`. A server without batched Direct
+     * Get is told by its reply, not by its version (ADR-31, ADR-44, #272): it answers a `multi_last` request
+     * with `408 Empty Request`, and any other batch request (`batch` > 0) with a single message that lacks the
+     * `Nats-Num-Pending` header every message of a batch carries. Either fails the call at once with an
+     * {@see UnsupportedFeatureException} for the feature `direct_get_batch` (code 408 or 0), instead of a
+     * stall or a one-message result.
      *
      * @param array<string,mixed> $body Direct Get batch request body (e.g. `batch`, `multi_last`, `seq`, `up_to_seq`).
      * @return Future<list<NatsMessage>>
@@ -866,11 +870,17 @@ final class JetStreamContext
             /** @var string|null $inboxRejection The -ERR the server rejected the inbox with, when it did (#175). */
             $inboxRejection = null;
             $operation = sprintf('Direct Get batch for stream "%s"', $stream);
+            // Whether the server's reply shows that it does not serve batched Direct Get (ADR-31, #272): the reply,
+            // not the server's version, tells (ADR-44).
+            $unbatched = false;
+            $asksForMultiLast = is_array($body['multi_last'] ?? null) && $body['multi_last'] !== [];
+            $batchSize = $body['batch'] ?? null;
+            $asksForBatch = $asksForMultiLast || (is_int($batchSize) && $batchSize > 0);
 
             // Guarded (#175): a 'maximum subscriptions exceeded' -ERR read before the server is known to hold the
             // inbox - by this fiber's read or any other's, the heartbeat's say - records the rejection here and
             // ends the read below, so that the call fails at once instead of waiting out its stall interval.
-            $onReply = static function (NatsMessage $msg) use (&$messages, &$done, &$error, $budget, $finished): void {
+            $onReply = static function (NatsMessage $msg) use (&$messages, &$done, &$error, &$unbatched, $asksForMultiLast, $asksForBatch, $budget, $finished): void {
                 $budget->touch();
                 $headers = NatsHeaders::fromWireBlock($msg->rawHeaders);
                 $status = (int) ($headers['Status'] ?? 0);
@@ -884,10 +894,23 @@ final class JetStreamContext
                 }
 
                 if ($status >= 400) {
-                    $error = [
-                        'code' => $status,
-                        'description' => trim((string) ($headers['Description'] ?? '')),
-                    ];
+                    $description = trim((string) ($headers['Description'] ?? ''));
+                    // A server without batched Direct Get (before 2.11) does not read `multi_last`, so it finds the
+                    // request empty. A 2.11+ server answers such a request with its messages, or with a 404 when
+                    // none of the subjects holds one.
+                    $unbatched = $asksForMultiLast && $status === 408 && $description === 'Empty Request';
+                    $error = ['code' => $status, 'description' => $description];
+                    $done = true;
+                    $finished->cancel();
+
+                    return;
+                }
+
+                // A server without batched Direct Get answers a batch request with one message and nothing after it,
+                // and that message lacks the Nats-Num-Pending header every message of a batch carries (ADR-31). The
+                // read ends here instead of waiting out its stall interval.
+                if ($asksForBatch && $messages === [] && !isset($headers['Nats-Num-Pending'])) {
+                    $unbatched = true;
                     $done = true;
                     $finished->cancel();
 
@@ -995,6 +1018,10 @@ final class JetStreamContext
                     $this->client->releaseSubscriptionWithin($sid, $budget->cancellation())->await();
                 }
 
+                if ($unbatched) {
+                    throw $this->batchedDirectGetUnsupported($stream, $error);
+                }
+
                 if ($error !== null) {
                     throw new JetStreamException(
                         $error['description'] !== '' ? $error['description'] : 'JetStream direct get batch error',
@@ -1013,10 +1040,10 @@ final class JetStreamContext
      * Creates or updates a durable consumer for a stream.
      *
      * Version-gated `$options`: `filter_subjects` requires NATS 2.10+, `priority_groups`/
-     * `priority_policy` require 2.11+. Against an older server the call fails with an
-     * UnsupportedFeatureException: before the request when the server's version is known to be older,
-     * after it when the server's reply does not confirm the field (the returned config lacks it, or the
-     * reply carries no config; an older server drops the field, #266).
+     * `priority_policy` require 2.11+. When the server's reply does not confirm such a field (the
+     * returned config lacks it, or the reply carries no config; an older server drops the field, #266),
+     * the call fails with an UnsupportedFeatureException. The request is always sent: the connected
+     * server's version decides nothing (ADR-44, #272).
      *
      * @param array<string,mixed> $options Additional consumer config fields (max_deliver, ack_wait, etc.).
      * @return Future<ConsumerInfo>
@@ -2090,16 +2117,10 @@ final class JetStreamContext
      * @param bool $resendOnReconnect Whether the frame goes out once more when the connection it went out on is
      *        replaced before the reply came (#249): a publish() with a Nats-Msg-Id, under
      *        {@see \IDCT\NATS\Connection\NatsOptions::$resendJetStreamPublishOnReconnect}.
-     * @param (\Closure():void)|null $beforeWrite Called before each attempt to write the frame, once the connection it
-     *        goes out on is open (#267, {@see NatsClient::requestWithHeadersGuarded()}); needs $headers.
      */
-    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false, ?\Closure $beforeWrite = null): NatsMessage
+    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false): NatsMessage
     {
         try {
-            if ($beforeWrite !== null && $headers !== null) {
-                return $this->client->requestWithHeadersGuarded($subject, $payload, $headers, $beforeWrite)->await();
-            }
-
             if ($resendOnReconnect && $headers !== null) {
                 return $this->client->requestResendingOnReconnect($subject, $payload, $headers, self::isDuplicateMessageInProcess(...))->await();
             }
@@ -2244,15 +2265,14 @@ final class JetStreamContext
      * used). The schedule expression may be `@at <RFC3339>`, `@every <duration>`, a 6-field cron
      * expression or a predefined alias (`@daily`, `@hourly`, ...) - build it with the {@see Schedule} helper.
      *
-     * Requires NATS server 2.12+ for a one-off `@at` schedule (with an optional TTL), and 2.14+ for
-     * everything else: `@every`, cron and the predefined aliases, and the `$source`, `$timeZone` and
-     * `$rollup` headers. A 2.12 server rejects the recurring patterns with an opaque 400 ("message
-     * schedules pattern is invalid") and ignores the three headers without an error, so when the
-     * INFO-advertised server version parses as older than 2.14 this throws an
-     * {@see \IDCT\NATS\Exception\UnsupportedFeatureException} before anything is published (#267). An
-     * unparseable version (a proxy, a custom build) is published as is, and the server decides. The version is
-     * the one of the server that takes the frame: a call made while the client reconnects waits for the new
-     * connection and is checked against that server, and so is the retry after a failed write.
+     * A one-off `@at` schedule (with an optional TTL) needs NATS server 2.12+, and everything else 2.14+:
+     * `@every`, cron and the predefined aliases, and the `$source`, `$timeZone` and `$rollup` headers. The call
+     * does not read the server version to decide anything (ADR-44, #272): the server the client is connected
+     * to may not be the one that stores the schedule, so the schedule is always published and that server
+     * decides. A 2.12 server rejects a recurring pattern with its own 400 ("message schedules pattern is
+     * invalid"), raised as a {@see JetStreamException}, and stores an `@at` schedule while ignoring
+     * Nats-Schedule-Source and Nats-Schedule-Rollup without an error: use those two only once the servers
+     * that hold the stream run 2.14+.
      *
      * @param string      $schedule    Schedule expression (@at / @every / cron / predefined alias).
      * @param string|null $scheduleTtl Optional Nats-Schedule-TTL (requires `allow_msg_ttl` on the stream).
@@ -2288,16 +2308,6 @@ final class JetStreamContext
                 throw new JetStreamException('Nats-Schedule-Time-Zone is only valid for cron schedule expressions');
             }
 
-            $need = $this->scheduleNeedingANewerServer($schedule, $source, $rollup);
-            // What only a newer server schedules is checked against the server the frame goes to (#267): at once when
-            // the connection is open, so an older server gets nothing at all, and again in the step that writes the
-            // frame, against the INFO of the server that takes it - after a reconnect the call waited for, and before
-            // the retry that follows a failed write. A call made while the client reconnects is not judged by the
-            // INFO of the connection being replaced.
-            if ($need !== null && $this->client->state() === ConnectionState::Open) {
-                $this->refuseOnAnOlderServer($need);
-            }
-
             $headers = [
                 'Nats-Schedule' => $schedule,
                 'Nats-Schedule-Target' => $targetSubject,
@@ -2319,11 +2329,7 @@ final class JetStreamContext
                 $headers['Nats-Schedule-Rollup'] = 'sub';
             }
 
-            $beforeWrite = $need === null ? null : function () use ($need): void {
-                $this->refuseOnAnOlderServer($need);
-            };
-
-            return $this->parsePublishAck($this->jsRequest($scheduleSubject, $payload, $headers, beforeWrite: $beforeWrite));
+            return $this->parsePublishAck($this->jsRequest($scheduleSubject, $payload, $headers));
         });
     }
 
@@ -4614,60 +4620,6 @@ final class JetStreamContext
     }
 
     /**
-     * What of a scheduled publish needs a newer server than the first scheduler release (#267), or null when nothing
-     * does. nats-server 2.12 accepts only `@at` schedules (with Nats-Schedule-TTL and Nats-Schedule-Target): it
-     * rejects `@every`, cron and the predefined aliases with an opaque 400 ("message schedules pattern is invalid"),
-     * and it stores an `@at` schedule while dropping Nats-Schedule-Source and Nats-Schedule-Rollup without an error.
-     * A time zone needs no check of its own: it is only accepted with a cron-class schedule, which this already names.
-     * The pattern is named before the headers.
-     *
-     * @param string $schedule The trimmed expression, already validated.
-     * @return array{string, string, string}|null The feature, what needs it, and what older servers do with it.
-     */
-    private function scheduleNeedingANewerServer(string $schedule, ?string $source, bool $rollup): ?array
-    {
-        return match (true) {
-            $this->isCronSchedule($schedule) => ['schedule_cron', 'The schedule "' . $schedule . '"', 'accept only "@at" schedules'],
-            str_starts_with($schedule, '@every') => ['schedule_every', 'The schedule "' . $schedule . '"', 'accept only "@at" schedules'],
-            $source !== null && $source !== '' => ['schedule_source', 'Nats-Schedule-Source (the source argument)', 'ignore it'],
-            $rollup => ['schedule_rollup', 'Nats-Schedule-Rollup (the rollup argument)', 'ignore it'],
-            default => null,
-        };
-    }
-
-    /**
-     * Fails before anything reaches the wire when the server the client is connected to right now advertises a version
-     * that parses as older than the one $need asks for (#267). An unparseable version (a proxy, a custom build)
-     * publishes as before and leaves the decision to the server. Called by publishScheduled() at once on an open
-     * connection, and in the step that writes the frame, so it reads the INFO of the server that takes it. Does not
-     * suspend.
-     *
-     * @param array{string, string, string} $need What {@see scheduleNeedingANewerServer()} found.
-     */
-    private function refuseOnAnOlderServer(array $need): void
-    {
-        [$feature, $what, $olderServers] = $need;
-        $required = FeatureSupport::REQUIREMENTS[$feature];
-        $serverVersion = $this->serverVersion();
-        if (!FeatureSupport::serverIsOlderThan($serverVersion, $required)) {
-            return;
-        }
-
-        throw new UnsupportedFeatureException(
-            $feature,
-            $required,
-            $serverVersion,
-            sprintf(
-                '%s requires NATS server %s+; older servers %s (connected server %s; nothing was published)',
-                $what,
-                $required,
-                $olderServers,
-                $serverVersion,
-            ),
-        );
-    }
-
-    /**
      * Publishes an ACK protocol token to a message reply subject.
      *
      * Runs inline in the caller's fiber (#136): the only synchronous work is the replyTo guard, so
@@ -5031,6 +4983,37 @@ final class JetStreamContext
      */
     private const PULL_REQUEST_FIELDS = ['group', 'id', 'min_pending', 'min_ack_pending', 'priority', 'max_bytes', 'no_wait', 'idle_heartbeat'];
 
+    /**
+     * The failure of a batched Direct Get whose reply shows that the server does not serve batched Direct Get
+     * (ADR-31, #272): it answered a `multi_last` request with `408 Empty Request` ($error: the status it sent), or a
+     * batch request with a single message without Nats-Num-Pending ($error null). KV `getAll()` and Object Store
+     * `list()` take their per-subject Direct Get fan-out on it. The connected server's version is only reported,
+     * never compared (ADR-44).
+     *
+     * @param array{code:int,description:string}|null $error
+     */
+    private function batchedDirectGetUnsupported(string $stream, ?array $error): UnsupportedFeatureException
+    {
+        $serverVersion = $this->serverVersion();
+        $reported = ($serverVersion !== null && $serverVersion !== '') ? $serverVersion : 'unknown';
+        $answer = $error === null
+            ? 'a single message without Nats-Num-Pending'
+            : sprintf('%d %s', $error['code'], $error['description']);
+
+        return new UnsupportedFeatureException(
+            'direct_get_batch',
+            '2.11',
+            $serverVersion,
+            sprintf(
+                'Batched Direct Get requires NATS server 2.11+, and the server answered the batch request for stream "%s" with %s (connected server reports %s)',
+                $stream,
+                $answer,
+                $reported,
+            ),
+            $error['code'] ?? 0,
+        );
+    }
+
     private function directGetStall(string $stream, int $expiresMs, int $received, ?\Throwable $previous = null): JetStreamException
     {
         return new JetStreamException(sprintf(
@@ -5329,25 +5312,19 @@ final class JetStreamContext
 
     /**
      * Sends a stream create or update request and returns the server's answer. A server older than a
-     * version-gated field of $config does not reject the field by default, it drops it (#266), so the
-     * request is refused before it is sent when the connected server's version is too old for such a
-     * field, and fails after it when the server's reply does not confirm the field: the returned config
-     * lacks it, or the reply carries no config ({@see FeatureSupport::assertSupportedBy()},
-     * {@see FeatureSupport::assertHonored()}).
+     * version-gated field of $config does not reject the field by default, it drops it (#266), so the call
+     * fails when the server's reply does not confirm such a field: the returned config lacks it, or the
+     * reply carries no config ({@see FeatureSupport::assertHonored()}). A strict server's own `unknown field`
+     * rejection is mapped as well ({@see throwApiError()}).
      *
-     * The pre-flight reads the INFO of the connection when the call is made, not in the step that writes
-     * the frame as {@see publishScheduled()} does (#267): a call made while the client fails over is
-     * checked against the version of the connection being replaced. The reply check covers the direction
-     * that matters, a failover to an older server, which takes the request, drops the field and has its
-     * reply refused (reporting its own version); a failover to a newer server is refused before the
-     * request, and the call can be made again once connected.
+     * Nothing is decided before the request (ADR-44, #272): the server the client is connected to may be
+     * neither the meta leader nor a server that will hold the stream, so its INFO version says nothing about
+     * whether the field is honored. The request is always sent, and the reply is judged.
      *
      * @param array<string,mixed> $config The full request body.
      */
     private function requestStreamChange(string $subject, string $name, array $config): StreamInfo
     {
-        FeatureSupport::assertSupportedBy($config, $this->serverVersion(), 'stream');
-
         $response = $this->requestJson($subject, $config);
 
         FeatureSupport::assertHonored(
@@ -5368,8 +5345,6 @@ final class JetStreamContext
      */
     private function requestConsumerChange(string $subject, string $stream, array $config): ConsumerInfo
     {
-        FeatureSupport::assertSupportedBy($config, $this->serverVersion(), 'consumer');
-
         $response = $this->requestJson($subject, ['stream_name' => $stream, 'config' => $config]);
 
         // The consumer's name comes from the reply, which describes what exists, else from the request's
@@ -5388,7 +5363,8 @@ final class JetStreamContext
     }
 
     /**
-     * The connected server's reported version (from the INFO handshake), or null when unknown.
+     * The connected server's reported version (from the INFO handshake), or null when unknown. Only reported in
+     * error messages: no request depends on it (ADR-44, #272).
      */
     private function serverVersion(): ?string
     {
@@ -5396,14 +5372,17 @@ final class JetStreamContext
     }
 
     /**
-     * Whether the connected server supports batched (ADR-31 `multi_last`) Direct Get, which requires
-     * NATS server 2.11+. KV `getAll()` and Object Store `list()` route through a single batched
-     * Direct Get when this is true, and fall back to a per-subject Direct Get fan-out otherwise (#110).
+     * Whether the connected server's INFO version is 2.11 or later, the release that brought batched (ADR-31
+     * `multi_last`) Direct Get. The check reads the version's numeric `major.minor` prefix (pre-release tags
+     * ignored); an unknown or unparseable version returns false.
      *
-     * The check reads the INFO-advertised version's numeric `major.minor` prefix (pre-release tags
-     * ignored, matching the {@see BatchPublisher} comparison). An unknown or unparseable version
-     * (proxies, custom builds) returns false so the conservative fan-out fallback - which works on any
-     * server - is used rather than sending a request an older server cannot honor.
+     * KV `getAll()` and Object Store `list()` no longer call it: they send the batched request and fall back to
+     * the per-subject fan-out when the reply shows that the server does not serve it (#272). The connected server
+     * is not necessarily the one that answers a Direct Get.
+     *
+     * @deprecated ADR-44 forbids choosing a request from the server version a client is connected to; this
+     *             decides nothing in the library any more and will be removed in the next major release. Send the
+     *             batched request and handle the {@see UnsupportedFeatureException} of {@see directGetBatch()}.
      */
     public function supportsBatchedDirectGet(): bool
     {

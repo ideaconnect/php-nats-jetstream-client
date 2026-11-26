@@ -133,9 +133,8 @@ final class FeatureSupportTest extends TestCase
     /**
      * Verifies only config fields are read from a config: the schedule_* keys of REQUIREMENTS are
      * scheduler features of publishScheduled(), not config fields, so a config carrying them asks for
-     * nothing, the pre-flight on a 2.10 server and the reply check let it through, and a strict
-     * server's "unknown field" rejection of one is not mapped to a 2.14 requirement. Every config field
-     * of REQUIREMENTS is still read (#266).
+     * nothing, the reply check lets it through, and a strict server's "unknown field" rejection of one
+     * is not mapped to a 2.14 requirement. Every config field of REQUIREMENTS is still read (#266).
      */
     public function testScheduleFeaturesAreNotConfigFields(): void
     {
@@ -154,14 +153,41 @@ final class FeatureSupportTest extends TestCase
             FeatureSupport::requestedFields(array_fill_keys(array_keys(FeatureSupport::REQUIREMENTS), true)),
         );
 
-        FeatureSupport::assertSupportedBy($scheduleKeys, '2.10.29', 'stream');
         FeatureSupport::assertHonored($scheduleKeys, null, '2.10.29', 'stream "S"');
         self::assertNull(FeatureSupport::unsupportedFromApiError('invalid JSON: json: unknown field "schedule_every"', 400, '2.12.0'));
 
         // The registry still answers for them.
         self::assertSame('2.14', FeatureSupport::requiredVersion('schedule_every'));
         self::assertSame('2.14', FeatureSupport::REQUIREMENTS['schedule_rollup']);
-        $this->addToAssertionCount(2);
+        $this->addToAssertionCount(1);
+    }
+
+    /**
+     * Verifies the INFO-version pre-flight of the stream and consumer calls is gone (ADR-44, #272): FeatureSupport
+     * keeps the reply check and the strict-server mapping, and nothing that compares a config with a server version.
+     */
+    public function testThereIsNoVersionPreflightAnyMore(): void
+    {
+        $methods = array_map(
+            static fn(\ReflectionMethod $method): string => $method->getName(),
+            (new \ReflectionClass(FeatureSupport::class))->getMethods(),
+        );
+
+        self::assertNotContains('assertSupportedBy', $methods);
+        self::assertContains('assertHonored', $methods);
+        self::assertContains('unsupportedFromApiError', $methods);
+    }
+
+    /**
+     * Verifies serverIsOlderThan() is deprecated, naming ADR-44 and the next major release as its removal (#272).
+     */
+    public function testServerIsOlderThanIsDeprecatedByAdr44(): void
+    {
+        $doc = (string) (new \ReflectionMethod(FeatureSupport::class, 'serverIsOlderThan'))->getDocComment();
+
+        self::assertMatchesRegularExpression('/@deprecated ADR-44 /', $doc);
+        self::assertStringContainsString('removed in the', $doc);
+        self::assertStringContainsString('next major release', $doc);
     }
 
     /**
@@ -209,85 +235,6 @@ final class FeatureSupportTest extends TestCase
         self::assertSame(['subject_delete_marker_ttl'], FeatureSupport::requestedFields(['subject_delete_marker_ttl' => -1]));
         self::assertSame(['subject_delete_marker_ttl'], FeatureSupport::requestedFields(['subject_delete_marker_ttl' => -0.5]));
         self::assertSame([], FeatureSupport::requestedFields(['subject_delete_marker_ttl' => 0, 'priority_timeout' => -1]));
-    }
-
-    /**
-     * @return iterable<string,array{array<string,mixed>,string,string,string}>
-     */
-    public static function tooOldServers(): iterable
-    {
-        yield 'allow_msg_ttl on 2.10' => [['allow_msg_ttl' => true], '2.10.29', 'allow_msg_ttl', '2.11'];
-        yield 'subject_delete_marker_ttl on 2.10' => [['subject_delete_marker_ttl' => 60_000_000_000], '2.10.29', 'subject_delete_marker_ttl', '2.11'];
-        yield 'negative subject_delete_marker_ttl on 2.10' => [['subject_delete_marker_ttl' => -1], '2.10.29', 'subject_delete_marker_ttl', '2.11'];
-        yield 'allow_msg_counter on 2.11' => [['allow_msg_counter' => true], '2.11.17', 'allow_msg_counter', '2.12'];
-        yield 'allow_msg_schedules on 2.11' => [['allow_msg_schedules' => true], '2.11.17', 'allow_msg_schedules', '2.12'];
-        yield 'allow_atomic on 2.11' => [['allow_atomic' => true], '2.11.17', 'allow_atomic', '2.12'];
-        yield 'filter_subjects on 2.9' => [['filter_subjects' => ['a.>', 'b.>']], '2.9.25', 'filter_subjects', '2.10'];
-        yield 'priority_groups on 2.10' => [['priority_groups' => ['g1']], '2.10.29', 'priority_groups', '2.11'];
-        yield 'filter_subjects on a 1.x server' => [['filter_subjects' => ['a.>']], '1.4.1', 'filter_subjects', '2.10'];
-        yield 'two-segment version' => [['allow_atomic' => true], '2.11', 'allow_atomic', '2.12'];
-        yield 'v-prefixed version' => [['allow_msg_ttl' => true], 'v2.10.0', 'allow_msg_ttl', '2.11'];
-        yield 'second field too old' => [['allow_msg_ttl' => true, 'allow_msg_counter' => true], '2.11.5', 'allow_msg_counter', '2.12'];
-    }
-
-    /**
-     * Verifies the pre-flight refuses a gated field the connected server's version is too old for,
-     * naming the field, its minimum version and the server's version (#266).
-     *
-     * @param array<string,mixed> $config
-     */
-    #[DataProvider('tooOldServers')]
-    public function testAssertSupportedByRefusesFieldTheServerIsTooOldFor(array $config, string $version, string $feature, string $required): void
-    {
-        try {
-            FeatureSupport::assertSupportedBy($config, $version, 'stream');
-            self::fail('Expected UnsupportedFeatureException');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame($feature, $e->feature);
-            self::assertSame($required, $e->requiredVersion);
-            self::assertSame($version, $e->serverVersion);
-            self::assertSame(0, $e->getCode());
-            self::assertSame(
-                sprintf(
-                    'The "%s" feature requires NATS server %s+, but the connected server reports %s (nothing was sent: an older server ignores the field and would set up the stream without it)',
-                    $feature,
-                    $required,
-                    $version,
-                ),
-                $e->getMessage(),
-            );
-        }
-    }
-
-    /**
-     * @return iterable<string,array{array<string,mixed>,?string}>
-     */
-    public static function serversThePreflightLetsThrough(): iterable
-    {
-        yield 'allow_msg_ttl on 2.11.0' => [['allow_msg_ttl' => true, 'subject_delete_marker_ttl' => 60_000_000_000], '2.11.0'];
-        yield 'allow_atomic on a 2.12 pre-release' => [['allow_atomic' => true], '2.12.0-beta.1'];
-        yield 'every field on 2.12' => [['filter_subjects' => ['a.>'], 'allow_msg_counter' => true, 'priority_groups' => ['g1']], 'v2.12.1'];
-        yield 'a 3.0 server' => [['allow_msg_counter' => true], '3.0.0'];
-        yield 'unparseable version' => [['allow_msg_counter' => true], 'synadia-custom'];
-        // The version must start with its number: "release-1.5" is a custom build, not a 1.5 server.
-        yield 'number not at the start' => [['allow_msg_ttl' => true], 'release-1.5'];
-        yield 'empty version' => [['allow_msg_counter' => true], ''];
-        yield 'no version' => [['allow_msg_counter' => true], null];
-        yield 'defaults on 2.10' => [['allow_msg_ttl' => false, 'subject_delete_marker_ttl' => 0, 'allow_atomic' => false, 'priority_policy' => 'none'], '2.10.29'];
-    }
-
-    /**
-     * Verifies the pre-flight passes a server new enough for every requested field, a version it
-     * cannot parse (the reply check covers that case), and fields set to their defaults (#266).
-     *
-     * @param array<string,mixed> $config
-     */
-    #[DataProvider('serversThePreflightLetsThrough')]
-    public function testAssertSupportedByPassesWhatItCannotRuleOut(array $config, ?string $version): void
-    {
-        FeatureSupport::assertSupportedBy($config, $version, 'stream');
-
-        $this->addToAssertionCount(1);
     }
 
     /**

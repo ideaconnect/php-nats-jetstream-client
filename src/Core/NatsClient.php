@@ -617,28 +617,6 @@ final class NatsClient
     }
 
     /**
-     * Sends a request with headers as {@see requestWithHeaders()} does, with $beforeWrite called before each attempt to
-     * write its frame, in the step that writes it, after any wait for a reconnect; what it throws fails the request,
-     * the frame not written. See {@see NatsConnection::requestWithHeadersGuarded()}.
-     *
-     * @internal For JetStreamContext::publishScheduled() (#267); not part of the supported API.
-     *
-     * @param array<string,string> $headers
-     * @param \Closure():void $beforeWrite Must not suspend.
-     * @return Future<NatsMessage>
-     */
-    public function requestWithHeadersGuarded(
-        string $subject,
-        string $payload,
-        array $headers,
-        \Closure $beforeWrite,
-        ?int $timeoutMs = null,
-        ?Cancellation $cancellation = null,
-    ): Future {
-        return $this->connection->requestWithHeadersGuarded($subject, $payload, $headers, $beforeWrite, $timeoutMs, $cancellation);
-    }
-
-    /**
      * Sends one request and collects multiple replies (scatter-gather), terminating on the first of:
      * {@see $maxResponses} replies, a no-responders sentinel, the per-message {@see $stallMs} gap, or
      * the total timeout. Mirrors nats.go `RequestMany` / nats.java `Connection.requestMany`. While a

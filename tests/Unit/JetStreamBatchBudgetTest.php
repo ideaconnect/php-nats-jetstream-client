@@ -338,9 +338,9 @@ final class JetStreamBatchBudgetTest extends TestCase
             if ($reply === null) {
                 return [];
             }
-            foreach ([[0.4, 'one'], [0.8, 'two']] as [$when, $payload]) {
-                $timers[] = EventLoop::delay($when, static function () use ($transport, $reply, $payload): void {
-                    foreach ($transport->replyFrame($reply, $payload) as $frame) {
+            foreach ([[0.4, 'one', 2], [0.8, 'two', 1]] as [$when, $payload, $pending]) {
+                $timers[] = EventLoop::delay($when, static function () use ($transport, $reply, $payload, $pending): void {
+                    foreach (self::batchMessage($transport, $reply, $payload, $pending) as $frame) {
                         $transport->pushFrame($frame);
                     }
                 });
@@ -437,13 +437,28 @@ final class JetStreamBatchBudgetTest extends TestCase
             if ($reply === null) {
                 return [];
             }
-            $frames = $transport->replyFrame($reply, 'message');
             if (str_starts_with($subject, '$JS.API.DIRECT.GET.')) {
+                $frames = self::batchMessage($transport, $reply, 'message', 1);
                 $frames[] = self::endFrame($reply, $transport->sidFor($reply) ?? 1);
+
+                return $frames;
             }
 
-            return $frames;
+            return $transport->replyFrame($reply, 'message');
         };
+    }
+
+    /**
+     * A message of a Direct Get batch on $reply's subscription, carrying the Nats-Num-Pending header every message of a
+     * batch carries on a 2.11+ server: a first message without it is a server without batched Direct Get (#272).
+     *
+     * @return list<string>
+     */
+    private static function batchMessage(ReconnectingTransport $transport, string $reply, string $payload, int $pending): array
+    {
+        $sid = $transport->sidFor($reply);
+
+        return $sid === null ? [] : [ReconnectingTransport::hmsgFrame($reply, $sid, "NATS/1.0\r\nNats-Num-Pending: {$pending}\r\n\r\n", $payload)];
     }
 
     private static function endFrame(string $reply, int $sid): string

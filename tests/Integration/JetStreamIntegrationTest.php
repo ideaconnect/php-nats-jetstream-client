@@ -16,7 +16,6 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\Enum\NoRespondersCause;
-use IDCT\NATS\JetStream\FeatureSupport;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
@@ -602,12 +601,13 @@ final class JetStreamIntegrationTest extends TestCase
     }
 
     /**
-     * Verifies the 2.14 pre-flight of publishScheduled() against the live server (#267). nats-server 2.12 (the
-     * fixture's version) rejects "@every" and cron schedules with an opaque 400 and stores an "@at" schedule while
-     * ignoring Nats-Schedule-Source and Nats-Schedule-Rollup: the client refuses all four calls before anything is
-     * stored. A 2.14+ server accepts and stores all four, so the test follows the version the server advertises: on
-     * 2.14+ each schedule is read back from its own schedule subject (a whole-stream count would also take in a message
-     * a schedule fired into the target subject meanwhile).
+     * Verifies that publishScheduled() sends every schedule whatever the server's version, and that the server's
+     * answer decides (ADR-44, #272). The JetStream API level ($JS.API.INFO `api.level`, read through accountInfo())
+     * says what to expect: a level-3 server (2.12, the fixture's version) rejects "@every" and cron schedules with a
+     * 400 "message schedules pattern is invalid" and stores an "@at" schedule while ignoring Nats-Schedule-Source and
+     * Nats-Schedule-Rollup; a level-4+ server (2.14+) accepts and stores all four. Each stored schedule is read back
+     * from its own schedule subject (a whole-stream count would also take in a message a schedule fired into the target
+     * subject meanwhile). Up to 2.32.0 the client refused all four calls on a 2.12 INFO version (#267).
      */
     public function testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders(): void
     {
@@ -629,11 +629,12 @@ final class JetStreamIntegrationTest extends TestCase
             ['allow_msg_schedules' => true],
         )->await();
 
-        $version = $client->serverInfo()?->version;
-        $older = FeatureSupport::serverIsOlderThan($version, '2.14');
+        $apiLevel = $js->accountInfo()->await()->apiLevel;
+        self::assertNotNull($apiLevel, 'a server with message schedules (2.12+) reports its JetStream API level');
+        $recurringRejected = $apiLevel < 4;
         $later = Schedule::atTimestamp(time() + 3600);
-        // Each call's schedule subject and payload: on a 2.14 server each schedule is looked up on its own subject,
-        // since a schedule may fire into the target subject while the test runs (the cron one at 03:00 Warsaw time).
+        // Each call's schedule subject and payload: each stored schedule is looked up on its own subject, since a
+        // schedule may fire into the target subject while the test runs (the cron one at 03:00 Warsaw time).
         $calls = [
             'schedule_every' => [$prefix . 'every', '{"event":"tick"}', static fn(string $subject, string $payload): Future => $js->publishScheduled($subject, $targetSubject, $payload, Schedule::every('1h'))],
             'schedule_cron' => [$prefix . 'cron', '{"event":"report"}', static fn(string $subject, string $payload): Future => $js->publishScheduled(
@@ -653,27 +654,25 @@ final class JetStreamIntegrationTest extends TestCase
             'schedule_rollup' => [$prefix . 'rollup', '{"event":"latest"}', static fn(string $subject, string $payload): Future => $js->publishScheduled($subject, $targetSubject, $payload, $later, rollup: true)],
         ];
 
+        $stored = [];
         foreach ($calls as $feature => [$subject, $payload, $call]) {
+            $recurring = $feature === 'schedule_every' || $feature === 'schedule_cron';
             try {
                 $ack = $call($subject, $payload)->await();
-                self::assertFalse($older, sprintf('%s must be refused on server %s', $feature, (string) $version));
+                self::assertFalse($recurring && $recurringRejected, sprintf('%s must be rejected by a level-%d server', $feature, $apiLevel));
                 self::assertSame($stream, $ack->stream);
-            } catch (UnsupportedFeatureException $e) {
-                self::assertTrue($older, sprintf('%s must be published on server %s', $feature, (string) $version));
-                self::assertSame($feature, $e->feature);
-                self::assertSame('2.14', $e->requiredVersion);
-                self::assertSame($version, $e->serverVersion);
+                $stored[$feature] = [$subject, $payload];
+            } catch (JetStreamException $e) {
+                self::assertNotInstanceOf(UnsupportedFeatureException::class, $e, 'the client decides nothing before the request');
+                self::assertTrue($recurring && $recurringRejected, sprintf('%s must be stored by a level-%d server: %s', $feature, $apiLevel, $e->getMessage()));
+                self::assertSame(400, $e->getCode());
+                self::assertStringContainsString('message schedules pattern is invalid', $e->getMessage());
             }
         }
 
-        if ($older) {
-            $state = $js->getStream($stream)->await()->raw['state'] ?? [];
-            $messages = is_array($state) ? (int) ($state['messages'] ?? -1) : -1;
-            self::assertSame(0, $messages, 'a refused schedule must leave nothing in the stream');
-        } else {
-            foreach ($calls as $feature => [$subject, $payload]) {
-                self::assertSame($payload, $js->getLastMessageForSubject($stream, $subject)->await()->payload, sprintf('%s is stored on %s', $feature, $subject));
-            }
+        self::assertCount($recurringRejected ? 2 : 4, $stored);
+        foreach ($stored as $feature => [$subject, $payload]) {
+            self::assertSame($payload, $js->getLastMessageForSubject($stream, $subject)->await()->payload, sprintf('%s is stored on %s', $feature, $subject));
         }
 
         $js->deleteStream($stream)->await();

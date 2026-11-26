@@ -5,7 +5,8 @@
  *
  * Stages several messages with the fluent $js->batch()->add(...) API and commits them
  * atomically in one operation. Requires a stream created with allow_atomic; on a
- * pre-2.12 server it skips cleanly via UnsupportedFeatureException.
+ * pre-2.12 server (the reply shows it ignored the field) it skips cleanly via
+ * UnsupportedFeatureException.
  *
  * Mirrors the README "Atomic Batch Publish" example. Run: php examples/atomic-batch-publish.php
  */
@@ -35,12 +36,15 @@ try {
         // Stream may not exist yet; ignore.
     }
 
-    // Atomic batches require a NATS 2.12+ server and a stream created with allow_atomic.
-    // On a pre-2.12 server this fails fast with UnsupportedFeatureException.
+    // Atomic batches require a NATS 2.12+ server and a stream created with allow_atomic. A pre-2.12
+    // server ignores the field: the reply shows it, and createStream() throws UnsupportedFeatureException.
     try {
         $js->createStream($stream, ['ex_atomic_batch.>'], ['allow_atomic' => true])->await();
         $created = true;
     } catch (UnsupportedFeatureException $e) {
+        // The server created the stream without the field (the example deleted any older one above):
+        // remove it on the way out.
+        $created = true;
         echo 'OK atomic-batch-publish: skipped, server does not support atomic batches ('
             . $e->getMessage() . ')' . PHP_EOL;
 

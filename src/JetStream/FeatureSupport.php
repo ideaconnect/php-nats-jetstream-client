@@ -15,16 +15,15 @@ use IDCT\NATS\Exception\UnsupportedFeatureException;
  * fields only in strict mode, which 2.10 does not have, 2.11 has only with `jetstream { strict: true }`,
  * and 2.12 turns on by default. A default 2.10 or 2.11 server drops the field and creates or updates
  * the stream or consumer without the feature (#266). The stream and consumer create/update calls of
- * {@see JetStreamContext} therefore check twice:
+ * {@see JetStreamContext} therefore judge the server's reply: {@see assertHonored()} checks that the
+ * config the server returned still carries each requested field, and fails naming the field the server
+ * dropped, or saying the reply carries no config to confirm it. A strict server's own
+ * `unknown field "X"` rejection is mapped as well ({@see unsupportedFromApiError()}).
  *
- * - before the request, {@see assertSupportedBy()} compares the fields the config asks for with the
- *   connected server's INFO-advertised version, and fails before anything is sent;
- * - after it, {@see assertHonored()} checks that the config the server returned still carries each of
- *   those fields (an unparseable version, or a JetStream API answered by an older server than the
- *   connected one), and fails naming the field the server dropped, or saying the reply carries no
- *   config to confirm it.
- *
- * A strict server's own `unknown field "X"` rejection is mapped as well ({@see unsupportedFromApiError()}).
+ * Nothing is refused before a request because of the server version (ADR-44, #272): a JetStream request
+ * is answered by the meta leader or by the server hosting the asset, and the server the client is
+ * connected to, whose version INFO reports, may be neither. {@see REQUIREMENTS} and
+ * {@see requiredVersion()} stay as documentation of what each feature needs.
  */
 final class FeatureSupport
 {
@@ -126,44 +125,6 @@ final class FeatureSupport
     }
 
     /**
-     * Pre-flight of a stream or consumer create/update (#266): throws an {@see UnsupportedFeatureException}
-     * for the first field of $config that asks for a feature the connected server's version is too old
-     * for, before anything is sent. The version is the INFO-advertised one, compared by
-     * {@see serverIsOlderThan()} on its numeric `major.minor` prefix as the atomic batch pre-flight does
-     * ({@see BatchPublisher::commit()}); in a cluster it stands for the servers that will hold the
-     * stream. An unknown or unparseable version (a proxy, a custom build) is never older, so it passes,
-     * and {@see assertHonored()} checks the reply instead.
-     *
-     * @internal For the stream and consumer create/update calls of {@see JetStreamContext} (#266); not part of
-     *           the supported API.
-     *
-     * @param array<string,mixed> $config The config about to be sent.
-     * @param string              $target What the request sets up, e.g. `stream` or `consumer`.
-     */
-    public static function assertSupportedBy(array $config, ?string $serverVersion, string $target): void
-    {
-        foreach (self::requestedFields($config) as $field) {
-            $required = self::REQUIREMENTS[$field];
-            if (!self::serverIsOlderThan($serverVersion, $required)) {
-                continue;
-            }
-
-            throw new UnsupportedFeatureException(
-                $field,
-                $required,
-                $serverVersion,
-                sprintf(
-                    'The "%s" feature requires NATS server %s+, but the connected server reports %s (nothing was sent: an older server ignores the field and would set up the %s without it)',
-                    $field,
-                    $required,
-                    $serverVersion,
-                    $target,
-                ),
-            );
-        }
-    }
-
-    /**
      * Reply check of a stream or consumer create/update (#266): throws an {@see UnsupportedFeatureException}
      * for the first field of $requested that asks for a feature the server's reply does not confirm. The
      * request has been sent by then, so the message says only what the reply shows about $target:
@@ -235,9 +196,16 @@ final class FeatureSupport
     /**
      * Whether an INFO-advertised server version is known to be older than $required (a "major.minor"
      * such as "2.14"). Only the numeric major.minor prefix counts: pre-release tags are ignored (a
-     * 2.14.0-beta server counts as 2.14), matching the {@see BatchPublisher} comparison. A missing or
-     * unparseable version (proxies, custom builds) is never "older": the caller then leaves the
-     * decision to the server.
+     * 2.14.0-beta server counts as 2.14). A missing or unparseable version (proxies, custom builds) is
+     * never "older".
+     *
+     * The library itself no longer calls it (#272).
+     *
+     * @deprecated ADR-44 forbids refusing a feature, choosing a request or changing a configuration because of
+     *             the server version a client is connected to: a JetStream request is answered by the meta leader
+     *             or by the server hosting the asset, which may run another release. This will be removed in the
+     *             next major release. Send the request and judge the server's reply; where a feature level must
+     *             be checked, use the API level `$JS.API.INFO` reports ({@see Models\AccountInfo::$apiLevel}).
      *
      * @throws \InvalidArgumentException When $required has no numeric major.minor prefix.
      */

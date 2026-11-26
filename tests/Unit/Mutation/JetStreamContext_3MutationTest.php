@@ -224,7 +224,7 @@ final class JetStreamContext_3MutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testDirectGetBatchCollectedMessageHasSidZero(): void
     {
-        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\n\r\n";
+        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\nNats-Num-Pending: 1\r\n\r\n";
         $b1 = 'aaa';
         $eob = "NATS/1.0 204 EOB\r\n\r\n";
 

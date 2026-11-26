@@ -12,6 +12,7 @@ use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
+use IDCT\NATS\Tests\Support\ServerWithoutBatchedDirectGet;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -1503,6 +1504,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectStatus(1, 503, 'No Responders'),                                  // Direct Get -> 503
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),            // STREAM.MSG.GET fallback
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -1515,10 +1517,10 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * On a MODERN server (2.11+, batched Direct Get supported) an allow_direct-disabled bucket
-     * answers the batched multi_last with 503 - the server-version gate cannot see per-STREAM
-     * Direct Get availability. getAll() must fall through to the per-subject fan-out (whose
-     * lookups fall back to the leader read) instead of failing the whole enumeration.
+     * An allow_direct-disabled bucket answers the batched multi_last with 503: a per-STREAM
+     * property the connected server's version could never show. getAll() must fall through to the
+     * per-subject fan-out (whose lookups fall back to the leader read) instead of failing the whole
+     * enumeration.
      */
     public function testGetAllFallsBackWhenBatchedDirectGetAnswers503(): void
     {
@@ -1531,7 +1533,7 @@ final class KeyValueBucketTest extends TestCase
         );
 
         $transport = new FakeTransport([
-            // 2.12 server: the BATCHED path is taken first.
+            // The BATCHED path is always taken first (#272).
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
         ]);
@@ -1554,6 +1556,49 @@ final class KeyValueBucketTest extends TestCase
         $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
 
         self::assertSame(['theme' => 'blue'], $all, 'the batched 503 must fall through to the fan-out + leader read');
+    }
+
+    /**
+     * The reply decides, not the version (ADR-31, ADR-44, #272): the connected server reports 2.14.10, but the server
+     * that holds the bucket answers the batched multi_last request with ONE message and no Nats-Num-Pending header,
+     * as a server without batched Direct Get answers a batch request. getAll() takes the per-subject fan-out, whose
+     * replies are the values, and does not read that lone message as the whole bucket.
+     */
+    public function testGetAllFallsBackToFanOutWhenTheBatchedReplyLacksNumPending(): void
+    {
+        $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":2,"bytes":64,"subjects":{"$KV.cfg.username":1,"$KV.cfg.email":1}}}';
+        $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"messages":2,"bytes":64,"subjects":{}}}';
+        $usernameHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 1\r\n\r\n";
+        $usernameBody = 'alice';
+        $emailHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.email\r\nNats-Sequence: 2\r\n\r\n";
+        $emailBody = 'a@example.com';
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.14.10","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // The batched request's reply on the DGET inbox (sid 2: mux SUB=1, DGET SUB=2): one message, no Nats-Num-Pending.
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.DGET' => [
+                sprintf("HMSG _INBOX.JS.DGET.x 2 %d %d\r\n%s%s\r\n", strlen($usernameHdrs), strlen($usernameHdrs) + strlen($usernameBody), $usernameHdrs, $usernameBody),
+            ],
+        ];
+        $this->muxServer($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfoPage1), $streamInfoPage1),
+            sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
+            sprintf("HMSG _INBOX.b 3 %d %d\r\n%s%s\r\n", strlen($usernameHdrs), strlen($usernameHdrs) + strlen($usernameBody), $usernameHdrs, $usernameBody),
+            sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", strlen($emailHdrs), strlen($emailHdrs) + strlen($emailBody), $emailHdrs, $emailBody),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $all = $client->jetStream()->keyValue('cfg')->getAll()->await();
+
+        self::assertSame(['username' => 'alice', 'email' => 'a@example.com'], $all);
+        $writes = implode('||', $transport->writes);
+        self::assertSame(1, substr_count($writes, 'multi_last'), 'the batched request is tried once');
+        self::assertStringContainsString('"last_by_subj":"$KV.cfg.email"', $writes, 'the fan-out reads each key');
     }
 
     /**
@@ -1737,8 +1782,8 @@ final class KeyValueBucketTest extends TestCase
         $eh = strlen($emailHdrs);
         $et = $eh + strlen($emailBody);
 
-        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and getAll() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -1751,6 +1796,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),                  // username -> PURGE (skipped)
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody),       // email -> value
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -1805,8 +1851,8 @@ final class KeyValueBucketTest extends TestCase
         $eh = strlen($emailHdrs);
         $et = $eh + strlen($emailBody);
 
-        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and getAll() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -1817,6 +1863,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $uh, $uh, $usernameHdrs),
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $eh, $et, $emailHdrs, $emailBody),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -2199,8 +2246,8 @@ final class KeyValueBucketTest extends TestCase
         $th = strlen($themeHdrs);
         $tt = $th + strlen($themeBody);
 
-        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and getAll() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -2211,6 +2258,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $nf, $nf, $notFound),                      // gone -> 404 (skipped)
             sprintf("HMSG _INBOX.c 4 %d %d\r\n%s%s\r\n", $th, $tt, $themeHdrs, $themeBody),       // theme -> value
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -2926,8 +2974,8 @@ final class KeyValueBucketTest extends TestCase
         $th = strlen($themeHdrs);
         $tt = $th + strlen($themeBody);
 
-        // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and getAll() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -2938,6 +2986,7 @@ final class KeyValueBucketTest extends TestCase
             // Only theme gets a Direct Get request (the non-KV subject is skipped).
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s%s\r\n", $th, $tt, $themeHdrs, $themeBody),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -2965,9 +3014,10 @@ final class KeyValueBucketTest extends TestCase
         $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
         // One batched reply stream on the batched Direct-Get inbox subscription (sid 2 - the mux inbox
         // is sid 1): a DEL tombstone (excluded), TWO live values, and the last frame carrying
-        // Nats-Num-Pending: 0 to terminate the batch.
-        $usernameHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 3\r\nKV-Operation: DEL\r\n\r\n";
-        $emailHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.email\r\nNats-Sequence: 4\r\n\r\n";
+        // Nats-Num-Pending: 0 to terminate the batch. Every frame of a batch carries Nats-Num-Pending, as
+        // a 2.11+ server sends it (a first frame without it is a server without batched Direct Get, #272).
+        $usernameHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.username\r\nNats-Sequence: 3\r\nKV-Operation: DEL\r\nNats-Num-Pending: 2\r\n\r\n";
+        $emailHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.email\r\nNats-Sequence: 4\r\nNats-Num-Pending: 1\r\n\r\n";
         $phoneHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.phone\r\nNats-Sequence: 5\r\nNats-Num-Pending: 0\r\n\r\n";
         $emailBody = 'e@example.com';
         $phoneBody = 'p@example.com';
@@ -3489,7 +3539,7 @@ final class KeyValueBucketTest extends TestCase
     }
 
     /**
-     * getAll() per-subject fan-out (pre-2.11 server, no batched Direct Get): an error that is
+     * getAll() per-subject fan-out (a server without batched Direct Get): an error that is
      * neither 404 (missing key, skipped) nor 503 (Direct Get unavailable, leader fallback) must
      * propagate VERBATIM - code and description - and fail the enumeration.
      */
@@ -3500,7 +3550,8 @@ final class KeyValueBucketTest extends TestCase
         $errHdrs = "NATS/1.0 500 Internal Error\r\nStatus: 500\r\nDescription: kv direct get exploded\r\n\r\n";
         $eh = strlen($errHdrs);
 
-        // Pre-2.11 server: the batched multi_last gate is off, so the per-subject fan-out runs.
+        // A server without batched Direct Get (2.10): the batched multi_last request is answered 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), so the per-subject fan-out runs (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -3510,6 +3561,7 @@ final class KeyValueBucketTest extends TestCase
             sprintf("MSG _INBOX.p 2 %d\r\n%s\r\n", strlen($streamInfoPage2), $streamInfoPage2),
             sprintf("HMSG _INBOX.b 3 %d %d\r\n%s\r\n", $eh, $eh, $errHdrs),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -3523,9 +3575,10 @@ final class KeyValueBucketTest extends TestCase
         }
 
         $writes = implode('', $transport->writes);
-        // The fan-out path was taken: a per-subject last_by_subj lookup, no batched multi_last.
+        // The fan-out path was taken: a per-subject last_by_subj lookup, after the one batched multi_last request
+        // the server answered as a server without batched Direct Get (#272).
         self::assertStringContainsString('"last_by_subj":"$KV.cfg.theme"', $writes);
-        self::assertStringNotContainsString('"multi_last"', $writes);
+        self::assertSame(1, substr_count($writes, '"multi_last"'));
     }
 
     /**
@@ -3538,7 +3591,7 @@ final class KeyValueBucketTest extends TestCase
         $streamInfoPage1 = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]},"state":{"messages":1,"subjects":{"$KV.cfg.theme":1}}}';
         $streamInfoPage2 = '{"config":{"name":"KV_cfg"},"state":{"subjects":{}}}';
         // A frame on a FOREIGN subject precedes the real key's frame (which terminates the batch).
-        $rogueHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.other.rogue\r\nNats-Sequence: 7\r\n\r\n";
+        $rogueHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.other.rogue\r\nNats-Sequence: 7\r\nNats-Num-Pending: 1\r\n\r\n";
         $themeHdrs = "NATS/1.0\r\nNats-Stream: KV_cfg\r\nNats-Subject: \$KV.cfg.theme\r\nNats-Sequence: 8\r\nNats-Num-Pending: 0\r\n\r\n";
         $rogueBody = 'zzz';
         $themeBody = 'dark';
@@ -3980,6 +4033,7 @@ final class KeyValueBucketTest extends TestCase
             $this->kvDirectStatus(1, 503, 'No Responders'),                          // per-key Direct Get -> 503
             sprintf("MSG _INBOX.c 1 %d\r\n%s\r\n", strlen($missing), $missing),      // leader fallback -> 404
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();

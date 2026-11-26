@@ -238,8 +238,7 @@ final class JetStreamContext_4MutationTest extends TestCase
         )->await();
 
         // kills FalseValue @ 1303 (rollup default false->true) - defaulting to true would emit the
-        // rollup header even though the caller never asked for it (and, on this 2.12 server, would
-        // trip the 2.14 pre-flight instead of publishing).
+        // rollup header even though the caller never asked for it.
         self::assertStringNotContainsString('Nats-Schedule-Rollup', $transport->writes[3]);
     }
 
@@ -264,8 +263,7 @@ final class JetStreamContext_4MutationTest extends TestCase
         )->await();
 
         // kills LogicalAnd @ 1321 (&& -> ||) - with source='' the OR form is true (because
-        // '' !== null) and would emit an empty Nats-Schedule-Source header. An empty source is no
-        // source, so it does not trip the 2.14 pre-flight on this 2.12 server either.
+        // '' !== null) and would emit an empty Nats-Schedule-Source header. An empty source is no source.
         self::assertStringNotContainsString('Nats-Schedule-Source', $transport->writes[3]);
     }
 
