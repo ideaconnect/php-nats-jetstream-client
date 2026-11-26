@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3762 unit tests, 160 integration tests, 49 Behat scenarios.
+Indicative totals: 3786 unit tests, 167 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -139,6 +139,28 @@ The application's own read - processIncoming() or readIncoming() - finding the s
 - `testServerPingWhosePongWriteFailsClosesTheConnectionWithReconnectOff` - A server PING whose PONG write finds the socket dead fails processIncoming() with the socket's error, as before, and the connection no longer stays Open on that socket.
 - `testFullSubscriptionQueueDoesNotEndTheConnection` - Guard: a full subscription queue under the Error policy still fails the read with SlowConsumerException, and the connection stays Open with its socket.
 - `testFatalErrDuringDrainDoesNotReconnect` - Guard: a fatal -ERR answering drain()'s flush PING does not reconnect (no second dial); drain() reports it and closes.
+
+### tests/Unit/ConsumerResetTest.php
+The consumer delivery state reset of ADR-60 (#274), `$JS.API.CONSUMER.RESET.<stream>.<consumer>` (nats-server 2.14+): `JetStreamContext::resetConsumer()` and the consumes whose consumer another client resets. Over `tests/Support/FakeTransport.php` with replies taken from a live nats-server 2.14.10 run; the ordered consumer over `tests/Support/OrderedConsumerResetServer.php`, a scripted server that answers each CONSUMER.CREATE with the consumer it names, delivers from its start with consumer sequences from 1, and has the first consumer send what a reset makes it send. Ten sabotage variants of the change (the ordered heartbeat check back to `>`, no version pre-flight, `<= 0` or no negative check, a sequence sent without one, no reply check, no `reset_seq` or a numeric-string one read, no stream-name check, the old push wording) each fail at least one test here.
+- `testAResetWithoutASequenceSendsAnEmptyRequest` - resetConsumer('ORDERS', 'PROC') on a 2.14.10 server sends `{}` to `$JS.API.CONSUMER.RESET.ORDERS.PROC` (`JetStreamApi::CONSUMER_RESET_PREFIX`).
+- `testAResetToASequenceSendsTheSequence` - Sequences 42, 1 and 0 go out as `{"seq":42}`, `{"seq":1}` and `{"seq":0}`.
+- `testTheReplyIsTheConsumerWithItsResetSequence` - The reply resolves to a ConsumerInfo with its stream, name, pull mode, `resetSequence` 2 and, in `raw`, the delivery state (`delivered` and `ack_floor` at stream sequence 1), `num_pending` and the config.
+- `testTheReplyOfAPushConsumerIsAPushConsumer` - A reply whose config has a deliver subject is a push consumer, with its `resetSequence`.
+- `testOnlyAnIntegerResetSequenceIsRead` - `ConsumerInfo::fromArray()` reads `reset_seq` only as an integer (0 included); a missing, string, float or null one, and a ConsumerInfo built without it, give null.
+- `testAnInvalidResetFailsWithItsErrCode` - The server's `400 invalid reset: not allowed` (err_code 10204) fails the call with a JetStreamException (not an UnsupportedFeatureException) carrying the description, code 400 and `ApiErrCode::CONSUMER_INVALID_RESET`.
+- `testAReplyWithoutTheConsumerFails` - A reply that is neither an error nor a consumer (no config, a null config, a string config) fails with "The reset reply for consumer "PROC" on stream "ORDERS" carries no consumer info: the reset may or may not have taken effect".
+- `testInvalidNamesAreRefusedWithNothingSent` - Data provider (a dotted or empty stream; a dotted, empty, spaced or wildcard consumer): the call fails with the "Invalid stream/consumer name" JetStreamException, and nothing is written after the CONNECT + PING handshake.
+- `testANegativeSequenceIsRefusedWithNothingSent` - Sequences -1 and PHP_INT_MIN fail with an InvalidArgumentException, nothing written.
+- `testAServerBefore214IsRefusedWithNothingSent` - On servers advertising 2.12.15, 2.12.0, v2.11.4, 2.13.9, 1.99.0 and "2" the call fails with an UnsupportedFeatureException (feature `consumer_reset`, required 2.14, the server's version, code 0, no err_code, "... (connected server X; nothing was sent)"), nothing written; `FeatureSupport::requiredVersion('consumer_reset')` is 2.14.
+- `testA214ServerOrAnUnparseableVersionGetsTheRequest` - On 2.14.0, 2.14.0-beta.1, v2.14.10, 2.15.2, 3.0.0, "custom-build" and no version at all the request is sent and its reply read.
+- `testARequestNothingAnswersTimesOut` - A reset nothing answers (a consumer or stream that does not exist, an older server whose version did not parse) fails with the request's TimeoutException.
+- `testNoRespondersIsAJetStreamException503` - A no-responders status fails the call with JetStreamException(503) "No JetStream responder for subject $JS.API.CONSUMER.RESET.ORDERS.PROC" (#161).
+- `testARunningPullConsumeKeepsDeliveringAfterTheConsumerIsReset` - A pull consume (2 pulls of 3) whose second pull brings the replay of a reset to stream sequence 2, consumer sequences back at 1, hands m-1, m-2, m-3, m-2, m-3, m-4 to the handler and reports nothing.
+- `testADurablePushConsumeKeepsDeliveringAfterTheConsumerIsReset` - A durable push subscription gets m-1 to m-3, then the replay from stream sequence 2 with consumer sequence 1 and m-4; all six reach the handler, and the heartbeat after them (last delivered 3) reports no mismatch.
+- `testAnIdleDurablePushConsumeReportsTheResetOnceAndKeepsDelivering` - After m-1 to m-3 two heartbeats report last delivered 0 (a reset while idle): one mismatch is reported ("last delivered sequence 0 below the 3 already seen", "appears to have been replaced or reset"), the repeat is silent, and m-4 (consumer sequence 1) reaches the handler with no report after it.
+- `testAnOrderedConsumerResetBackwardRecreatesItselfWithoutADuplicate` - The first consumer delivers m-1 to m-3, then m-2 again with consumer sequence 1 (a reset to 2): the ordered consumer discards it, deletes ORD1 and recreates the consumer `by_start_sequence` from 4, so the handler gets m-1 to m-4 once each.
+- `testAnOrderedConsumerResetForwardWhileIdleRecreatesItselfWithoutAGap` - After m-1 to m-3 a heartbeat reports last delivered 0 (a reset forward past the tail while idle): the ordered consumer recreates itself from stream sequence 4 at once, and m-4 and m-5 reach the handler. With the heartbeat check back at "above only" nothing is recreated and the handler stops at m-3.
+- `testAnOrderedConsumerHeartbeatInStepWithItsDeliveriesRecreatesNothing` - Guard: a heartbeat reporting last delivered 3 after three deliveries recreates and deletes nothing.
 
 ### tests/Unit/CorruptChunkOperationReadTest.php
 The read of one of the library's operations that gets a chunk which fails to parse recovers the connection as a read that met a lost socket does (#195): in a fiber of its own, waited for only within the operation's wait, or not at all with waiting disabled. Over `ReconnectingTransport`, heartbeat off; the recovery's first dial is held until the operation has returned, so each operation ends with the connection still Connecting; a 3 s watchdog bounds a broken case.
@@ -3557,6 +3579,16 @@ Operations issued while a reconnect is in flight wait for it within one budget (
 - `testSubscriptionDrainStopsDelivery` - `drainSubscription` delivers the in-flight message (`one`) then removes the subscription so a later publish (`two`) is not delivered; asserts only `['one']` received.
 - `testWebSocketCompressionAndCustomHeaders` - A WebSocket connection with permessage-deflate compression and a custom upgrade header round-trips a large compressible payload unchanged.
 - `testWebSocketTransportCarriesPubSubAndJetStream` - The WebSocket transport carries a core pub/sub round trip (`ws-hello`) and a JetStream publish + read-back (seq>=1, payload matches) over the same ws:// connection.
+
+### tests/Integration/ConsumerResetIntegrationTest.php
+The consumer delivery state reset of ADR-60 (#274) against a live server; the consume tests reset the consumer from a second client, as an operator or the CLI would. The fixture stack runs nats-server 2.12, so there only the first test runs and the others are skipped; with NATS_URL pointing at a 2.14+ server the first is skipped and the others run (all seven checked against nats-server 2.14.10 and 2.12.15).
+- `testAResetIsRefusedBeforeSendingOnAServerBefore214` - On a server older than 2.14 resetConsumer() fails with the UnsupportedFeatureException (`consumer_reset`, 2.14, the server's version), and the consumer still delivers m-1.
+- `testAResetToASequenceDeliversFromThatSequence` - A pull consumer that fetched and acked m-1 to m-3, reset to 2, answers with `resetSequence` 2, delivered at stream sequence 1 and 4 pending, and delivers m-2 with consumer sequence 1; reset again without a sequence it goes back to just above its ack floor (2) and delivers m-2 again.
+- `testAnInvalidResetFailsWithItsErrCode` - A sequence on a `deliver_policy: new` consumer fails with code 400 and err_code 10204 ("invalid reset ...").
+- `testAResetOfAConsumerThatDoesNotExistTimesOut` - The consumer answers its own reset, so a reset of a missing consumer times out (TimeoutException at the 0.5 s request timeout).
+- `testARunningPullConsumeKeepsDeliveringAfterAnotherClientResetsItsConsumer` - A running pull consume that handled and acked m-1 to m-3 gets m-2 and m-3 again after another client resets its consumer to 2, then m-4.
+- `testADurablePushConsumeKeepsDeliveringAfterAnotherClientResetsItsConsumer` - The same for a durable push subscription with idle heartbeats; no gap is reported.
+- `testAnOrderedConsumerRecreatesItselfAfterAnotherClientResetsItsConsumer` - An ordered consumer whose consumer another client resets to 2 delivers m-1 to m-5 once each; reset forward to 100 while idle, it recreates itself at the next heartbeat and delivers m-6 and m-7. With the ordered heartbeat check back at "above only" m-6 and m-7 never arrive.
 
 ### tests/Integration/DrainLifecycleIntegrationTest.php
 drain() and drainSubscription() against a live NATS server.
