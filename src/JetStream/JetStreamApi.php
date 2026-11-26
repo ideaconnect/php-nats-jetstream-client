@@ -43,11 +43,11 @@ final class JetStreamApi
     /**
      * Returns the API prefix of a JetStream domain, `$JS.<domain>.API.` (nats.go `jetstream.NewWithDomain()`, nats.java
      * `JetStreamOptions.domain()`). A domain is a single subject token: nats-server refuses a domain with a `.`, `*`,
-     * `>` or whitespace, and so does this method, before any request is sent.
+     * `>` or whitespace, and so does this method, before any request is sent. Reached through {@see resolvePrefix()}.
      *
      * @throws JetStreamException When the domain is empty or contains whitespace, a control character, `.`, `*` or `>`.
      */
-    public static function domainPrefix(string $domain): string
+    private static function domainPrefix(string $domain): string
     {
         if ($domain === '') {
             throw new JetStreamException('JetStream domain must not be empty');
@@ -65,12 +65,12 @@ final class JetStreamApi
     /**
      * Normalizes an API prefix given directly, such as the subject an account imports another account's JetStream API
      * under (nats.go `jetstream.NewWithAPIPrefix()`, nats.java `JetStreamOptions.prefix()`): a trailing `.` is added
-     * when missing (`JS.from-a.API` becomes `JS.from-a.API.`).
+     * when missing (`JS.from-a.API` becomes `JS.from-a.API.`). Reached through {@see resolvePrefix()}.
      *
      * @throws JetStreamException When the prefix is empty, has an empty token (`a..b`, a leading `.`), or contains
      *                            whitespace, a control character, `*` or `>`.
      */
-    public static function normalizePrefix(string $prefix): string
+    private static function normalizePrefix(string $prefix): string
     {
         $body = str_ends_with($prefix, '.') ? substr($prefix, 0, -1) : $prefix;
         if ($body === '') {
@@ -90,7 +90,9 @@ final class JetStreamApi
     /**
      * Resolves the API prefix of a context from an optional domain and an optional API prefix: the domain's prefix
      * ({@see domainPrefix()}), the given prefix ({@see normalizePrefix()}), or {@see DEFAULT_PREFIX} when neither is
-     * given. A domain and a prefix together are refused, as nats.go refuses them.
+     * given. A domain and a prefix together are refused. That is this client's own rule (#273): nats.go's `jetstream`
+     * package has one constructor for each and cannot combine them, while its legacy `nats.Domain()` /
+     * `nats.APIPrefix()` options and nats.java's `JetStreamOptions` let the last one set win.
      *
      * @throws JetStreamException When both are given, or the one given is invalid.
      */
