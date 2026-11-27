@@ -23,8 +23,8 @@ use function Amp\delay;
  * The consumer delivery state reset of ADR-60 (#274) against a live server. nats-server 2.14 added
  * `$JS.API.CONSUMER.RESET`; the default fixture (`nats`) runs 2.12, so there only the pre-flight refusal runs and
  * the rest is skipped. The second `composer test:e2e` integration stage runs against the `nats-214` fixture
- * (`NATS_URL=nats://127.0.0.1:14232 RUN_INTEGRATION=1 composer test:integration:2.14`), where the pre-flight
- * refusal is skipped and the rest run.
+ * (`NATS_URL=nats://127.0.0.1:14232 RUN_INTEGRATION=1 composer test:integration:2.14`), which leaves the pre-flight
+ * refusal out (it skips itself on 2.14+) and runs the rest.
  *
  * The consume tests reset the consumer from a second client, as an operator or the CLI would.
  */
