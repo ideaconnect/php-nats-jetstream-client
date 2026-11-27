@@ -68,6 +68,7 @@ Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
 - [Pull Consumer Priority Groups](#pull-consumer-priority-groups)
 - [Stream Mirroring and Sourcing](#stream-mirroring-and-sourcing)
 - [Republish and Subject Transform](#republish-and-subject-transform)
+- [JetStream Domains and API Prefixes (Leaf Nodes, Account Imports)](#jetstream-domains-and-api-prefixes-leaf-nodes-account-imports)
 - [Compatibility Mapping](#compatibility-mapping)
 - [Behavior Notes](#behavior-notes)
   - [`processIncoming()`](#processincoming)
@@ -125,6 +126,7 @@ Current functionality includes:
 - Pull-consumer batching/iteration chain API (`PullConsumerIterator` with `setBatching()`, `setIterations()`, `handle()`)
 - Stream mirroring and sourcing configuration helpers (`StreamSource`)
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
+- JetStream domains and API prefixes (`jetStream(domain: 'hub')`, `jetStream(apiPrefix: '...')`): the JetStream of a hub through a leaf node, or of another account through an import - see [JetStream Domains and API Prefixes](#jetstream-domains-and-api-prefixes-leaf-nodes-account-imports)
 
 Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+). NATS 2.12 runs only one-off `@at` schedules (with an optional TTL); `@every`, cron, the aliases and the `source`, `timeZone` and `rollup` arguments of `publishScheduled()` need NATS 2.14+, and on an older server `publishScheduled()` throws an `UnsupportedFeatureException` before anything is published (see [NATS Server Version Requirements](#nats-server-version-requirements)).
 
@@ -2428,6 +2430,58 @@ $js->createStream('MAPPED', ['raw.>'], [
 $client->disconnect()->await();
 ```
 
+### JetStream Domains and API Prefixes (Leaf Nodes, Account Imports)
+
+_Verified by: [JetStreamDomainTest](tests/Unit/JetStreamDomainTest.php); [JetStreamDomainIntegrationTest](tests/Integration/JetStreamDomainIntegrationTest.php) (live, through the `nats-leaf` fixture: a leaf node without JetStream connected to the `nats-hub` fixture, which runs JetStream with `jetstream { domain: hub }`)._
+
+By default a JetStream context sends its API requests to `$JS.API.>`, the JetStream of the account the client is connected to. Two common deployments serve it elsewhere:
+
+- **A JetStream domain.** A client connected to a leaf node reaches the hub's JetStream (or the hub a leaf node's) under the domain, on `$JS.<domain>.API.>`. A leaf node without JetStream of its own answers `$JS.API.>` with no responders, so the default context fails there with a `JetStreamException` (503).
+- **An API prefix.** An account that imports another account's JetStream API (an import of `$JS.API.>` with `to: "JS.from-a.API.>"`) reaches it under that prefix.
+
+Pass the domain or the prefix to `jetStream()`, as nats.go does with `jetstream.NewWithDomain()` / `jetstream.NewWithAPIPrefix()` and nats.java with `JetStreamOptions.domain()` / `prefix()`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+// Connected to a leaf node whose hub runs JetStream with `jetstream { domain: hub }`.
+$client = new NatsClient(new NatsOptions(servers: ['nats://leaf.example.net:4222']));
+$client->connect()->await();
+
+$js = $client->jetStream(domain: 'hub');   // API requests go to $JS.hub.API.>
+echo $js->apiPrefix(), PHP_EOL;            // $JS.hub.API.
+
+$js->createStream('ORDERS', ['orders.>'])->await();
+$js->createConsumer('ORDERS', 'worker')->await();
+$js->publish('orders.created', '{"id":1}')->await();   // published to orders.created itself
+
+foreach ($js->fetchBatch('ORDERS', 'worker', 10)->await() as $message) {
+	$js->ack($message)->await();
+}
+
+// The KV and Object Store buckets of the context use its prefix too.
+$kv = $js->keyValue('config');
+$kv->create()->await();
+$kv->put('theme', 'dark')->await();
+
+// An account that imports another account's JetStream API under JS.from-a.API.
+$imported = $client->jetStream(apiPrefix: 'JS.from-a.API');
+
+$client->disconnect()->await();
+```
+
+- `jetStream()` without arguments is unchanged and returns the same context every time. Each domain or prefix gets a context of its own, kept the same way; a domain and the equivalent prefix (`domain: 'hub'`, `apiPrefix: '$JS.hub.API'`) share one. `new JetStreamContext($client, domain: 'hub')` works too.
+- A domain is a single subject token: an empty domain, or one with `.`, `*`, `>`, whitespace or a control character, is refused with a `JetStreamException`, and so are an empty prefix, a prefix with an empty token (`JS..API`), a wildcard or whitespace, and a domain together with a prefix (this client's own rule: nats.go's `jetstream` package has a constructor for each, while its legacy `nats.Domain()` / `nats.APIPrefix()` options and nats.java's `JetStreamOptions` let the last one set win). A trailing `.` is added to a prefix without one. Nothing is sent for a refused domain or prefix.
+- Every JetStream API request of the context uses its prefix: streams, consumers, account info, message get and delete, Direct Get, pulls (`CONSUMER.MSG.NEXT`, from `fetchBatch()` and `pullConsumer()->handle()`), pause, unpin, reset (`resetConsumer()`), and the requests of its KV and Object Store buckets. A JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, and acks and flow-control replies to the reply subject the server gave.
+- KV writes (`put()`, `create()`, `update()`, `delete()`, `purge()`) go through the prefix, as nats.go's do: `$JS.hub.API.$KV.<bucket>.<key>`. nats-server maps `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, while a plain `$KV.` publish from a leaf node gets no responders. For an account import, import the other account's `$KV.>` under the same prefix (`to: "JS.from-a.API.$KV.>"`), and the subjects of the streams and Object Stores you publish to under their own names. The stored subjects stay `$KV.<bucket>.<key>`, so reads and watches are unchanged.
+- The `domain` shorthand of a KV mirror or source, and `StreamSource::external()`, are independent of the context's prefix: they name where the ORIGIN stream lives. A KV mirror of a bucket in another domain writes through that origin's API, not through the context's prefix.
+- The server version checks (the version-gated stream and consumer fields, `batch()`, `publishScheduled()`, `resetConsumer()`) read the INFO of the server the client is connected to. Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests: through a 2.12 leaf node `resetConsumer()` is refused with an `UnsupportedFeatureException` before anything is sent, although a 2.14 hub would answer it.
+
 ## Compatibility Mapping
 
 This repository tracks parity against the basis-company `nats.php` README examples while exposing an Amp-first API.
@@ -2792,6 +2846,7 @@ When you run `docker compose up -d` in this repository, additional local auth fi
 - TLS handshake-first auth: `tls://127.0.0.1:14225` using the generated files under `build/tls/`
 - JWT auth: `nats://127.0.0.1:14227` using the generated operator/account resolver chain under `build/nats/jwt/`
 - standalone NKey auth: `nats://127.0.0.1:14226` with seed `SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY`
+- JetStream domain: a hub `nats://127.0.0.1:14230` running JetStream with `jetstream { domain: hub }`, and a leaf node `nats://127.0.0.1:14231` without JetStream connected to it (`build/nats/hub.conf`, `build/nats/leaf.conf`); `scripts/wait-for-nats-services.sh` waits until the leaf node's connection to the hub is up
 
 The integration tests use those defaults automatically. Override them with environment variables when you want to target external infrastructure instead.
 
@@ -2826,6 +2881,8 @@ composer fixture:jwt:check
 - `NATS_JWT_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` to derive the public NKey and sign the server nonce (defaults to `build/nats/jwt/user.seed`)
 - `NATS_NKEY_URL`: standalone NKey-auth server URL used by `testStandaloneNkeyAuthenticationFlow`
 - `NATS_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` for standalone NKey challenge-response auth
+- `NATS_HUB_URL`: JetStream hub with the domain `hub` used by `JetStreamDomainIntegrationTest` (default: `nats://127.0.0.1:14230`)
+- `NATS_LEAF_URL`: leaf node without JetStream connected to that hub, used by `JetStreamDomainIntegrationTest`, which skips when nothing listens there (default: `nats://127.0.0.1:14231`)
 
 Example overrides for external infrastructure:
 

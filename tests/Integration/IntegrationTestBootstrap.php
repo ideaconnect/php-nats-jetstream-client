@@ -239,6 +239,26 @@ trait IntegrationTestBootstrap
     }
 
     /**
+     * Returns the URL of the JetStream hub with the domain `hub` (nats-hub, #273).
+     */
+    protected function integrationHubServerUrl(): string
+    {
+        $url = getenv('NATS_HUB_URL');
+
+        return is_string($url) && $url !== '' ? $url : 'nats://127.0.0.1:14230';
+    }
+
+    /**
+     * Returns the URL of the leaf node without JetStream connected to that hub (nats-leaf, #273).
+     */
+    protected function integrationLeafServerUrl(): string
+    {
+        $url = getenv('NATS_LEAF_URL');
+
+        return is_string($url) && $url !== '' ? $url : 'nats://127.0.0.1:14231';
+    }
+
+    /**
      * Returns the configured JWT-auth NATS server URL.
      */
     protected function integrationJwtServerUrl(): string

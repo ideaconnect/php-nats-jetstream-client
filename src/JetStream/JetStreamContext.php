@@ -78,15 +78,6 @@ final class JetStreamContext
     private const NO_RESPONDERS_LOOK_SECONDS = 0.02;
 
     /**
-     * Creates a JetStream API context bound to a NATS client.
-      *
-      * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
-      * @param int $publishRetryAttempts Max publish attempts when the JetStream API momentarily has no
-      *                                  responder (503). 1 disables retry. Only 503s are retried - a real
-      *                                  publish error (precondition mismatch, bad subject) is not.
-      * @param int $publishRetryWaitMs Delay between publish retry attempts, in milliseconds.
-     */
-    /**
      * Stop closures for live ordered consumers, keyed by the INITIAL deliver sid each
      * {@see subscribeOrderedConsumer()} call returned. Recreates rotate the actual deliver sid, so
      * the returned sid alone goes stale after the first rotation; the registered closure resolves
@@ -97,11 +88,58 @@ final class JetStreamContext
      */
     private array $orderedStops = [];
 
+    /**
+     * The prefix of every JetStream API subject this context sends a request to (#273): `$JS.API.` by default,
+     * `$JS.<domain>.API.` for a JetStream domain, or the prefix given directly (an account's import of another
+     * account's JetStream API). Resolved by {@see JetStreamApi::resolvePrefix()}.
+     */
+    private readonly string $apiPrefix;
+
+    /**
+     * Creates a JetStream API context bound to a NATS client.
+     *
+     * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
+     * @param int $publishRetryAttempts Max publish attempts when the JetStream API momentarily has no
+     *                                  responder (503). 1 disables retry. Only 503s are retried - a real
+     *                                  publish error (precondition mismatch, bad subject) is not.
+     * @param int $publishRetryWaitMs Delay between publish retry attempts, in milliseconds.
+     * @param string|null $domain JetStream domain to reach (`hub` sends the API requests to `$JS.hub.API.`), as nats.go
+     *                            `jetstream.NewWithDomain()` does: the JetStream of a hub seen from a leaf node, or
+     *                            the JetStream of a leaf node seen from the hub. Null = no domain.
+     * @param string|null $apiPrefix JetStream API prefix to send the API requests to, as nats.go
+     *                               `jetstream.NewWithAPIPrefix()` does: the subject an account imports another
+     *                               account's `$JS.API.>` under. A trailing `.` is added when missing. Null = the
+     *                               default `$JS.API.`. A domain and a prefix together are refused.
+     * @throws JetStreamException When the domain or the prefix is invalid, or both are given.
+     */
     public function __construct(
         private readonly NatsClient $client,
         private readonly int $publishRetryAttempts = 3,
         private readonly int $publishRetryWaitMs = 250,
-    ) {}
+        ?string $domain = null,
+        ?string $apiPrefix = null,
+    ) {
+        $this->apiPrefix = JetStreamApi::resolvePrefix($domain, $apiPrefix);
+    }
+
+    /**
+     * Returns the prefix of the JetStream API subjects this context sends its requests to: `$JS.API.` by default,
+     * `$JS.<domain>.API.` for a domain, or the API prefix the context was made with (always ending with `.`).
+     */
+    public function apiPrefix(): string
+    {
+        return $this->apiPrefix;
+    }
+
+    /**
+     * Returns a JetStream API subject (a {@see JetStreamApi} constant, plus its tokens) as this context sends it: the
+     * leading `$JS.API.` replaced by the context's {@see apiPrefix()}. The KV and Object Store buckets of the context
+     * build their own API requests with it.
+     */
+    public function apiSubject(string $subject): string
+    {
+        return JetStreamApi::withPrefix($subject, $this->apiPrefix);
+    }
 
     /**
      * Returns a fluent pull-consumer iterator builder.
@@ -142,7 +180,7 @@ final class JetStreamContext
     public function accountInfo(): Future
     {
         return async(function (): AccountInfo {
-            $payload = $this->requestJson(JetStreamApi::ACCOUNT_INFO, []);
+            $payload = $this->requestJson($this->apiSubject(JetStreamApi::ACCOUNT_INFO), []);
 
             return AccountInfo::fromArray($payload);
         });
@@ -302,7 +340,7 @@ final class JetStreamContext
                 'subjects' => $subjects,
             ]);
 
-            return $this->requestStreamChange(JetStreamApi::STREAM_CREATE_PREFIX . $name, $name, $payload);
+            return $this->requestStreamChange($this->apiSubject(JetStreamApi::STREAM_CREATE_PREFIX) . $name, $name, $payload);
         });
     }
 
@@ -317,7 +355,7 @@ final class JetStreamContext
         self::assertValidJsName($config->name(), 'stream');
 
         return async(fn(): StreamInfo => $this->requestStreamChange(
-            JetStreamApi::STREAM_CREATE_PREFIX . $config->name(),
+            $this->apiSubject(JetStreamApi::STREAM_CREATE_PREFIX) . $config->name(),
             $config->name(),
             $config->toArray(),
         ));
@@ -336,7 +374,7 @@ final class JetStreamContext
         return async(function () use ($name, $config): StreamInfo {
             $payload = array_merge($config, ['name' => $name]);
 
-            return $this->requestStreamChange(JetStreamApi::STREAM_UPDATE_PREFIX . $name, $name, $payload);
+            return $this->requestStreamChange($this->apiSubject(JetStreamApi::STREAM_UPDATE_PREFIX) . $name, $name, $payload);
         });
     }
 
@@ -391,7 +429,7 @@ final class JetStreamContext
         return async(function () use ($subjectFilter): array {
             $body = $subjectFilter !== null && $subjectFilter !== '' ? ['subject' => $subjectFilter] : [];
 
-            return $this->paginateList(JetStreamApi::STREAM_NAMES, $body, static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::STREAM_NAMES), $body, static function (array $response): array {
                 $raw = $response['streams'] ?? null;
 
                 return is_array($raw) ? array_values(array_filter($raw, 'is_string')) : [];
@@ -409,7 +447,7 @@ final class JetStreamContext
         self::assertValidJsName($name, 'stream');
 
         return async(function () use ($name): StreamInfo {
-            $response = $this->requestJson(JetStreamApi::STREAM_INFO_PREFIX . $name, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_INFO_PREFIX) . $name, []);
 
             return StreamInfo::fromArray($response);
         });
@@ -425,7 +463,7 @@ final class JetStreamContext
         self::assertValidJsName($name, 'stream');
 
         return async(function () use ($name): bool {
-            $response = $this->requestJson(JetStreamApi::STREAM_DELETE_PREFIX . $name, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_DELETE_PREFIX) . $name, []);
 
             return (bool) ($response['success'] ?? false);
         });
@@ -442,7 +480,7 @@ final class JetStreamContext
         self::assertValidJsName($name, 'stream');
 
         return async(function () use ($name, $options): array {
-            $response = $this->requestJson(JetStreamApi::STREAM_PURGE_PREFIX . $name, $options);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_PURGE_PREFIX) . $name, $options);
 
             return ['purged' => (int) ($response['purged'] ?? 0)];
         });
@@ -457,7 +495,7 @@ final class JetStreamContext
     public function listStreams(array $options = []): Future
     {
         return async(function () use ($options): array {
-            return $this->paginateList(JetStreamApi::STREAM_LIST, $options, static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::STREAM_LIST), $options, static function (array $response): array {
                 $raw = $response['streams'] ?? null;
                 $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
@@ -476,7 +514,7 @@ final class JetStreamContext
         self::assertValidJsName($stream, 'stream');
 
         return async(function () use ($stream): array {
-            return $this->paginateList(JetStreamApi::CONSUMER_LIST_PREFIX . $stream, [], static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::CONSUMER_LIST_PREFIX) . $stream, [], static function (array $response): array {
                 $raw = $response['consumers'] ?? null;
                 $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
@@ -496,7 +534,7 @@ final class JetStreamContext
 
         return async(function () use ($stream, $seq): NatsMessage {
             $response = $this->requestJson(
-                JetStreamApi::STREAM_MSG_GET_PREFIX . $stream,
+                $this->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $stream,
                 ['seq' => $seq],
             );
 
@@ -522,7 +560,7 @@ final class JetStreamContext
             }
 
             $response = $this->requestJson(
-                JetStreamApi::STREAM_MSG_GET_PREFIX . $stream,
+                $this->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $stream,
                 ['last_by_subj' => $subject],
             );
 
@@ -590,7 +628,7 @@ final class JetStreamContext
                 $body['no_erase'] = true;
             }
 
-            $response = $this->requestJson(JetStreamApi::STREAM_MSG_DELETE_PREFIX . $stream, $body);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_MSG_DELETE_PREFIX) . $stream, $body);
 
             return (bool) ($response['success'] ?? false);
         });
@@ -642,7 +680,7 @@ final class JetStreamContext
             $json = json_encode($body, JSON_THROW_ON_ERROR);
 
             try {
-                $message = $this->client->request(JetStreamApi::STREAM_DIRECT_GET_PREFIX . $stream, $json)->await();
+                $message = $this->client->request($this->apiSubject(JetStreamApi::STREAM_DIRECT_GET_PREFIX) . $stream, $json)->await();
             } catch (JetStreamException $e) {
                 throw $e;
             } catch (NatsException $e) {
@@ -852,7 +890,7 @@ final class JetStreamContext
             // max_payload. Keep the flags here and there identical - adding e.g. JSON_UNESCAPED_SLASHES
             // to one but not the other would make that budget under-count and let a chunk overflow.
             $json = json_encode($body, JSON_THROW_ON_ERROR);
-            $subject = JetStreamApi::STREAM_DIRECT_GET_PREFIX . $stream;
+            $subject = $this->apiSubject(JetStreamApi::STREAM_DIRECT_GET_PREFIX) . $stream;
             $inbox = Inbox::generate('_INBOX.JS.DGET');
 
             $budget = new BatchReadBudget($expiresMs + 1000, rolling: true);
@@ -1033,7 +1071,7 @@ final class JetStreamContext
             $this->assertValidPriorityConfig($config);
 
             return $this->requestConsumerChange(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
+                $this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream . '.' . $consumer,
                 $stream,
                 $config,
             );
@@ -1056,7 +1094,7 @@ final class JetStreamContext
 
         return async(function () use ($stream, $config): ConsumerInfo {
             $name = $config->getName();
-            $subject = JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . ($name !== null ? '.' . $name : '');
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream . ($name !== null ? '.' . $name : '');
 
             return $this->requestConsumerChange($subject, $stream, $config->toArray());
         });
@@ -1089,7 +1127,7 @@ final class JetStreamContext
         self::assertValidJsName($stream, 'stream');
 
         return async(function () use ($stream): array {
-            return $this->paginateList(JetStreamApi::CONSUMER_NAMES_PREFIX . $stream, [], static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::CONSUMER_NAMES_PREFIX) . $stream, [], static function (array $response): array {
                 $raw = $response['consumers'] ?? null;
 
                 return is_array($raw) ? array_values(array_filter($raw, 'is_string')) : [];
@@ -1112,7 +1150,7 @@ final class JetStreamContext
             $config = $this->applyFilterSubjects($config, $filterSubject);
             $this->assertValidPriorityConfig($config);
 
-            return $this->requestConsumerChange(JetStreamApi::CONSUMER_CREATE_PREFIX . $stream, $stream, $config);
+            return $this->requestConsumerChange($this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream, $stream, $config);
         });
     }
 
@@ -1139,7 +1177,7 @@ final class JetStreamContext
             $config = $this->applyFilterSubjects($config, $filterSubject);
 
             return $this->requestConsumerChange(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
+                $this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream . '.' . $consumer,
                 $stream,
                 $config,
             );
@@ -1173,7 +1211,7 @@ final class JetStreamContext
                 $config['inactive_threshold'] = self::EPHEMERAL_INACTIVE_THRESHOLD_NS;
             }
 
-            return $this->requestConsumerChange(JetStreamApi::CONSUMER_CREATE_PREFIX . $stream, $stream, $config);
+            return $this->requestConsumerChange($this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream, $stream, $config);
         });
     }
 
@@ -1995,7 +2033,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(function () use ($stream, $consumer): ConsumerInfo {
-            $response = $this->requestJson(JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::CONSUMER_INFO_PREFIX) . $stream . '.' . $consumer, []);
 
             return ConsumerInfo::fromArray($response);
         });
@@ -2012,7 +2050,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(function () use ($stream, $consumer): bool {
-            $response = $this->requestJson(JetStreamApi::CONSUMER_DELETE_PREFIX . $stream . '.' . $consumer, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::CONSUMER_DELETE_PREFIX) . $stream . '.' . $consumer, []);
 
             return (bool) ($response['success'] ?? false);
         });
@@ -2030,7 +2068,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(fn(): array => $this->requestJson(
-            JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
+            $this->apiSubject(JetStreamApi::CONSUMER_PAUSE_PREFIX) . $stream . '.' . $consumer,
             ['pause_until' => $pauseUntil],
         ));
     }
@@ -2046,7 +2084,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(fn(): array => $this->requestJson(
-            JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
+            $this->apiSubject(JetStreamApi::CONSUMER_PAUSE_PREFIX) . $stream . '.' . $consumer,
             [],
         ));
     }
@@ -2068,7 +2106,7 @@ final class JetStreamContext
             }
 
             $response = $this->requestJson(
-                JetStreamApi::CONSUMER_UNPIN_PREFIX . $stream . '.' . $consumer,
+                $this->apiSubject(JetStreamApi::CONSUMER_UNPIN_PREFIX) . $stream . '.' . $consumer,
                 ['group' => $group],
             );
 
@@ -2137,7 +2175,7 @@ final class JetStreamContext
             }
 
             $response = $this->requestJson(
-                JetStreamApi::CONSUMER_RESET_PREFIX . $stream . '.' . $consumer,
+                $this->apiSubject(JetStreamApi::CONSUMER_RESET_PREFIX) . $stream . '.' . $consumer,
                 $sequence === null ? [] : ['seq' => $sequence],
             );
 
@@ -2602,7 +2640,7 @@ final class JetStreamContext
 
             $payload = $this->buildPullRequest($batch, $expiresMs, $pull);
 
-            $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_MSG_NEXT_PREFIX) . $stream . '.' . $consumer;
             $json = json_encode($payload, JSON_THROW_ON_ERROR);
 
             $budget = new BatchReadBudget($expiresMs + 1000);
@@ -2892,7 +2930,7 @@ final class JetStreamContext
                 return NoRespondersCause::ServerGoingAway;
             }
 
-            $subject = JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer;
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_INFO_PREFIX) . $stream . '.' . $consumer;
             $giveUp = new DeferredCancellation();
             // The question's own time, which a refusal of it still watches the connection for.
             $questionTime = new TimeoutCancellation(($timeoutMs ?? $this->client->options()->requestTimeoutMs) / 1000);
@@ -3267,7 +3305,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(function () use ($stream, $consumer, $cfg, $handler, $ctl): int {
-            $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_MSG_NEXT_PREFIX) . $stream . '.' . $consumer;
             $base = Inbox::generate('_INBOX.JS.PULL');
             $prefix = $base . '.';
 

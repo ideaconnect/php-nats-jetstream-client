@@ -55,7 +55,7 @@ Use this file as the authoritative project guide for coding agents working in th
   Repo automation: coverage checks, JWT fixture generation/checking, NATS readiness, repeated integration runs, and full end-to-end test flow.
 
 - `build/nats/`
-  NATS config fixtures for token, user/pass, TLS, NKey, and JWT services.
+  NATS config fixtures for token, user/pass, TLS, NKey, and JWT services, and the JetStream domain hub/leaf pair (`hub.conf`, `leaf.conf`).
 
 - `build/nats/jwt/`
   Generated JWT/NKey artifacts used by the JWT-auth NATS fixture.
@@ -65,7 +65,7 @@ Use this file as the authoritative project guide for coding agents working in th
   TLS fixture material used by integration tests.
 
 - `docker-compose.yml`
-  Local integration fixture stack. Services expose client ports `14222` to `14229` (`14229` is `nats-ws`'s WebSocket port) and monitoring ports `18222` to `18229`.
+  Local integration fixture stack. Services expose client ports `14222` to `14231` (`14229` is `nats-ws`'s WebSocket port; `14230` is `nats-hub`, a JetStream hub with the domain `hub`, and `14231` is `nats-leaf`, a leaf node without JetStream connected to it) and monitoring ports `18222` to `18231`.
 
 ## Commands Agents Should Know
 
