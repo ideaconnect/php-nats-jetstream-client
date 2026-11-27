@@ -15,6 +15,26 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Documentation
+
+- `[docs]` The "JetStream Domains and API Prefixes" section (#273, #276) said an account import needs `$JS.API.>`
+  under a prefix, `$KV.>` under the same prefix, and the subjects published to, and that reads and watches stay
+  unchanged; that last sentence holds for a JetStream domain only (#281). An import also needs `response: stream` on
+  the export of `$JS.API.>` for every call with several replies (`fetchBatch()` above 1, `pullConsumer()->handle()`,
+  `directGetBatch()`, `getAll()`, Object Store `list()`, a multi-chunk object `get()`), an import of `$JS.ACK.>` for
+  `ack()`, `nak()`, `term()`, `inProgress()`, `ackSync()` and `nakWithDelay()`, an import of `$JS.FC.>` for an ordered
+  consumer and its `watch()`es (without it delivery stops after 2 MB with no error), and a stream export covering this
+  client's four fixed push-delivery prefixes (`_INBOX.JS.ORD.`, `_INBOX.KV.KEYS.`, `_INBOX.KV.HIST.`,
+  `_INBOX.JS.PUSH.`) for `subscribeOrderedConsumer()`, KeyValue/Object Store `watch()`, `keys()`, `history()` and a
+  push subscription without its own `deliverSubject`. New "Account imports" subsection: the full account config that
+  was measured, what already works with only the three entries the section already described, a table of what each
+  further entry is for and what happens without it, and that a stream export covering one of the prefixes hands the
+  importing account everything published on it, not only what one import's calls deliver. Measured once against
+  nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and 2.15.3 with this client at 2.34.0; not covered by a test of this
+  repository.
+
 ## [2.34.0] - 2026-11-26
 
 ### Added
