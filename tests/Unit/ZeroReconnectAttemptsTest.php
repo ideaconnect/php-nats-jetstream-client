@@ -326,22 +326,6 @@ final class ZeroReconnectAttemptsTest extends TestCase
         self::assertSame([ConnectionEvent::Connected, ConnectionEvent::Disconnected, ConnectionEvent::Reconnected], $recorder->events);
     }
 
-    /** One attempt allowed is one failover dial for a lame duck notice naming another server. */
-    public function testWithOneAttemptALameDuckNoticeFailsOverWithOneDial(): void
-    {
-        $transport = new ReconnectingTransport();
-        $recorder = new LifecycleRecorder();
-        $connection = $this->open($transport, $recorder, true, 1);
-        $transport->pushFrame(self::LAME_DUCK_INFO);
-
-        $connection->processIncoming()->await();
-
-        self::assertSame(ConnectionState::Open, $connection->state());
-        self::assertCount(2, $transport->connectCalls, 'one failover dial');
-        self::assertSame(1, $transport->epoch(), 'on the new connection');
-        self::assertContains(ConnectionEvent::Reconnected, $recorder->events);
-    }
-
     private function open(
         ReconnectingTransport $transport,
         LifecycleRecorder $recorder,

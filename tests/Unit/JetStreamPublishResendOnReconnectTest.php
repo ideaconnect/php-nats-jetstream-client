@@ -502,32 +502,6 @@ final class JetStreamPublishResendOnReconnectTest extends TestCase
     }
 
     /**
-     * A lame-duck failover replaces the connection the same way: the leaving server's INFO answers the publish instead
-     * of an ack, the client fails over to the server it names, and the frame goes out again there.
-     */
-    public function testALameDuckFailoverSendsTheFrameAgainOnTheServerItFailsOverTo(): void
-    {
-        $transport = new ReconnectingTransport();
-        $client = $this->client($transport, requestTimeoutMs: 5_000);
-        $lameDuck = 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n";
-        $transport->responder = static function (string $subject, ?string $replyTo) use ($transport, $lameDuck): array {
-            if ($subject !== self::SUBJECT || $replyTo === null) {
-                return [];
-            }
-
-            return $transport->epoch() === 0 ? [$lameDuck] : $transport->replyFrame($replyTo, self::ack(4));
-        };
-
-        $start = hrtime(true);
-        $ack = $client->jetStream()->publish(self::SUBJECT, self::PAYLOAD, msgId: self::MSG_ID)->await();
-
-        self::assertSame(4, $ack->seq);
-        self::assertLessThan(2.0, $this->secondsSince($start));
-        self::assertSame([1, 1], self::publishesPerSession($transport, 2));
-        self::assertStringStartsWith('tcp://10.0.0.2:4222', $transport->connectCalls[count($transport->connectCalls) - 1]);
-    }
-
-    /**
      * Both copies are answered and the two acks come in one read - the first frame's, then the second frame's as a
      * duplicate: the first resolves the publish, and the second, delivered to the same reply subject in the same batch,
      * is ignored. The connection carries on: the next publish on it gets its own ack.

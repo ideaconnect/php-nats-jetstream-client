@@ -45,6 +45,10 @@ enum ConnectionEvent
     /** The server advertised additional cluster endpoints in an async INFO (`connect_urls`). */
     case DiscoveredServers;
 
-    /** The server entered lame-duck mode (`ldm`) and is shutting down gracefully. */
+    /**
+     * The server entered lame-duck mode (`ldm`) and is shutting down gracefully. Announced once per connection, and
+     * nothing else happens at the notice: the server keeps the connection for its grace period and then closes it, and
+     * the reconnect that follows is announced as for any lost connection, Disconnected and then Reconnected (#265).
+     */
     case LameDuck;
 }

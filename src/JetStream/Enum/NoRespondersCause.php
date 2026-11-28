@@ -33,8 +33,8 @@ enum NoRespondersCause: string
      * is recovering it, has replaced it or is draining it, the application is closing it, or its server announced lame
      * duck mode. The pull met a server that is going away, which stops its consumers before it closes the connection.
      * Once the server has closed it, the next pull goes out on the connection that follows; until then (lame duck mode
-     * keeps it open for its grace period when there is no other server to fail over to) a pull gets the 503 again at
-     * once, so a loop pauses before it pulls again.
+     * keeps it open for its grace period, and the client stays on it, #265) a pull gets the 503 again at once, so a loop
+     * pauses before it pulls again.
      */
     case ServerGoingAway = 'server_going_away';
 

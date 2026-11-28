@@ -8704,56 +8704,6 @@ final class NatsConnectionTest extends TestCase
     }
 
     /**
-     * handleServerInfoUpdate() emits LameDuck, attempts failover, and emits error when
-     * failover fails (reconnect enabled but no spare server).
-     */
-    public function testLameDuckWithFailoverEmitsErrorWhenRecoveryFails(): void
-    {
-        $events = [];
-        $errors = [];
-        // Single server + lame-duck INFO: pool has only one server so failover threshold (> 1) is not met.
-        // Result: LameDuck is emitted but recoverConnection() is NOT called (not enough pool members).
-        // To force the recoverConnection() code path we need pool > 1, which means we need a discovered
-        // peer. We seed one via a prior async INFO so the pool grows to 2 before the lame-duck arrives.
-        $transport = new FakeTransport([
-            'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
-            "PONG\r\n",
-            // First async INFO: discover a peer (pool grows to 2).
-            'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
-            // Second async INFO: lame-duck with reconnect enabled + pool of 2 -> recoverConnection() fires.
-            // With no second server actually available, recovery will fail -> emitError() is called.
-            'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n",
-        ]);
-
-        $connection = $this->own(new NatsConnection(
-            new NatsOptions(
-                reconnectEnabled: true,
-                maxReconnectAttempts: 1,
-                reconnectDelayMs: 1,
-                reconnectJitterMs: 0,
-                pingIntervalSeconds: 0,
-                connectionListener: static function (ConnectionEvent $e, ?\Throwable $err) use (&$events): void {
-                    $events[] = $e;
-                },
-                errorListener: static function (\Throwable $err) use (&$errors): void {
-                    $errors[] = $err->getMessage();
-                },
-            ),
-            $transport,
-        ));
-        $connection->connect()->await();
-
-        // Read the discovery INFO (pool grows to 2).
-        $connection->processIncoming()->await();
-        // Read the lame-duck INFO (triggers failover attempt -> fails -> emitError).
-        $connection->processIncoming()->await();
-
-        self::assertContains(ConnectionEvent::LameDuck, $events);
-        // Recovery failed (no real second server), so emitError() was invoked.
-        self::assertNotEmpty($errors);
-    }
-
-    /**
      * drainPendingForSid() unsets pendingMessages when subscription is gone.
      */
     public function testDrainPendingForSidRemovesPendingWhenSubscriptionIsGone(): void

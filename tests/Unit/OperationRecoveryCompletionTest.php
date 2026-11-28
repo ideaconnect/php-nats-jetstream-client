@@ -26,8 +26,6 @@ final class OperationRecoveryCompletionTest extends TestCase
 {
     use ReconnectScenarios;
 
-    private const LAME_DUCK = 'INFO {"server_id":"S1","ldm":true,"connect_urls":["127.0.0.1:4223"]}' . "\r\n";
-
     protected function tearDown(): void
     {
         $this->closeOpenedConnections();
@@ -36,7 +34,7 @@ final class OperationRecoveryCompletionTest extends TestCase
     /** @return iterable<string, array{string, string}> */
     public static function pollCases(): iterable
     {
-        foreach (['lost read', 'lame duck', 'joiner'] as $origin) {
+        foreach (['lost read', 'joiner'] as $origin) {
             foreach (['listener', 'lower sid'] as $tail) {
                 yield $origin . ', held ' . $tail => [$origin, $tail];
             }
@@ -44,8 +42,7 @@ final class OperationRecoveryCompletionTest extends TestCase
     }
 
     /**
-     * A poll on `jobs` whose read meets the lost connection, or brings the lame-duck INFO, takes the `job` the new server
-     * sends during the replay while the recovery's tail - the Reconnected listener, or the handler of `low`, a lower
+     * A poll on `jobs` whose read meets the lost connection takes the `job` the new server sends during the replay while the recovery's tail - the Reconnected listener, or the handler of `low`, a lower
      * sid delivered first - is still held. Up to 2.25.10 such a poll waited for the whole tail and timed out with its
      * message queued. The joiner rows are guards: a poll that joined another read's reconnect already returned.
      */
@@ -120,7 +117,6 @@ final class OperationRecoveryCompletionTest extends TestCase
     public static function origins(): iterable
     {
         yield 'lost read' => ['lost read'];
-        yield 'lame duck' => ['lame duck'];
     }
 
     /**
@@ -375,12 +371,11 @@ final class OperationRecoveryCompletionTest extends TestCase
         $returned->complete();
     }
 
+    /** Ends the connection the way $origin names: 'lost read', the only one left since a lame-duck notice moves nothing (#265). */
     private static function trigger(ReconnectingTransport $transport, string $origin): void
     {
         if ($origin === 'lost read') {
             $transport->dropConnection();
-        } else {
-            $transport->pushFrame(self::LAME_DUCK);
         }
     }
 }

@@ -17,8 +17,47 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- A lame-duck notice (an async `INFO` with `"ldm":true`) no longer moves the client to another server (#265). The
+  connection stays on the server until the server closes it, at the end of its grace period (10 s by default), and the
+  ordinary reconnect runs then. `LameDuck` is still emitted at the notice; `Disconnected` and `Reconnected` now come
+  at the server's close, not at the notice, and the client moves to another server only then.
+
+### Fixed
+
+- `[bugfix]` The request whose read brings a lame-duck notice gets its reply (#265). With reconnect on and a pool of
+  more than one server, the client failed over at the notice (#47) and closed the socket the reply was coming on:
+  whenever the reply came in a later read than the `INFO`, a `request()` or a JetStream `publish()` timed out after its
+  whole timeout although the server had answered (a published message was stored and not acked), and a
+  `fetchBatch()` ended with a 408, its message delivered again only after `ack_wait`. nats-server keeps the connection
+  for its grace period after the notice and then closes it, and nats.go, nats.java, nats.js and nats.py do not
+  reconnect on the notice either. Measured with three nats-server 2.15.2 containers and a client given the first
+  server only, lame duck mode 6 s into a 25 s run: a JetStream publish every 50 ms lost one publish to a 10 s timeout
+  before and none after (482 acked, 482 stored), and a fetch of one every 50 ms with 600 messages waiting had one 408
+  and one redelivery before and none after; the server closed the connection 10 s after the notice and the reconnect
+  took under 10 ms. Removed with the failover: its start in a fiber of its own for an operation's read (#191), the
+  wait for it in the reads (#203), its own failure report (#201), and the handling of a chunk read on a connection
+  the failover was leaving. Frames read on a connection that was replaced or closed while their chunk was handled are
+  still the old connection's (#182, #205). Strictly a `[bc-break]` for code that relied on the move at the notice (see
+  the upgrade note), flagged `[bugfix]` per the note above.
+
 ### Testing & CI
 
+- `[docs]` New `LameDuckNoticeKeepsTheConnectionTest` (#265): over the scripted server, the server answers a
+  `request()`, a JetStream `publish()` and a `fetchBatch()` of one with the lame-duck notice alone and the reply 50 ms
+  later on the same session; each gets its reply with no second dial, your own `processIncoming()` of the notice
+  dials nothing, the connection is still on the first server 0.3 s after the reply, and the server's close then
+  reconnects once, to the server the notice named. Each fails on 2.35.0. Removed with the failover:
+  `OperationReadLameDuckFailoverTest`, `ListenerOperationFailoverTest`, the failover tests of
+  `LameDuckChunkRemainderTest` and `LameDuckAuthenticationReportingTest`,
+  `NatsConnectionTest::testLameDuckWithFailoverEmitsErrorWhenRecoveryFails`,
+  `ZeroReconnectAttemptsTest::testWithOneAttemptALameDuckNoticeFailsOverWithOneDial`, two `ReconnectedListenerTest`
+  tests, `JetStreamPublishResendOnReconnectTest::testALameDuckFailoverSendsTheFrameAgainOnTheServerItFailsOverTo`, and
+  the lame-duck data sets of `OperationRecoveryCompletionTest`, `PullConsumerConnectionLossTest` and
+  `DiagnoseNoRespondersTest`: started by the server's close, each repeated a lost-connection test or data set already
+  there. Two other `ReconnectedListenerTest` tests now leave a reconnect with its dial held instead of a failover, and
+  `LameDuckChunkRemainderTest` has a data set for reconnect on with the notice naming another server.
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
   nats-server 2.12, stale since #286 (#279) added the second `composer test:e2e` integration stage against the
   `nats-214` fixture. Both now say which test runs against which fixture, as the consumer reset texts do, and the

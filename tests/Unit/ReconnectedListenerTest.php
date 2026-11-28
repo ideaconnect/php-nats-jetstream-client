@@ -53,7 +53,6 @@ final class ReconnectedListenerTest extends TestCase
 
     private const STALE = "-ERR 'Stale Connection'\r\n";
 
-    private const LAME_DUCK = 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n";
 
     private const TWO_RECONNECTS = [
         ConnectionEvent::Connected,
@@ -257,52 +256,6 @@ final class ReconnectedListenerTest extends TestCase
         self::assertSame(['SUB orders ' . $action->result], $transport->controlLinesStartingWith('SUB orders', 2));
         self::assertLessThan(2.0, self::secondsTaken($action), 'the subscribe did not wait out its budget');
         $this->assertReconnectedAgain($connection, $transport);
-    }
-
-    /**
-     * The listener reads a lame-duck INFO naming another server: the connection fails over to it. The read used
-     * to hang, past its own 0.5 s, in a failover that joined the reconnect with nothing to bound the wait.
-     */
-    public function testLameDuckInfoReadInAReconnectedListenerFailsOver(): void
-    {
-        $transport = new ReconnectingTransport();
-        $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection) use ($transport): int {
-            $transport->pushFrame(self::LAME_DUCK);
-
-            return $connection->processIncoming(new TimeoutCancellation(0.5))->await();
-        });
-        $connection = $this->connect($transport, connectionListener: $action->listener());
-        $action->connection = $connection;
-
-        $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
-
-        self::assertNull($action->failure);
-        $this->assertReconnectedAgain($connection, $transport);
-    }
-
-    /**
-     * The listener reads a lame-duck INFO with a PING behind it in the same chunk (#182): the connection fails over,
-     * and the PING, the leaving server's, is not answered on the connection the failover opened. The dispatch used to
-     * go on with the chunk after the failover and write the PONG there.
-     */
-    public function testPingBehindALameDuckInfoReadInAReconnectedListenerIsNotAnsweredOnTheNewConnection(): void
-    {
-        $transport = new ReconnectingTransport();
-        $action = new ListenerAction(new LifecycleRecorder(), static function (NatsConnection $connection) use ($transport): int {
-            $transport->pushFrame(self::LAME_DUCK . "PING\r\n");
-
-            return $connection->processIncoming(new TimeoutCancellation(0.5))->await();
-        });
-        $connection = $this->connect($transport, connectionListener: $action->listener());
-        $action->connection = $connection;
-
-        $this->loseConnectionAndReadThroughTheReconnect($connection, $transport);
-
-        self::assertNull($action->failure);
-        self::assertSame(2, $action->result, 'the read returned both frames');
-        $this->assertReconnectedAgain($connection, $transport);
-        self::assertSame([], $transport->controlLinesStartingWith('PONG', 2), 'no PONG on the connection the failover opened');
-        self::assertSame([], $transport->controlLinesStartingWith('PONG'), 'the leaving server\'s PING was not answered at all');
     }
 
     /**
@@ -821,16 +774,15 @@ final class ReconnectedListenerTest extends TestCase
 
     /**
      * A guarded publish (the pull consumer engine's, which still runs the recovery of its failed write inline, #244)
-     * whose failed write runs the reconnect, whose listener returns while a lame-duck failover it let start holds
-     * its dial: the publish is buffered behind the failover and sent on the connection the failover opens. The
-     * failover used to join the reconnect, which was waiting for its listener, and never happen: the publish went
-     * to the connection the server was about to close. A plain publish hands its frame to the first reconnect
-     * instead ({@see FailedPublishWriteTest}).
+     * whose failed write runs the reconnect, whose listener returns while the next reconnect, which the new
+     * connection's loss started, holds its dial: the publish is buffered behind that reconnect and sent on the
+     * connection it opens. A plain publish hands its frame to the first reconnect instead
+     * ({@see FailedPublishWriteTest}). Started with a lame-duck failover up to 2.35.0, which no longer exists (#265).
      */
-    public function testGuardedPublishWhoseListenerLeavesAFailoverInFlightIsSentOnTheConnectionItOpens(): void
+    public function testGuardedPublishWhoseListenerLeavesAReconnectWithItsDialHeldIsSentOnTheConnectionItOpens(): void
     {
         $transport = new ReconnectingTransport();
-        [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startFailover(...));
+        [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startReconnectWithItsDialHeld(...));
 
         $transport->failNextWriteContaining('PUB orders');
         self::publishGuarded($connection)->await(new TimeoutCancellation(3));
@@ -838,7 +790,7 @@ final class ReconnectedListenerTest extends TestCase
         $this->waitUntilOpen($connection);
 
         self::assertListenerLeftAReconnectInFlight($action);
-        self::assertSame(2, $transport->epoch(), 'failed over');
+        self::assertSame(2, $transport->epoch(), 'reconnected again');
         self::assertSame(['PUB orders reply 7'], $transport->controlLinesStartingWith('PUB', 2));
         self::assertSame([], $transport->controlLinesStartingWith('PUB', 1));
     }
@@ -908,25 +860,24 @@ final class ReconnectedListenerTest extends TestCase
     }
 
     /**
-     * A request whose publish runs the reconnect, whose listener returns while a lame-duck failover holds its
-     * dial, gets its reply on the connection the failover opens. The failover used to join the reconnect and
-     * never happen.
+     * A request whose publish runs the reconnect, whose listener returns while the next reconnect holds its dial,
+     * gets its reply on the connection that reconnect opens. Started with a lame-duck failover up to 2.35.0 (#265).
      */
-    public function testRequestWhoseListenerLeavesAFailoverInFlightGetsItsReply(): void
+    public function testRequestWhoseListenerLeavesAReconnectWithItsDialHeldGetsItsReply(): void
     {
         $transport = new ReconnectingTransport();
         $transport->responder = static fn(string $subject, ?string $replyTo, string $payload): array => $replyTo !== null
             ? $transport->replyFrame($replyTo, 're: ' . $payload)
             : [];
-        [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startFailover(...));
+        [$connection, $action] = $this->connectWithReconnectedAction($transport, $this->startReconnectWithItsDialHeld(...));
         $connection->request('svc', 'warm-up')->await();
 
         $transport->failNextWriteContaining('PUB svc');
-        $request = $connection->request('svc', 'during-the-failover');
+        $request = $connection->request('svc', 'during-the-reconnect');
         $this->waitUntil(static fn(): bool => $action->seconds !== null);
         $transport->releaseDial();
 
-        self::assertSame('re: during-the-failover', $request->await(new TimeoutCancellation(3))->payload);
+        self::assertSame('re: during-the-reconnect', $request->await(new TimeoutCancellation(3))->payload);
         self::assertListenerLeftAReconnectInFlight($action);
         self::assertSame(2, $transport->epoch());
     }
@@ -1508,13 +1459,13 @@ final class ReconnectedListenerTest extends TestCase
         self::assertSame(ConnectionState::Connecting, $action->result, 'the listener returned with the next reconnect in flight');
     }
 
-    /** A lame-duck INFO naming another server starts a failover, whose dial is held. */
-    private function startFailover(NatsConnection $connection, ReconnectingTransport $transport): void
+    /** The new connection dies: a reader starts the next reconnect, whose dial is held. */
+    private function startReconnectWithItsDialHeld(NatsConnection $connection, ReconnectingTransport $transport): void
     {
         $transport->holdNextDial();
-        $transport->pushFrame(self::LAME_DUCK);
+        $transport->dropConnection();
         async(static fn(): int => $connection->processIncoming(new TimeoutCancellation(3))->await())->ignore();
-        $this->waitUntil(static fn(): bool => $transport->epoch() === 1 && !$transport->sessionLive());
+        $this->waitUntil(static fn(): bool => $connection->state() === ConnectionState::Connecting && count($transport->connectCalls) === 3);
     }
 
     /** The new connection dies with dials refused: a reader starts the next reconnect, which backs off. */
