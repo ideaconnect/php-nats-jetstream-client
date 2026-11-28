@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants), which runs the suite twice: once against the `nats` fixture (2.12) and once against `nats-214` (2.14, `composer test:integration:2.14`, failing on any skipped test). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3795 unit tests, 171 integration tests, 49 Behat scenarios.
+Indicative totals: 3829 unit tests, 171 integration tests, 49 Behat scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
@@ -3068,6 +3068,8 @@ A request whose publish the server refuses for lack of permission (`-ERR 'Permis
 - `testARequestManyWithRepliesCollectedReturnsThemWhenItsSubjectIsRefusedLater` - A requestMany() that has collected a reply returns it as soon as a refusal of its subject arrives behind the reply (as one of a plain publish to the subject would), well before its 5 s timeout.
 - `testEveryRequestInFlightToTheRefusedSubjectFails` - Two requests in flight to the refused subject both fail at the one -ERR the server sends once both PUBs are on the wire: the permissions are the user's, so the -ERR refuses every request to the subject, whichever publish it answers.
 - `testASubjectTheServerQuotesIsReadAsItsSubject` - (an apostrophe / a backslash / a double quote in the subject, quoted with Go's %q as nats-server does) The refused request fails at once with its own subject, and a request in flight to the subject before that character gets its reply. All three fail on the first form of the fix, which read the subject up to the first quote.
+- `testSubjectOfAPublishViolationUndoesGosPercentQ` - (32 subjects nats-server 2.15.3 wrote with Go's %q, a plain one and an apostrophe/backslash/double-quote one included) `subjectOfAPublishViolation()`, called by reflection, decodes every form %q writes - `\x`, `\u`, `\U`, the C letters, `\\` and `\"` - and returns the subject as published, compared with `bin2hex()` for a readable mismatch. 10 of the 32 fail on `stripcslashes()`, the forms it leaves as literal text.
+- `testASubjectGoWritesWithUOrCapitalUIsReadAsItsSubject` - (U+00A0 written with `\u`, U+E0001 written with `\U`) The refused request fails within 2.5 s of its 5 s timeout, naming the subject as published, while a request in flight to what `stripcslashes()` used to make of it - a literal `u00a0` or `U000e0001` in place of the escape - still gets its reply. Both subjects end only at the 5 s timeout on `stripcslashes()`.
 - `testAJetStreamCallTheServerRefusesFailsAtOnceWithTheRefusal` - (getConsumer() / getStream() / a JetStream publish()) The call fails within 2.5 s of its 5 s timeout with the PermissionViolationException itself, not a JetStreamException and not a timeout.
 
 ### tests/Unit/RetirePullInboxTest.php

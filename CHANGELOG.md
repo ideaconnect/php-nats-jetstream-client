@@ -17,6 +17,18 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` A refused request still waited out its timeout when the `-ERR` named the subject in a form
+  `stripcslashes()` does not undo: Go's `%q` writes a character it does not count as printable as `\u` (4 hex
+  digits) or `\U` (8 hex digits), which `stripcslashes()` leaves as literal text (`svc.a\u00a0b` read back as
+  `svc.au00a0b`), so no request was in flight to that reading and the refused one waited out its timeout instead of
+  failing at once. `subjectOfAPublishViolation()` now decodes `\x`, `\u` and `\U` in one left-to-right pass, as well
+  as the `\a \b \f \n \r \t \v` and `\\`/`\"` forms `%q` writes, without `mb_*`, `IntlChar` or `iconv`. A subject the
+  account maps to another one stays a documented limit: the server checks the permission on the mapped subject and
+  names that one in the `-ERR`, not the subject the request published to, so such a request still ends with a
+  `TimeoutException` at its timeout (#259).
+
 ### Testing & CI
 
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran

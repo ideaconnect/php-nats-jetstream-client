@@ -20,6 +20,10 @@ namespace IDCT\NATS\Exception;
  * fetchBatch() and the pull consumer publish with an inbox of their own, and a refused pull still ends at its expiry.
  * The -ERR names the subject and not the publish: one left unread from an earlier refused publish to the subject
  * refuses a later request to it as well, whatever the server did with that request's own publish.
+ *
+ * Not thrown for a subject the account maps to another one: the server checks the permission on the mapped subject
+ * and names that one in the -ERR, not the subject the request published to, so such a request still fails with a
+ * {@see TimeoutException} at its timeout.
  */
 final class PermissionViolationException extends NatsException
 {

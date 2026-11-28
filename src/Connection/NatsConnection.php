@@ -5519,17 +5519,99 @@ final class NatsConnection
 
     /**
      * The subject a "Permissions Violation for Publish to" -ERR names, or null for any other error. nats-server writes
-     * it with Go's %q, so it is in double quotes, with a backslash before a double quote or a backslash in it, and an
-     * apostrophe left as it is, although the whole text is in single quotes: -ERR 'Permissions Violation for Publish to
-     * "svc.o'brien"'. A subject without the quotes, as a server could write it, ends at a space or a quote.
+     * it with Go's %q, so it is in double quotes, and decoded here ({@see decodeGoQuotedSubject()}) as %q writes it:
+     * - `\\` and `\"`;
+     * - `\a \b \f \n \r \t \v`;
+     * - `\x` plus 2 lowercase hex digits for a byte below 0x20, for 0x7f, and for each byte that is not valid UTF-8;
+     * - `\u` plus 4, or `\U` plus 8, lowercase hex digits for any other character Go does not count as printable;
+     * - every other character as it is, an apostrophe included, although the whole text is in single quotes:
+     *   -ERR 'Permissions Violation for Publish to "svc.o'brien"'.
+     * A subject without the quotes, as a server could write it, ends at a space or a quote.
      */
     private static function subjectOfAPublishViolation(string $error): ?string
     {
         if (preg_match('/permissions violation for publish to "((?:[^"\\\\]|\\\\.)*)"/i', $error, $quoted) === 1) {
-            return stripcslashes($quoted[1]);
+            return self::decodeGoQuotedSubject($quoted[1]);
         }
 
         return preg_match('/permissions violation for publish to ([^\s"\']+)/i', $error, $bare) === 1 ? $bare[1] : null;
+    }
+
+    /**
+     * Undoes Go's %q quoting of a subject nats-server names in a -ERR ({@see subjectOfAPublishViolation()}), left to
+     * right, in one pass. Decodes what %q wrote; it does not re-encode the published subject and compare, which would
+     * need Go's table of printable runes, and that table changes with each Unicode version (U+0378 is unassigned
+     * today, and Go already writes it as `\u0378`). Uses no mb_* function, IntlChar or iconv: none of them is required
+     * by this package (composer.json), and a missing one would throw from inside the -ERR dispatch.
+     */
+    private static function decodeGoQuotedSubject(string $quoted): string
+    {
+        $decoded = preg_replace_callback(
+            '/\\\\(?:x(?<byte>[0-9a-fA-F]{2})|u(?<bmp>[0-9a-fA-F]{4})|U(?<full>[0-9a-fA-F]{8})|(?<letter>[abfnrtv\\\\"]))/',
+            static function (array $match): string {
+                if ($match['byte'] !== null) {
+                    return pack('C', (int) hexdec($match['byte']));
+                }
+
+                if ($match['bmp'] !== null) {
+                    return self::utf8BytesOfCodePoint((int) hexdec($match['bmp']));
+                }
+
+                if ($match['full'] !== null) {
+                    return self::utf8BytesOfCodePoint((int) hexdec($match['full']));
+                }
+
+                $letter = $match['letter'];
+                if ($letter === null) {
+                    // Unreachable: the regex matches a backslash followed by byte, bmp, full or letter, no other way.
+                    return '';
+                }
+
+                return match ($letter) {
+                    'a' => "\x07",
+                    'b' => "\x08",
+                    'f' => "\x0c",
+                    'n' => "\n",
+                    'r' => "\r",
+                    't' => "\t",
+                    'v' => "\x0b",
+                    default => $letter,
+                };
+            },
+            $quoted,
+            flags: PREG_UNMATCHED_AS_NULL,
+        );
+
+        return $decoded ?? $quoted;
+    }
+
+    /** The UTF-8 bytes of a Unicode code point, built with pack('C*', ...) rather than chr() or a mb_* function. */
+    private static function utf8BytesOfCodePoint(int $codePoint): string
+    {
+        if ($codePoint < 0x80) {
+            return pack('C', $codePoint);
+        }
+
+        if ($codePoint < 0x800) {
+            return pack('C*', 0xC0 | ($codePoint >> 6), 0x80 | ($codePoint & 0x3F));
+        }
+
+        if ($codePoint < 0x10000) {
+            return pack(
+                'C*',
+                0xE0 | ($codePoint >> 12),
+                0x80 | (($codePoint >> 6) & 0x3F),
+                0x80 | ($codePoint & 0x3F),
+            );
+        }
+
+        return pack(
+            'C*',
+            0xF0 | ($codePoint >> 18),
+            0x80 | (($codePoint >> 12) & 0x3F),
+            0x80 | (($codePoint >> 6) & 0x3F),
+            0x80 | ($codePoint & 0x3F),
+        );
     }
 
     /**
