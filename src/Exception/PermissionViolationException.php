@@ -11,7 +11,8 @@ namespace IDCT\NATS\Exception;
  * nothing. Permissions belong to the connection's user, so a request to the same subject on this connection is refused
  * again until they change.
  *
- * Thrown by request(), requestWithHeaders() and requestMany() (one that has collected no reply), and so by the
+ * Thrown by request(), requestWithHeaders() and requestMany() (one that has collected no reply - one that has
+ * collected a reply is not refused by an -ERR for its subject any more, and goes on collecting), and so by the
  * JetStream API calls and JetStream publishes made through them, as soon as the -ERR is read, whichever fiber's read
  * meets it. Before, request() and requestWithHeaders() waited out their timeout and failed with a
  * {@see TimeoutException}, and requestMany() returned an empty list. Not a {@see ConnectionException}: the connection is

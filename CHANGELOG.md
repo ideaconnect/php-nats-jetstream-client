@@ -17,6 +17,22 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Fixed
+
+- `[bugfix]` A `requestMany()` that has already collected a reply on its inbox no longer ends early when another
+  `-ERR 'Permissions Violation for Publish to "<subject>"'` for its subject is read afterward - a bug since 2.30.0,
+  when that `-ERR` first started ending the collection. A reply is proof that this request's own publish, made once,
+  got through, so the `-ERR` necessarily answered another publish to the same subject - a plain `publish()` by
+  another fiber, say - and more replies may still be coming. The collection now goes
+  on to its usual end: `maxResponses`, the stall interval, the total timeout, a 503, or a connection close; the
+  `-ERR` still reaches the error listener as before. Measured live against nats-server 2.12.15, 2.14.10 and 2.15.3: a
+  two-responder `requestMany()` whose subject is refused between the two replies returned only the first, at
+  0.802-0.804 s, where it now returns both, at 1.501-1.503 s. A `requestMany()` that has collected nothing yet is
+  still refused by such an `-ERR`, as before, with a `PermissionViolationException`; so is one answered by a 503
+  (no responders) read behind an `-ERR` for its subject in the same chunk - the 503 is itself the proof of having
+  been received, so that case now also returns `[]` without throwing, rather than the exception the mark would
+  otherwise have produced (#258).
+
 ### Testing & CI
 
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
