@@ -62,6 +62,7 @@ Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
 - [Stream Message Get](#stream-message-get)
 - [JetStream Direct Get](#jetstream-direct-get)
 - [Atomic Batch Publish](#atomic-batch-publish)
+- [Fast-ingest Batch Publish](#fast-ingest-batch-publish)
 - [Credentials File Authentication](#credentials-file-authentication)
 - [Typed Stream Configuration](#typed-stream-configuration)
 - [Pull Consumer Batching/Iteration](#pull-consumer-batchingiteration)
@@ -107,6 +108,7 @@ Current functionality includes:
 - JetStream publish ACK
 - JetStream stream message get by sequence - both the regular `STREAM.MSG.GET` request and the Direct Get API (`directGetStreamMessage()` / `directGetLastMessageForSubject()`)
 - JetStream atomic (all-or-nothing) batch publish (`batch()` -> `BatchPublisher`, ADR-50; requires `allow_atomic`, NATS 2.12+)
+- JetStream fast-ingest batch publish (`fastPublisher()` -> `FastPublisher`, ADR-50; opt-in, flow-controlled and non-atomic; requires `allow_batched`, NATS 2.14+)
 - Scheduled publish (`@at` support)
 - Distributed counter CRDT (atomic `incrementCounter()` / `counterValue()`, arbitrary-precision values)
 - KeyValue API (bucket lifecycle with history/TTL/storage options, put/get/update/delete/purge, watch, getAll/status)
@@ -205,6 +207,7 @@ depends on the feature:
 | Scheduled publishing, one-off `@at` | `publishScheduled()` (with `scheduleTtl`), `Schedule::at/atTimestamp` | 2.12 | `allow_msg_schedules`, `Nats-Schedule`, `Nats-Schedule-Target`, `Nats-Schedule-TTL` |
 | Scheduled publishing, recurring (`@every`/cron/aliases), `timeZone`, `source`, `rollup` | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.14 | `allow_msg_schedules`, `Nats-Schedule-Time-Zone`, `Nats-Schedule-Source`, `Nats-Schedule-Rollup` |
 | Atomic batch publish | `batch()` -> `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
+| Fast-ingest batch publish | `fastPublisher()` -> `FastPublisher` | 2.14 | `allow_batched`, reply subject `<inbox>.<flow>.<gap>.<seq>.<op>.$FI` |
 | Consumer delivery state reset (ADR-60) | `resetConsumer()` | 2.14 | `$JS.API.CONSUMER.RESET` |
 | Durable stream sourcing/mirroring through a named consumer (ADR-60) | `AckPolicy::FlowControl`, `StreamSource::consumer()` | 2.14 | `ack_policy: flow_control`, `consumer` of a source or mirror; sent as is, see [Durable sourcing](#durable-sourcing-nats-214) |
 | Distributed counter CRDT | `incrementCounter()`, `counterValue()` | 2.12 | `allow_msg_counter`, `Nats-Incr` |
@@ -2072,6 +2075,91 @@ $js->deleteStream('ORDERS')->await();
 $client->disconnect()->await();
 ```
 
+### Fast-ingest Batch Publish
+
+_Verified by: [FastPublisherTest](tests/Unit/FastPublisherTest.php) (the protocol against a scripted server whose replies are those of nats-server 2.14.10 and 2.15.3: `testABatchOf26AtFlow10UsesItsOwnInboxAndTheReplySubjectsOfTheProtocol`, `testNothingAfterTheFirstMessageIsWrittenBeforeTheFirstAck`, `testMessage200WaitsUntilTheAckFor100Arrives`, `testAStalledMessagePingsAtTheHighestSequenceWhichThePingDoesNotAdvance`, `testAFirstReplyThatDoesNotStartTheBatchFailsTheFirstAdd`, `testAGapInFailModeEndsTheBatchWithItsPubAck`, `testARefusedMessageInOkModeReachesOnErrorAndTheCommitCountsTheSequence`, `testCloseSendsAnEobCommitToTheBatchSubject`, `testTheInfoVersionIsNeverChecked`, and more); [FastIngestIntegrationTest](tests/Integration/FastIngestIntegrationTest.php) (against nats-server 2.14 in the second `composer test:e2e` stage, and `testAServerBefore214StoresTheFirstMessageAsAPlainPublish` against the 2.12 fixture in the first)._
+
+`$js->fastPublisher()` starts a fast-ingest batch (ADR-50, NATS server 2.14+): a flow-controlled, non-atomic batch
+publisher for callers who need throughput and accept the gap mode they pick. It is opt-in: `publish()`, `batch()` and
+the Object Store uploads are unchanged. One publisher is one batch; the target stream must be created with
+`allow_batched`.
+
+`add($subject, $payload, $headers = [])` publishes a message at once and returns a `Future<FastPubAck>`
+(`batchSequence`, and `ackSequence`, the highest batch sequence the server had acknowledged). The first `add()` waits
+for the server's first reply, which starts the batch. After that the server sends a flow ack every `msgs` messages
+(never less often than the `flow` asked for, often more), and `add()` waits only when `maxOutstandingAcks` acks are
+outstanding (1 to 3, default 2), pinging the batch every third of the ack timeout to recover a lost ack. Nothing travels
+in headers: the batch's state is in each message's reply subject, `<inbox>.<flow>.<gap>.<seq>.<op>.$FI`, on a control
+inbox of the batch's own (`<inboxPrefix>.<batch id>.>`), which is released when the batch ends.
+
+The gap mode decides what a lost message or a failed per-message check (`Nats-Expected-*` headers) does:
+
+- `fail` (the default): it ends the batch. Every message up to the end was stored, in order. The next call throws a
+  `FastBatchException` whose `pubAck` is the PubAck the server ended the batch with (`batchCount`: the last batch
+  sequence stored) and whose previous exception is the gap or error notice; every later call throws the same way
+  without sending anything.
+- `ok` (`continueOnGap: true`): the batch goes on, and `onError` receives each gap and each refused message as a
+  `FastBatchException` (`batchSequence`, `getErrCode()`, for instance 10071 for a wrong last sequence), in the fiber of
+  the next `add()`, `commit()` or `close()`. Some messages may be missing.
+
+`commit($subject, $payload)` stores a last message and returns the batch's `PubAck`: `batchId` is the batch id, and
+`batchCount` is the batch sequence of the commit, not the number of messages stored (in gap mode `ok`, four messages
+with one refused commit with count 4 and store 3). `close()` ends the batch without storing a message (an EOB commit
+to the subject of the first message), with `batchCount` the sequence of the last message.
+
+- **One fiber per publisher.** Await each `add()`, `commit()` and `close()` before the next one; a call made while
+  another is still running fails without sending anything.
+- **End every batch.** A publisher releases its control inbox when the batch ends: `commit()`, `close()`, a failure
+  that ends it, or an ack timeout. One left without any of them keeps its inbox subscribed until the connection
+  closes.
+- **Idle batches.** The server abandons a batch that has had no message for 10 seconds, without a word; what it
+  stored stays in the stream. The next message, commit or ping then fails with err_code 10208 (`batch publish ID
+  unknown`), which surfaces as a `JetStreamException` at the next read: a stall, the commit, or the `add()` after it.
+- **Limits.** 1,000 fast-ingest batches in flight per stream and 50,000 per server; the first message of a batch past
+  either fails with 10211. A batch has no size limit.
+- **Errors at the start.** A stream without `allow_batched` refuses the batch with 10205; a subject no stream captures
+  gets the `JetStreamException` (503) of a JetStream publish without responders. Nothing more is sent.
+- **Older servers.** `createStream(..., ['allow_batched' => true])` fails with an `UnsupportedFeatureException` on a
+  server older than 2.14, like every version-gated field (see [NATS Server Version
+  Requirements](#nats-server-version-requirements)). A 2.10 to 2.12 server stores a fast-ingest message as a plain
+  publish: the first `add()` (or a `commit()` without one) then throws an `UnsupportedFeatureException` (feature
+  `allow_batched`, 2.14) naming the stream and sequence the message was stored at, and sends nothing more. The
+  publisher never checks the INFO version.
+- **Not covered.** Keep-alive pings while the application is idle, and recovery across a reconnect beyond what the
+  gap mode gives.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Exception\FastBatchException;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+
+$js = $client->jetStream();
+
+// The stream must allow fast-ingest batches (NATS 2.14+).
+$js->createStream('METRICS', ['metrics.>'], ['allow_batched' => true])->await();
+
+$fast = $js->fastPublisher(flow: 100, maxOutstandingAcks: 2);
+try {
+	for ($i = 1; $i < 10_000; $i++) {
+		$fast->add('metrics.cpu', (string) $i)->await();
+	}
+	$ack = $fast->commit('metrics.cpu', 'last')->await();
+	echo "Batch {$ack->batchId} committed at batch sequence {$ack->batchCount}" . PHP_EOL;
+} catch (FastBatchException $e) {
+	// Gap mode `fail`: the batch ended early; messages up to this batch sequence were stored, in order.
+	echo 'Stored up to ' . $e->pubAck?->batchCount . ': ' . $e->getMessage() . PHP_EOL;
+}
+
+$client->disconnect()->await();
+```
+
 ### Credentials File Authentication
 
 > 📄 **Runnable example:** [`examples/auth-credentials-file.php`](examples/auth-credentials-file.php)
@@ -2714,7 +2802,7 @@ The same watchdog protects KV **and Object Store** watches, which both ride orde
 - **Observability.** Pass a PSR-3 `LoggerInterface` via `new NatsOptions(logger: $logger)` to capture lifecycle events (connect, disconnect, reconnect, close, server discovery, lame-duck), per-attempt reconnect/backoff, and async errors. It defaults to a `NullLogger`. For structured, programmatic hooks (metrics, alerting, circuit breakers) without parsing log strings, pass typed closures instead: `connectionListener: Closure(ConnectionEvent $event, ?Throwable $error): void` is invoked on connection-lifecycle transitions, and `errorListener: Closure(Throwable $error): void` on async errors. The connection listener hears of a connection only while it is still the open one: a connection closed, being closed, replaced or lost before the listener was told it opened is not announced, and when it was lost, neither is its loss, though a `Closed` still is. Only the logger records every transition - see [Reconnect Behavior](#reconnect-behavior). Exceptions thrown by a listener are swallowed so a faulty hook cannot disrupt the connection; so are those a logger throws while it logs a lifecycle transition, a failed reconnect attempt, or any error it reports - and such an error still reaches the `errorListener`. _Verified by: [NatsConnectionTest::testLoggerCapturesLifecycleEvents](tests/Unit/NatsConnectionTest.php)._
 - **Server version requirements.** Newer features (per-message TTL, atomic batch publish, scheduled publish, priority groups, counters, batched Direct Get) require recent NATS servers - see [NATS Server Version Requirements](#nats-server-version-requirements).
 - **An `-ERR` can fail an unrelated operation.** An operation's read (a `request()`, a JetStream call, a polling queue) delivers messages for every subscription on the connection. Another subscription's handler that throws there is reported and the operation completes (see [Handler Failures](#handler-failures)), but an `-ERR` the server keeps the connection open for, such as its rejection of another subscription's SUB, fails the operation whose read meets it, even when its own result has arrived: the `-ERR` names no subscription. A service's `run()` and a pull consumer's run (`handle()`) report it instead and go on (#209); a request, a fetch, a batched Direct Get and a queue poll still fail on it. See [Reconnect Behavior](#reconnect-behavior).
-- **Not yet implemented.** A dedicated high-throughput fast-ingest batch publisher ([#12](https://github.com/ideaconnect/php-nats-jetstream-client/issues/12)) is tracked but blocked on an upstream reference; standard JetStream publish with in-flight pipelining is available today and is sufficient for most workloads.
+- **Not yet implemented.** An opt-in fast-ingest mode for Object Store uploads is not there: `put()` and `putStream()` keep their acknowledged chunk publishes. The [fast-ingest batch publisher](#fast-ingest-batch-publish) (`fastPublisher()`, NATS 2.14+, [#12](https://github.com/ideaconnect/php-nats-jetstream-client/issues/12)) is available for streams created with `allow_batched`.
 
 ## Configuration Option Mapping
 

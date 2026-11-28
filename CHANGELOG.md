@@ -17,6 +17,28 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Added
+
+- `[feature]` Fast-ingest batch publish (ADR-50, NATS server 2.14+, #12): `JetStreamContext::fastPublisher(flow: 100,
+  maxOutstandingAcks: 2, continueOnGap: false, ackTimeoutMs: null, onError: null)` returns a `FastPublisher`, an
+  opt-in, flow-controlled, non-atomic batch publisher for a stream created with `allow_batched`. `add()` publishes a
+  message at once and returns a `FastPubAck` (`batchSequence`, `ackSequence`); the first one waits for the server to
+  start the batch, later ones wait only when `maxOutstandingAcks` (1 to 3) flow acks are outstanding, at the flow the
+  server's latest ack sets, pinging the batch every third of the ack timeout. `commit()` stores a last message and
+  returns the batch's `PubAck` (`batchId`, `batchCount`: the commit's batch sequence); `close()` ends the batch
+  without one (EOB). The batch's state travels in the reply subject `<inbox>.<flow>.<gap>.<seq>.<op>.$FI`, on a
+  control inbox of its own (`<inboxPrefix>.<batch id>.>`), released when the batch ends. In gap mode `fail` (the
+  default) a lost message or a failed `Nats-Expected-*` check ends the batch with every earlier message stored in
+  order, and the next call throws the new `FastBatchException` carrying the PubAck it ended with; in gap mode `ok`
+  such notices go to `onError` as `FastBatchException`s and the batch goes on. A stream without `allow_batched` fails
+  the first `add()` with err_code 10205, a server older than 2.14 (which stores the message as a plain publish) with an
+  `UnsupportedFeatureException`; the INFO version is never checked. The behaviour follows the Synadia Orbit Go
+  `jetstreamext.FastPublisher` (v0.4.0) and ADR-50 at revision 11; `maxOutstandingAcks` above 3 is refused, as ADR-50
+  requires. `publish()`, `batch()` and the Object Store uploads are unchanged.
+- `[feature]` `allow_batched` is a version-gated stream config field (2.14): `FeatureSupport::requiredVersion()`
+  reports it, and `createStream()`/`addStream()`/`updateStream()`/`createOrUpdateStream()` with it fail with an
+  `UnsupportedFeatureException` against an older server, as for the other gated fields (#266).
+
 ### Testing & CI
 
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran

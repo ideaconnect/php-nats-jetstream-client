@@ -57,6 +57,7 @@ final class FeatureSupport
         'allow_msg_schedules' => '2.12',
         'allow_atomic' => '2.12',
         'allow_msg_counter' => '2.12',
+        'allow_batched' => '2.14',
     ];
 
     /**

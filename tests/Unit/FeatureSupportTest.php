@@ -20,6 +20,7 @@ final class FeatureSupportTest extends TestCase
         self::assertSame('2.10', FeatureSupport::requiredVersion('filter_subjects'));
         self::assertSame('2.11', FeatureSupport::requiredVersion('allow_msg_ttl'));
         self::assertSame('2.12', FeatureSupport::requiredVersion('allow_atomic'));
+        self::assertSame('2.14', FeatureSupport::requiredVersion('allow_batched'));
         self::assertNull(FeatureSupport::requiredVersion('not_a_real_field'));
     }
 
@@ -150,7 +151,7 @@ final class FeatureSupportTest extends TestCase
         self::assertSame([], FeatureSupport::requestedFields($scheduleKeys));
         self::assertSame(['allow_msg_schedules'], FeatureSupport::requestedFields($scheduleKeys + ['allow_msg_schedules' => true]));
         self::assertSame(
-            ['filter_subjects', 'allow_msg_ttl', 'subject_delete_marker_ttl', 'priority_groups', 'priority_policy', 'priority_timeout', 'allow_msg_schedules', 'allow_atomic', 'allow_msg_counter'],
+            ['filter_subjects', 'allow_msg_ttl', 'subject_delete_marker_ttl', 'priority_groups', 'priority_policy', 'priority_timeout', 'allow_msg_schedules', 'allow_atomic', 'allow_msg_counter', 'allow_batched'],
             FeatureSupport::requestedFields(array_fill_keys(array_keys(FeatureSupport::REQUIREMENTS), true)),
         );
 

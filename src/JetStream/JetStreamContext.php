@@ -173,6 +173,36 @@ final class JetStreamContext
     }
 
     /**
+     * Starts a fast-ingest batch (ADR-50, NATS server 2.14+): an opt-in, flow-controlled, non-atomic batch publisher
+     * for callers who need throughput and accept the gap mode they pick. The target stream must be created with
+     * `allow_batched` enabled. publish() and batch() are unchanged.
+     *
+     * The first add() waits for the server to start the batch; later ones wait only when $maxOutstandingAcks flow
+     * acks are outstanding. commit() stores a last message and returns the batch's PubAck; close() ends the batch
+     * without one. In gap mode `fail` (the default) the first lost or refused message ends the batch, with every
+     * earlier message stored in order; with $continueOnGap the batch goes on and $onError receives each gap and each
+     * refused message. Nothing is checked against the server's INFO version: a server that predates fast ingest
+     * stores the first message as a plain publish, and add() then fails with an UnsupportedFeatureException.
+     *
+     * @param int $flow Ask the server for at most one flow ack every this many messages (1..65535).
+     * @param int $maxOutstandingAcks Flow acks that may be outstanding before add() waits (1..3; ADR-50 allows no more).
+     * @param bool $continueOnGap Gap mode `ok` instead of `fail`.
+     * @param int|null $ackTimeoutMs How long one call waits for the server in all; null = the request timeout.
+     * @param (\Closure(\IDCT\NATS\Exception\FastBatchException): void)|null $onError Receives the notices that do not
+     *        end the batch (gap mode `ok`), in the fiber of the next add(), commit() or close().
+     * @throws JetStreamException When a setting is out of range (nothing is sent).
+     */
+    public function fastPublisher(
+        int $flow = FastPublisher::DEFAULT_FLOW,
+        int $maxOutstandingAcks = FastPublisher::DEFAULT_MAX_OUTSTANDING_ACKS,
+        bool $continueOnGap = false,
+        ?int $ackTimeoutMs = null,
+        ?\Closure $onError = null,
+    ): FastPublisher {
+        return new FastPublisher($this->client, $flow, $maxOutstandingAcks, $continueOnGap, $ackTimeoutMs, $onError);
+    }
+
+    /**
      * Retrieves account-wide JetStream metrics and limits.
      *
      * @return Future<AccountInfo>
