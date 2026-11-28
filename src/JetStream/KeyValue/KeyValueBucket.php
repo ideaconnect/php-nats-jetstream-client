@@ -67,6 +67,13 @@ final class KeyValueBucket
     private ?string $writePrefix = null;
 
     /**
+     * Whether {@see $writePrefix} already names the JetStream API the writes go through: an EXTERNAL
+     * (cross-domain) mirror's `<external api>.$KV.<origin>.`. The context's own API prefix is then not
+     * put in front of it (nats.go mapStreamToKVS turns useJSPfx off for such a mirror).
+     */
+    private bool $writePrefixIsExternal = false;
+
+    /**
      * Creates a KV bucket context bound to a client and bucket name.
      *
      * @param NatsClient $client Connected client used for publish/subscribe operations behind KV APIs.
@@ -143,6 +150,7 @@ final class KeyValueBucket
             // (nats.go builds the KV handle only from a successful create - mapStreamToKVS parity).
             $this->readPrefix = null;
             $this->writePrefix = null;
+            $this->writePrefixIsExternal = false;
             if ($mirror !== null) {
                 // The mirror is CONFIRMED server-side: this handle now fronts it - writes go
                 // through to the ORIGIN bucket's subjects (the mirror stream ingests nothing
@@ -309,6 +317,7 @@ final class KeyValueBucket
         if ($externalApi !== null) {
             $this->readPrefix = '$KV.' . $origin . '.';
             $this->writePrefix = rtrim($externalApi, '.') . '.$KV.' . $origin . '.';
+            $this->writePrefixIsExternal = true;
         } else {
             $this->writePrefix = '$KV.' . $origin . '.';
         }
@@ -344,6 +353,7 @@ final class KeyValueBucket
             // stream it re-binds to is no longer a mirror.
             $this->readPrefix = null;
             $this->writePrefix = null;
+            $this->writePrefixIsExternal = false;
             if (isset($config['mirror']) && is_array($config['mirror'])) {
                 $this->applyMirrorPrefixes($config['mirror']);
             }
@@ -565,7 +575,7 @@ final class KeyValueBucket
      */
     private function getViaStreamMessage(string $key): ?KeyValueEntry
     {
-        $subject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
+        $subject = $this->jetStream->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $this->streamName();
         $payload = json_encode(['last_by_subj' => $this->subjectForKey($key)], JSON_THROW_ON_ERROR);
         $data = $this->decodeReply(JetStreamRequest::plain($this->client, $subject, $payload)->payload);
 
@@ -1182,11 +1192,24 @@ final class KeyValueBucket
     /**
      * Resolves a full WRITE subject for a key (put/create/update/delete/purge publishes). Identical
      * to the read subject except on a mirror bucket, where writes go through to the ORIGIN
-     * (nats.go putPre parity) - the mirror stream itself ingests no subjects.
+     * (nats.go putPre parity) - the mirror stream itself ingests no subjects - and on a context made
+     * for a JetStream domain or API prefix, where the write goes through that API as well:
+     * `$JS.hub.API.$KV.<bucket>.<key>` (nats.go useJSPfx parity, #273). nats-server maps
+     * `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, and an account importing
+     * another account's KV imports its `$KV.>` under the same prefix (nats.go's convention). A plain
+     * `$KV.` publish from a leaf node does not reach the hub's stream (no responders, seen with 2.12
+     * and 2.15 hubs), while a plain publish to a stream's own subjects does. The stored subject stays
+     * `$KV.<bucket>.<key>`, so reads are not prefixed.
      */
     private function writeSubjectForKey(string $key): string
     {
-        return ($this->writePrefix ?? $this->subjectPrefix()) . $key;
+        $prefix = $this->writePrefix ?? $this->subjectPrefix();
+        $apiPrefix = $this->jetStream->apiPrefix();
+        if (!$this->writePrefixIsExternal && $apiPrefix !== JetStreamApi::DEFAULT_PREFIX) {
+            $prefix = $apiPrefix . $prefix;
+        }
+
+        return $prefix . $key;
     }
 
     /**
@@ -1196,7 +1219,7 @@ final class KeyValueBucket
      */
     private function requestStreamInfoWithSubjects(): array
     {
-        $subject = JetStreamApi::STREAM_INFO_PREFIX . $this->streamName();
+        $subject = $this->jetStream->apiSubject(JetStreamApi::STREAM_INFO_PREFIX) . $this->streamName();
 
         // The STREAM.INFO subjects map is server-capped, so a bucket with many keys must be enumerated
         // across pages (offset) or getAll() would silently truncate. The no-new-subjects guard also

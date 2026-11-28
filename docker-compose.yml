@@ -24,6 +24,21 @@ services:
       - "14222:4222"
       - "18222:8222"
 
+  # A 2.14 server for the second `composer test:e2e` integration stage (#279): the ten other fixtures
+  # above and below stay on 2.12, so a live test that needs a newer server keeps skipping against them.
+  nats-214:
+    image: nats:2.14-alpine
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 2s
+      retries: 4
+      start_period: 5s
+    ports:
+      - "14232:4222"
+      - "18232:8222"
+
   nats-token:
     image: nats:2.12-alpine
     command: ["--config", "/etc/nats-config/token.conf"]
@@ -131,3 +146,36 @@ services:
     ports:
       - "14229:8080"
       - "18229:8222"
+
+  # JetStream domain fixture (#273): a hub with `jetstream { domain: hub }` and a leaf node without
+  # JetStream connected to it. A client on the leaf node reaches the hub's JetStream only under the
+  # domain ($JS.hub.API.>). The leaf node retries its remote until the hub is up.
+  nats-hub:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats-config/hub.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 2s
+      retries: 4
+      start_period: 5s
+    volumes:
+      - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
+    ports:
+      - "14230:4222"
+      - "18230:8222"
+
+  nats-leaf:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats-config/leaf.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 2s
+      retries: 4
+      start_period: 5s
+    volumes:
+      - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
+    ports:
+      - "14231:4222"
+      - "18231:8222"

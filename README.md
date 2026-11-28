@@ -68,6 +68,7 @@ Source repository: https://github.com/ideaconnect/php-nats-jetstream-client
 - [Pull Consumer Priority Groups](#pull-consumer-priority-groups)
 - [Stream Mirroring and Sourcing](#stream-mirroring-and-sourcing)
 - [Republish and Subject Transform](#republish-and-subject-transform)
+- [JetStream Domains and API Prefixes (Leaf Nodes, Account Imports)](#jetstream-domains-and-api-prefixes-leaf-nodes-account-imports)
 - [Compatibility Mapping](#compatibility-mapping)
 - [Behavior Notes](#behavior-notes)
   - [`processIncoming()`](#processincoming)
@@ -125,6 +126,7 @@ Current functionality includes:
 - Pull-consumer batching/iteration chain API (`PullConsumerIterator` with `setBatching()`, `setIterations()`, `handle()`)
 - Stream mirroring and sourcing configuration helpers (`StreamSource`)
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
+- JetStream domains and API prefixes (`jetStream(domain: 'hub')`, `jetStream(apiPrefix: '...')`): the JetStream of a hub through a leaf node, or of another account through an import - see [JetStream Domains and API Prefixes](#jetstream-domains-and-api-prefixes-leaf-nodes-account-imports)
 
 Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+). NATS 2.12 runs only one-off `@at` schedules (with an optional TTL); `@every`, cron, the aliases and the `source`, `timeZone` and `rollup` arguments of `publishScheduled()` need NATS 2.14+ on the servers that hold the stream. `publishScheduled()` sends every schedule whatever version the connected server reports, and the server that stores it decides (see [NATS Server Version Requirements](#nats-server-version-requirements)).
 
@@ -208,6 +210,7 @@ a server without a feature shows up depends on the feature:
 | Scheduled publishing, recurring (`@every`/cron/aliases), `timeZone`, `source`, `rollup` | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.14 | `allow_msg_schedules`, `Nats-Schedule-Time-Zone`, `Nats-Schedule-Source`, `Nats-Schedule-Rollup` |
 | Atomic batch publish | `batch()` -> `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
 | Consumer delivery state reset (ADR-60) | `resetConsumer()` | 2.14 | `$JS.API.CONSUMER.RESET` |
+| Durable stream sourcing/mirroring through a named consumer (ADR-60) | `AckPolicy::FlowControl`, `StreamSource::consumer()` | 2.14 | `ack_policy: flow_control`, `consumer` of a source or mirror; sent as is, see [Durable sourcing](#durable-sourcing-nats-214) |
 | Distributed counter CRDT | `incrementCounter()`, `counterValue()` | 2.12 | `allow_msg_counter`, `Nats-Incr` |
 | Publish de-duplication | `publish(..., msgId:)` | 2.2 | `Nats-Msg-Id` |
 
@@ -1663,7 +1666,7 @@ $client->disconnect()->await();
 
 ### Consumer Reset
 
-_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (a 2.14+ server; against the 2.12 fixture stack only the timeout of a server without the reset API runs)._
+_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (the second `composer test:e2e` integration stage, against the `nats-214` fixture, a 2.14+ server; against the default `nats` fixture (2.12) only the timeout of a server without the reset API runs)._
 
 `resetConsumer($stream, $consumer, $sequence)` resets a consumer's delivery state through `$JS.API.CONSUMER.RESET` (ADR-60, NATS 2.14+), to replay messages or to move past a range that cannot be processed without deleting and recreating the consumer: it keeps its name, its config and the clients bound to it. The pending and redelivery state is dropped and the consumer sequence starts again at 1.
 
@@ -2309,7 +2312,7 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/stream-mirroring-and-sourcing.php`](examples/stream-mirroring-and-sourcing.php)
 
-_Verified by: [StreamSourceTest](tests/Unit/StreamSourceTest.php); [features/jetstream-core/config_helpers.feature](features/jetstream-core/config_helpers.feature) (live source filtering + mirror replication)._
+_Verified by: [StreamSourceTest](tests/Unit/StreamSourceTest.php); [features/jetstream-core/config_helpers.feature](features/jetstream-core/config_helpers.feature) (live source filtering + mirror replication); [DurableSourcingIntegrationTest](tests/Integration/DurableSourcingIntegrationTest.php) (the second `composer test:e2e` integration stage, against the `nats-214` fixture, a 2.14+ server; against the default `nats` fixture (2.12) only the refusals run)._
 
 Use `StreamSource` to build mirror/source configuration arrays:
 
@@ -2342,6 +2345,57 @@ $client->disconnect()->await();
 ```
 
 Use those arrays in `createStream()` or `updateStream()` options. Source configurations work with the current high-level API and are covered against the live fixture stack. Mirror-only stream configs also work through `createStream()` when you pass an empty `subjects` list together with the `mirror` configuration.
+
+#### Durable sourcing (NATS 2.14+)
+
+A 2.14+ server sources or mirrors a WorkQueue or Interest stream reliably by itself (ADR-60): give the origin as above (`StreamSource::source('JOBS')`, `StreamSource::mirror('JOBS')`) and the server creates a durable consumer with the `flow_control` ack policy on the origin, so a message leaves the origin only after the sourcing stream has stored it. It removes that consumer together with the sourcing stream. Nothing new is needed in the client's config for this.
+
+Name a consumer of your own with `StreamSource::consumer($name, $deliverSubject)` when its configuration should be yours or it should outlive the sourcing stream (deleting the sourcing stream leaves a consumer of your own in place). ADR-60 moves the start sequence, start time and filter subject onto that consumer: `toArray()` refuses `consumer()` together with `startSeq()`, `startTime()` or `filterSubject()` with a `JetStreamException` that names them (the server's own error, err_code 10215 for a source and 10213 for a mirror, names no field).
+
+Create the consumer first, on the origin, and give the source its exact deliver subject. The server checks neither when the sourcing stream is created: a stream that names a consumer that does not exist, delivers to another subject or acks explicitly is created without an error and stays empty (a consumer created later is picked up on a retry, after seconds or tens of seconds). For the consumer, a durable name, a deliver subject outside the origin's own subjects and `AckPolicy::FlowControl` are enough: the server sets `flow_control` and the 1 s idle heartbeat itself, and refuses `ack_wait`, `backoff` and a positive `max_deliver` on it.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
+use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
+use IDCT\NATS\JetStream\Configuration\StreamSource;
+use IDCT\NATS\JetStream\Enum\AckPolicy;
+use IDCT\NATS\JetStream\Enum\RetentionPolicy;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+$js = $client->jetStream();
+
+$js->addStream(StreamConfiguration::create('JOBS')->subjects('jobs.>')->retention(RetentionPolicy::WorkQueue))->await();
+
+// 1. The consumer, on the origin.
+$js->addConsumer('JOBS', ConsumerConfiguration::create()
+	->durable('JOBS_ARCHIVE')
+	->deliverSubject('deliver.jobs.archive')
+	->ackPolicy(AckPolicy::FlowControl))->await();
+
+// 2. The sourcing stream names it, with the same deliver subject.
+$js->createStream('ARCHIVE', [], [
+	'sources' => [StreamSource::source('JOBS')->consumer('JOBS_ARCHIVE', 'deliver.jobs.archive')->toArray()],
+])->await();
+
+$client->disconnect()->await();
+```
+
+The client checks the server version for neither of the two; a server before 2.14 answers:
+
+| Request | 2.10, 2.11 | 2.12 |
+| --- | --- | --- |
+| a consumer with `AckPolicy::FlowControl` | refused: 400, err_code 10025 (`invalid JSON`) | refused: 400, err_code 10025 (`invalid JSON`) |
+| a source or mirror with `consumer()` | the stream is created without `consumer` and sources the old way; the client does not notice | refused: 400, err_code 10025 (`unknown field "consumer"`) |
+| a WorkQueue origin sourced without `consumer()` | sourced the old way, which the server did not support for such an origin before 2.14: the work queue is emptied at once | as 2.10 and 2.11 |
+
+Each refusal is a plain `JetStreamException` (`getCode()` 400, `getErrCode()` 10025). With the order above, an older server already refuses step 1. When you set the source up against a server of unknown version, check the `StreamInfo` that `createStream()` returns (`raw['config']['sources']`) for the `consumer` object.
 
 ### Republish and Subject Transform
 
@@ -2383,6 +2437,117 @@ $js->createStream('MAPPED', ['raw.>'], [
 
 $client->disconnect()->await();
 ```
+
+### JetStream Domains and API Prefixes (Leaf Nodes, Account Imports)
+
+_Verified by: [JetStreamDomainTest](tests/Unit/JetStreamDomainTest.php); [JetStreamDomainIntegrationTest](tests/Integration/JetStreamDomainIntegrationTest.php) (live, through the `nats-leaf` fixture: a leaf node without JetStream connected to the `nats-hub` fixture, which runs JetStream with `jetstream { domain: hub }`)._
+
+By default a JetStream context sends its API requests to `$JS.API.>`, the JetStream of the account the client is connected to. Two common deployments serve it elsewhere:
+
+- **A JetStream domain.** A client connected to a leaf node reaches the hub's JetStream (or the hub a leaf node's) under the domain, on `$JS.<domain>.API.>`. A leaf node without JetStream of its own answers `$JS.API.>` with no responders, so the default context fails there with a `JetStreamException` (503).
+- **An API prefix.** An account that imports another account's JetStream API (an import of `$JS.API.>` with `to: "JS.from-a.API.>"`) reaches it under that prefix. The export needs `response: stream`, and the import needs more than `$JS.API.>` alone; see [Account imports](#account-imports) below.
+
+Pass the domain or the prefix to `jetStream()`, as nats.go does with `jetstream.NewWithDomain()` / `jetstream.NewWithAPIPrefix()` and nats.java with `JetStreamOptions.domain()` / `prefix()`:
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+
+// Connected to a leaf node whose hub runs JetStream with `jetstream { domain: hub }`.
+$client = new NatsClient(new NatsOptions(servers: ['nats://leaf.example.net:4222']));
+$client->connect()->await();
+
+$js = $client->jetStream(domain: 'hub');   // API requests go to $JS.hub.API.>
+echo $js->apiPrefix(), PHP_EOL;            // $JS.hub.API.
+
+$js->createStream('ORDERS', ['orders.>'])->await();
+$js->createConsumer('ORDERS', 'worker')->await();
+$js->publish('orders.created', '{"id":1}')->await();   // published to orders.created itself
+
+foreach ($js->fetchBatch('ORDERS', 'worker', 10)->await() as $message) {
+	$js->ack($message)->await();
+}
+
+// The KV and Object Store buckets of the context use its prefix too.
+$kv = $js->keyValue('config');
+$kv->create()->await();
+$kv->put('theme', 'dark')->await();
+
+// An account that imports another account's JetStream API under JS.from-a.API.
+$imported = $client->jetStream(apiPrefix: 'JS.from-a.API');
+
+$client->disconnect()->await();
+```
+
+- `jetStream()` without arguments is unchanged and returns the same context every time. Each domain or prefix gets a context of its own, kept the same way; a domain and the equivalent prefix (`domain: 'hub'`, `apiPrefix: '$JS.hub.API'`) share one. `new JetStreamContext($client, domain: 'hub')` works too.
+- A domain is a single subject token: an empty domain, or one with `.`, `*`, `>`, whitespace or a control character, is refused with a `JetStreamException`, and so are an empty prefix, a prefix with an empty token (`JS..API`), a wildcard or whitespace, and a domain together with a prefix (this client's own rule: nats.go's `jetstream` package has a constructor for each, while its legacy `nats.Domain()` / `nats.APIPrefix()` options and nats.java's `JetStreamOptions` let the last one set win). A trailing `.` is added to a prefix without one. Nothing is sent for a refused domain or prefix.
+- Every JetStream API request of the context uses its prefix: streams, consumers, account info, message get and delete, Direct Get, pulls (`CONSUMER.MSG.NEXT`, from `fetchBatch()` and `pullConsumer()->handle()`), pause, unpin, reset (`resetConsumer()`), and the requests of its KV and Object Store buckets. A JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, and acks and flow-control replies to the reply subject the server gave; through an account import those reply subjects need imports of their own, see [Account imports](#account-imports) below.
+- KV writes (`put()`, `create()`, `update()`, `delete()`, `purge()`) go through the prefix, as nats.go's do: `$JS.hub.API.$KV.<bucket>.<key>`. nats-server maps `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, while a plain `$KV.` publish from a leaf node gets no responders. For an account import, import the other account's `$KV.>` under the same prefix (`to: "JS.from-a.API.$KV.>"`), and the subjects of the streams and Object Stores you publish to under their own names. The stored subjects stay `$KV.<bucket>.<key>`, so reads and watches are unchanged for a JetStream domain; through an account import they need the further entries in [Account imports](#account-imports) below.
+- The `domain` shorthand of a KV mirror or source, and `StreamSource::external()`, are independent of the context's prefix: they name where the ORIGIN stream lives. A KV mirror of a bucket in another domain writes through that origin's API, not through the context's prefix.
+- The server version checks (the version-gated stream and consumer fields, `batch()`, `publishScheduled()`, `resetConsumer()`) read the INFO of the server the client is connected to. Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests: through a 2.12 leaf node `resetConsumer()` is refused with an `UnsupportedFeatureException` before anything is sent, although a 2.14 hub would answer it.
+
+#### Account imports
+
+_Measured once for #281, against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and 2.15.3 with this client at 2.34.0; not covered by a test of this repository._
+
+This is the account config that passed every call below, with one user added to each account for the measurement; on 2.10.29 `directGetBatch()` fails with or without an import, since batched Direct Get needs nats-server 2.11. `orders.>` stands for the subjects of the streams the importing account publishes to, and `DELIVER.READER.>` for a delivery subject the caller chose:
+
+```
+accounts {
+  ORIGIN {
+    jetstream: enabled
+    exports [
+      { service: "$JS.API.>", response: stream, accounts: [TARGET] }
+      { service: "$KV.>", accounts: [TARGET] }
+      { service: "orders.>", accounts: [TARGET] }
+      { service: "$O.>", accounts: [TARGET] }
+      { service: "$JS.ACK.>", accounts: [TARGET] }
+      { service: "$JS.FC.>", accounts: [TARGET] }
+      { stream: "_INBOX.JS.ORD.>", accounts: [TARGET] }
+      { stream: "_INBOX.JS.PUSH.>", accounts: [TARGET] }
+      { stream: "_INBOX.KV.KEYS.>", accounts: [TARGET] }
+      { stream: "_INBOX.KV.HIST.>", accounts: [TARGET] }
+      { stream: "DELIVER.READER.>", accounts: [TARGET] }
+    ]
+  }
+  TARGET {
+    imports [
+      { service: { account: ORIGIN, subject: "$JS.API.>" }, to: "JS.from-a.API.>" }
+      { service: { account: ORIGIN, subject: "$KV.>" }, to: "JS.from-a.API.$KV.>" }
+      { service: { account: ORIGIN, subject: "orders.>" } }
+      { service: { account: ORIGIN, subject: "$O.>" } }
+      { service: { account: ORIGIN, subject: "$JS.ACK.>" } }
+      { service: { account: ORIGIN, subject: "$JS.FC.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.JS.ORD.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.JS.PUSH.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.KV.KEYS.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.KV.HIST.>" } }
+      { stream: { account: ORIGIN, subject: "DELIVER.READER.>" } }
+    ]
+  }
+}
+```
+
+With only the imports the bullets above already describe (`$JS.API.>` under a prefix, `$KV.>` under the same prefix, and the subjects you publish to under their own names), these already work: `accountInfo()`, creating and deleting streams, consumers and buckets, `publish()`, a pull of one message (`fetchBatch()` with a batch of 1), KV `put()`, `get()`, `update()`, `delete()` and Object Store `put()`. `fetchNext()` and the `get()` of a one-chunk object pass the same way too.
+
+The calls in this table need one of the four further entries in the config above as well. Without it some of them throw, and others return as if they had worked or receive nothing; the last column says which:
+
+| Entry | Calls that need it | Without it |
+| --- | --- | --- |
+| `response: stream` on the export of `$JS.API.>` | every call with several replies to one request: `fetchBatch()` above 1, `pullConsumer()->handle()`, `directGetBatch()`; on nats-server 2.11 and later also `getAll()` and Object Store `list()`; the `get()` of an object of several chunks | Only the first reply arrives. `fetchBatch()` of 5 returned 1 after 3.0 s (its expiry was 2 s), although the server had delivered all 5 and left 4 pending for nobody. `handle()` handled 1 of 3. `directGetBatch()`, `getAll()` (3 keys) and `list()` (3 objects) threw `JetStreamException` "Direct Get batch for stream "..." stalled: no progress for 6000 ms (received 1 message(s), no end-of-batch marker)" (3000 ms for `directGetBatch()`, whose expiry was 2 s). `get()` of 3 chunks threw `JetStreamException` (503) "JetStream pull request ended with status 503" after 11 s. |
+| import of `$JS.ACK.>` | `ack()`, `nak()`, `term()`, `inProgress()`, `ackSync()`; `nakWithDelay()` by reading (it publishes the same way, `src/JetStream/JetStreamContext.php:4668`) | `ack()`, `nak()`, `term()` and `inProgress()` returned without an error and reached nobody: ORIGIN read 1, 2, 3 and 4 pending acks after the four calls and an ack floor of 0 (with the import: 0, 1, 0, 1 and an ack floor of 3), and a message acked with `ack()` came again after its 1 s ack wait. `ackSync()` failed at once with `NatsException` "No responders for subject $JS.ACK....". |
+| a stream export that covers the delivery subject | `subscribeOrderedConsumer()` and the `watch()` of KeyValue and Object Store (`_INBOX.JS.ORD.`), `keys()` (`_INBOX.KV.KEYS.`), `history()` (`_INBOX.KV.HIST.`), `subscribePushConsumer()` and `subscribeEphemeralPushConsumer()` (`_INBOX.JS.PUSH.`, or the caller's own `deliverSubject`) | Subscriptions and watches received nothing, and nothing reached the error listener in the 12 s watched. `keys()` and `history()` threw `JetStreamException` "Key enumeration stalled: no progress for 2.000 s (collected 0 key(s), replay not caught up)" and "Key history for "theme" stalled: ..." once their progress timeout was over (2 s in the measurement, 5 s by default). |
+| import of `$JS.FC.>` | everything on an ordered consumer: `subscribeOrderedConsumer()`, both `watch()`; a push consumer created with `flow_control`, by reading | Delivery stopped after 2.0 MB with no error: 128 of 300 16 KB messages on a replay, and 128 of 200 when they were published one by one while the consumer read. With the import: 300 of 300 and 200 of 200. |
+
+The push side of this client always delivers on one of four fixed literals: `_INBOX.JS.ORD.` for an ordered consumer, ridden by `subscribeOrderedConsumer()` and the `watch()` of KeyValue and Object Store; `_INBOX.KV.KEYS.` for `keys()`; `_INBOX.KV.HIST.` for `history()`; and `_INBOX.JS.PUSH.` for a push subscription without its own delivery subject (`subscribePushConsumer()`, `subscribeEphemeralPushConsumer()`). `NatsOptions::inboxPrefix` (default `_INBOX`, see [Configuration Option Mapping](#configuration-option-mapping)) is only the prefix of the request inbox and does not change any of these. A stream export covering one of them hands the importing account everything published on it, not only what one import's own calls deliver: while a client of ORIGIN watched a bucket of its own, a client of TARGET subscribed directly to `_INBOX.JS.ORD.>` received the same two values as that watch, and none of them without the export. `accounts: [...]` on an export only limits which account may import it, not what that account receives once it does. A push subscription is kept to itself with a `deliverSubject:` of its own, exported to that account alone instead of the whole `_INBOX.JS.PUSH.>`: `subscribePushConsumer(deliverSubject: 'DELIVER.READER.one')` worked with a stream export of `DELIVER.READER.>` alone, and `subscribeEphemeralPushConsumer()` takes the same argument (by reading). `watch()`, `keys()`, `history()` and `subscribeOrderedConsumer()` have no such argument.
+
+The export's response threshold (`threshold` on a service export, default 2 minutes, [`server/const.go:237` at nats-server v2.12.15](https://github.com/nats-io/nats-server/blob/v2.12.15/server/const.go#L237)) is how long after a request a reply still reaches the importing account. With `threshold: "2s"`, a `fetchBatch()` of one message with an expiry of 6 s, whose message was published after 4 s, ended with `JetStreamException` (408) "No messages received within timeout" although the message was there. This client's default waits are shorter than the default threshold (a pull waits 3 s, an Object Store download 10 s); a pull given an `expiresMs` above 2 minutes needs a longer threshold (by reading: the 2-minute default was not run).
+
+See the NATS documentation, [Cross-account subjects, "Consumers driven from another account"](https://docs.nats.io/reference/2.14/jetstream/cross-account-subjects), for the `response: stream`, `$JS.ACK.>` and delivery-subject entries above. `$JS.FC.>` is this measurement's own finding: that page lists `$JS.FC` for sourcing, not in its config for a client.
 
 ## Compatibility Mapping
 
@@ -2718,6 +2883,7 @@ Additional useful commands:
 ```bash
 composer test
 RUN_INTEGRATION=1 composer test:integration
+NATS_URL=nats://127.0.0.1:14232 RUN_INTEGRATION=1 composer test:integration:2.14
 composer test:bdd
 BEHAT_SUITE=core composer test:bdd
 composer test:integration:repeat
@@ -2731,7 +2897,7 @@ composer infection
 
 Infection requires **PHP 8.3+** and is intentionally **not** in `require-dev` (so the library stays installable on PHP 8.2). The CI `mutation` job installs it on the fly; to run mutation testing locally, add it first: `composer require --dev infection/infection:^0.33`.
 
-`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, runs the Behat feature suite, and tears the stack down again. `SKIP_UNIT_TESTS=1 composer test:e2e` leaves out the unit stage; CI sets it, because its coverage step and the Unit + Static jobs already run the unit suite.
+`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs the integration suite twice (against the `nats` fixture, 2.12, then against `nats-214`, 2.14, failing the second run on any skipped test), runs the Behat feature suite, and tears the stack down again. `SKIP_UNIT_TESTS=1 composer test:e2e` leaves out the unit stage; CI sets it, because its coverage step and the Unit + Static jobs already run the unit suite.
 
 The compose servers run without debug or trace logging. To trace one while debugging, add `"-DV"` to its `command` in `docker-compose.yml` and recreate it with `docker compose up -d --force-recreate <name>`.
 
@@ -2748,6 +2914,8 @@ When you run `docker compose up -d` in this repository, additional local auth fi
 - TLS handshake-first auth: `tls://127.0.0.1:14225` using the generated files under `build/tls/`
 - JWT auth: `nats://127.0.0.1:14227` using the generated operator/account resolver chain under `build/nats/jwt/`
 - standalone NKey auth: `nats://127.0.0.1:14226` with seed `SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY`
+- JetStream domain: a hub `nats://127.0.0.1:14230` running JetStream with `jetstream { domain: hub }`, and a leaf node `nats://127.0.0.1:14231` without JetStream connected to it (`build/nats/hub.conf`, `build/nats/leaf.conf`); `scripts/wait-for-nats-services.sh` waits until the leaf node's connection to the hub is up
+- nats-server 2.14: `nats://127.0.0.1:14232` (`nats-214`), used only by the second `composer test:e2e` integration stage (`composer test:integration:2.14`) to run the integration suite against a server newer than the other fixtures' 2.12
 
 The integration tests use those defaults automatically. Override them with environment variables when you want to target external infrastructure instead.
 
@@ -2782,6 +2950,8 @@ composer fixture:jwt:check
 - `NATS_JWT_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` to derive the public NKey and sign the server nonce (defaults to `build/nats/jwt/user.seed`)
 - `NATS_NKEY_URL`: standalone NKey-auth server URL used by `testStandaloneNkeyAuthenticationFlow`
 - `NATS_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` for standalone NKey challenge-response auth
+- `NATS_HUB_URL`: JetStream hub with the domain `hub` used by `JetStreamDomainIntegrationTest` (default: `nats://127.0.0.1:14230`)
+- `NATS_LEAF_URL`: leaf node without JetStream connected to that hub, used by `JetStreamDomainIntegrationTest`, which skips when nothing listens there (default: `nats://127.0.0.1:14231`)
 
 Example overrides for external infrastructure:
 

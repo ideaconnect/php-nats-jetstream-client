@@ -1352,7 +1352,7 @@ final class ObjectStoreBucket
      */
     private function metaSubjects(): array
     {
-        $apiSubject = JetStreamApi::STREAM_INFO_PREFIX . $this->streamName();
+        $apiSubject = $this->jetStream->apiSubject(JetStreamApi::STREAM_INFO_PREFIX) . $this->streamName();
 
         // The STREAM.INFO subjects map is capped by the server, so a bucket with many objects must be
         // enumerated across pages (offset) - otherwise list() would silently truncate. The
@@ -1398,7 +1398,7 @@ final class ObjectStoreBucket
      */
     private function requestStreamMessage(string $subject): array
     {
-        $apiSubject = JetStreamApi::STREAM_MSG_GET_PREFIX . $this->streamName();
+        $apiSubject = $this->jetStream->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $this->streamName();
         $payload = json_encode(['last_by_subj' => $subject], JSON_THROW_ON_ERROR);
         $message = JetStreamRequest::plain($this->client, $apiSubject, $payload);
 

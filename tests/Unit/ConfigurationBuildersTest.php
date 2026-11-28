@@ -141,4 +141,16 @@ final class ConfigurationBuildersTest extends TestCase
         self::assertArrayNotHasKey('durable_name', $config->toArray());
         self::assertSame('none', $config->toArray()['ack_policy']);
     }
+
+    public function testConsumerConfigurationCarriesTheFlowControlAckPolicy(): void
+    {
+        $array = ConsumerConfiguration::create()
+            ->durable('SRC')
+            ->deliverSubject('deliver.wq')
+            ->ackPolicy(AckPolicy::FlowControl)
+            ->toArray();
+
+        self::assertSame('flow_control', $array['ack_policy']);
+        self::assertSame(['durable_name' => 'SRC', 'deliver_subject' => 'deliver.wq', 'ack_policy' => 'flow_control'], $array);
+    }
 }

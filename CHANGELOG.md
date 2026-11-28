@@ -111,6 +111,94 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   nothing is decided from the version, including across a reconnect to a server of another version. The live
   `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders` and `ConsumerResetIntegrationTest` read
   the expected answers, and which tests run, from the API level instead of the INFO version.
+- `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
+  nats-server 2.12, stale since #286 (#279) added the second `composer test:e2e` integration stage against the
+  `nats-214` fixture. Both now say which test runs against which fixture, as the consumer reset texts do, and the
+  README's "Stream Mirroring and Sourcing" `Verified by` line names the second stage (#287).
+
+### Documentation
+
+- `[docs]` The "JetStream Domains and API Prefixes" section (#273, #276) said an account import needs `$JS.API.>`
+  under a prefix, `$KV.>` under the same prefix, and the subjects published to, and that reads and watches stay
+  unchanged; that last sentence holds for a JetStream domain only (#281). An import also needs `response: stream` on
+  the export of `$JS.API.>` for every call with several replies (`fetchBatch()` above 1, `pullConsumer()->handle()`,
+  `directGetBatch()`, on nats-server 2.11 and later also `getAll()` and Object Store `list()`, a multi-chunk object
+  `get()`), an import of `$JS.ACK.>` for `ack()`, `nak()`, `term()`, `inProgress()`, `ackSync()` and, by reading,
+  `nakWithDelay()`, an import of `$JS.FC.>` for an ordered consumer and its `watch()`es (without it delivery stops
+  after 2 MB with no error), and a stream export covering this client's four fixed push-delivery prefixes
+  (`_INBOX.JS.ORD.`, `_INBOX.KV.KEYS.`, `_INBOX.KV.HIST.`, `_INBOX.JS.PUSH.`) for `subscribeOrderedConsumer()`,
+  KeyValue/Object Store `watch()`, `keys()`, `history()` and a push subscription without its own `deliverSubject`.
+  New "Account imports" subsection: the full account config that was measured, what already works with only the
+  three entries the section already described, a table of what each further entry is for and what happens without
+  it, and that a stream export covering one of the prefixes hands the importing account everything published on it,
+  not only what one import's calls deliver. Measured once against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and
+  2.15.3 with this client at 2.34.0; not covered by a test of this repository.
+
+## [2.35.0] - 2026-11-28
+
+### Added
+
+- `[feature]` Durable stream sourcing and mirroring (ADR-60, NATS server 2.14+) with the typed builders (#280):
+  `AckPolicy::FlowControl` (`flow_control`) is the ack policy of the durable push consumer a stream sources or
+  mirrors a WorkQueue or Interest stream through, and `StreamSource::consumer($name, $deliverSubject)` names such a
+  consumer in a source or mirror (`consumer: {name, deliver_subject}`, after `external`). `toArray()` refuses
+  `consumer()` together with `startSeq()`, `startTime()` or `filterSubject()` with a `JetStreamException` that names
+  them (they belong on the consumer, and the server's own error names no field); `consumer()` refuses an empty name
+  or deliver subject. The client checks the server version for neither: a server before 2.14 refuses the ack policy
+  (400, err_code 10025), 2.12 refuses a source that names a consumer the same way, and 2.10 and 2.11 drop the field
+  and source the old way. README "Stream Mirroring and Sourcing" says what a 2.14 server does by itself, when to
+  name a consumer of your own and what to create first.
+
+### Testing & CI
+
+- `[docs]` New `nats-214` fixture in `docker-compose.yml` (nats-server 2.14, port 14232/18232) and a second
+  `composer test:e2e` integration stage against it (`composer test:integration:2.14`, `--fail-on-skipped`), so a
+  live test that needs a server newer than the other fixtures' 2.12 runs in CI instead of always skipping itself
+  (#279). A test that can pass only on a server older than 2.14 is excluded from that stage by having
+  `ServerBefore214` in its name.
+
+## [2.34.0] - 2026-11-26
+
+### Added
+
+- `[feature]` JetStream domains and API prefixes (#273): `NatsClient::jetStream(domain: 'hub')` returns a context
+  whose JetStream API requests go to `$JS.hub.API.` instead of `$JS.API.` (nats.go `jetstream.NewWithDomain()`), and
+  `jetStream(apiPrefix: 'JS.from-a.API')` one whose requests go to the prefix an account imports another account's
+  JetStream API under (nats.go `jetstream.NewWithAPIPrefix()`; a trailing `.` is added when missing). A client
+  connected to a leaf node can now use the hub's JetStream: before, every JetStream, KV and Object Store call went to
+  `$JS.API.`, which a leaf node without JetStream answers with no responders. Every API request of the context uses
+  its prefix (streams, consumers, account info, message get/delete, Direct Get, pulls from `fetchBatch()` and
+  `pullConsumer()->handle()`, pause/unpin, `resetConsumer()`, and the requests of its KV and Object Store buckets); a
+  JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, acks and flow-control
+  replies to the server's reply subject. KV writes go through the prefix
+  (`$JS.hub.API.$KV.<bucket>.<key>`, nats.go useJSPfx parity): nats-server maps it back to `$KV.<bucket>.<key>`, while
+  a plain `$KV.` publish from a leaf node gets no responders. A KV mirror of a bucket in another domain keeps writing
+  through that origin's API. An invalid domain (empty, or with `.`, `*`, `>`, whitespace or a control character), an
+  invalid prefix (empty, an empty token, a wildcard or whitespace) and a domain together with a prefix throw a
+  `JetStreamException` before any request (the last is this client's own rule: nats.go's legacy options and nats.java
+  let the last one set win). One context is kept per prefix, and `jetStream()` without arguments is unchanged. The
+  server version checks still read the INFO of the server the client is connected to, so through a 2.12 leaf node
+  `resetConsumer()` is refused before anything is sent, although a 2.14 hub would answer it. Also new:
+  `JetStreamContext::apiPrefix()`, `JetStreamContext::apiSubject()`, the `domain` and `apiPrefix` constructor
+  arguments of `JetStreamContext`, and `JetStreamApi::DEFAULT_PREFIX`, `resolvePrefix()` and `withPrefix()`.
+
+### Testing & CI
+
+- `[docs]` New `JetStreamDomainTest` over `tests/Support/PrefixedJetStreamServer.php`, a scripted server that answers
+  the JetStream API under one prefix only, maps a prefixed KV write to its `$KV.` subject and gives the no-responders
+  status to every other `$JS.` subject, as a leaf node of another domain does: every API call (47 of them, KV and
+  Object Store included, `resetConsumer()` against a scripted 2.14 INFO) sends its request under the context's prefix
+  for the default prefix, the domain `hub` and the prefix `$JS.from-a.API`, and none elsewhere; a stream create, a
+  consumer create, a JetStream publish, a pull with its ack, a pull consume, a KV put/get (and its STREAM.MSG.GET
+  fallback) and an Object Store put work through each prefix; a KV handle bound with `bind()` writes through the
+  prefix; KV mirror writes; the validation of domains and prefixes; one context per prefix.
+- `[docs]` New `nats-hub` (JetStream with `jetstream { domain: hub }`, port 14230) and `nats-leaf` (no JetStream,
+  connected to the hub, port 14231) fixtures in `docker-compose.yml` (`build/nats/hub.conf`, `build/nats/leaf.conf`);
+  `scripts/wait-for-nats-services.sh` also waits until the leaf node's connection to the hub is up. New
+  `JetStreamDomainIntegrationTest`, through the leaf node: the default context gets no responders and the domain
+  context the hub's account info; a stream and a consumer used end to end (publish, pull, ackSync, a pull consume); a
+  KV bucket (put, get, update, delete, keys, read back on the hub; a plain `$KV.` write from the leaf node gets no
+  responders); a multi-chunk Object Store object written and read back. It skips when the leaf node is not running.
 
 ## [2.33.0] - 2026-11-26
 
