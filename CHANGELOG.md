@@ -15,6 +15,9 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+A released section is not rewritten: it records what that release shipped. A correction to one is a `[docs]` entry
+of the next release that names the release and the entry it corrects.
+
 ## [Unreleased]
 
 ### Testing & CI
@@ -32,6 +35,11 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   nats-server 2.12, stale since #286 (#279) added the second `composer test:e2e` integration stage against the
   `nats-214` fixture. Both now say which test runs against which fixture, as the consumer reset texts do, and the
   README's "Stream Mirroring and Sourcing" `Verified by` line names the second stage (#287).
+- `[docs]` `TESTS.md` no longer gives totals (#261). Its "Indicative totals" line said 3795 unit tests, 171
+  integration tests and 49 Behat scenarios, where the suite had 4213, 175 and 51 when the line was removed (PHPUnit's
+  `--list-tests`, each data set one test, and `behat --dry-run`). The pull requests that added tests raised it by
+  their own count, from a figure already below the real one at 2.29.0 (3762, against the 3822 unit tests of its
+  release notes). "How to run" now says how to count them.
 
 ### Documentation
 
@@ -50,6 +58,28 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   it, and that a stream export covering one of the prefixes hands the importing account everything published on it,
   not only what one import's calls deliver. Measured once against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and
   2.15.3 with this client at 2.34.0; not covered by a test of this repository.
+- `[docs]` Four corrections to the 2.30.0 section, which stays as released (#261):
+  - The `requestMany()` entry is tagged `[behavior]`, a tag this file does not define. The change gives a caller an
+    exception where an empty list came, and it corrects an evident bug, a refusal reported as "nobody answered": a
+    `[bc-break]` that the note on flags treats as a `[bugfix]`, so 2.30.0 needed no major version.
+  - The `[bugfix]` entry on `diagnoseNoResponders()` describes no defect of a release: 2.29.0 did not have it. It is
+    part of the first entry's change, and says what that change does for a user who may pull but not ask for consumer
+    info: the server's refusal of the diagnosis's question does not end it, the connection is watched for the rest of
+    the question's time, `ServerGoingAway` when the server closes it or announces lame duck mode, `NoAnswer` at the
+    timeout. 2.30.1 fixed two defects of that watch: with reconnect on it returned only once the reconnect was over
+    (#257), and over a transport whose idle read returns at once it never returned (#256).
+  - The paragraph on what is not covered names `fetchBatch()` and the pull consumer. In 2.30.0 three more cases waited
+    out their time, measured on nats-server 2.14.2: a refused `directGetBatch()` (2.002 s with `expiresMs` 1000,
+    #260), a refused request to a subject with a character Go writes as a `\u` escape, such as U+00A0, and one to a
+    subject the account maps to another, since the `-ERR` names the mapped subject (#259). The first entry's "the
+    subject is read as nats-server quotes it" holds for the apostrophe, the backslash and the double quote it names,
+    not for Go's `\u` escapes.
+  - The `requestMany()` entry cites nats.js as doing the same. The clients differ: nats.js fails one request for each
+    `-ERR`, the first in flight to the named subject
+    ([`handleError()`](https://github.com/nats-io/nats.js/blob/343dfe5fa81fd5bd44fd236747f94b8eb6370a86/core/src/muxsubscription.ts#L65-L86));
+    nats.go fails none, hands the error to its async error callback, and the request ends at its timeout
+    ([`processTransientError()`](https://github.com/nats-io/nats.go/blob/792e440f256cdc41dd7e9e7d5b1595bcc3c2ea02/nats.go#L4334-L4364));
+    2.30.0 fails every request in flight to the subject.
 
 ## [2.35.0] - 2026-11-28
 
