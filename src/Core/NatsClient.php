@@ -13,7 +13,9 @@ use IDCT\NATS\Connection\Enum\InboxRetirement;
 use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Connection\NatsConnection;
 use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\SlowConsumerException;
+use IDCT\NATS\JetStream\JetStreamApi;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\Protocol\ServerInfo;
 use IDCT\NATS\Services\Service;
@@ -29,7 +31,13 @@ final class NatsClient
 {
     private readonly NatsConnection $connection;
     private readonly NatsOptions $options;
-    private ?JetStreamContext $jetStreamContext = null;
+
+    /**
+     * The JetStream contexts {@see jetStream()} made, one per API prefix (`$JS.API.` for the default context).
+     *
+     * @var array<string, JetStreamContext>
+     */
+    private array $jetStreamContexts = [];
 
     /**
      * Creates a high-level client facade over the connection runtime.
@@ -617,11 +625,37 @@ final class NatsClient
     }
 
     /**
+     * Sends a request with headers as {@see requestWithHeaders()} does, with $beforeWrite called before each attempt to
+     * write its frame, in the step that writes it, after any wait for a reconnect; what it throws fails the request,
+     * the frame not written. See {@see NatsConnection::requestWithHeadersGuarded()}.
+     *
+     * @internal For JetStreamContext::publishScheduled() (#267); not part of the supported API.
+     *
+     * @param array<string,string> $headers
+     * @param \Closure():void $beforeWrite Must not suspend.
+     * @return Future<NatsMessage>
+     */
+    public function requestWithHeadersGuarded(
+        string $subject,
+        string $payload,
+        array $headers,
+        \Closure $beforeWrite,
+        ?int $timeoutMs = null,
+        ?Cancellation $cancellation = null,
+    ): Future {
+        return $this->connection->requestWithHeadersGuarded($subject, $payload, $headers, $beforeWrite, $timeoutMs, $cancellation);
+    }
+
+    /**
      * Sends one request and collects multiple replies (scatter-gather), terminating on the first of:
      * {@see $maxResponses} replies, a no-responders sentinel, the per-message {@see $stallMs} gap, or
      * the total timeout. Mirrors nats.go `RequestMany` / nats.java `Connection.requestMany`. While a
      * reconnect is in flight it first waits for it within the total timeout
      * ({@see NatsOptions::$waitForReconnect}).
+     *
+     * A publish the server refuses for lack of permission ends the collection: with the replies collected
+     * so far, or, with none, with a {@see \IDCT\NATS\Exception\PermissionViolationException}, as
+     * nats.js ends such a request (2.30.0; it returned an empty list at the timeout before).
      *
      * @param array<string,string>|null $headers Optional request headers (null = plain request).
      * @param int|null $maxResponses Stop after this many replies (null = time-bounded only).
@@ -716,14 +750,22 @@ final class NatsClient
 
     /**
      * Returns a JetStream API context bound to this client instance.
+     *
+     * Without arguments it is the context of the connected account's own JetStream (`$JS.API.`). With a JetStream
+     * domain (`jetStream(domain: 'hub')`, nats.go `jetstream.NewWithDomain()`) its API requests go to
+     * `$JS.<domain>.API.`, which is how a client connected to a leaf node reaches the JetStream of the hub (#273); with
+     * an API prefix (`jetStream(apiPrefix: 'JS.from-a.API')`, nats.go `jetstream.NewWithAPIPrefix()`) they go to the
+     * subject the account imports another account's JetStream API under. One context is kept per resulting prefix,
+     * so repeated calls with the same domain or prefix return the same context. The KV buckets and Object Stores
+     * taken from a context use its prefix too.
+     *
+     * @throws JetStreamException When the domain or the prefix is invalid, or both are given (before any request).
      */
-    public function jetStream(): JetStreamContext
+    public function jetStream(?string $domain = null, ?string $apiPrefix = null): JetStreamContext
     {
-        if ($this->jetStreamContext === null) {
-            $this->jetStreamContext = new JetStreamContext($this);
-        }
+        $prefix = JetStreamApi::resolvePrefix($domain, $apiPrefix);
 
-        return $this->jetStreamContext;
+        return $this->jetStreamContexts[$prefix] ??= new JetStreamContext($this, apiPrefix: $prefix);
     }
 
     /**

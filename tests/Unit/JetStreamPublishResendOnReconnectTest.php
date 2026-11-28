@@ -152,7 +152,8 @@ final class JetStreamPublishResendOnReconnectTest extends TestCase
             '{"val":"1"}',
         ];
         yield 'a scheduled publish' => [
-            static fn(NatsClient $client): Future => $client->jetStream()->publishScheduled(self::SUBJECT, 'orders.later', self::PAYLOAD, '@every 1m'),
+            // An @at schedule: the fixture server advertises 2.12, which refuses the recurring ones before any write (#267).
+            static fn(NatsClient $client): Future => $client->jetStream()->publishScheduled(self::SUBJECT, 'orders.later', self::PAYLOAD, '@at 2030-01-01T00:00:00Z'),
             self::ack(7),
         ];
     }

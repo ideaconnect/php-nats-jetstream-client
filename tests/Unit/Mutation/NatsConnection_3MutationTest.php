@@ -881,11 +881,11 @@ final class NatsConnection_3MutationTest extends TestCase
     }
 
     /**
-     * performRecovery uses max(1, maxReconnectAttempts) reconnect attempts. With maxReconnectAttempts=0
-     * and reconnect enabled, recovery (reached via the read-error path, which does not gate on the
-     * attempt count) must still make exactly ONE attempt.
+     * maxReconnectAttempts=0 disables reconnect retries, as NatsOptions documents (#268): with reconnect enabled,
+     * a recovery reached via the read-error path makes NO attempt and ends the connection as with reconnect off,
+     * with "Reconnect is disabled" and the read's error as its cause. It used to make max(1, 0) = 1 attempt.
      */
-    public function testPerformRecoveryMakesAtLeastOneAttemptWhenMaxIsZero(): void
+    public function testPerformRecoveryMakesNoAttemptWhenMaxIsZero(): void
     {
         $reconnectConnects = 0;
         $transport = new class ($reconnectConnects) implements TransportInterface {
@@ -951,19 +951,24 @@ final class NatsConnection_3MutationTest extends TestCase
         ));
         $connection->connect()->await();
 
+        $error = null;
         try {
-            $connection->processIncoming()->await(); // read throws -> recovery
-        } catch (ConnectionException) {
-            // expected: exhausted
+            $connection->processIncoming()->await(); // read throws -> recovery ends the connection
+        } catch (ConnectionException $e) {
+            $error = $e;
         }
 
-        // kills DecrementInteger @ 1240: real performs max(1, 0) = 1 reconnect attempt; the mutant
-        // (max(0, 0) = 0) performs ZERO attempts.
-        self::assertSame(1, $reconnectConnects);
+        // kills the GreaterThan / GreaterThanOrEqualTo mutants of reconnectsAfterLoss(): with `>= 0` (or the
+        // attempt count left out) the recovery dials once more, as it did before #268.
+        self::assertSame(0, $reconnectConnects);
+        self::assertSame(ConnectionState::Closed, $connection->state());
+        self::assertInstanceOf(ConnectionException::class, $error);
+        self::assertSame('Reconnect is disabled', $error->getMessage());
+        self::assertInstanceOf(TransportClosedException::class, $error->getPrevious());
     }
 
     /**
-     * performRecovery uses EXACTLY max(1, maxReconnectAttempts) attempts: with maxReconnectAttempts=1
+     * performRecovery uses EXACTLY maxReconnectAttempts attempts: with maxReconnectAttempts=1
      * and every reconnect failing, precisely one reconnect attempt is made before giving up.
      */
     public function testPerformRecoveryAttemptCountIsExactWhenMaxIsOne(): void

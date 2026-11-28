@@ -11,10 +11,16 @@ use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\Enum\NoRespondersCause;
+use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\ReconnectingTransport;
 use IDCT\NATS\Tests\Support\ReconnectScenarios;
+use IDCT\NATS\Tests\Support\SpinBreakingTransport;
+use IDCT\NATS\Tests\Support\WatchedTransport;
 use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
+use Revolt\EventLoop;
+
+use function Amp\delay;
 
 /**
  * JetStreamContext::diagnoseNoResponders(): why a pull ended with status 503 (no responders), told by a CONSUMER.INFO
@@ -39,6 +45,11 @@ final class DiagnoseNoRespondersTest extends TestCase
     private const CONSUMER = '{"type":"io.nats.jetstream.api.v1.consumer_info_response","stream_name":"ORDERS","name":"worker","config":{"durable_name":"worker","ack_policy":"explicit"}}';
 
     private const LAME_DUCK_INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true,"ldm":true}' . "\r\n";
+
+    /** Lame duck mode with another server to fail over to: a client with reconnect on moves to it. */
+    private const LAME_DUCK_INFO_WITH_ANOTHER_SERVER = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n";
+
+    private const REFUSAL = "-ERR 'Permissions Violation for Publish to \"" . self::QUESTION . "\"'\r\n";
 
     protected function tearDown(): void
     {
@@ -323,6 +334,255 @@ final class DiagnoseNoRespondersTest extends TestCase
         self::assertSame([1], self::questionsPerSession($transport, 1));
     }
 
+    /**
+     * A user allowed to pull but not to ask for consumer info: the server refuses the question at once, with a
+     * permissions violation, which client 2.30.0 reads as soon as it comes. On a connection that stays that is still
+     * NoAnswer at the timeout, not at the refusal: the refusal comes from a server going away as well.
+     */
+    #[DataProvider('reconnectModes')]
+    public function testAQuestionTheServerRefusesOnAConnectionThatStaysIsNoAnswerAtItsTimeout(bool $reconnect): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: $reconnect);
+        $transport->responder = self::refusing();
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', 300)->await();
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::NoAnswer, $cause);
+        self::assertGreaterThan(0.25, $elapsed, sprintf('the diagnosis ended after %.3f s, at the refusal, before its 0.3 s timeout', $elapsed));
+        self::assertLessThan(2.5, $elapsed, sprintf('the diagnosis took %.3f s: not the 0.3 s it was given', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame([1], self::questionsPerSession($transport, 1));
+    }
+
+    /** @return iterable<string, array{\Closure(ReconnectingTransport): void}> */
+    public static function serversGoingAwayAfterTheRefusal(): iterable
+    {
+        yield 'lame duck mode, announced after the refusal' => [static function (ReconnectingTransport $transport): void {
+            $transport->pushFrame(self::LAME_DUCK_INFO);
+        }];
+        yield 'a graceful stop, which closes the connection after the refusal' => [static function (ReconnectingTransport $transport): void {
+            $transport->dropConnection();
+        }];
+    }
+
+    /**
+     * The same user on a server going away: the refusal comes at once, and the server announces lame duck mode or
+     * closes the connection 150 ms later. The connection is watched, and read, after the refusal: ServerGoingAway,
+     * long before the 30 s timeout. Reading the refusal as NoAnswer at once, as client 2.30.0's first form did, read
+     * the 503 of a server going away as a missing consumer (ideaconnect/symfony-nats-messenger#106).
+     *
+     * @param \Closure(ReconnectingTransport): void $goAway
+     */
+    #[DataProvider('serversGoingAwayAfterTheRefusal')]
+    public function testAQuestionTheServerRefusesBeforeItGoesAwayIsServerGoingAway(\Closure $goAway): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: false, requestTimeoutMs: 30_000);
+        $transport->responder = self::refusing();
+        $transport->afterWrite = static function (string $bytes) use ($transport, $goAway): void {
+            if (str_contains($bytes, ' ' . self::QUESTION . ' ')) {
+                EventLoop::delay(0.15, static fn() => $goAway($transport));
+            }
+        };
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker')->await();
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::ServerGoingAway, $cause);
+        self::assertGreaterThan(0.1, $elapsed, sprintf('the diagnosis ended after %.3f s, before the server went away', $elapsed));
+        self::assertLessThan(2.5, $elapsed, sprintf('the diagnosis took %.3f s, with a 30 s timeout', $elapsed));
+    }
+
+    /** @return iterable<string, array{\Closure(ReconnectingTransport): void}> */
+    public static function serversGoingAwayWhileTheNextDialIsHeld(): iterable
+    {
+        yield 'the server closes the connection' => [static function (ReconnectingTransport $transport): void {
+            $transport->dropConnection();
+        }];
+        yield 'lame duck mode, with another server to fail over to' => [static function (ReconnectingTransport $transport): void {
+            $transport->pushFrame(self::LAME_DUCK_INFO_WITH_ANOTHER_SERVER);
+        }];
+    }
+
+    /**
+     * The same user with reconnect on, and the dial of the next server held: 150 ms after the refusal the server
+     * closes the connection, or announces lame duck mode naming another server. The watch's read meets it first and
+     * runs the reconnect, or the failover, itself, waiting for all of it; the watch goes on looking at the connection
+     * every 20 ms while that read is in flight, and the cause is ServerGoingAway while the dial is still held, the client
+     * Connecting, long before the 30 s timeout. The reconnect goes on without the watch, and the question is not asked
+     * again on the new connection. In 2.30.0 the watch awaited that read, and so returned only once the reconnect was
+     * over (#257): here only after the dial's release, which the test makes only once the diagnosis has returned.
+     *
+     * @param \Closure(ReconnectingTransport): void $goAway
+     */
+    #[DataProvider('serversGoingAwayWhileTheNextDialIsHeld')]
+    public function testARefusedQuestionIsServerGoingAwayWhileTheReconnectItsWatchStartedIsStillDialling(\Closure $goAway): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: true, requestTimeoutMs: 30_000);
+        $transport->responder = self::refusing();
+        $transport->holdNextDial();
+        $this->resources()->onRelease($transport->releaseDial(...), 'held dial of the next server');
+        $transport->afterWrite = static function (string $bytes) use ($transport, $goAway): void {
+            if ($transport->epoch() === 0 && str_contains($bytes, ' ' . self::QUESTION . ' ')) {
+                EventLoop::delay(0.15, static fn() => $goAway($transport));
+            }
+        };
+
+        $start = hrtime(true);
+        $diagnosis = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker');
+        $this->waitUntil(static fn(): bool => $diagnosis->isComplete(), 2.5);
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::ServerGoingAway, $diagnosis->await());
+        self::assertGreaterThan(0.1, $elapsed, sprintf('the diagnosis ended after %.3f s, before the server went away', $elapsed));
+        self::assertSame(ConnectionState::Connecting, $client->state(), 'the dial of the next server is still held');
+        self::assertCount(2, $transport->connectCalls, 'the reconnect is dialling the next server');
+
+        $transport->releaseDial();
+        $this->waitUntilOpen($client);
+        self::assertSame([1, 0], self::questionsPerSession($transport, 2));
+        $this->waitUntil(static fn(): bool => self::waitingRequests($client) === []);
+    }
+
+    /**
+     * The reconnect that the watch's read runs gives up once the watch has returned: the dial of the next server is
+     * refused when it is let go, and the client has one attempt. The read then fails ("Reconnect attempts exhausted")
+     * with no one awaiting it any more, and the failure is not reported as an unhandled one: the client is Closed, and
+     * nothing reaches the event loop. A guard: it passes without the watch's explicit ignore() of that read too, since
+     * Amp counts a future awaited once as handled, and the watch awaits each read it starts.
+     */
+    public function testAReconnectThatTheWatchsReadStartedMayFailAfterTheWatchHasReturned(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: true, requestTimeoutMs: 30_000, maxReconnectAttempts: 1);
+        $transport->responder = self::refusing();
+        $transport->holdNextDial();
+        $this->resources()->onRelease($transport->releaseDial(...), 'held dial of the next server');
+        $transport->afterWrite = static function (string $bytes) use ($transport): void {
+            if ($transport->epoch() === 0 && str_contains($bytes, ' ' . self::QUESTION . ' ')) {
+                EventLoop::delay(0.15, static fn() => $transport->dropConnection());
+            }
+        };
+
+        $diagnosis = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker');
+        $this->waitUntil(static fn(): bool => $diagnosis->isComplete(), 2.5);
+        self::assertSame(NoRespondersCause::ServerGoingAway, $diagnosis->await());
+        $stateThen = $client->state();
+        self::assertSame(ConnectionState::Connecting, $stateThen);
+
+        $transport->refuseDials();
+        $transport->releaseDial();
+        $this->waitUntil(static fn(): bool => $client->state() === ConnectionState::Closed);
+        unset($diagnosis);
+        gc_collect_cycles();
+        delay(0.01);
+        self::assertSame([1], self::questionsPerSession($transport, 1));
+    }
+
+    /**
+     * The application closes the client while the watch waits, with a close that takes 0.3 s (a TLS or WebSocket close
+     * handshake): ServerGoingAway at the next look, and the watch's read of the socket, still waiting, ends with the
+     * watch rather than at the question's 30 s timeout or once the close is over. A guard of the read kept across the
+     * looks: 2.30.0, whose read lasted one look, passes it as well.
+     */
+    public function testTheWatchsReadOfTheSocketEndsWithTheWatch(): void
+    {
+        $inner = new ReconnectingTransport();
+        $transport = new WatchedTransport($inner);
+        $client = new NatsClient(new NatsOptions(
+            connectTimeoutMs: 500,
+            requestTimeoutMs: 30_000,
+            reconnectEnabled: false,
+            pingIntervalSeconds: 0,
+        ), $transport);
+        $this->opened[] = $this->own($client);
+        $client->connect()->await();
+        $inner->responder = self::refusing();
+        $inner->closeDelay = 0.3;
+
+        $diagnosis = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker');
+        $this->waitUntil(static fn(): bool => self::questionsPerSession($inner, 1) === [1] && $transport->readsUnderWay === 1);
+        $close = $client->disconnect();
+
+        self::assertSame(NoRespondersCause::ServerGoingAway, $diagnosis->await());
+        $this->waitUntil(static fn(): bool => $transport->readsUnderWay === 0 || $close->isComplete());
+        self::assertFalse($close->isComplete(), 'the watch\'s read was still waiting on the socket when the close was over');
+        self::assertSame(1, $transport->cancelledReads);
+        $close->await();
+        self::assertSame(ConnectionState::Closed, $client->state());
+    }
+
+    /**
+     * The refused question on a connection that stays, and 50 ms later an -ERR that fails the read that brings it and
+     * keeps the connection open (`Invalid Publish Subject`, for another publish of the application): the watch's read
+     * fails, the connection is still there, and the watch goes on until the question's 0.3 s are over: NoAnswer, the
+     * connection Open. A watch that took the failed read for the connection gone would make it ServerGoingAway at once.
+     */
+    public function testAFailedReadOfTheWatchOnAConnectionThatStaysIsStillNoAnswerAtItsTimeout(): void
+    {
+        $transport = new ReconnectingTransport();
+        $client = $this->client($transport, reconnect: false);
+        $transport->responder = self::refusing();
+        $transport->afterWrite = static function (string $bytes) use ($transport): void {
+            if (str_contains($bytes, ' ' . self::QUESTION . ' ')) {
+                EventLoop::delay(0.05, static fn() => $transport->pushFrame("-ERR 'Invalid Publish Subject'\r\n"));
+            }
+        };
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', 300)->await();
+        $elapsed = $this->secondsSince($start);
+
+        self::assertSame(NoRespondersCause::NoAnswer, $cause);
+        self::assertGreaterThan(0.25, $elapsed, sprintf('the diagnosis ended after %.3f s, before its 0.3 s timeout', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state());
+        self::assertSame([1], self::questionsPerSession($transport, 1));
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function idleReads(): iterable
+    {
+        yield 'an idle read that waits, as a socket\'s does' => [true];
+        yield 'an idle read that returns at once' => [false];
+    }
+
+    /**
+     * The refused question on a connection that stays, over a transport whose idle read waits and over one whose idle
+     * read returns '' at once, as the read contract allows (TransportInterface::readLine()): NoAnswer at the 0.3 s
+     * timeout either way. The watch pauses 1 ms after a read that consumed nothing, as the client's other wait loops
+     * do. In 2.30.0 it read again at once, and over the second transport it spun at full CPU with no timer of the
+     * process firing, its own timeout included, and never returned (#256). The reads are counted, not timed: past
+     * 10,000 the transport pauses each read (tests/Support/SpinBreakingTransport.php), so that a watch that spins ends
+     * at its timeout too, with a count far above what a watch that pauses makes.
+     */
+    #[DataProvider('idleReads')]
+    public function testARefusedQuestionOnAConnectionThatStaysIsNoAnswerAtItsTimeoutWhateverAnIdleReadDoes(bool $idleReadWaits): void
+    {
+        $fake = new FakeTransport([ReconnectingTransport::INFO, "PONG\r\n"], $idleReadWaits);
+        $fake->onWrite = static fn(string $bytes): array => str_contains($bytes, 'PUB ' . self::QUESTION . ' ') ? [self::REFUSAL] : [];
+        $transport = new SpinBreakingTransport($fake, 10_000);
+        $client = new NatsClient(new NatsOptions(requestTimeoutMs: self::BUDGET_MS, pingIntervalSeconds: 0), $transport);
+        $this->opened[] = $this->own($client);
+        $client->connect()->await();
+        $readsBefore = $transport->reads;
+
+        $start = hrtime(true);
+        $cause = $client->jetStream()->diagnoseNoResponders('ORDERS', 'worker', 300)->await();
+        $elapsed = $this->secondsSince($start);
+        $reads = $transport->reads - $readsBefore;
+
+        self::assertSame(NoRespondersCause::NoAnswer, $cause);
+        self::assertLessThan(1_000, $reads, sprintf('%d reads of the socket in %.3f s: the watch spins on idle reads', $reads, $elapsed));
+        self::assertGreaterThan(0.25, $elapsed, sprintf('the diagnosis ended after %.3f s, before its 0.3 s timeout', $elapsed));
+        self::assertLessThan(2.5, $elapsed, sprintf('the diagnosis took %.3f s: not the 0.3 s it was given', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state());
+    }
+
     /** @return iterable<string, array{string, string}> */
     public static function invalidNames(): iterable
     {
@@ -380,13 +640,13 @@ final class DiagnoseNoRespondersTest extends TestCase
     /**
      * @param (\Closure(ConnectionEvent, ?\Throwable): void)|null $connectionListener
      */
-    private function client(ReconnectingTransport $transport, bool $reconnect, int $requestTimeoutMs = self::BUDGET_MS, ?\Closure $connectionListener = null): NatsClient
+    private function client(ReconnectingTransport $transport, bool $reconnect, int $requestTimeoutMs = self::BUDGET_MS, ?\Closure $connectionListener = null, int $maxReconnectAttempts = 1_000): NatsClient
     {
         $client = new NatsClient(new NatsOptions(
             connectTimeoutMs: 500,
             requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: $reconnect,
-            maxReconnectAttempts: 1_000,
+            maxReconnectAttempts: $maxReconnectAttempts,
             reconnectDelayMs: 5,
             reconnectMaxDelayMs: 20,
             reconnectJitterMs: 0,
@@ -415,6 +675,17 @@ final class DiagnoseNoRespondersTest extends TestCase
 
             return $transport->replyFrame($replyTo, $answer);
         };
+    }
+
+    /**
+     * Refuses the question, as nats-server refuses a user who may not publish to its subject: an -ERR, and the connection
+     * kept open.
+     *
+     * @return \Closure(string, ?string, string): list<string>
+     */
+    private static function refusing(): \Closure
+    {
+        return static fn(string $subject): array => $subject === self::QUESTION ? [self::REFUSAL] : [];
     }
 
     /** Drops the connection right after the question was written on session $epoch, before any answer. */

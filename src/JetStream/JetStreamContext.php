@@ -11,6 +11,7 @@ use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
+use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -18,8 +19,10 @@ use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Exception\TimeoutException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Consumers\PullConsumerIterator;
@@ -75,15 +78,6 @@ final class JetStreamContext
     private const NO_RESPONDERS_LOOK_SECONDS = 0.02;
 
     /**
-     * Creates a JetStream API context bound to a NATS client.
-      *
-      * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
-      * @param int $publishRetryAttempts Max publish attempts when the JetStream API momentarily has no
-      *                                  responder (503). 1 disables retry. Only 503s are retried - a real
-      *                                  publish error (precondition mismatch, bad subject) is not.
-      * @param int $publishRetryWaitMs Delay between publish retry attempts, in milliseconds.
-     */
-    /**
      * Stop closures for live ordered consumers, keyed by the INITIAL deliver sid each
      * {@see subscribeOrderedConsumer()} call returned. Recreates rotate the actual deliver sid, so
      * the returned sid alone goes stale after the first rotation; the registered closure resolves
@@ -94,11 +88,58 @@ final class JetStreamContext
      */
     private array $orderedStops = [];
 
+    /**
+     * The prefix of every JetStream API subject this context sends a request to (#273): `$JS.API.` by default,
+     * `$JS.<domain>.API.` for a JetStream domain, or the prefix given directly (an account's import of another
+     * account's JetStream API). Resolved by {@see JetStreamApi::resolvePrefix()}.
+     */
+    private readonly string $apiPrefix;
+
+    /**
+     * Creates a JetStream API context bound to a NATS client.
+     *
+     * @param NatsClient $client Connected NATS client used to issue JetStream API request/reply calls.
+     * @param int $publishRetryAttempts Max publish attempts when the JetStream API momentarily has no
+     *                                  responder (503). 1 disables retry. Only 503s are retried - a real
+     *                                  publish error (precondition mismatch, bad subject) is not.
+     * @param int $publishRetryWaitMs Delay between publish retry attempts, in milliseconds.
+     * @param string|null $domain JetStream domain to reach (`hub` sends the API requests to `$JS.hub.API.`), as nats.go
+     *                            `jetstream.NewWithDomain()` does: the JetStream of a hub seen from a leaf node, or
+     *                            the JetStream of a leaf node seen from the hub. Null = no domain.
+     * @param string|null $apiPrefix JetStream API prefix to send the API requests to, as nats.go
+     *                               `jetstream.NewWithAPIPrefix()` does: the subject an account imports another
+     *                               account's `$JS.API.>` under. A trailing `.` is added when missing. Null = the
+     *                               default `$JS.API.`. A domain and a prefix together are refused.
+     * @throws JetStreamException When the domain or the prefix is invalid, or both are given.
+     */
     public function __construct(
         private readonly NatsClient $client,
         private readonly int $publishRetryAttempts = 3,
         private readonly int $publishRetryWaitMs = 250,
-    ) {}
+        ?string $domain = null,
+        ?string $apiPrefix = null,
+    ) {
+        $this->apiPrefix = JetStreamApi::resolvePrefix($domain, $apiPrefix);
+    }
+
+    /**
+     * Returns the prefix of the JetStream API subjects this context sends its requests to: `$JS.API.` by default,
+     * `$JS.<domain>.API.` for a domain, or the API prefix the context was made with (always ending with `.`).
+     */
+    public function apiPrefix(): string
+    {
+        return $this->apiPrefix;
+    }
+
+    /**
+     * Returns a JetStream API subject (a {@see JetStreamApi} constant, plus its tokens) as this context sends it: the
+     * leading `$JS.API.` replaced by the context's {@see apiPrefix()}. The KV and Object Store buckets of the context
+     * build their own API requests with it.
+     */
+    public function apiSubject(string $subject): string
+    {
+        return JetStreamApi::withPrefix($subject, $this->apiPrefix);
+    }
 
     /**
      * Returns a fluent pull-consumer iterator builder.
@@ -139,7 +180,7 @@ final class JetStreamContext
     public function accountInfo(): Future
     {
         return async(function (): AccountInfo {
-            $payload = $this->requestJson(JetStreamApi::ACCOUNT_INFO, []);
+            $payload = $this->requestJson($this->apiSubject(JetStreamApi::ACCOUNT_INFO), []);
 
             return AccountInfo::fromArray($payload);
         });
@@ -267,6 +308,15 @@ final class JetStreamContext
     /**
      * Creates or updates a stream using a minimal configuration payload.
      *
+     * Version-gated `$options` (the config fields of {@see FeatureSupport::REQUIREMENTS}, e.g.
+     * `allow_msg_ttl` 2.11+, `allow_msg_counter` 2.12+) set to anything but their default fail with an
+     * UnsupportedFeatureException against a server too old for them: before the request when the
+     * connected server's version is known to be older, after it when the server's reply does not
+     * confirm the field (the returned config lacks it, or the reply carries no config), since an older
+     * server drops a field it does not know instead of rejecting it (#266). A negative
+     * `subject_delete_marker_ttl` is invalid rather than off, so it counts as a request for the feature.
+     * The same holds for {@see addStream()} and {@see updateStream()}.
+     *
      * @param list<string> $subjects
      * @param array<string,mixed> $options Additional stream config fields.
      * @return Future<StreamInfo>
@@ -290,9 +340,7 @@ final class JetStreamContext
                 'subjects' => $subjects,
             ]);
 
-            $response = $this->requestJson(JetStreamApi::STREAM_CREATE_PREFIX . $name, $payload);
-
-            return StreamInfo::fromArray($response);
+            return $this->requestStreamChange($this->apiSubject(JetStreamApi::STREAM_CREATE_PREFIX) . $name, $name, $payload);
         });
     }
 
@@ -306,11 +354,11 @@ final class JetStreamContext
     {
         self::assertValidJsName($config->name(), 'stream');
 
-        return async(function () use ($config): StreamInfo {
-            $response = $this->requestJson(JetStreamApi::STREAM_CREATE_PREFIX . $config->name(), $config->toArray());
-
-            return StreamInfo::fromArray($response);
-        });
+        return async(fn(): StreamInfo => $this->requestStreamChange(
+            $this->apiSubject(JetStreamApi::STREAM_CREATE_PREFIX) . $config->name(),
+            $config->name(),
+            $config->toArray(),
+        ));
     }
 
     /**
@@ -326,9 +374,7 @@ final class JetStreamContext
         return async(function () use ($name, $config): StreamInfo {
             $payload = array_merge($config, ['name' => $name]);
 
-            $response = $this->requestJson(JetStreamApi::STREAM_UPDATE_PREFIX . $name, $payload);
-
-            return StreamInfo::fromArray($response);
+            return $this->requestStreamChange($this->apiSubject(JetStreamApi::STREAM_UPDATE_PREFIX) . $name, $name, $payload);
         });
     }
 
@@ -383,7 +429,7 @@ final class JetStreamContext
         return async(function () use ($subjectFilter): array {
             $body = $subjectFilter !== null && $subjectFilter !== '' ? ['subject' => $subjectFilter] : [];
 
-            return $this->paginateList(JetStreamApi::STREAM_NAMES, $body, static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::STREAM_NAMES), $body, static function (array $response): array {
                 $raw = $response['streams'] ?? null;
 
                 return is_array($raw) ? array_values(array_filter($raw, 'is_string')) : [];
@@ -401,7 +447,7 @@ final class JetStreamContext
         self::assertValidJsName($name, 'stream');
 
         return async(function () use ($name): StreamInfo {
-            $response = $this->requestJson(JetStreamApi::STREAM_INFO_PREFIX . $name, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_INFO_PREFIX) . $name, []);
 
             return StreamInfo::fromArray($response);
         });
@@ -417,7 +463,7 @@ final class JetStreamContext
         self::assertValidJsName($name, 'stream');
 
         return async(function () use ($name): bool {
-            $response = $this->requestJson(JetStreamApi::STREAM_DELETE_PREFIX . $name, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_DELETE_PREFIX) . $name, []);
 
             return (bool) ($response['success'] ?? false);
         });
@@ -434,7 +480,7 @@ final class JetStreamContext
         self::assertValidJsName($name, 'stream');
 
         return async(function () use ($name, $options): array {
-            $response = $this->requestJson(JetStreamApi::STREAM_PURGE_PREFIX . $name, $options);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_PURGE_PREFIX) . $name, $options);
 
             return ['purged' => (int) ($response['purged'] ?? 0)];
         });
@@ -449,7 +495,7 @@ final class JetStreamContext
     public function listStreams(array $options = []): Future
     {
         return async(function () use ($options): array {
-            return $this->paginateList(JetStreamApi::STREAM_LIST, $options, static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::STREAM_LIST), $options, static function (array $response): array {
                 $raw = $response['streams'] ?? null;
                 $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
@@ -468,7 +514,7 @@ final class JetStreamContext
         self::assertValidJsName($stream, 'stream');
 
         return async(function () use ($stream): array {
-            return $this->paginateList(JetStreamApi::CONSUMER_LIST_PREFIX . $stream, [], static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::CONSUMER_LIST_PREFIX) . $stream, [], static function (array $response): array {
                 $raw = $response['consumers'] ?? null;
                 $arrays = is_array($raw) ? array_values(array_filter($raw, 'is_array')) : [];
 
@@ -488,7 +534,7 @@ final class JetStreamContext
 
         return async(function () use ($stream, $seq): NatsMessage {
             $response = $this->requestJson(
-                JetStreamApi::STREAM_MSG_GET_PREFIX . $stream,
+                $this->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $stream,
                 ['seq' => $seq],
             );
 
@@ -514,7 +560,7 @@ final class JetStreamContext
             }
 
             $response = $this->requestJson(
-                JetStreamApi::STREAM_MSG_GET_PREFIX . $stream,
+                $this->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $stream,
                 ['last_by_subj' => $subject],
             );
 
@@ -582,7 +628,7 @@ final class JetStreamContext
                 $body['no_erase'] = true;
             }
 
-            $response = $this->requestJson(JetStreamApi::STREAM_MSG_DELETE_PREFIX . $stream, $body);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_MSG_DELETE_PREFIX) . $stream, $body);
 
             return (bool) ($response['success'] ?? false);
         });
@@ -634,7 +680,7 @@ final class JetStreamContext
             $json = json_encode($body, JSON_THROW_ON_ERROR);
 
             try {
-                $message = $this->client->request(JetStreamApi::STREAM_DIRECT_GET_PREFIX . $stream, $json)->await();
+                $message = $this->client->request($this->apiSubject(JetStreamApi::STREAM_DIRECT_GET_PREFIX) . $stream, $json)->await();
             } catch (JetStreamException $e) {
                 throw $e;
             } catch (NatsException $e) {
@@ -844,7 +890,7 @@ final class JetStreamContext
             // max_payload. Keep the flags here and there identical - adding e.g. JSON_UNESCAPED_SLASHES
             // to one but not the other would make that budget under-count and let a chunk overflow.
             $json = json_encode($body, JSON_THROW_ON_ERROR);
-            $subject = JetStreamApi::STREAM_DIRECT_GET_PREFIX . $stream;
+            $subject = $this->apiSubject(JetStreamApi::STREAM_DIRECT_GET_PREFIX) . $stream;
             $inbox = Inbox::generate('_INBOX.JS.DGET');
 
             $budget = new BatchReadBudget($expiresMs + 1000, rolling: true);
@@ -1005,7 +1051,10 @@ final class JetStreamContext
      * Creates or updates a durable consumer for a stream.
      *
      * Version-gated `$options`: `filter_subjects` requires NATS 2.10+, `priority_groups`/
-     * `priority_policy` require 2.11+. An older server rejects these with an UnsupportedFeatureException.
+     * `priority_policy` require 2.11+. Against an older server the call fails with an
+     * UnsupportedFeatureException: before the request when the server's version is known to be older,
+     * after it when the server's reply does not confirm the field (the returned config lacks it, or the
+     * reply carries no config; an older server drops the field, #266).
      *
      * @param array<string,mixed> $options Additional consumer config fields (max_deliver, ack_wait, etc.).
      * @return Future<ConsumerInfo>
@@ -1021,12 +1070,11 @@ final class JetStreamContext
             $config = $this->applyFilterSubjects($config, $filterSubject);
             $this->assertValidPriorityConfig($config);
 
-            $response = $this->requestJson(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
-                ['stream_name' => $stream, 'config' => $config],
+            return $this->requestConsumerChange(
+                $this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream . '.' . $consumer,
+                $stream,
+                $config,
             );
-
-            return ConsumerInfo::fromArray($response);
         });
     }
 
@@ -1046,11 +1094,9 @@ final class JetStreamContext
 
         return async(function () use ($stream, $config): ConsumerInfo {
             $name = $config->getName();
-            $subject = JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . ($name !== null ? '.' . $name : '');
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream . ($name !== null ? '.' . $name : '');
 
-            $response = $this->requestJson($subject, ['stream_name' => $stream, 'config' => $config->toArray()]);
-
-            return ConsumerInfo::fromArray($response);
+            return $this->requestConsumerChange($subject, $stream, $config->toArray());
         });
     }
 
@@ -1081,7 +1127,7 @@ final class JetStreamContext
         self::assertValidJsName($stream, 'stream');
 
         return async(function () use ($stream): array {
-            return $this->paginateList(JetStreamApi::CONSUMER_NAMES_PREFIX . $stream, [], static function (array $response): array {
+            return $this->paginateList($this->apiSubject(JetStreamApi::CONSUMER_NAMES_PREFIX) . $stream, [], static function (array $response): array {
                 $raw = $response['consumers'] ?? null;
 
                 return is_array($raw) ? array_values(array_filter($raw, 'is_string')) : [];
@@ -1104,12 +1150,7 @@ final class JetStreamContext
             $config = $this->applyFilterSubjects($config, $filterSubject);
             $this->assertValidPriorityConfig($config);
 
-            $response = $this->requestJson(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream,
-                ['stream_name' => $stream, 'config' => $config],
-            );
-
-            return ConsumerInfo::fromArray($response);
+            return $this->requestConsumerChange($this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream, $stream, $config);
         });
     }
 
@@ -1135,12 +1176,11 @@ final class JetStreamContext
             $config['deliver_subject'] = $deliverSubject;
             $config = $this->applyFilterSubjects($config, $filterSubject);
 
-            $response = $this->requestJson(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream . '.' . $consumer,
-                ['stream_name' => $stream, 'config' => $config],
+            return $this->requestConsumerChange(
+                $this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream . '.' . $consumer,
+                $stream,
+                $config,
             );
-
-            return ConsumerInfo::fromArray($response);
         });
     }
 
@@ -1171,12 +1211,7 @@ final class JetStreamContext
                 $config['inactive_threshold'] = self::EPHEMERAL_INACTIVE_THRESHOLD_NS;
             }
 
-            $response = $this->requestJson(
-                JetStreamApi::CONSUMER_CREATE_PREFIX . $stream,
-                ['stream_name' => $stream, 'config' => $config],
-            );
-
-            return ConsumerInfo::fromArray($response);
+            return $this->requestConsumerChange($this->apiSubject(JetStreamApi::CONSUMER_CREATE_PREFIX) . $stream, $stream, $config);
         });
     }
 
@@ -1234,9 +1269,11 @@ final class JetStreamContext
      * (nats.go ErrConsumerSequenceMismatch parity); a delivery that advances the local sequence
      * re-arms the signal. A sequence REGRESSION (heartbeat or delivery below the tracked max)
      * means the consumer was replaced server-side (delete + recreate resets cseq to 1 - within
-     * one instance cseq only advances, and redeliveries get fresh cseqs), so the tracker REBASES
-     * to the new instance instead of masking its real gaps behind the stale high-water mark
-     * (2nd-round review; nats.go fires on any ldseq != dseq).
+     * one instance cseq only advances, and redeliveries get fresh cseqs) or reset (ADR-60
+     * `$JS.API.CONSUMER.RESET`, by this client's {@see resetConsumer()} or by another one: cseq
+     * starts again at 1 too), so the tracker REBASES to the new numbering instead of masking its
+     * real gaps behind the stale high-water mark (2nd-round review; nats.go fires on any
+     * ldseq != dseq). Delivery goes on either way.
      *
      * @param callable(NatsMessage):void $handler
      * @return \Closure(NatsMessage):void
@@ -1278,7 +1315,7 @@ final class JetStreamContext
                             // this instance is >= the rebased value) - and re-arm the gap signal so
                             // a real gap in the NEW instance is reported against ITS numbering.
                             $this->emitClientError(new JetStreamException(sprintf(
-                                'Push consumer %s on stream "%s": consumer sequence mismatch - the server reports last delivered sequence %d below the %d already seen this session; the consumer appears to have been replaced (sequence regressed), rebasing gap detection to the new instance (ADR-9)',
+                                'Push consumer %s on stream "%s": consumer sequence mismatch - the server reports last delivered sequence %d below the %d already seen this session; the consumer appears to have been replaced or reset (sequence regressed), rebasing gap detection to the new instance (ADR-9)',
                                 $consumerLabel,
                                 $stream,
                                 $lastDelivered,
@@ -1805,10 +1842,15 @@ final class JetStreamContext
                     // check needs no per-frame consumer-name scoping (#122). If the server delivered
                     // past what we processed in order, deliveries at the tail were missed and no
                     // further message will expose the gap on its own; recreate proactively from the
-                    // last in-order point (#86). The headers were already parsed by
-                    // handlePushControlMessage (out-param) - do not re-parse the block (#139).
+                    // last in-order point (#86). A report BELOW it is what a reset of the consumer
+                    // produces (ADR-60 `$JS.API.CONSUMER.RESET`, e.g. from the CLI: the consumer
+                    // sequence starts again at 1): recreate from the last in-order point as well,
+                    // since a reset forward past the stream's tail would otherwise hold every new
+                    // message back until the stream reached the reset sequence. The headers were
+                    // already parsed by handlePushControlMessage (out-param) - do not re-parse the
+                    // block (#139).
                     $lastDelivered = $this->heartbeatLastConsumerSeq($controlHeaders ?? []);
-                    if ($lastDelivered !== null && $lastDelivered > $expectedConsumerSeq - 1) {
+                    if ($lastDelivered !== null && $lastDelivered !== $expectedConsumerSeq - 1) {
                         $recreate();
                     }
 
@@ -1852,8 +1894,9 @@ final class JetStreamContext
                 }
 
                 if ($metadata->consumerSequence !== $expectedConsumerSeq) {
-                    // A push was missed (the consumer delivery sequence skipped): recreate just after
-                    // the last in-order message and DISCARD this out-of-order message.
+                    // A push was missed (the consumer delivery sequence skipped), or the consumer was
+                    // reset (ADR-60: the sequence starts again at 1): recreate just after the last
+                    // in-order message and DISCARD this out-of-order message.
                     $recreate();
 
                     return;
@@ -1990,7 +2033,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(function () use ($stream, $consumer): ConsumerInfo {
-            $response = $this->requestJson(JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::CONSUMER_INFO_PREFIX) . $stream . '.' . $consumer, []);
 
             return ConsumerInfo::fromArray($response);
         });
@@ -2007,7 +2050,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(function () use ($stream, $consumer): bool {
-            $response = $this->requestJson(JetStreamApi::CONSUMER_DELETE_PREFIX . $stream . '.' . $consumer, []);
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::CONSUMER_DELETE_PREFIX) . $stream . '.' . $consumer, []);
 
             return (bool) ($response['success'] ?? false);
         });
@@ -2025,7 +2068,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(fn(): array => $this->requestJson(
-            JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
+            $this->apiSubject(JetStreamApi::CONSUMER_PAUSE_PREFIX) . $stream . '.' . $consumer,
             ['pause_until' => $pauseUntil],
         ));
     }
@@ -2041,7 +2084,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(fn(): array => $this->requestJson(
-            JetStreamApi::CONSUMER_PAUSE_PREFIX . $stream . '.' . $consumer,
+            $this->apiSubject(JetStreamApi::CONSUMER_PAUSE_PREFIX) . $stream . '.' . $consumer,
             [],
         ));
     }
@@ -2063,11 +2106,89 @@ final class JetStreamContext
             }
 
             $response = $this->requestJson(
-                JetStreamApi::CONSUMER_UNPIN_PREFIX . $stream . '.' . $consumer,
+                $this->apiSubject(JetStreamApi::CONSUMER_UNPIN_PREFIX) . $stream . '.' . $consumer,
                 ['group' => $group],
             );
 
             return (bool) ($response['success'] ?? true);
+        });
+    }
+
+    /**
+     * Resets a consumer's delivery state (ADR-60, `$JS.API.CONSUMER.RESET`, NATS server 2.14+), as an
+     * alternative to deleting and recreating it to replay messages or to move past a range that cannot be
+     * processed: the consumer keeps its name, its config and the clients bound to it.
+     *
+     * The pending and redelivery state is dropped and the consumer sequence starts again at 1. Where the
+     * delivery goes on from depends on $sequence:
+     *
+     * - null (an empty request) or 0: just above the consumer's ack floor. Messages delivered but not
+     *   acknowledged are delivered again; acknowledged ones are not.
+     * - above 0: from the first message at or after that stream sequence, backward or forward (a sequence
+     *   past the stream's last message waits for it). The server allows it only for a consumer with
+     *   `deliver_policy` `all`, `by_start_sequence` (not below its `opt_start_seq`) or `by_start_time` (not
+     *   before its `opt_start_time`); anything else is refused with 400 and err_code 10204
+     *   ({@see ApiErrCode::CONSUMER_INVALID_RESET}), thrown as a {@see JetStreamException} carrying both.
+     *
+     * Running consumes keep receiving, with consumer sequences starting again at 1: a pull consume and a
+     * push subscription carry on, and an ordered consumer recreates itself from its last in-order message
+     * ({@see subscribeOrderedConsumer()}), so a reset made by another client (the CLI, an operator) does not
+     * break them either.
+     *
+     * Older servers do not answer the request: on a server advertising a version before 2.14 the call fails
+     * with an {@see UnsupportedFeatureException} (feature `consumer_reset`) before anything is sent; when the
+     * version does not parse, the request is sent and an older server lets it time out. The reset is
+     * answered by the consumer itself, so a consumer or stream that does not exist gets no answer on 2.14
+     * either: the call fails with the request timeout, not with a "consumer not found" error.
+     *
+     * @param int|null $sequence The stream sequence to deliver from; null or 0 resets to the ack floor.
+     * @return Future<ConsumerInfo> The consumer as the reset left it (`delivered`, `ack_floor`, `num_pending`
+     *         in its raw payload), with {@see ConsumerInfo::$resetSequence} set to the stream sequence the next
+     *         delivery starts from.
+     *
+     * @throws JetStreamException When the stream or consumer name is invalid (nothing is sent).
+     * @throws \InvalidArgumentException When $sequence is negative (nothing is sent).
+     */
+    public function resetConsumer(string $stream, string $consumer, ?int $sequence = null): Future
+    {
+        self::assertValidJsName($stream, 'stream');
+        self::assertValidJsName($consumer, 'consumer');
+
+        if ($sequence !== null && $sequence < 0) {
+            throw new \InvalidArgumentException('The sequence of resetConsumer() must not be negative (null or 0 resets the consumer to its ack floor)');
+        }
+
+        return async(function () use ($stream, $consumer, $sequence): ConsumerInfo {
+            $serverVersion = $this->serverVersion();
+            $required = FeatureSupport::REQUIREMENTS['consumer_reset'];
+            if (FeatureSupport::serverIsOlderThan($serverVersion, $required)) {
+                throw new UnsupportedFeatureException(
+                    'consumer_reset',
+                    $required,
+                    $serverVersion,
+                    sprintf(
+                        'Consumer reset requires NATS server %s+; older servers do not answer it (connected server %s; nothing was sent)',
+                        $required,
+                        $serverVersion,
+                    ),
+                );
+            }
+
+            $response = $this->requestJson(
+                $this->apiSubject(JetStreamApi::CONSUMER_RESET_PREFIX) . $stream . '.' . $consumer,
+                $sequence === null ? [] : ['seq' => $sequence],
+            );
+
+            if (!is_array($response['config'] ?? null)) {
+                // nats.go ErrConsumerResetResponseEmpty: an answer that is neither an error nor a consumer.
+                throw new JetStreamException(sprintf(
+                    'The reset reply for consumer "%s" on stream "%s" carries no consumer info: the reset may or may not have taken effect',
+                    $consumer,
+                    $stream,
+                ));
+            }
+
+            return ConsumerInfo::fromArray($response);
         });
     }
 
@@ -2093,10 +2214,16 @@ final class JetStreamContext
      * @param bool $resendOnReconnect Whether the frame goes out once more when the connection it went out on is
      *        replaced before the reply came (#249): a publish() with a Nats-Msg-Id, under
      *        {@see \IDCT\NATS\Connection\NatsOptions::$resendJetStreamPublishOnReconnect}.
+     * @param (\Closure():void)|null $beforeWrite Called before each attempt to write the frame, once the connection it
+     *        goes out on is open (#267, {@see NatsClient::requestWithHeadersGuarded()}); needs $headers.
      */
-    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false): NatsMessage
+    private function jsRequest(string $subject, string $payload, ?array $headers = null, bool $resendOnReconnect = false, ?\Closure $beforeWrite = null): NatsMessage
     {
         try {
+            if ($beforeWrite !== null && $headers !== null) {
+                return $this->client->requestWithHeadersGuarded($subject, $payload, $headers, $beforeWrite)->await();
+            }
+
             if ($resendOnReconnect && $headers !== null) {
                 return $this->client->requestResendingOnReconnect($subject, $payload, $headers, self::isDuplicateMessageInProcess(...))->await();
             }
@@ -2236,18 +2363,33 @@ final class JetStreamContext
     }
 
     /**
-     * Publishes a scheduled message using the NATS 2.12 scheduler headers (ADR-51). The target stream
+     * Publishes a scheduled message using the NATS message scheduler headers (ADR-51). The target stream
      * must be created with `allow_msg_schedules` enabled (and `allow_msg_ttl` when a schedule TTL is
-     * used). The schedule expression may be `@at <RFC3339>`, `@every <duration>`, or a 6-field cron
-     * expression - build it with the {@see Schedule} helper.
+     * used). The schedule expression may be `@at <RFC3339>`, `@every <duration>`, a 6-field cron
+     * expression or a predefined alias (`@daily`, `@hourly`, ...) - build it with the {@see Schedule} helper.
      *
-     * Requires NATS server 2.12+.
+     * Requires NATS server 2.12+ for a one-off `@at` schedule (with an optional TTL), and 2.14+ for
+     * everything else: `@every`, cron and the predefined aliases, and the `$source`, `$timeZone` and
+     * `$rollup` headers. A 2.12 server rejects the recurring patterns with an opaque 400 ("message
+     * schedules pattern is invalid") and ignores the three headers without an error, so when the
+     * INFO-advertised server version parses as older than 2.14 this throws an
+     * {@see \IDCT\NATS\Exception\UnsupportedFeatureException} before anything is published (#267). An
+     * unparseable version (a proxy, a custom build) is published as is, and the server decides. The version is
+     * the one of the server that takes the frame: a call made while the client reconnects waits for the new
+     * connection and is checked against that server, and so is the retry after a failed write.
      *
-     * @param string      $schedule    Schedule expression (@at / @every / cron).
+     * @param string      $schedule    Schedule expression (@at / @every / cron / predefined alias).
      * @param string|null $scheduleTtl Optional Nats-Schedule-TTL (requires `allow_msg_ttl` on the stream).
-     * @param string|null $source      Optional Nats-Schedule-Source identifier.
-     * @param string|null $timeZone    Optional IANA time zone, valid for cron schedules only.
-     * @param bool        $rollup      When true, emits Nats-Schedule-Rollup: sub (one active schedule per subject).
+     * @param string|null $source      Optional Nats-Schedule-Source: a subject (no wildcards) whose last
+     *                                 message the schedule publishes to the target instead of $payload;
+     *                                 $payload and its headers are the fallback when that subject has no
+     *                                 message. The server wants it inside the stream and apart from the
+     *                                 target and the schedule subject (2.14+).
+     * @param string|null $timeZone    Optional IANA time zone, valid for cron schedules only (2.14+).
+     * @param bool        $rollup      When true, emits Nats-Schedule-Rollup: sub, which sets a subject
+     *                                 rollup on the message the schedule produces, so the target subject
+     *                                 keeps only that latest message (2.14+). One schedule per schedule
+     *                                 subject is the scheduler's own rule, with or without it.
      * @return Future<PubAck>
      */
     public function publishScheduled(
@@ -2268,6 +2410,16 @@ final class JetStreamContext
 
             if ($timeZone !== null && $timeZone !== '' && !$this->isCronSchedule($schedule)) {
                 throw new JetStreamException('Nats-Schedule-Time-Zone is only valid for cron schedule expressions');
+            }
+
+            $need = $this->scheduleNeedingANewerServer($schedule, $source, $rollup);
+            // What only a newer server schedules is checked against the server the frame goes to (#267): at once when
+            // the connection is open, so an older server gets nothing at all, and again in the step that writes the
+            // frame, against the INFO of the server that takes it - after a reconnect the call waited for, and before
+            // the retry that follows a failed write. A call made while the client reconnects is not judged by the
+            // INFO of the connection being replaced.
+            if ($need !== null && $this->client->state() === ConnectionState::Open) {
+                $this->refuseOnAnOlderServer($need);
             }
 
             $headers = [
@@ -2291,7 +2443,11 @@ final class JetStreamContext
                 $headers['Nats-Schedule-Rollup'] = 'sub';
             }
 
-            return $this->parsePublishAck($this->jsRequest($scheduleSubject, $payload, $headers));
+            $beforeWrite = $need === null ? null : function () use ($need): void {
+                $this->refuseOnAnOlderServer($need);
+            };
+
+            return $this->parsePublishAck($this->jsRequest($scheduleSubject, $payload, $headers, beforeWrite: $beforeWrite));
         });
     }
 
@@ -2484,7 +2640,7 @@ final class JetStreamContext
 
             $payload = $this->buildPullRequest($batch, $expiresMs, $pull);
 
-            $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_MSG_NEXT_PREFIX) . $stream . '.' . $consumer;
             $json = json_encode($payload, JSON_THROW_ON_ERROR);
 
             $budget = new BatchReadBudget($expiresMs + 1000);
@@ -2740,7 +2896,10 @@ final class JetStreamContext
      *    to - a pull gets the 503 again at once, and this answers ServerGoingAway at once, without asking.
      *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays: a user
      *    allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful
-     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer.
+     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer. The
+     *    server refuses the question of such a user at once, with a permissions violation (read as soon as it comes
+     *    since client 2.30.0), and the connection is then watched until the timeout all the same, as a server going
+     *    away refuses it too: that user still tells a server going away from one that stays.
      *
      * The question waits for its answer only while that connection stays. The client keeps a request waiting for its
      * reply across a reconnect, up to its timeout, but the server that would have answered this one is gone, and an
@@ -2772,8 +2931,10 @@ final class JetStreamContext
                 return NoRespondersCause::ServerGoingAway;
             }
 
-            $subject = JetStreamApi::CONSUMER_INFO_PREFIX . $stream . '.' . $consumer;
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_INFO_PREFIX) . $stream . '.' . $consumer;
             $giveUp = new DeferredCancellation();
+            // The question's own time, which a refusal of it still watches the connection for.
+            $questionTime = new TimeoutCancellation(($timeoutMs ?? $this->client->options()->requestTimeoutMs) / 1000);
             $question = $this->client->request($subject, '{}', $timeoutMs, $giveUp->getCancellation());
 
             while (true) {
@@ -2801,6 +2962,10 @@ final class JetStreamContext
                         return NoRespondersCause::ServerGoingAway;
                     }
 
+                    if ($failure instanceof PermissionViolationException) {
+                        return $this->watchTheConnectionUntil($generation, $questionTime);
+                    }
+
                     return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
                         ? NoRespondersCause::JetStreamError
                         : NoRespondersCause::NoAnswer;
@@ -2825,6 +2990,72 @@ final class JetStreamContext
 
             return NoRespondersCause::ConsumerFound;
         });
+    }
+
+    /**
+     * The cause of a 503 when the question was refused for lack of permission (a user who may pull but not ask for
+     * consumer info): the refusal comes at once, from a server that stays as from one going away, and tells nothing.
+     * So the connection is watched for the rest of the question's time, as while a question waits unanswered: a server
+     * going away closes it or announces lame duck mode, ServerGoingAway; one that stays keeps it, NoAnswer at the
+     * deadline. The watch reads the socket, as the question's wait did, since the client reads it only while something
+     * waits: without a read, neither the close nor the lame duck INFO would be seen. Before client 2.30.0 the refused
+     * question waited out its timeout, which watched the connection the same way.
+     *
+     * It looks at the connection every 20 ms whatever the read does, as the question's wait does, with one read kept in
+     * flight across the looks and bounded by the question's time. The read has no subscription of its own, so no
+     * wake-up, and a read without one that is the first to notice a lost connection, or the lame duck INFO of a server
+     * naming another one, runs the reconnect or the failover itself and waits for all of it
+     * ({@see \IDCT\NATS\Connection\NatsConnection::readIncomingForOperation()}). Awaited only until the next look, it
+     * goes on in its own fiber, the look sees the connection left and the cause is ServerGoingAway, while the client
+     * still reconnects. Awaiting the read itself made the watch return only once the reconnect was over, past the
+     * question's time (#257). A read that consumed nothing is followed by a 1 ms pause, as in the client's other wait
+     * loops: on a transport whose idle read returns at once the watch would otherwise spin, and no timer of the process,
+     * the question's deadline included, would fire again (#256). The read still in flight when the watch returns is
+     * let go of: its wait on the socket, or for a reconnect another fiber runs, ends with the watch, a reconnect or a
+     * failover it runs itself goes on, and what it ends with is nobody's to handle.
+     */
+    private function watchTheConnectionUntil(int $generation, Cancellation $questionTime): NoRespondersCause
+    {
+        $watchEnd = new DeferredCancellation();
+        $readTime = new CompositeCancellation($questionTime, $watchEnd->getCancellation());
+        /** @var Future<IncomingChunkResult>|null $read */
+        $read = null;
+
+        try {
+            while (!$this->connectionLeftSince($generation)) {
+                if ($questionTime->isRequested()) {
+                    return NoRespondersCause::NoAnswer;
+                }
+
+                $read ??= $this->client->readIncomingForOperation($readTime);
+                try {
+                    $result = $read->await(new CompositeCancellation($questionTime, new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS)));
+                } catch (CancelledException) {
+                    // The look came due with the read still in flight, which goes on across the next look, or the
+                    // question's time is over, which ends the read too: look again.
+                    continue;
+                } catch (\Throwable) {
+                    // A read that fails: the connection is gone, which the next look sees, or it stays, and a pause
+                    // keeps the watch from spinning.
+                    $read = null;
+                    delay(self::NO_RESPONDERS_LOOK_SECONDS);
+
+                    continue;
+                }
+
+                $read = null;
+                if (!$result->consumedBytes) {
+                    // Nothing read - an idle transport whose read returns at once, or another fiber's read: yield, so
+                    // that the event loop goes on and the deadlines fire.
+                    delay(0.001);
+                }
+            }
+
+            return NoRespondersCause::ServerGoingAway;
+        } finally {
+            $watchEnd->cancel();
+            $read?->ignore();
+        }
     }
 
     /**
@@ -3075,7 +3306,7 @@ final class JetStreamContext
         self::assertValidJsName($consumer, 'consumer');
 
         return async(function () use ($stream, $consumer, $cfg, $handler, $ctl): int {
-            $subject = JetStreamApi::CONSUMER_MSG_NEXT_PREFIX . $stream . '.' . $consumer;
+            $subject = $this->apiSubject(JetStreamApi::CONSUMER_MSG_NEXT_PREFIX) . $stream . '.' . $consumer;
             $base = Inbox::generate('_INBOX.JS.PULL');
             $prefix = $base . '.';
 
@@ -4508,6 +4739,60 @@ final class JetStreamContext
     }
 
     /**
+     * What of a scheduled publish needs a newer server than the first scheduler release (#267), or null when nothing
+     * does. nats-server 2.12 accepts only `@at` schedules (with Nats-Schedule-TTL and Nats-Schedule-Target): it
+     * rejects `@every`, cron and the predefined aliases with an opaque 400 ("message schedules pattern is invalid"),
+     * and it stores an `@at` schedule while dropping Nats-Schedule-Source and Nats-Schedule-Rollup without an error.
+     * A time zone needs no check of its own: it is only accepted with a cron-class schedule, which this already names.
+     * The pattern is named before the headers.
+     *
+     * @param string $schedule The trimmed expression, already validated.
+     * @return array{string, string, string}|null The feature, what needs it, and what older servers do with it.
+     */
+    private function scheduleNeedingANewerServer(string $schedule, ?string $source, bool $rollup): ?array
+    {
+        return match (true) {
+            $this->isCronSchedule($schedule) => ['schedule_cron', 'The schedule "' . $schedule . '"', 'accept only "@at" schedules'],
+            str_starts_with($schedule, '@every') => ['schedule_every', 'The schedule "' . $schedule . '"', 'accept only "@at" schedules'],
+            $source !== null && $source !== '' => ['schedule_source', 'Nats-Schedule-Source (the source argument)', 'ignore it'],
+            $rollup => ['schedule_rollup', 'Nats-Schedule-Rollup (the rollup argument)', 'ignore it'],
+            default => null,
+        };
+    }
+
+    /**
+     * Fails before anything reaches the wire when the server the client is connected to right now advertises a version
+     * that parses as older than the one $need asks for (#267). An unparseable version (a proxy, a custom build)
+     * publishes as before and leaves the decision to the server. Called by publishScheduled() at once on an open
+     * connection, and in the step that writes the frame, so it reads the INFO of the server that takes it. Does not
+     * suspend.
+     *
+     * @param array{string, string, string} $need What {@see scheduleNeedingANewerServer()} found.
+     */
+    private function refuseOnAnOlderServer(array $need): void
+    {
+        [$feature, $what, $olderServers] = $need;
+        $required = FeatureSupport::REQUIREMENTS[$feature];
+        $serverVersion = $this->serverVersion();
+        if (!FeatureSupport::serverIsOlderThan($serverVersion, $required)) {
+            return;
+        }
+
+        throw new UnsupportedFeatureException(
+            $feature,
+            $required,
+            $serverVersion,
+            sprintf(
+                '%s requires NATS server %s+; older servers %s (connected server %s; nothing was published)',
+                $what,
+                $required,
+                $olderServers,
+                $serverVersion,
+            ),
+        );
+    }
+
+    /**
      * Publishes an ACK protocol token to a message reply subject.
      *
      * Runs inline in the caller's fiber (#136): the only synchronous work is the replyTo guard, so
@@ -5159,12 +5444,72 @@ final class JetStreamContext
     /**
      * Raises a JetStream API error, upgrading it to an {@see \IDCT\NATS\Exception\UnsupportedFeatureException}
      * when the server's response shows the failure is a version-gated feature this server is too old for
-     * (e.g. an `unknown field "allow_atomic"` rejection). Reactive only - no per-request version probe.
+     * (e.g. a strict server's `unknown field "allow_atomic"` rejection).
      */
     private function throwApiError(string $description, int $code, ?int $errCode = null): never
     {
         throw FeatureSupport::unsupportedFromApiError($description, $code, $this->serverVersion(), $errCode)
             ?? new JetStreamException($description, $code, null, $errCode);
+    }
+
+    /**
+     * Sends a stream create or update request and returns the server's answer. A server older than a
+     * version-gated field of $config does not reject the field by default, it drops it (#266), so the
+     * request is refused before it is sent when the connected server's version is too old for such a
+     * field, and fails after it when the server's reply does not confirm the field: the returned config
+     * lacks it, or the reply carries no config ({@see FeatureSupport::assertSupportedBy()},
+     * {@see FeatureSupport::assertHonored()}).
+     *
+     * The pre-flight reads the INFO of the connection when the call is made, not in the step that writes
+     * the frame as {@see publishScheduled()} does (#267): a call made while the client fails over is
+     * checked against the version of the connection being replaced. The reply check covers the direction
+     * that matters, a failover to an older server, which takes the request, drops the field and has its
+     * reply refused (reporting its own version); a failover to a newer server is refused before the
+     * request, and the call can be made again once connected.
+     *
+     * @param array<string,mixed> $config The full request body.
+     */
+    private function requestStreamChange(string $subject, string $name, array $config): StreamInfo
+    {
+        FeatureSupport::assertSupportedBy($config, $this->serverVersion(), 'stream');
+
+        $response = $this->requestJson($subject, $config);
+
+        FeatureSupport::assertHonored(
+            $config,
+            $response['config'] ?? null,
+            $this->serverVersion(),
+            sprintf('stream "%s"', $name),
+        );
+
+        return StreamInfo::fromArray($response);
+    }
+
+    /**
+     * Sends a consumer create (create-or-update) request with the checks of {@see requestStreamChange()}
+     * for the version-gated consumer fields (`filter_subjects`, `priority_*`, #266).
+     *
+     * @param array<string,mixed> $config The consumer config.
+     */
+    private function requestConsumerChange(string $subject, string $stream, array $config): ConsumerInfo
+    {
+        FeatureSupport::assertSupportedBy($config, $this->serverVersion(), 'consumer');
+
+        $response = $this->requestJson($subject, ['stream_name' => $stream, 'config' => $config]);
+
+        // The consumer's name comes from the reply, which describes what exists, else from the request's
+        // durable name; an ephemeral consumer whose reply carries no name is described by its stream.
+        $name = $response['name'] ?? $config['durable_name'] ?? null;
+        FeatureSupport::assertHonored(
+            $config,
+            $response['config'] ?? null,
+            $this->serverVersion(),
+            is_string($name) && $name !== ''
+                ? sprintf('consumer "%s" on stream "%s"', $name, $stream)
+                : sprintf('the consumer on stream "%s"', $stream),
+        );
+
+        return ConsumerInfo::fromArray($response);
     }
 
     /**

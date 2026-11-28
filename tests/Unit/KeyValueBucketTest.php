@@ -1871,7 +1871,7 @@ final class KeyValueBucketTest extends TestCase
      */
     public function testCreateWithSubjectDeleteMarkerTtl(): void
     {
-        $createPayload = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"]}}';
+        $createPayload = '{"config":{"name":"KV_cfg","subjects":["$KV.cfg.>"],"allow_msg_ttl":true,"subject_delete_marker_ttl":3600000000000}}';
 
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",

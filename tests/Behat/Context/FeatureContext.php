@@ -21,6 +21,7 @@ use IDCT\NATS\Core\SubscriptionQueue;
 use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\ProtocolException;
 use IDCT\NATS\Exception\TimeoutException;
 use IDCT\NATS\JetStream\Configuration\Republish;
@@ -57,6 +58,9 @@ final class FeatureContext implements Context
 
     /** @var list<string> */
     private array $createdStreams = [];
+
+    /** @var list<string> Streams made on the username and password server, deleted after the scenario. */
+    private array $userPassStreams = [];
 
     /** @var array<string,Service> */
     private array $services = [];
@@ -131,6 +135,18 @@ final class FeatureContext implements Context
                 }
             }
         }
+
+        // The streams of the permission scenarios are on the username and password server, made by "local-user".
+        $owner = $this->clients['auth'] ?? null;
+        if ($owner !== null) {
+            foreach ($this->userPassStreams as $stream) {
+                try {
+                    $owner->jetStream()->deleteStream($stream)->await();
+                } catch (Throwable) {
+                }
+            }
+        }
+        $this->userPassStreams = [];
 
         $primary = $this->clients['primary'] ?? null;
         if ($primary !== null) {
@@ -2973,6 +2989,164 @@ final class FeatureContext implements Context
             nonceSigner: $signer,
             reconnectEnabled: false,
         ));
+    }
+
+    /**
+     * The user "limited-user" of build/nats/userpass.conf, who may not publish to "permissions.refused.>" nor ask for
+     * consumer info, as alias "limited", next to "local-user", who may, as alias "auth".
+     *
+     * @Given a user who may not publish to :pattern is connected to the username and password server
+     */
+    public function aUserWhoMayNotPublishToIsConnectedToTheUsernameAndPasswordServer(string $pattern): void
+    {
+        if ($pattern !== 'permissions.refused.>') {
+            throw new RuntimeException('build/nats/userpass.conf denies "permissions.refused.>" to limited-user, not ' . $pattern);
+        }
+
+        foreach (['limited' => ['limited-user', 'limited-pass'], 'auth' => [$this->integrationUsername(), $this->integrationPassword()]] as $alias => [$username, $password]) {
+            $client = new NatsClient(new NatsOptions(
+                servers: [$this->integrationUserPassServerUrl()],
+                username: $username,
+                password: $password,
+                requestTimeoutMs: 5_000,
+                reconnectEnabled: false,
+            ));
+            $client->connect()->await();
+            $this->clients[$alias] = $client;
+        }
+    }
+
+    /**
+     * @When that user sends a request to :subject
+     */
+    public function thatUserSendsARequestTo(string $subject): void
+    {
+        $this->refusedCall(fn(): mixed => $this->client('limited')->request($subject, 'x')->await());
+    }
+
+    /**
+     * Creates a stream with a durable consumer as "local-user", and asks for the consumer's info as "limited-user".
+     *
+     * @When that user asks for the info of a consumer
+     */
+    public function thatUserAsksForTheInfoOfAConsumer(): void
+    {
+        $stream = 'PERMISSIONS_' . bin2hex(random_bytes(4));
+        $this->state->stream = $stream;
+        $owner = $this->client('auth')->jetStream();
+        $owner->createStream($stream, [strtolower($stream) . '.>'])->await();
+        // Deleted after the scenario, whichever of its steps fails.
+        $this->userPassStreams[] = $stream;
+        $owner->createConsumer($stream, 'worker')->await();
+
+        $this->refusedCall(fn(): mixed => $this->client('limited')->jetStream()->getConsumer($stream, 'worker')->await());
+    }
+
+    /**
+     * @Then it should fail at once with a permission violation for :subject
+     */
+    public function itShouldFailAtOnceWithAPermissionViolationFor(string $subject): void
+    {
+        if ($this->state->lastExceptionClass !== PermissionViolationException::class) {
+            throw new RuntimeException(sprintf(
+                'Expected %s, got %s: %s',
+                PermissionViolationException::class,
+                (string) $this->state->lastExceptionClass,
+                (string) $this->state->lastExceptionMessage,
+            ));
+        }
+
+        if (!str_contains((string) $this->state->lastExceptionMessage, 'Permissions Violation for Publish to "' . $subject . '"')) {
+            throw new RuntimeException('The failure does not name the refused subject: ' . (string) $this->state->lastExceptionMessage);
+        }
+
+        // The timeout is 5 s: the request used to fail at its end, with a TimeoutException.
+        if ($this->state->lastRequestSeconds >= 2.5) {
+            throw new RuntimeException(sprintf('The refused call failed after %.3f s, with a 5 s timeout.', $this->state->lastRequestSeconds));
+        }
+    }
+
+    /**
+     * @Then it should fail at once with a permission violation for the consumer info subject
+     */
+    public function itShouldFailAtOnceWithAPermissionViolationForTheConsumerInfoSubject(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $this->itShouldFailAtOnceWithAPermissionViolationFor('$JS.API.CONSUMER.INFO.' . $stream . '.worker');
+    }
+
+    /**
+     * A responder on "permissions.allowed.echo", subscribed by "local-user", answers "limited-user": the refusal left the
+     * connection open and nothing latched.
+     *
+     * @Then a request from that user to a subject it may publish to should still be answered
+     */
+    public function aRequestFromThatUserToASubjectItMayPublishToShouldStillBeAnswered(): void
+    {
+        $responder = $this->client('auth');
+        $responder->subscribe('permissions.allowed.echo', static function (NatsMessage $message) use ($responder): void {
+            if ($message->replyTo !== null) {
+                $responder->publish($message->replyTo, 'pong')->ignore();
+            }
+        })->await();
+        // The SUB reaches the server before the other connection's request does.
+        $this->awaitSubscriptionsOnServer($responder);
+
+        $stop = new DeferredCancellation();
+        $pump = async(static function () use ($responder, $stop): void {
+            while (!$stop->isCancelled()) {
+                try {
+                    $responder->processIncoming()->await($stop->getCancellation());
+                } catch (CancelledException) {
+                    return;
+                } catch (Throwable) {
+                    delay(0.01);
+                }
+            }
+        });
+
+        try {
+            $reply = $this->client('limited')->request('permissions.allowed.echo', 'ping')->await()->payload;
+        } finally {
+            $stop->cancel();
+            $pump->await();
+        }
+
+        if ($reply !== 'pong') {
+            throw new RuntimeException('Expected the reply "pong", got "' . $reply . '".');
+        }
+    }
+
+    /**
+     * @Then that user can still read the stream's info
+     */
+    public function thatUserCanStillReadTheStreamsInfo(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $info = $this->client('limited')->jetStream()->getStream($stream)->await();
+
+        if ($info->name !== $stream) {
+            throw new RuntimeException('Expected the info of stream ' . $stream . ', got ' . $info->name);
+        }
+    }
+
+    /**
+     * Runs a call the server is expected to refuse, recording what it threw and how long it took.
+     *
+     * @param \Closure(): mixed $call
+     */
+    private function refusedCall(\Closure $call): void
+    {
+        $this->state->lastExceptionClass = null;
+        $this->state->lastExceptionMessage = null;
+        $start = $this->monotonic();
+        try {
+            $call();
+        } catch (Throwable $e) {
+            $this->recordException($e);
+        } finally {
+            $this->state->lastRequestSeconds = $this->monotonic() - $start;
+        }
     }
 
     /**

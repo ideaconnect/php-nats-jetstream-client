@@ -55,7 +55,7 @@ Use this file as the authoritative project guide for coding agents working in th
   Repo automation: coverage checks, JWT fixture generation/checking, NATS readiness, repeated integration runs, and full end-to-end test flow.
 
 - `build/nats/`
-  NATS config fixtures for token, user/pass, TLS, NKey, and JWT services.
+  NATS config fixtures for token, user/pass, TLS, NKey, and JWT services, and the JetStream domain hub/leaf pair (`hub.conf`, `leaf.conf`).
 
 - `build/nats/jwt/`
   Generated JWT/NKey artifacts used by the JWT-auth NATS fixture.
@@ -65,7 +65,7 @@ Use this file as the authoritative project guide for coding agents working in th
   TLS fixture material used by integration tests.
 
 - `docker-compose.yml`
-  Local integration fixture stack. Services expose client ports `14222` to `14229` (`14229` is `nats-ws`'s WebSocket port) and monitoring ports `18222` to `18229`.
+  Local integration fixture stack. Services expose client ports `14222` to `14232` (`14229` is `nats-ws`'s WebSocket port; `14230` is `nats-hub`, a JetStream hub with the domain `hub`, and `14231` is `nats-leaf`, a leaf node without JetStream connected to it; `14232` is `nats-214`, a plain nats-server 2.14 for the second `composer test:e2e` integration stage, while every other server runs 2.12) and monitoring ports `18222` to `18232`.
 
 ## Commands Agents Should Know
 
@@ -82,6 +82,9 @@ Use this file as the authoritative project guide for coding agents working in th
 
 - Run integration tests only:
   `RUN_INTEGRATION=1 composer test:integration`
+
+- Run integration tests against the 2.14 server (`nats-214`), failing on any skipped test:
+  `NATS_URL=nats://127.0.0.1:14232 RUN_INTEGRATION=1 composer test:integration:2.14`
 
 - Run Behat feature tests:
   `composer test:bdd`
@@ -146,9 +149,10 @@ Choose the narrowest useful test first, then broaden only as needed.
 - Default integration endpoints come from `tests/Integration/IntegrationTestBootstrap.php` and target local fixture ports.
 - The preferred local flow is `composer test:e2e`.
 - Behat feature tests reuse the same Docker Compose fixture stack and readiness flow via `composer test:bdd`.
-- `scripts/run-tests-e2e.sh` performs JWT fixture validation first, then starts compose, waits for readiness, runs unit tests, runs integration tests, and runs Behat.
+- `scripts/run-tests-e2e.sh` performs JWT fixture validation first, then starts compose, waits for readiness, runs unit tests, runs integration tests against `nats` (2.12), runs them again against `nats-214` (2.14), and runs Behat.
 - `scripts/run-tests-bdd.sh` performs the same fixture preflight and readiness flow before running Behat.
 - `scripts/wait-for-nats-services.sh` polls the monitoring port of every compose server; keep its port list in step with `docker-compose.yml` when adding a server.
+- `composer test:e2e` runs the integration suite twice: against `nats` (2.12) and against `nats-214` (2.14, `composer test:integration:2.14`). The second run fails when any test is skipped. A live test that needs a server newer than 2.12 skips itself on an older one, so it runs in the second stage; a test that can pass only on a server older than 2.14 has `ServerBefore214` in its name, and the second run leaves it out (`--exclude-filter ServerBefore214`).
 - `KEEP_NATS_SERVICES=1 composer test:e2e` leaves compose services running after the run.
 - `SKIP_JWT_FIXTURE_CHECK=1 composer test:e2e` skips JWT fixture validation when explicitly desired.
 - `SKIP_UNIT_TESTS=1 composer test:e2e` skips the unit stage. CI's E2E job sets it: its coverage step and the Unit + Static jobs already run the unit suite.

@@ -8,6 +8,7 @@ use IDCT\NATS\Exception\ConnectionException;
 use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\Exception\NatsException;
 use IDCT\NATS\Exception\NatsThrowable;
+use IDCT\NATS\Exception\PermissionViolationException;
 use IDCT\NATS\Exception\SlowConsumerException;
 use IDCT\NATS\Exception\SubscriptionLimitException;
 use IDCT\NATS\Protocol\ProtocolCodec;
@@ -44,6 +45,28 @@ final class ExceptionHierarchyTest extends TestCase
         // #242: existing catch (ConnectionException) handlers still catch a subscription-limit failure.
         self::assertInstanceOf(NatsThrowable::class, $this->asThrowable(new SubscriptionLimitException('x')));
         self::assertInstanceOf(ConnectionException::class, $this->asThrowable(new SubscriptionLimitException('x')));
+        // A refused publish of a request is a NatsException, and not a ConnectionException: the connection is fine.
+        $refused = $this->asThrowable(new PermissionViolationException('x', subject: 'svc.secret'));
+        self::assertInstanceOf(NatsThrowable::class, $refused);
+        self::assertInstanceOf(NatsException::class, $refused);
+        self::assertNotInstanceOf(ConnectionException::class, $refused);
+    }
+
+    /**
+     * A refused publish takes an exception's own arguments first, as JetStreamException does, and its subject last: code
+     * that builds one again from the message, the code and the previous exception still can.
+     */
+    public function testAPermissionViolationTakesAnExceptionsArgumentsFirstAndItsSubjectLast(): void
+    {
+        $refused = new PermissionViolationException('refused', 3, null, 'svc.secret');
+        self::assertSame('svc.secret', $refused->getSubject());
+        self::assertSame(3, $refused->getCode());
+        self::assertSame(0, (new PermissionViolationException('refused'))->getCode(), 'the code is 0 unless given');
+
+        $rebuilt = new ($refused::class)($refused->getMessage(), $refused->getCode(), $refused);
+        self::assertSame('refused', $rebuilt->getMessage());
+        self::assertSame($refused, $rebuilt->getPrevious());
+        self::assertSame('', $rebuilt->getSubject());
     }
 
     public function testTransportExceptionsImplementMarkerWhileRemainingRuntimeExceptions(): void
