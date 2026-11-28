@@ -20,6 +20,60 @@ of the next release that names the release and the entry it corrects.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- A refused `fetchBatch()` or `fetchNext()` throws `PermissionViolationException`, a `NatsException` and not a
+  `JetStreamException`. Code that catches `JetStreamException` around a pull to tell an empty pull (408) from other
+  outcomes no longer sees the refusal there: catch `PermissionViolationException`, or `NatsException`, as well.
+
+### Fixed
+
+- `[bugfix]` A pull whose publish the server refuses for lack of permission fails at once (#260). nats-server answers
+  a pull to `$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>` by a user who may not publish there with
+  `-ERR 'Permissions Violation for Publish to "<subject>"'` and keeps the connection open, and no message or status
+  ever comes for it. `fetchBatch()` and `fetchNext()` publish with an inbox of their own, not through `request()`, so
+  2.30.0's refusal of requests did not reach them: they waited out their expiry plus a second and threw the
+  `JetStreamException` (408) of an empty pull, 2.003 s for a 1 s expiry on nats-server 2.14.2. A worker pulling in a
+  loop stayed idle for ever without an error: ideaconnect/symfony-nats-messenger reads that 408 as an empty batch, so
+  `messenger:consume` ran on (ideaconnect/symfony-nats-messenger#130). The connection now watches the pull's subject
+  while the fetch runs, and the fetch fails as soon as the `-ERR` is read, whichever fiber's read meets it, with the
+  `PermissionViolationException` a refused request throws, naming the subject. A pull that has received a message is
+  not refused: the message shows that its own publish got through, and the fetch publishes no more once it holds one,
+  so an `-ERR` for its subject, before or after that message, answered another publish to it, another fetch of the
+  same consumer or a plain publish, and the pull goes on to its usual end; a pull that has received nothing is still
+  refused, whichever publish the `-ERR` answers, as #258 rules for `requestMany()`. A pull to another subject is left
+  alone, the connection stays open, and the error listener still gets the `-ERR`. That holds wherever the fetch waits
+  when the `-ERR` is read: in a read, or in its own publish, whose bytes are on the wire while its writer is not
+  resumed yet. What the server sent for the pull ahead of the `-ERR` and another fiber's read has not delivered yet,
+  held up behind an earlier subscription's handler, is delivered first: a message there counts as received, and a
+  terminal status such as `409 Consumer Deleted` is the pull's result, as without the refusal. Once the refusal is
+  known, the fetch releases its inbox without waiting for the `UNSUB` to complete. Nor does it wait for the `PONG` its
+  own read owes the server: a fetch whose read brings in a chunk with a server `PING` answers it in wire order, queues
+  the rest of the chunk, and waits for the `PONG`'s write only until its deadline or the refusal, which another
+  fiber's read may bring meanwhile; the messages and the terminal status behind the `PING` are its result as usual. So
+  does a fetch whose read meets a server `PING` while `drain()` runs: the `PONG` stays bounded by the drain's budget
+  and is the drain's to finish, and the fetch no longer waits for it past its own deadline. A read that has no
+  operation of its own, your `processIncoming()`, a serving loop's or the heartbeat's, and whose chunk carries a
+  message or a status for a pull in flight, answers a `PING` among them in wire order too and queues the rest of the
+  chunk before it waits for the `PONG`, so a pull refused meanwhile by an `-ERR` the fetch's read brings still gets
+  that message or that status, where it lost the message, and never reported the status, while that `PONG`'s
+  completion was held. A `PONG` the socket then fails to take ends the connection, as one that fails while the read
+  waits does: the error listener hears of it and the connection recovers, or closes with reconnect off; not once the
+  connection has closed meanwhile, on its own (an EOF, a fatal `-ERR`) or by `disconnect()`, whose close is announced
+  once. A chunk with both a failed `PONG` and a fatal `-ERR` still fails the read with the one that came first, the
+  other reported. A fetch whose read waited for a `PONG` whose completion was held stayed pending past its deadline.
+  The deferred `PONG` is not the fetch's alone: every read that waits for an operation's own result, that of
+  `request()`, `requestMany()`, `flush()`, `rtt()` or one of the library's operations reading for its own
+  subscription, such as a pull or a `SubscriptionQueue` poll, no longer waits past its deadline for a `PONG` whose
+  write has not completed, and a `PONG` that fails after it stopped waiting is the connection's to handle, as above.
+
+  The pull consumer and `directGetBatch()` are not covered yet (#260): a refused pull of theirs still ends at its
+  expiry. The refusal is matched by subject, as for requests, and the limit of #259 holds for pulls too: an `-ERR`
+  naming a subject the client cannot match to the pull's, one the account maps to another subject, or a stream or
+  consumer name Go writes with `\u` escapes, refuses nothing, and the pull ends as one nothing answers: at its expiry
+  as an empty one (408) by default, or, with an `idle_heartbeat`, with the missed-heartbeat `JetStreamException`
+  (code 0) once two heartbeat intervals pass with nothing, about 200 ms for a 100 ms `idle_heartbeat`.
+
 ### Testing & CI
 
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran

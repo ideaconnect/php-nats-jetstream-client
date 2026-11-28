@@ -17,9 +17,19 @@ namespace IDCT\NATS\Exception;
  * {@see TimeoutException}, and requestMany() returned an empty list. Not a {@see ConnectionException}: the connection is
  * fine, and reconnecting would not help. The -ERR still reaches the error listener as before.
  *
- * fetchBatch() and the pull consumer publish with an inbox of their own, and a refused pull still ends at its expiry.
+ * Thrown as well by fetchBatch() and fetchNext() (one that has received no message), whose pull to
+ * "$JS.API.CONSUMER.MSG.NEXT.<stream>.<consumer>" the server refused, at once, where they used to end at their expiry
+ * with the {@see JetStreamException} (408) of an empty pull (#260). Not a JetStreamException, so a caller that reads a
+ * 408 as "nothing to fetch" does not take it for one. The pull consumer and directGetBatch() publish with an inbox of
+ * their own and are not covered: a refused pull of theirs still ends at its expiry.
  * The -ERR names the subject and not the publish: one left unread from an earlier refused publish to the subject
- * refuses a later request to it as well, whatever the server did with that request's own publish.
+ * refuses a later request, or a pull that has received no message, to it as well, whatever the server did with that
+ * request's own publish. A pull that has received a message is not refused: its own publish got through. It is
+ * matched as the server writes it, so one the client cannot match to the subject it published to - one the account
+ * maps to another subject, or one with a character Go writes as a \u escape (#259) - throws nothing: the request ends
+ * with its TimeoutException, and the pull as one nothing answers, by default with its 408 at its expiry, or, with an
+ * idle_heartbeat, with the missed-heartbeat JetStreamException (code 0) once two heartbeat intervals pass with
+ * nothing, as before.
  */
 final class PermissionViolationException extends NatsException
 {

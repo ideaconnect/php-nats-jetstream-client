@@ -2992,8 +2992,8 @@ final class FeatureContext implements Context
     }
 
     /**
-     * The user "limited-user" of build/nats/userpass.conf, who may not publish to "permissions.refused.>" nor ask for
-     * consumer info, as alias "limited", next to "local-user", who may, as alias "auth".
+     * The user "limited-user" of build/nats/userpass.conf, who may not publish to "permissions.refused.>", ask for
+     * consumer info nor pull, as alias "limited", next to "local-user", who may, as alias "auth".
      *
      * @Given a user who may not publish to :pattern is connected to the username and password server
      */
@@ -3073,6 +3073,50 @@ final class FeatureContext implements Context
     {
         $stream = $this->requireValue($this->state->stream, 'stream');
         $this->itShouldFailAtOnceWithAPermissionViolationFor('$JS.API.CONSUMER.INFO.' . $stream . '.worker');
+    }
+
+    /**
+     * Creates a stream with a durable pull consumer and one message as "local-user", and pulls from the consumer as
+     * "limited-user", who may not publish to "$JS.API.CONSUMER.MSG.NEXT.>", with a 5 s expiry (#260).
+     *
+     * @When that user pulls from a consumer with a message waiting
+     */
+    public function thatUserPullsFromAConsumerWithAMessageWaiting(): void
+    {
+        $stream = 'PERMISSIONS_' . bin2hex(random_bytes(4));
+        $this->state->stream = $stream;
+        $owner = $this->client('auth')->jetStream();
+        $owner->createStream($stream, [strtolower($stream) . '.>'])->await();
+        // Deleted after the scenario, whichever of its steps fails.
+        $this->userPassStreams[] = $stream;
+        $owner->createConsumer($stream, 'worker')->await();
+        $owner->publish(strtolower($stream) . '.waiting', 'waiting')->await();
+
+        $this->refusedCall(fn(): mixed => $this->client('limited')->jetStream()->fetchBatch($stream, 'worker', 1, 5_000)->await());
+    }
+
+    /**
+     * @Then it should fail at once with a permission violation for the pull subject
+     */
+    public function itShouldFailAtOnceWithAPermissionViolationForThePullSubject(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $this->itShouldFailAtOnceWithAPermissionViolationFor('$JS.API.CONSUMER.MSG.NEXT.' . $stream . '.worker');
+    }
+
+    /**
+     * The refused pull reached no consumer: "local-user" pulls the message from the same consumer.
+     *
+     * @Then the message should still be waiting for a user who may pull
+     */
+    public function theMessageShouldStillBeWaitingForAUserWhoMayPull(): void
+    {
+        $stream = $this->requireValue($this->state->stream, 'stream');
+        $messages = $this->client('auth')->jetStream()->fetchBatch($stream, 'worker', 1, 2_000)->await();
+
+        if (count($messages) !== 1 || $messages[0]->payload !== 'waiting') {
+            throw new RuntimeException('Expected the waiting message, got ' . count($messages) . ' message(s).');
+        }
     }
 
     /**

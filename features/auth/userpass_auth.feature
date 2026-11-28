@@ -20,3 +20,9 @@ Feature: Username and password authentication
     When that user asks for the info of a consumer
     Then it should fail at once with a permission violation for the consumer info subject
     And that user can still read the stream's info
+
+  Scenario: A pull the server refuses for a publish permission fails at once
+    Given a user who may not publish to "permissions.refused.>" is connected to the username and password server
+    When that user pulls from a consumer with a message waiting
+    Then it should fail at once with a permission violation for the pull subject
+    And the message should still be waiting for a user who may pull

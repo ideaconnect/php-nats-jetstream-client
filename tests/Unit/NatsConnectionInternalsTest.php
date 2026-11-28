@@ -555,7 +555,8 @@ final class NatsConnectionInternalsTest extends TestCase
     private function handleFrame(NatsConnection $connection, ProtocolFrame $frame): array
     {
         $reports = [];
-        (new \ReflectionMethod($connection, 'handleFrame'))->invokeArgs($connection, [$frame, &$reports]);
+        $pongWrites = [];
+        (new \ReflectionMethod($connection, 'handleFrame'))->invokeArgs($connection, [$frame, &$reports, &$pongWrites]);
 
         return $reports;
     }

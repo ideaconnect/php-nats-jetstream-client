@@ -217,6 +217,29 @@ final class NatsConnection
      */
     private array $muxRefusals = [];
     /**
+     * The subject each pull in flight publishes to, keyed by the sid of the pull's own reply inbox
+     * ({@see watchPublishRefusal()}): a pull publishes with an inbox of its own, not through a request, so
+     * {@see refuseRequestsTo()} does not know it. Registered before the pull is published and removed when it ends.
+     *
+     * @var array<int, string>
+     */
+    private array $publishRefusalWatches = [];
+    /**
+     * The server's -ERR text for each watched pull whose publish the server refused for lack of permission, keyed like
+     * {@see $publishRefusalWatches}. Removed with the watch.
+     *
+     * @var array<int, string>
+     */
+    private array $publishRefusals = [];
+    /**
+     * What to call once the publish watched for a sid is refused ({@see watchPublishRefusal()}), keyed like
+     * {@see $publishRefusalWatches}: a fetch's cancellation of its wait, so that it learns of the refusal while it
+     * waits for its own publish to complete (review of #264). Removed with the watch.
+     *
+     * @var array<int, \Closure(): void>
+     */
+    private array $publishRefusalCallbacks = [];
+    /**
      * Strictly-increasing per-connection token counter. Guarantees pairwise-distinct request tokens
      * within an epoch by construction (never reset); the random $muxBase provides unguessability (#118).
      */
@@ -4688,8 +4711,9 @@ final class NatsConnection
                 $dispatchError = null;
                 try {
                     // As on the clean path, a read with a wake-up starts a lame-duck failover an INFO among them brings
-                    // in a fiber of its own (#191, #195): the recovery below joins it within the read's wait.
-                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
+                    // in a fiber of its own (#191, #195): the recovery below joins it within the read's wait. Its wait for
+                    // the PONGs the frames owe the server ends with that wait too (review of #264).
+                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes, pongWake: $wake, pongDeadline: $cancellation);
                 } catch (\Throwable $e) {
                     $dispatchError = $e;
                 }
@@ -4766,8 +4790,10 @@ final class NatsConnection
             // but still trickles data would never trip maxPingsOut and the watchdog could not escalate.
             $dispatchError = null;
             try {
-                // A read with a wake-up starts a lame-duck failover in a fiber of its own, waited for below (#191).
-                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
+                // A read with a wake-up starts a lame-duck failover in a fiber of its own, waited for below (#191), and
+                // waits for the PONGs the chunk owes the server only within its own wait: its deadline or its wake-up
+                // ends that wait, and the connection then watches the write (review of #264).
+                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes, pongWake: $wake, pongDeadline: $cancellation);
             } catch (\Throwable $e) {
                 // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
                 // delivery, #128) before this frame error reaches the caller below, recovering the
@@ -4868,8 +4894,21 @@ final class NatsConnection
      * replays SUBs, not missed messages) (#128). One failure is rethrown after every frame has been
      * dispatched, the one that matters most to the caller ({@see dispatchFailureRank()}): a failure that
      * ends the connection (a fatal -ERR, a failed PONG write) outranks any other met earlier in the chunk,
-     * which outranks a full subscription queue; among equals the first wins. The caller decides from it what
-     * happens to the connection, and the others are reported instead.
+     * which outranks a full subscription queue; among equals the first in wire order wins, a PONG's failure
+     * at the place of its PING. The caller decides from it what happens to the connection, and the others are
+     * reported instead.
+     *
+     * A read with a wake-up answers a PING in wire order, but does not wait for the PONG's write at the PING (review of
+     * #264): the frames behind it are handled and queued first, and the writes are waited for once the whole chunk
+     * is, before the chunk's reports, and only within the read's own wait ({@see awaitPongWrite()}). A write that did
+     * not complete used to hold the rest of the chunk back, and the operation whose read brought it in, past its
+     * deadline and its wake-up. So is a PING the connection answers while it drains: the write stays bounded by the
+     * drain's budget, and is the drain's once the read stops waiting. A read without one writes the PONG in place,
+     * as before, like the lame-duck failover it runs inline: its caller waits for all of it. Unless the chunk
+     * carries a delivery for a pull in flight ({@see carriesADeliveryForAWatchedPublish()}): the PONG is then
+     * answered in wire order the same way, the rest of the chunk queued, and only then waited for, in full, so
+     * that a pull that settles meanwhile on news another fiber's read brings finds its message or its terminal
+     * status queued rather than still behind the PING (third review of #264).
      *
      * The frames are the server's that the chunk was read from, and the chunk's connection can be gone before
      * the last of them is handled (#182): a lame-duck INFO among them fails the connection over inline
@@ -4906,17 +4945,33 @@ final class NatsConnection
      *        operation's or a flush's, which waits for it only within the operation's own wait ({@see readChunk()},
      *        #191), also for the frames it parsed ahead of bytes that fail to parse (#195). Your own read, a serving
      *        loop's, the heartbeat's and those of a connect or a reconnect run it inline.
+     * @param Cancellation|null $pongWake The wake-up of a read that has one ({@see readChunk()}): the PINGs of the chunk
+     *        are then answered in fibers of their own, and the wait for their PONGs ends when it or $pongDeadline fires
+     *        as well ({@see awaitPongWrite()}). Null writes each PONG inline, at its PING, unless the chunk carries a
+     *        delivery for a pull in flight.
+     * @param Cancellation|null $pongDeadline That read's own cancellation, its caller's deadline. Only with $pongWake.
      */
-    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false, ?int $generation = null, ?int $closes = null): void
+    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false, ?int $generation = null, ?int $closes = null, ?Cancellation $pongWake = null, ?Cancellation $pongDeadline = null): void
     {
         $firstError = null;
+        // Where in the chunk the failure held was met: a PONG's failure counts at the place of its PING.
+        $firstErrorPosition = 0;
         /** @var list<array{\Throwable, string}> $reports What to report, with its log level. */
         $reports = [];
+        /**
+         * The PONGs written for the chunk's PINGs, not waited for yet ({@see handleFrame()}).
+         *
+         * @var list<array{write: Future<null>, generation: int, closes: int, position: int, drain: bool}> $pongWrites
+         */
+        $pongWrites = [];
         // Runtime reads provide the origin captured before I/O (#205). Other callers own their socket.
         $generation ??= $this->connectionGeneration;
         $closes ??= $this->terminalCloses;
+        // A read with a wake-up, or one whose chunk carries a delivery for a pull in flight, answers the chunk's PINGs
+        // in fibers of their own and waits for them once the chunk is queued (review of #264).
+        $answerPingsInTheirOwnFiber = $pongWake !== null || $this->carriesADeliveryForAWatchedPublish($frames);
 
-        foreach ($frames as $frame) {
+        foreach ($frames as $position => $frame) {
             // The chunk's connection is gone once a frame handled before this one has replaced or ended it.
             $replaced = $this->connectionGeneration !== $generation || $this->terminalCloses !== $closes;
             // Or it is being left, by a lame-duck failover started in a fiber of its own that has not replaced it yet
@@ -4927,29 +4982,29 @@ final class NatsConnection
             }
 
             try {
-                $this->handleFrame($frame, $reports, $stale, $failOverInItsOwnFiber, $reportServerErrors);
+                $this->handleFrame($frame, $reports, $pongWrites, $stale, $failOverInItsOwnFiber, $reportServerErrors, $answerPingsInTheirOwnFiber, $position);
             } catch (\Throwable $e) {
-                $reportable = $reportOverflows && $e instanceof SlowConsumerException && $e->sid !== $ownSid;
-                if (!$reportable && ($firstError === null || $this->dispatchFailureRank($e) > $this->dispatchFailureRank($firstError))) {
-                    // The first failure, or one that matters more than the one held: a fatal -ERR after a
-                    // non-closing one, which the server sends ahead of closing, say, when a rejected SUB's
-                    // answer sat unread; any failure after an overflow, which only says that a subscriber fell
-                    // behind. The one held is reported instead.
-                    if ($firstError !== null) {
-                        $reports[] = [$firstError, 'error'];
+                $this->holdDispatchFailure($e, $position, $firstError, $firstErrorPosition, $reports, $reportOverflows, $ownSid);
+            }
+        }
+
+        // The PONGs answering the chunk's PINGs, written in fibers of their own, once every frame of the chunk is
+        // queued (review of #264): a PONG the socket will not take ends the connection as before, and is held like a
+        // frame's failure, at the place of its PING. A read with a wake-up stops waiting at its deadline or its
+        // wake-up, and the connection, or the drain, then watches the write itself. A read without one, whose chunk
+        // carries a delivery for a pull in flight, waits for all of it, as it waits for an inline PONG.
+        if ($pongWrites !== []) {
+            $pongWait = $pongWake === null ? null : ($pongDeadline === null ? $pongWake : new CompositeCancellation($pongDeadline, $pongWake));
+            foreach ($pongWrites as $pongWrite) {
+                try {
+                    if ($pongWait === null) {
+                        $pongWrite['write']->await();
+                    } else {
+                        $this->awaitPongWrite($pongWrite, $pongWait);
                     }
-
-                    $firstError = $e;
-
-                    continue;
+                } catch (\Throwable $e) {
+                    $this->holdDispatchFailure($e, $pongWrite['position'], $firstError, $firstErrorPosition, $reports, $reportOverflows, $ownSid);
                 }
-
-                // Only one failure is rethrown (below): the one that matters most, the first among equals.
-                // Any other failure from the same chunk would otherwise vanish - neither thrown nor observable -
-                // hiding the corresponding message loss from the error listener and from tests. Surface it
-                // (contained so a throwing logger cannot mask the error being rethrown) (#158), like an
-                // overflow this caller reports instead of throwing.
-                $reports[] = [$e, 'error'];
             }
         }
 
@@ -4978,6 +5033,218 @@ final class NatsConnection
         }
 
         return $failure instanceof SlowConsumerException ? 0 : 1;
+    }
+
+    /**
+     * Holds a failure met while dispatching a chunk, a frame's or its PONG's, to be thrown once the whole chunk is
+     * dispatched, or reports it ({@see dispatchFrames()}). $position is where in the chunk it was met, a PONG's failure
+     * at its PING: among failures that matter as much, the first in wire order is the one thrown, also when a PONG's
+     * failure is only learnt once the frames behind its PING are handled (third review of #264). A PING followed by
+     * a fatal -ERR whose PONG the socket would not take used to throw the -ERR and report the PONG's failure, where
+     * the PONG written in place had thrown its own failure and reported the -ERR.
+     *
+     * @param list<array{\Throwable, string}> $reports
+     * @param-out list<array{\Throwable, string}> $reports
+     */
+    private function holdDispatchFailure(\Throwable $failure, int $position, ?\Throwable &$firstError, int &$firstErrorPosition, array &$reports, bool $reportOverflows, ?int $ownSid): void
+    {
+        $reportable = $reportOverflows && $failure instanceof SlowConsumerException && $failure->sid !== $ownSid;
+        if (!$reportable && ($firstError === null || $this->outranksTheHeldFailure($failure, $position, $firstError, $firstErrorPosition))) {
+            // The first failure, or one that matters more than the one held: a fatal -ERR after a
+            // non-closing one, which the server sends ahead of closing, say, when a rejected SUB's
+            // answer sat unread; any failure after an overflow, which only says that a subscriber fell
+            // behind; or a PONG's failure that matters as much, met at a PING ahead of the one held.
+            // The one held is reported instead.
+            if ($firstError !== null) {
+                $reports[] = [$firstError, 'error'];
+            }
+
+            $firstError = $failure;
+            $firstErrorPosition = $position;
+
+            return;
+        }
+
+        // Only one failure is rethrown: the one that matters most, the first among equals.
+        // Any other failure from the same chunk would otherwise vanish - neither thrown nor observable -
+        // hiding the corresponding message loss from the error listener and from tests. Surface it
+        // (contained so a throwing logger cannot mask the error being rethrown) (#158), like an
+        // overflow this caller reports instead of throwing.
+        $reports[] = [$failure, 'error'];
+    }
+
+    /**
+     * Whether a failure met at $position of a chunk is to be thrown instead of the one held, met at $heldPosition
+     * ({@see holdDispatchFailure()}): it matters more, or as much and came first in wire order.
+     */
+    private function outranksTheHeldFailure(\Throwable $failure, int $position, \Throwable $held, int $heldPosition): bool
+    {
+        $rank = $this->dispatchFailureRank($failure);
+        $heldRank = $this->dispatchFailureRank($held);
+
+        return $rank > $heldRank || ($rank === $heldRank && $position < $heldPosition);
+    }
+
+    /**
+     * Whether a chunk carries a delivery, a MSG or an HMSG, for an operation that watches its publish for a refusal,
+     * such as a pull in flight ({@see watchPublishRefusal()}): the dispatch of such a chunk by a read without a
+     * wake-up answers its PINGs in fibers of their own and queues the rest of the chunk before it waits for them
+     * ({@see dispatchFrames()}, third review of #264). A PONG written in place, its completion held, kept a message
+     * or a terminal status behind it unqueued while the pull, refused by an -ERR another fiber's read brought,
+     * settled without them: the message was lost and the terminal status never reported.
+     *
+     * @param list<ProtocolFrame> $frames
+     */
+    private function carriesADeliveryForAWatchedPublish(array $frames): bool
+    {
+        if ($this->publishRefusalWatches === []) {
+            return false;
+        }
+
+        foreach ($frames as $frame) {
+            if (
+                ($frame->type === ProtocolFrameType::Msg || $frame->type === ProtocolFrameType::HMsg)
+                && $frame->sid !== null
+                && isset($this->publishRefusalWatches[$frame->sid])
+            ) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /**
+     * Writes the PONG that answers a server PING in a fiber of its own, and returns the write without waiting for it
+     * ({@see handleFrame()}, review of #264): for a read with a wake-up, or one whose chunk carries a delivery for a
+     * pull in flight. The fiber is queued at the PING and the dispatch waits for it before the chunk's reports and
+     * delivery, so the PONG is written ahead of anything those, or a fiber queued since, write, and the PONGs of a
+     * chunk go out in the order of their PINGs. A PONG the socket will not take marks its failure as ending the
+     * connection (#171).
+     *
+     * @return Future<null>
+     */
+    private function writePong(): Future
+    {
+        $write = async(function (): null {
+            try {
+                $this->transport->write($this->codec->encodePong())->await();
+            } catch (\Throwable $pongError) {
+                // A socket that will not take the PONG is gone (#171).
+                $this->connectionEndingFailures[$pongError] = true;
+
+                throw $pongError;
+            }
+
+            return null;
+        });
+        // Its failure reaches the read that waits for it, or the connection ({@see awaitPongWrite()}).
+        $write->ignore();
+
+        return $write;
+    }
+
+    /**
+     * Writes the PONG that answers a server PING while the connection drains, bounded like every other write of
+     * drain() (#149): a PONG stuck behind a stalled socket must not hold the drain past its budget, and past it
+     * drain()'s teardown closes the socket. A socket that fails the write takes with it the PONG the drain's flush
+     * waits for, and that flush ends now, whichever fiber's read met the PING, as when a read fails during a drain;
+     * the failure is thrown, not marked as ending the connection, which the drain closes anyway.
+     */
+    private function writeDrainPong(float $drainDeadline): void
+    {
+        try {
+            $this->writeBounded($this->codec->encodePong(), $this->remainingBudgetCancellation($drainDeadline));
+        } catch (CancelledException) {
+            // Wedged: see above.
+        } catch (\Throwable $pongError) {
+            $this->failPongWaiters(new ConnectionException('Connection lost before the server answered the PING'));
+
+            throw $pongError;
+        }
+    }
+
+    /**
+     * {@see writeDrainPong()} in a fiber of its own, for a read with a wake-up, or one whose chunk carries a delivery
+     * for a pull in flight, which waits for it once the chunk is queued ({@see handleFrame()}, third review of #264).
+     * The write stays bounded by the drain's budget whoever waits for it, and a failure ends the drain's flush from
+     * the fiber, also once the read has stopped waiting.
+     *
+     * @return Future<null>
+     */
+    private function writeDrainPongInItsOwnFiber(float $drainDeadline): Future
+    {
+        $write = async(function () use ($drainDeadline): null {
+            $this->writeDrainPong($drainDeadline);
+
+            return null;
+        });
+        // Its failure reaches the read that waits for it; the drain's flush has ended with it already.
+        $write->ignore();
+
+        return $write;
+    }
+
+    /**
+     * Waits for the write of a PONG that a read with a wake-up answered a PING of its chunk with ({@see writePong()}),
+     * once the whole chunk is queued (review of #264), until it completes or $wait fires. $wait is the read's own
+     * cancellation, its caller's deadline, and its wake-up (an operation's, a flush's): a pull whose refusal an -ERR
+     * recorded, in this chunk or in another fiber's, is woken by it and settles at once, and an operation keeps to its
+     * deadline, whatever happens to the write. The frames of the chunk are then delivered as usual, and the operation
+     * looks again. A PONG the socket will not take while the read waits fails the dispatch, and the read recovers the
+     * connection before it throws, as when the dispatch wrote the PONG itself (#171).
+     *
+     * Once the read stops waiting, the connection takes the write over: when it fails, the failure is reported and the
+     * connection it was written on recovered, as for a write whose caller stopped waiting ({@see publishFrameWithin()}).
+     * Not a connection since replaced or ended, or one the user is closing: its PONG went with it, and the close has
+     * been announced already (third review of #264). Checked when the failure comes and again when the recovery it
+     * queues starts. A late failure used to recover a connection that a read's EOF or a fatal -ERR had closed
+     * meanwhile, with reconnect off, and announce the same close twice. Nor a PONG the connection answered while it
+     * drains: its write stays bounded by the drain's budget, and the drain keeps what becomes of it, its flush ended
+     * when the write fails ({@see writeDrainPong()}). The read used to wait for the write within the dispatch, so that
+     * a PONG whose completion was held kept a refused pull pending past its deadline, also the drain's whole budget.
+     *
+     * @param array{write: Future<null>, generation: int, closes: int, position: int, drain: bool} $pongWrite The write,
+     *        the {@see $connectionGeneration} and the {@see $terminalCloses} it is written on, its PING's place in the
+     *        chunk, and whether the drain owns it.
+     */
+    private function awaitPongWrite(array $pongWrite, Cancellation $wait): void
+    {
+        try {
+            // Also with $wait already fired: the PONG's fiber, queued at the PING, then writes before the read goes on.
+            $pongWrite['write']->await($wait);
+        } catch (CancelledException) {
+            if ($pongWrite['drain']) {
+                return;
+            }
+
+            // The read's deadline or its wake-up: the connection takes the write over.
+            $generation = $pongWrite['generation'];
+            $closes = $pongWrite['closes'];
+            $pongWrite['write']->catch(function (\Throwable $pongError) use ($generation, $closes): void {
+                if (!$this->stillTheConnectionOf($generation, $closes)) {
+                    return;
+                }
+
+                $this->emitErrorSafely($pongError);
+                async(function () use ($generation, $closes, $pongError): void {
+                    // A listener the report called, or a fiber queued meanwhile, may have closed it.
+                    if ($this->stillTheConnectionOf($generation, $closes)) {
+                        $this->recoverConnection(failedGeneration: $generation, cause: $pongError);
+                    }
+                })->ignore();
+            })->ignore();
+        }
+    }
+
+    /**
+     * Whether the connection is still the one of $generation, neither replaced nor ended since ($closes), nor being
+     * closed by the user: what a PONG written on it and failed once its read stopped waiting still has to recover
+     * ({@see awaitPongWrite()}).
+     */
+    private function stillTheConnectionOf(int $generation, int $closes): bool
+    {
+        return $this->connectionGeneration === $generation && $this->terminalCloses === $closes && !$this->closing;
     }
 
     /**
@@ -5514,6 +5781,110 @@ final class NatsConnection
             $this->muxRefusals[$token] = $error;
             // Registered with the subject, and renewed but never removed without it.
             $this->muxWakes[$token]->cancel();
+        }
+    }
+
+    /**
+     * Watches the publish of an operation that publishes with a reply inbox of its own, such as a pull
+     * ({@see \IDCT\NATS\JetStream\JetStreamContext::fetchBatch()}), for a refusal by the server for lack of permission: an -ERR
+     * 'Permissions Violation for Publish to "<subject>"' that names $subject, read by whichever fiber's read, records
+     * the server's text for $sid ({@see publishRefusalOf()}) and ends the reads of the operation waiting for a delivery
+     * to $sid, wherever they wait ({@see nextDeliveryTo()}), so that the operation looks at once instead of at its
+     * deadline (#260). Call before the publish, since the -ERR may be read before the publish returns, and end the watch
+     * with {@see unwatchPublishRefusal()} when the operation ends.
+     *
+     * $onRefused is called once, from that dispatch, when the refusal is recorded: for an operation that waits for
+     * something else than a delivery meanwhile, such as the completion of its own publish, whose bytes are on the wire
+     * while its writer is not resumed yet. A fetch passes the cancellation of its wait there, so that it learns of the
+     * refusal at once, wherever it waits (review of #264). It must not suspend; what it throws is dropped.
+     *
+     * The -ERR names the subject and not the publish, as for requests ({@see refuseRequestsTo()}): every watch on the
+     * subject is marked by it, whichever publish to the subject it answers, and the first such -ERR is the one recorded.
+     * The name is matched as the -ERR gives it: one the client cannot match to the subject it published to - an
+     * account's subject mapping, a name Go writes with \u escapes (#259) - marks nothing, and the operation ends as it
+     * would without the refusal.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     *
+     * @param int $sid The operation's own reply inbox, which keys the watch.
+     * @param string $subject The subject the operation publishes to.
+     * @param (\Closure(): void)|null $onRefused Called once the refusal is recorded; must not suspend.
+     */
+    public function watchPublishRefusal(int $sid, string $subject, ?\Closure $onRefused = null): void
+    {
+        $this->publishRefusalWatches[$sid] = $subject;
+        if ($onRefused !== null) {
+            $this->publishRefusalCallbacks[$sid] = $onRefused;
+        }
+    }
+
+    /**
+     * The server's -ERR text when it refused the publish watched for $sid ({@see watchPublishRefusal()}), or null while
+     * it has not. Set by the dispatch of an -ERR, which another fiber's read can make while the caller waits.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     */
+    public function publishRefusalOf(int $sid): ?string
+    {
+        return $this->publishRefusals[$sid] ?? null;
+    }
+
+    /**
+     * Ends the watch of {@see watchPublishRefusal()} for $sid, with the refusal it recorded, if any, and its callback.
+     * Leaves nothing behind for an operation that has ended.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     */
+    public function unwatchPublishRefusal(int $sid): void
+    {
+        unset($this->publishRefusalWatches[$sid], $this->publishRefusals[$sid], $this->publishRefusalCallbacks[$sid]);
+    }
+
+    /**
+     * Delivers what an earlier or a concurrent read has queued for $sid and not reached, without reading, with the
+     * rules an operation's read delivers it with ({@see deliverQueuedForOwnSid()}): for an operation about to end on
+     * news that came in the same chunk as frames for its own subscription, such as a pull whose publish the server
+     * refused ({@see watchPublishRefusal()}). The read that queued the chunk can be held up in an earlier
+     * subscription's handler, which awaits, and the operation would otherwise release its subscription, and the
+     * queued frames with it, before they reached its handler: a message, or a terminal status, the server sent ahead
+     * of the -ERR (review of #264). Nothing when nothing is queued for $sid, when a delivery to $sid is under way
+     * further up some fiber's stack (that one delivers it), or when the queue is a disconnect()'s to discard
+     * ({@see leftoversBelongToAClose()}). An overflow or a handler failure of $sid is thrown, as an operation's read
+     * throws it.
+     *
+     * @internal For the library's own operations; not part of the supported API.
+     */
+    public function deliverWhatIsQueuedFor(int $sid): void
+    {
+        $this->deliverQueuedForOwnSid(
+            $sid,
+            reportOverflows: !$this->options->slowConsumerErrorsFailOperations,
+            reportHandlerFailures: !$this->options->handlerErrorsFailOperations,
+        );
+    }
+
+    /**
+     * Marks every watched publish to $subject as refused ({@see watchPublishRefusal()}), calls its callback and wakes
+     * the operations reading for them. A watch on another subject, or one already refused, is left alone. Called from
+     * the dispatch of the -ERR, so it must not suspend.
+     */
+    private function refuseWatchedPublishesTo(string $subject, string $error): void
+    {
+        foreach ($this->publishRefusalWatches as $sid => $watched) {
+            if ($watched !== $subject || isset($this->publishRefusals[$sid])) {
+                continue;
+            }
+
+            $this->publishRefusals[$sid] = $error;
+            $onRefused = $this->publishRefusalCallbacks[$sid] ?? null;
+            if ($onRefused !== null) {
+                try {
+                    $onRefused();
+                } catch (\Throwable) {
+                    // A throwing callback must never break frame dispatch.
+                }
+            }
+            $this->wakeReadsWaitingFor($sid);
         }
     }
 
@@ -7727,33 +8098,59 @@ final class NatsConnection
      *        own ({@see handleServerInfoUpdate()}, {@see dispatchFrames()}).
      * @param bool $reportServerErrors Queue nonfatal server -ERR exceptions for reporting, after recording
      *        any inbox rejection. Other frame failures and fatal server errors still throw.
+     * @param list<array{write: Future<null>, generation: int, closes: int, position: int, drain: bool}> $pongWrites
+     *        Collects the write of the PONG that answers a PING, started and not waited for ({@see writePong()},
+     *        {@see writeDrainPong()}), with the {@see $connectionGeneration} and the {@see $terminalCloses} it is written
+     *        on, the PING's $position and whether the drain owns the write, for {@see dispatchFrames()} to wait for once
+     *        the whole chunk is queued. Only with $answerPingsInTheirOwnFiber.
+     * @param bool $answerPingsInTheirOwnFiber For a PING: whether its PONG is written in a fiber of its own, for the
+     *        dispatch to wait for once the chunk is queued, rather than inline (review of #264): for a read with a
+     *        wake-up, as for its lame-duck failover ({@see dispatchFrames()}, $failOverInItsOwnFiber), and for one whose
+     *        chunk carries a delivery for a pull in flight ({@see carriesADeliveryForAWatchedPublish()}).
+     * @param int $position The frame's place in its chunk, which a PONG's failure is ranked at ({@see holdDispatchFailure()}).
      * @param-out list<array{\Throwable, string}> $reports
+     * @param-out list<array{write: Future<null>, generation: int, closes: int, position: int, drain: bool}> $pongWrites
      */
-    private function handleFrame(ProtocolFrame $frame, array &$reports, bool $stale = false, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false): void
+    private function handleFrame(ProtocolFrame $frame, array &$reports, array &$pongWrites, bool $stale = false, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false, bool $answerPingsInTheirOwnFiber = false, int $position = 0): void
     {
         if ($frame->type === ProtocolFrameType::Ping) {
             $drainDeadline = $this->drainDeadline;
             if ($this->state === ConnectionState::Draining && $drainDeadline !== null) {
-                // Bounded like every other write of drain() (#149): a PONG stuck behind a stalled socket
-                // must not hold the drain past its budget. Past it, drain()'s teardown closes the socket.
-                try {
-                    $this->writeBounded($this->codec->encodePong(), $this->remainingBudgetCancellation($drainDeadline));
-                } catch (CancelledException) {
-                    // Wedged: see above.
-                } catch (\Throwable $pongError) {
-                    // The socket is gone, and with it the PONG the drain's flush waits for: end that flush now,
-                    // whichever fiber's read met this PING, as a read failing during a drain does. Not marked as
-                    // ending the connection, which the drain closes anyway, so the read treats it like any other
-                    // failure: it reports it when it reports failures (the drain's own read, a serving loop's),
-                    // and throws it otherwise.
-                    $this->failPongWaiters(new ConnectionException('Connection lost before the server answered the PING'));
+                // Bounded like every other write of drain() (#149), whichever fiber's read met the PING. A read with a
+                // wake-up, or one whose chunk carries a delivery for a pull in flight, writes it in a fiber of its own
+                // and waits for it once the chunk is queued, only within its own wait (third review of #264): a refused
+                // pull whose read met the PING stayed pending until the write completed, or the drain's budget ran out,
+                // well past its own deadline. The drain keeps what becomes of the write once that read stops waiting.
+                if ($answerPingsInTheirOwnFiber) {
+                    $pongWrites[] = ['write' => $this->writeDrainPongInItsOwnFiber($drainDeadline), 'generation' => $this->connectionGeneration, 'closes' => $this->terminalCloses, 'position' => $position, 'drain' => true];
 
-                    throw $pongError;
+                    return;
                 }
+
+                // A read without one has its caller wait for all of it, and writes the PONG in place. Its failure
+                // is not marked as ending the connection, so the read treats it like any other failure: it reports
+                // it when it reports failures (the drain's own read, a serving loop's), and throws it otherwise.
+                $this->writeDrainPong($drainDeadline);
 
                 return;
             }
 
+            // A read with a wake-up, an operation's or a flush's, starts the PONG here, in wire order, and does not wait
+            // for it here (review of #264): the frames behind the PING in the chunk are queued before anything waits
+            // for the write, and dispatchFrames() then waits for it within the read's own wait ({@see awaitPongWrite()}).
+            // A write that did not complete held up the rest of the chunk and the operation whose read brought it in:
+            // a pull whose refusal the -ERR ahead of the PING had recorded waited for the PONG past its deadline, and
+            // one that stopped waiting left the frames behind the PING, its messages and its terminal status, unqueued.
+            // So does a read without one whose chunk carries a delivery for a pull in flight, which then waits for the
+            // write in full once the chunk is queued (third review of #264).
+            if ($answerPingsInTheirOwnFiber) {
+                $pongWrites[] = ['write' => $this->writePong(), 'generation' => $this->connectionGeneration, 'closes' => $this->terminalCloses, 'position' => $position, 'drain' => false];
+
+                return;
+            }
+
+            // A read without one - your own, a serving loop's, the heartbeat's, a connect's or a reconnect's - has its
+            // caller wait for all of it, and writes the PONG inline, in place.
             try {
                 $this->transport->write($this->codec->encodePong())->await();
             } catch (\Throwable $pongError) {
@@ -7855,11 +8252,13 @@ final class NatsConnection
                 }
 
                 // A permissions violation for a publish names the subject: the requests in flight to it reach no
-                // responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}). "Publish with
-                // Reply of" names a reply subject, never this connection's inbox, and is left alone.
+                // responder and fail at once, instead of at their deadlines ({@see refuseRequestsTo()}), and so do the
+                // pulls in flight to it ({@see refuseWatchedPublishesTo()}, #260). "Publish with Reply of" names a reply
+                // subject, never this connection's inbox, and is left alone.
                 $refusedSubject = self::subjectOfAPublishViolation($error);
                 if ($refusedSubject !== null) {
                     $this->refuseRequestsTo($refusedSubject, $error);
+                    $this->refuseWatchedPublishesTo($refusedSubject, $error);
                 }
 
                 // Non-fatal server error (e.g. a per-subscription permissions violation): surface it
