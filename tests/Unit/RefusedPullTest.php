@@ -43,13 +43,14 @@ use function Amp\delay;
  * (ideaconnect/symfony-nats-messenger#130). The connection now watches the pull's subject while the fetch runs
  * ({@see NatsConnection::watchPublishRefusal()}), and the fetch fails with a {@see PermissionViolationException} that
  * names the subject, which is not a JetStreamException, so a caller that reads a 408 as "nothing to do" cannot take it
- * for one. Messages delivered before the refusal are returned. A refusal read by another fiber's read is covered in
- * MuxInboxDropWakeupTest.
+ * for one. A pull that holds a message when an -ERR for its subject comes is not refused: the message shows that its
+ * own publish got through, so the -ERR answered another publish, and the pull goes on to its usual end (review of #264,
+ * as #258 rules for requestMany()). A refusal read by another fiber's read is covered in MuxInboxDropWakeupTest.
  *
  * Over `tests/Support/FakeTransport.php`, whose onWrite answers each PUB the client writes: with the messages a test
  * gives for the subject, delivered on the reply inbox, then with the -ERR for a refused subject. Each pull has a 5 s
  * expiry, so the fetch's budget is 6 s. Each regression test fails on the code before the fix, the fetch ending only
- * at that deadline: with the 408, or, with messages delivered, with them.
+ * at that deadline, with the 408.
  *
  * The orderings of the review of #264 run over `tests/Support/ReconnectingTransport.php`, seen through
  * `tests/Support/WatchedTransport.php` and `tests/Support/CompletionHoldingTransport.php`, with an application read
@@ -108,6 +109,38 @@ final class RefusedPullTest extends TestCase
         self::assertLessThan(2.5, $elapsed, sprintf('%s failed after %.3f s, with a 6 s budget', $fetch, $elapsed));
         self::assertSame(ConnectionState::Open, $client->state(), 'a refused pull leaves the connection open');
         self::assertCount(1, self::linesStartingWith($transport, 'UNSUB '), 'the fetch unsubscribed its inbox');
+        self::assertNoWatchLeft($client);
+    }
+
+    /** @return iterable<string, array{?string, ?string, string}> */
+    public static function prefixedContexts(): iterable
+    {
+        yield "jetStream(domain: 'hub')" => ['hub', null, '$JS.hub.API.CONSUMER.MSG.NEXT.ORDERS.worker'];
+        yield "jetStream(apiPrefix: 'acc.js')" => [null, 'acc.js', 'acc.js.CONSUMER.MSG.NEXT.ORDERS.worker'];
+    }
+
+    /**
+     * A pull made through a context with a JetStream domain or an API prefix (#273, #276) publishes to the prefixed
+     * subject, and the watch takes that subject: refused there, the pull fails at once with the refusal, whose
+     * getSubject() is the subject it published to, prefix included. A guard of the subject the watch takes: a watch on
+     * the default `$JS.API.` subject would leave such a pull to its deadline and the 408.
+     */
+    #[DataProvider('prefixedContexts')]
+    public function testAPullThroughAPrefixedContextIsRefusedOnTheSubjectItPublishedTo(?string $domain, ?string $apiPrefix, string $subject): void
+    {
+        $transport = self::server([$subject]);
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport));
+        $client->connect()->await();
+
+        $start = hrtime(true);
+        $failure = self::failureOf($client->jetStream(domain: $domain, apiPrefix: $apiPrefix)->fetchBatch(self::STREAM, 'worker', 1, 5_000));
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        self::assertCount(1, self::linesStartingWith($transport, 'PUB ' . $subject . ' '), 'the pull went out on the prefixed subject');
+        self::assertInstanceOf(PermissionViolationException::class, $failure, self::describe($failure));
+        self::assertSame($subject, $failure->getSubject());
+        self::assertLessThan(2.5, $elapsed, sprintf('the pull failed after %.3f s, with a 6 s budget', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state(), 'a refused pull leaves the connection open');
         self::assertNoWatchLeft($client);
     }
 
@@ -173,23 +206,74 @@ final class RefusedPullTest extends TestCase
         self::assertNoWatchLeft($client);
     }
 
-    /**
-     * A pull that holds messages when its publish is refused returns them at once, as at its deadline: they are real,
-     * and the server counted them as delivered. Here the server delivers one message of a batch of 5 and then refuses
-     * a publish to the subject. The fetch used to return the same message at its 6 s deadline.
-     */
-    public function testAPullWithMessagesReturnsThemAtOnceWhenItsPublishIsRefused(): void
+    /** @return iterable<string, array{string}> */
+    public static function refusalsAroundTheFirstMessage(): iterable
     {
-        $transport = self::server([], [self::PULL => ['first']], errorsAfter: [self::PULL => [self::PULL]]);
-        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 5_000), $transport));
-        $client->connect()->await();
+        yield "the -ERR behind m-1: another fiber's plain publish to the pull subject, refused" => ['behind'];
+        yield 'the -ERR ahead of m-1, in one chunk' => ['ahead'];
+    }
+
+    /**
+     * A pull that holds a message is not refused by an -ERR for its subject: the message shows that its own publish
+     * got through, and the fetch publishes no more once it holds one, so the -ERR answered another publish to the
+     * subject. A fetch of 2 gets m-1 and an -ERR refusing its subject, and m-2 is sent only once the error listener has
+     * heard the -ERR: the fetch returns both, throws nothing and leaves no watch, well within its 4 s budget, and the
+     * connection stays open. The -ERR answers another fiber's plain publish() to the pull subject, behind m-1, or comes
+     * ahead of m-1 in one chunk. It used to return [m-1] at the -ERR and release an inbox the server was still serving,
+     * where #258 rules the same out for requestMany() (review of #264). Fails on the code before the fix with [m-1].
+     */
+    #[DataProvider('refusalsAroundTheFirstMessage')]
+    public function testAPullThatHoldsAMessageGoesOnPastARefusalOfItsSubject(string $order): void
+    {
+        /** @var ?\Closure(): void $sendTheSecondMessage */
+        $sendTheSecondMessage = null;
+        $refusalsHeard = 0;
+        [$server, , , $client] = $this->connectOverTheScriptedServer(
+            errorListener: static function (\Throwable $error) use (&$sendTheSecondMessage, &$refusalsHeard): void {
+                if (!str_contains($error->getMessage(), 'Permissions Violation for Publish to')) {
+                    return;
+                }
+
+                $refusalsHeard++;
+                if ($refusalsHeard === 1 && $sendTheSecondMessage !== null) {
+                    $sendTheSecondMessage();
+                }
+            },
+        );
+        $server->responder = static function (string $subject, ?string $replyTo) use ($server, $order): array {
+            if ($subject !== self::PULL) {
+                return [];
+            }
+            if ($replyTo === null) {
+                // Another fiber's plain publish to the pull subject: refused.
+                return [self::refusal(self::PULL)];
+            }
+
+            $first = ReconnectingTransport::msgFrame($replyTo, (int) $server->sidFor($replyTo), 'm-1', '$JS.ACK.ORDERS.worker.1.1.1.0.0');
+
+            return [$order === 'ahead' ? self::refusal(self::PULL) . $first : $first];
+        };
+        $sendTheSecondMessage = static function () use ($server): void {
+            $replyTo = self::replySubjectOfThePull($server);
+            $server->pushFrame(ReconnectingTransport::msgFrame($replyTo, (int) $server->sidFor($replyTo), 'm-2', '$JS.ACK.ORDERS.worker.1.2.2.0.0'));
+        };
 
         $start = hrtime(true);
-        $messages = $client->jetStream()->fetchBatch(self::STREAM, 'worker', 5, 5_000)->await();
+        $fetch = $client->jetStream()->fetchBatch(self::STREAM, 'worker', 2, 3_000);
+        $fetch->ignore();
+        if ($order === 'behind') {
+            $this->waitUntil(static fn(): bool => $server->controlLinesStartingWith('PUB ' . self::PULL . ' ') !== []);
+            $client->publish(self::PULL, 'not a pull')->await();
+        }
+        [$messages, $failure] = self::settle($fetch);
         $elapsed = (hrtime(true) - $start) / 1e9;
 
-        self::assertSame(['first'], self::payloads($messages));
-        self::assertLessThan(2.5, $elapsed, sprintf('returned after %.3f s, with a 6 s budget', $elapsed));
+        self::assertNull($failure, sprintf('the fetch ended after %.3f s with %s', $elapsed, self::describe($failure)));
+        self::assertSame(['m-1', 'm-2'], self::payloads($messages), 'the pull went on past the -ERR to its second message');
+        self::assertSame(1, $refusalsHeard, 'the error listener heard the -ERR');
+        self::assertLessThan(0.5, $elapsed, sprintf('the fetch returned after %.3f s, with a 4 s budget', $elapsed));
+        self::assertSame(ConnectionState::Open, $client->state(), 'a refusal of another publish leaves the connection open');
+        self::assertCount(1, $server->controlLinesStartingWith('PUB ' . self::PULL . ' _INBOX.'), 'the fetch published its pull once');
         self::assertNoWatchLeft($client);
     }
 
@@ -294,9 +378,9 @@ final class RefusedPullTest extends TestCase
      * inbox and the -ERR refusing the pull. Its delivery is held up in the earlier subscription's handler (the gate),
      * so the fetch's frames wait in its queue, behind the handler, when the -ERR has woken the fetch's read, parked on
      * the socket. The fetch delivers what is queued for its inbox before it settles the refusal, and the usual rules
-     * then decide, while the gate is still held: a message is returned (a partial batch of 1 for 5), a 409 alone is
-     * thrown as the JetStreamException(409) it is, and a message with a 409 behind it is returned with the terminal
-     * callback called once. It used to release the inbox, the queued frames with it, and throw the
+     * then decide, while the gate is still held: a fetch of 1 returns the message, which ends it by itself, a 409 alone
+     * is thrown as the JetStreamException(409) it is, and a message with a 409 behind it is returned with the terminal
+     * callback called once ({@see batchFor()}). It used to release the inbox, the queued frames with it, and throw the
      * PermissionViolationException: the message and the terminal status were lost (review of #264).
      *
      * The chunk opens with an INFO that names a new cluster member, and the application's DiscoveredServers listener
@@ -344,7 +428,7 @@ final class RefusedPullTest extends TestCase
             $fetch = $client->jetStream()->fetchBatch(
                 self::STREAM,
                 'worker',
-                5,
+                self::batchFor($queued),
                 3_000,
                 [],
                 static function (int $code, string $description) use (&$terminal): void {
@@ -390,14 +474,14 @@ final class RefusedPullTest extends TestCase
     /**
      * The application's read takes one chunk with a server PING and, behind it, frames for the fetch's inbox, and the
      * PONG answering the PING reaches the server with its completion held. The fetch's read then takes the socket and
-     * brings the -ERR refusing the pull in the server's next chunk. While the PONG's completion is still held, the
-     * fetch of 5 returns the message (a partial batch), throws the JetStreamException(409), or returns the message and
-     * calls the terminal callback once with the 409: the application's dispatch answers the PING in wire order and
-     * queues the frames behind it before it waits for the PONG, since the chunk carries a delivery for a pull in flight
-     * (third review of #264). It used to write the PONG in place, the frames behind it not queued while it waited:
-     * the fetch settled the refusal without them, threw the PermissionViolationException, lost the message and never
-     * called the terminal callback, even once the PONG was let go. Fails on the code before the fix with that
-     * exception.
+     * brings the -ERR refusing the pull in the server's next chunk. While the PONG's completion is still held, a fetch
+     * of 1 returns the message, a fetch of 5 throws the JetStreamException(409), or returns the message and calls the
+     * terminal callback once with the 409 ({@see batchFor()}), and the PONG went out ahead of the fetch's UNSUB, in
+     * wire order: the application's dispatch answers the PING in wire order and queues the frames behind it before it
+     * waits for the PONG, since the chunk carries a delivery for a pull in flight (third review of #264). It used to
+     * write the PONG in place, the frames behind it not queued while it waited: the fetch settled the refusal without
+     * them, threw the PermissionViolationException, lost the message and never called the terminal callback, even once
+     * the PONG was let go. Fails on the code before the fix with that exception.
      *
      * @param list<string> $queued
      */
@@ -415,7 +499,7 @@ final class RefusedPullTest extends TestCase
             $fetch = $client->jetStream()->fetchBatch(
                 self::STREAM,
                 'worker',
-                5,
+                self::batchFor($queued),
                 3_000,
                 [],
                 static function (int $code, string $description) use (&$terminal): void {
@@ -445,6 +529,13 @@ final class RefusedPullTest extends TestCase
             self::assertTheResultOfThePull($queued, $messages, $failure, $terminal);
             self::assertLessThan(0.5, $elapsed, sprintf('the fetch ended after %.3f s, with a 4 s budget', $elapsed));
             self::assertNoWatchLeft($client);
+            $this->waitUntil(static fn(): bool => in_array('UNSUB ' . $inboxSid, $server->controlLines(), true));
+            $lines = $server->controlLines();
+            self::assertLessThan(
+                array_search('UNSUB ' . $inboxSid, $lines, true),
+                array_search('PONG', $lines, true),
+                'the PONG went out ahead of the UNSUB the fetch wrote after it: ' . implode(' | ', $lines),
+            );
         } finally {
             $holding->releaseHeldCompletions();
             $stop->cancel();
@@ -845,9 +936,10 @@ final class RefusedPullTest extends TestCase
      * ended it.
      *
      * @param (\Closure(ConnectionEvent, ?\Throwable): void)|null $connectionListener
+     * @param (\Closure(\Throwable): void)|null $errorListener
      * @return array{ReconnectingTransport, WatchedTransport, CompletionHoldingTransport, NatsClient}
      */
-    private function connectOverTheScriptedServer(?\Closure $connectionListener = null, int $requestTimeoutMs = 5_000): array
+    private function connectOverTheScriptedServer(?\Closure $connectionListener = null, int $requestTimeoutMs = 5_000, ?\Closure $errorListener = null): array
     {
         $server = new ReconnectingTransport();
         $watched = new WatchedTransport($server);
@@ -858,10 +950,23 @@ final class RefusedPullTest extends TestCase
             requestTimeoutMs: $requestTimeoutMs,
             reconnectEnabled: false,
             connectionListener: $connectionListener,
+            errorListener: $errorListener,
         ), $holding));
         $client->connect()->await();
 
         return [$server, $watched, $holding, $client];
+    }
+
+    /**
+     * The batch a fetch whose inbox gets the frames $queued names asks for: 1 for a message alone, so that the message
+     * ends the pull by itself, and 5 otherwise. A pull that holds a message goes on past a refusal of its subject to
+     * its usual end (review of #264), and a fetch of 5 with one message would wait out its deadline.
+     *
+     * @param list<string> $queued
+     */
+    private static function batchFor(array $queued): int
+    {
+        return $queued === ['message'] ? 1 : 5;
     }
 
     /**
@@ -882,9 +987,9 @@ final class RefusedPullTest extends TestCase
     }
 
     /**
-     * What a fetch of 5 whose inbox got the frames $queued names ends with, refused or not: a message alone is returned
-     * (a partial batch), a 409 alone is thrown as the JetStreamException(409) it is, and a message with a 409 behind
-     * it is returned with the terminal callback called once.
+     * What a fetch of {@see batchFor()} whose inbox got the frames $queued names ends with, refused or not: a message
+     * alone is returned, a 409 alone is thrown as the JetStreamException(409) it is, and a message with a 409 behind it
+     * is returned with the terminal callback called once.
      *
      * @param list<string> $queued
      * @param list<NatsMessage> $messages
@@ -1012,16 +1117,14 @@ final class RefusedPullTest extends TestCase
 
     /**
      * A server that answers every SUB silently and every PUB with, in order: the -ERRs refusing the subjects
-     * $errorsBefore gives for that subject, the messages $deliveries gives for it, delivered on its reply inbox, the
-     * -ERRs refusing the subjects $errorsAfter gives for it, and the -ERR refusing it when it is in $refused, as
-     * nats-server writes them.
+     * $errorsBefore gives for that subject, the messages $deliveries gives for it, delivered on its reply inbox, and
+     * the -ERR refusing it when it is in $refused, as nats-server writes them.
      *
      * @param list<string> $refused
      * @param array<string, list<string>> $deliveries
-     * @param array<string, list<string>> $errorsAfter
      * @param array<string, list<string>> $errorsBefore
      */
-    private static function server(array $refused, array $deliveries = [], array $errorsAfter = [], array $errorsBefore = []): FakeTransport
+    private static function server(array $refused, array $deliveries = [], array $errorsBefore = []): FakeTransport
     {
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
@@ -1029,7 +1132,7 @@ final class RefusedPullTest extends TestCase
         ]);
         /** @var array<string, int> $sids */
         $sids = [];
-        $transport->onWrite = static function (string $bytes) use ($refused, $deliveries, $errorsAfter, $errorsBefore, &$sids): array {
+        $transport->onWrite = static function (string $bytes) use ($refused, $deliveries, $errorsBefore, &$sids): array {
             $frames = [];
             $lines = explode("\r\n", $bytes);
             for ($index = 0, $count = count($lines); $index < $count; $index++) {
@@ -1054,9 +1157,6 @@ final class RefusedPullTest extends TestCase
                     foreach ($deliveries[$subject] ?? [] as $payload) {
                         $frames[] = sprintf("MSG %s %d %d\r\n%s\r\n", $replyTo, $sids[$replyTo], strlen($payload), $payload);
                     }
-                }
-                foreach ($errorsAfter[$subject] ?? [] as $other) {
-                    $frames[] = self::refusal($other);
                 }
                 if (in_array($subject, $refused, true)) {
                     $frames[] = self::refusal($subject);

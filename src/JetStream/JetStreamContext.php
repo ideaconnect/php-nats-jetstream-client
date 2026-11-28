@@ -2799,17 +2799,27 @@ final class JetStreamContext
                         // The inbox was rejected, by an -ERR another fiber's read met: no reply can come on it (#175).
                         $this->throwIfInboxRejected('JetStream pull fetch', $inbox, $inboxRejection);
 
-                        // The server refused the pull for lack of permission (#260): nothing more can come for it. What
-                        // another fiber's read queued for the inbox ahead of the -ERR and has not delivered yet - held up
-                        // behind an earlier subscription's handler - is delivered first (review of #264): a message there
-                        // is returned, as at the deadline, and a terminal status decides as it would without the refusal.
-                        // With neither the fetch fails below. A refusal the client cannot match to the subject (#259) is
-                        // not recorded: the pull goes on as one nothing answers, to the heartbeat check below or its
-                        // deadline.
+                        // An -ERR refused a publish to the pull's subject (#260). What another fiber's read queued for the
+                        // inbox ahead of it and has not delivered yet - held up behind an earlier subscription's handler -
+                        // is delivered first (review of #264), and a terminal status there decides as it would without
+                        // the -ERR. With no message the pull is refused, whichever publish the -ERR answered, and the
+                        // fetch fails below. A message shows that this pull's own publish got through, and the fetch
+                        // publishes no more once it holds one: the -ERR answered another publish to the subject, another
+                        // fetch of the consumer or a plain publish, so the pull goes on to its usual end and no later
+                        // -ERR for the subject refuses it (as for requestMany(), #258). Only a message counts: a
+                        // heartbeat does not show that the pull's latest publish got through, since a fetch whose publish
+                        // failed sends it again after the reconnect. A refusal the client cannot match to the subject
+                        // (#259) is not recorded: the pull goes on as one nothing answers, to the heartbeat check below
+                        // or its deadline.
                         if ($this->client->publishRefusalOf($sid) !== null) {
                             $this->client->deliverWhatIsQueuedFor($sid);
+                            if ($messages === []) {
+                                break;
+                            }
 
-                            break;
+                            $this->client->unwatchPublishRefusal($sid);
+
+                            continue;
                         }
 
                         $nowNs = hrtime(true);
