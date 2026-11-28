@@ -15,6 +15,16 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` New `nats-214` fixture in `docker-compose.yml` (nats-server 2.14, port 14232/18232) and a second
+  `composer test:e2e` integration stage against it (`composer test:integration:2.14`, `--fail-on-skipped`), so a
+  live test that needs a server newer than the other fixtures' 2.12 runs in CI instead of always skipping itself
+  (#279). A test that can pass only on a server older than 2.14 is excluded from that stage by having
+  `ServerBefore214` in its name.
+
 ## [2.34.0] - 2026-11-26
 
 ### Added
