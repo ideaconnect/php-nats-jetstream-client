@@ -1,6 +1,6 @@
 # Test Catalog
 
-Every automated test in the suite with a one-line description of what it verifies. When you add or change a test, update the matching entry here. The per-file sections below are authoritative; the counts are indicative.
+Every automated test in the suite with a one-line description of what it verifies. When you add or change a test, update the matching entry here.
 
 ## How to run
 
@@ -8,7 +8,7 @@ Every automated test in the suite with a one-line description of what it verifie
 - **Integration** (live server): `RUN_INTEGRATION=1 composer test:integration`, or `composer test:e2e` for the full Dockerised stack (TLS/auth/WebSocket variants), which runs the suite twice: once against the `nats` fixture (2.12) and once against `nats-214` (2.14, `composer test:integration:2.14`, failing on any skipped test). Real connect/auth/TLS/WebSocket, JetStream/KV/ObjectStore/Services round-trips, reconnect, heartbeat soak, multi-consumer concurrency, and `nats` CLI interop.
 - **Behat** (live server): `composer test:bdd` - behaviour specs.
 
-Indicative totals: 3795 unit tests, 171 integration tests, 49 Behat scenarios.
+To count the tests: `vendor/bin/phpunit --testsuite unit --list-tests` and `--testsuite integration --list-tests` (each data set is one test, as in PHPUnit's summary), and `vendor/bin/behat --dry-run` for the scenarios.
 
 ## Unit Tests (`tests/Unit/`)
 
