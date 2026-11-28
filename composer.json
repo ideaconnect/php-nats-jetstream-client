@@ -34,6 +34,7 @@
     "test": "phpunit",
     "test:unit": "phpunit --testsuite unit",
     "test:integration": "phpunit --testsuite integration",
+    "test:integration:2.14": "phpunit --testsuite integration --exclude-filter ServerBefore214 --fail-on-skipped --display-skipped",
     "test:bdd": "bash scripts/run-tests-bdd.sh",
     "test:bdd:core": "vendor/bin/behat --suite core",
     "test:e2e": "bash scripts/run-tests-e2e.sh",
