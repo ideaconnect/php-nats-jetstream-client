@@ -494,6 +494,222 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
+     * A STREAM.MSG.GET reply frame carrying one stored message.
+     *
+     * @param array<string,mixed> $message
+     */
+    private static function storedMessageReply(array $message): string
+    {
+        $json = json_encode(['type' => 'io.nats.jetstream.api.v1.stream_msg_get_response', 'message' => $message], JSON_THROW_ON_ERROR);
+
+        return sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($json), $json);
+    }
+
+    /**
+     * The subject and the decoded JSON body of the first request after the handshake and the mux SUB.
+     *
+     * @return array{string, array<string,mixed>}
+     */
+    private static function firstApiRequest(FakeTransport $transport): array
+    {
+        $lines = explode("\r\n", $transport->writes[3]);
+        $head = explode(' ', $lines[0]);
+        self::assertSame('PUB', $head[0]);
+
+        /** @var array<string,mixed> $body */
+        $body = json_decode($lines[1], true, flags: JSON_THROW_ON_ERROR);
+
+        return [$head[1], $body];
+    }
+
+    /**
+     * @return iterable<string, array{int|null, array<string,mixed>}>
+     */
+    public static function nextMessageForSubjectRequests(): iterable
+    {
+        yield 'no start sequence' => [null, ['next_by_subj' => 'orders.new']];
+        yield 'start 0' => [0, ['next_by_subj' => 'orders.new']];
+        yield 'start 1' => [1, ['next_by_subj' => 'orders.new', 'seq' => 1]];
+        yield 'start 5' => [5, ['next_by_subj' => 'orders.new', 'seq' => 5]];
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() sends STREAM.MSG.GET with next_by_subj, and seq only for a
+     * start sequence above 0; the whole body is compared, so a stray last_by_subj would fail it (#36, #15).
+     *
+     * @param array<string,mixed> $expectedBody
+     */
+    #[DataProvider('nextMessageForSubjectRequests')]
+    public function testGetNextMessageForSubjectSendsNextBySubj(?int $startSequence, array $expectedBody): void
+    {
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->muxReplies($transport, [
+            self::storedMessageReply(['subject' => 'orders.new', 'seq' => 5, 'time' => '2026-11-28T15:59:23.267085923Z', 'data' => base64_encode('x')]),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        if ($startSequence === null) {
+            $js->getNextMessageForSubject('ORDERS', 'orders.new')->await();
+        } else {
+            $js->getNextMessageForSubject('ORDERS', 'orders.new', $startSequence)->await();
+        }
+
+        [$subject, $body] = self::firstApiRequest($transport);
+        self::assertSame('$JS.API.STREAM.MSG.GET.ORDERS', $subject);
+        self::assertSame($expectedBody, $body);
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() returns the stored subject, sequence, time, payload (a "0"
+     * body kept) and header block (#15).
+     */
+    public function testGetNextMessageForSubjectParsesTheStoredMessage(): void
+    {
+        $headerBlock = "NATS/1.0\r\nX-Custom: present\r\n\r\n";
+
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->muxReplies($transport, [
+            self::storedMessageReply([
+                'subject' => 'orders.new',
+                'seq' => 7,
+                'time' => '2026-11-28T15:59:23.267085923Z',
+                'data' => base64_encode('0'),
+                'hdrs' => base64_encode($headerBlock),
+            ]),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $message = $client->jetStream()->getNextMessageForSubject('ORDERS', 'orders.new', 3)->await();
+
+        self::assertSame('orders.new', $message->subject);
+        self::assertSame(7, $message->sequence);
+        self::assertSame('2026-11-28T15:59:23.267085923Z', $message->time);
+        self::assertSame('0', $message->payload);
+        self::assertSame($headerBlock, $message->rawHeaders);
+        self::assertSame('present', NatsHeaders::fromWireBlock($message->rawHeaders)['X-Custom'] ?? null);
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() reads a sequence sent as a numeric string, and gives an empty
+     * time and null headers when the reply carries neither (#15).
+     */
+    public function testGetNextMessageForSubjectToleratesAStringSequenceAndNoTimeOrHeaders(): void
+    {
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->muxReplies($transport, [
+            self::storedMessageReply(['subject' => 'orders.new', 'seq' => '9', 'data' => base64_encode('plain')]),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $message = $client->jetStream()->getNextMessageForSubject('ORDERS', 'orders.new')->await();
+
+        self::assertSame(9, $message->sequence);
+        self::assertSame('', $message->time);
+        self::assertSame('plain', $message->payload);
+        self::assertNull($message->rawHeaders);
+    }
+
+    /**
+     * @return iterable<string, array{string}>
+     */
+    public static function wildcardNextSubjects(): iterable
+    {
+        yield 'single-token wildcard' => ['orders.*'];
+        yield 'full wildcard' => ['orders.>'];
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() sends a wildcard subject unchanged, unlike
+     * getLastMessageForSubject(): the server matches next_by_subj as a filter (#15).
+     */
+    #[DataProvider('wildcardNextSubjects')]
+    public function testGetNextMessageForSubjectSendsAWildcardSubjectUnchanged(string $subject): void
+    {
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->muxReplies($transport, [
+            self::storedMessageReply(['subject' => 'orders.b', 'seq' => 2, 'time' => '2026-11-28T15:59:23.267085923Z', 'data' => base64_encode('b')]),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $message = $client->jetStream()->getNextMessageForSubject('ORDERS', $subject, 2)->await();
+
+        self::assertSame('orders.b', $message->subject);
+        self::assertSame(2, $message->sequence);
+        self::assertSame(['next_by_subj' => $subject, 'seq' => 2], self::firstApiRequest($transport)[1]);
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() surfaces the server's "no message found" reply (nothing at or
+     * after the start sequence) as a JetStreamException with code 404 and err_code 10037 (#15).
+     */
+    public function testGetNextMessageForSubjectSurfacesNoMessageFoundAs404(): void
+    {
+        $err = '{"type":"io.nats.jetstream.api.v1.stream_msg_get_response","error":{"code":404,"err_code":10037,"description":"no message found"}}';
+
+        $transport = new FakeTransport([self::INFO_2_12, "PONG\r\n"]);
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($err), $err),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        try {
+            $client->jetStream()->getNextMessageForSubject('ORDERS', 'orders.new', 6)->await();
+            self::fail('Expected a JetStreamException');
+        } catch (JetStreamException $e) {
+            self::assertSame(404, $e->getCode());
+            self::assertSame(10037, $e->getErrCode());
+            self::assertSame('no message found', $e->getMessage());
+        }
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() refuses an empty subject before sending: the server would
+     * ignore it and answer with the message at the start sequence on any subject (#15).
+     */
+    public function testGetNextMessageForSubjectRefusesAnEmptySubject(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('getNextMessageForSubject requires a non-empty subject');
+
+        try {
+            $client->jetStream()->getNextMessageForSubject('ORDERS', '', 3)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() refuses a negative start sequence before sending (the server
+     * would answer 400, "invalid JSON") (#15).
+     */
+    public function testGetNextMessageForSubjectRefusesANegativeStartSequence(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('getNextMessageForSubject requires a start sequence of 0 or more, got -1');
+
+        try {
+            $client->jetStream()->getNextMessageForSubject('ORDERS', 'orders.new', -1)->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
      * Verifies createOrUpdateStream() falls back to UPDATE when the stream already exists (#44).
      */
     public function testCreateOrUpdateStreamFallsBackToUpdate(): void
@@ -8582,6 +8798,23 @@ final class JetStreamContextTest extends TestCase
 
         try {
             $client->jetStream()->getLastMessageForSubject('bad.name', 'orders.created')->await();
+        } finally {
+            self::assertCount(2, $transport->writes);
+        }
+    }
+
+    /**
+     * Verifies getNextMessageForSubject() rejects a dotted stream name before dispatch (#131, #15).
+     */
+    public function testGetNextMessageForSubjectRejectsDottedStreamName(): void
+    {
+        [$client, $transport] = $this->connectedForNameGuard();
+
+        $this->expectException(JetStreamException::class);
+        $this->expectExceptionMessage('Invalid stream name "bad.name"');
+
+        try {
+            $client->jetStream()->getNextMessageForSubject('bad.name', 'orders.created')->await();
         } finally {
             self::assertCount(2, $transport->writes);
         }

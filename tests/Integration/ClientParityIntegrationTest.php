@@ -12,9 +12,12 @@ use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionEvent;
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
+use IDCT\NATS\JetStream\Models\StoredMessage;
 use IDCT\NATS\Services\ServiceError;
 use IDCT\NATS\Transport\WebSocketTransport;
 use PHPUnit\Framework\TestCase;
@@ -722,6 +725,92 @@ final class ClientParityIntegrationTest extends TestCase
 
         $js->deleteStream($stream)->await();
         $client->disconnect()->await();
+    }
+
+    /**
+     * #36 / #15 - getNextMessageForSubject walks a subject by sequence over the leader path, on a stream
+     * without allow_direct: a concrete subject yields its own sequences and then the 404, a wildcard all
+     * of them, and the start sequence itself counts.
+     */
+    public function testGetNextMessageForSubjectWalksASubjectLive(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $base = 'it.' . strtolower($stream);
+        $client = $this->client();
+        $js = $client->jetStream();
+        $info = $js->createStream($stream, [$base . '.>'])->await();
+        $config = is_array($info->raw['config'] ?? null) ? $info->raw['config'] : [];
+        self::assertFalse((bool) ($config['allow_direct'] ?? false), 'the stream is served by the leader only');
+
+        // Interleaved subjects: a, b, a, c, a, then h with a stored header.
+        $subjectBySequence = [];
+        foreach (['a', 'b', 'a', 'c', 'a'] as $token) {
+            $subjectBySequence[$js->publish($base . '.' . $token, 'payload-' . $token)->await()->seq] = $base . '.' . $token;
+        }
+        $subjectBySequence[$js->publish($base . '.h', 'with-header', ['X-Trace' => 'p15'])->await()->seq] = $base . '.h';
+        $sequences = array_keys($subjectBySequence);
+        $sequencesOnA = array_keys($subjectBySequence, $base . '.a', true);
+        self::assertCount(3, $sequencesOnA);
+
+        // A concrete subject: its own sequences only, then the 404.
+        $walk = $this->walkSubject($js, $stream, $base . '.a', $sequences[0]);
+        self::assertSame($sequencesOnA, array_map(static fn(StoredMessage $message): int => $message->sequence, $walk));
+        foreach ($walk as $message) {
+            self::assertSame($base . '.a', $message->subject);
+            self::assertSame('payload-a', $message->payload);
+        }
+
+        // The start sequence itself counts, and the default start reads from the beginning.
+        self::assertSame($sequencesOnA[2], $js->getNextMessageForSubject($stream, $base . '.a', $sequencesOnA[2])->await()->sequence);
+        self::assertSame($sequencesOnA[0], $js->getNextMessageForSubject($stream, $base . '.a')->await()->sequence);
+
+        // A wildcard: every message, each with its subject and store time; the last keeps its stored header.
+        $walk = $this->walkSubject($js, $stream, $base . '.*', 0);
+        self::assertSame($sequences, array_map(static fn(StoredMessage $message): int => $message->sequence, $walk));
+        foreach ($walk as $message) {
+            self::assertSame($subjectBySequence[$message->sequence], $message->subject);
+            self::assertMatchesRegularExpression('/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/', $message->time);
+        }
+        $last = $walk[count($walk) - 1];
+        self::assertSame('with-header', $last->payload);
+        self::assertNotNull($last->rawHeaders);
+        self::assertSame('p15', NatsHeaders::fromWireBlock($last->rawHeaders)['X-Trace'] ?? null);
+
+        // A full wildcard from the fourth sequence starts there (subject c).
+        $fromFourth = $js->getNextMessageForSubject($stream, $base . '.>', $sequences[3])->await();
+        self::assertSame($sequences[3], $fromFourth->sequence);
+        self::assertSame($base . '.c', $fromFourth->subject);
+
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Reads $subject with getNextMessageForSubject() from $from by `sequence + 1` until the server answers
+     * 404 "no message found" (err_code 10037), and returns the messages read.
+     *
+     * @return list<StoredMessage>
+     */
+    private function walkSubject(JetStreamContext $js, string $stream, string $subject, int $from): array
+    {
+        $messages = [];
+        while (count($messages) <= 10) {
+            try {
+                $message = $js->getNextMessageForSubject($stream, $subject, $from)->await();
+            } catch (JetStreamException $e) {
+                self::assertSame(404, $e->getCode(), $e->getMessage());
+                self::assertSame(10037, $e->getErrCode(), $e->getMessage());
+
+                return $messages;
+            }
+
+            $messages[] = $message;
+            $from = $message->sequence + 1;
+        }
+
+        self::fail('the walk over ' . $subject . ' did not end with a 404');
     }
 
     /**
