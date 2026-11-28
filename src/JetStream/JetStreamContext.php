@@ -11,7 +11,6 @@ use Amp\DeferredCancellation;
 use Amp\Future;
 use Amp\TimeoutCancellation;
 use IDCT\NATS\Connection\Enum\ConnectionState;
-use IDCT\NATS\Connection\IncomingChunkResult;
 use IDCT\NATS\Core\Inbox;
 use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
@@ -2936,43 +2935,24 @@ final class JetStreamContext
             $questionTime = new TimeoutCancellation(($timeoutMs ?? $this->client->options()->requestTimeoutMs) / 1000);
             $question = $this->client->request($subject, '{}', $timeoutMs, $giveUp->getCancellation());
 
-            while (true) {
-                try {
-                    $answer = $question->await(new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS));
-
-                    break;
-                } catch (\Exception $failure) {
-                    if ($failure instanceof CancelledException && !$question->isComplete()) {
-                        // The look at the connection came due with the question still waiting.
-                        if (!$this->connectionLeftSince($generation)) {
-                            continue;
-                        }
-
-                        $giveUp->cancel();
-
-                        return NoRespondersCause::ServerGoingAway;
-                    }
-
-                    // The question ended unanswered: with the connection's exception, the request's timeout, its inbox
-                    // refused, or a write that failed on the new connection too (the raw transport error then). The
-                    // server had no responder for the question either when it says so: JetStream is not there to
-                    // answer it.
-                    if ($this->connectionLeftSince($generation)) {
-                        return NoRespondersCause::ServerGoingAway;
-                    }
-
-                    if ($failure instanceof PermissionViolationException) {
-                        return $this->watchTheConnectionUntil($generation, $questionTime);
-                    }
-
-                    return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
-                        ? NoRespondersCause::JetStreamError
-                        : NoRespondersCause::NoAnswer;
-                }
+            if (!$this->awaitWhileTheConnectionStays($generation, $question, $giveUp) || $this->connectionLeftSince($generation)) {
+                return NoRespondersCause::ServerGoingAway;
             }
 
-            if ($this->connectionLeftSince($generation)) {
-                return NoRespondersCause::ServerGoingAway;
+            try {
+                $answer = $question->await();
+            } catch (\Exception $failure) {
+                // The question ended unanswered: with the connection's exception, the request's timeout, its inbox
+                // refused, or a write that failed on the new connection too (the raw transport error then). The
+                // server had no responder for the question either when it says so: JetStream is not there to
+                // answer it.
+                if ($failure instanceof PermissionViolationException) {
+                    return $this->watchTheConnectionUntil($generation, $questionTime);
+                }
+
+                return $failure instanceof NatsException && str_contains($failure->getMessage(), 'No responders')
+                    ? NoRespondersCause::JetStreamError
+                    : NoRespondersCause::NoAnswer;
             }
 
             try {
@@ -3000,61 +2980,83 @@ final class JetStreamContext
      * waits: without a read, neither the close nor the lame duck INFO would be seen. Before client 2.30.0 the refused
      * question waited out its timeout, which watched the connection the same way.
      *
-     * It looks at the connection every 20 ms whatever the read does, as the question's wait does, with one read kept in
-     * flight across the looks and bounded by the question's time. The read has no subscription of its own, so no
-     * wake-up, and a read without one that is the first to notice a lost connection, or the lame duck INFO of a server
-     * naming another one, runs the reconnect or the failover itself and waits for all of it
-     * ({@see \IDCT\NATS\Connection\NatsConnection::readIncomingForOperation()}). Awaited only until the next look, it
-     * goes on in its own fiber, the look sees the connection left and the cause is ServerGoingAway, while the client
-     * still reconnects. Awaiting the read itself made the watch return only once the reconnect was over, past the
-     * question's time (#257). A read that consumed nothing is followed by a 1 ms pause, as in the client's other wait
-     * loops: on a transport whose idle read returns at once the watch would otherwise spin, and no timer of the process,
-     * the question's deadline included, would fire again (#256). The read still in flight when the watch returns is
-     * let go of: its wait on the socket, or for a reconnect another fiber runs, ends with the watch, a reconnect or a
-     * failover it runs itself goes on, and what it ends with is nobody's to handle.
+     * It looks at the connection every 20 ms whatever the reads do, the same way {@see awaitWhileTheConnectionStays()}
+     * watches the question's wait. The reads run one after another in a fiber of their own, each bounded by the
+     * question's time, until the watch ends them or the question's time is over. That fiber has no subscription of
+     * its own, so no wake-up, and a read without one that is the first to notice a lost connection, or the lame duck
+     * INFO of a server naming another one, runs the reconnect or the failover itself and waits for all of it
+     * ({@see \IDCT\NATS\Connection\NatsConnection::readIncomingForOperation()}). The fiber is awaited only until the
+     * next look, so when it is still inside such a read the look sees the connection left and the cause is
+     * ServerGoingAway, while the fiber keeps running the reconnect on its own (#257). A read that consumed nothing is
+     * followed by a 1 ms pause, as in the client's other wait loops: on a transport whose idle read returns at once
+     * the fiber would otherwise spin, and no timer of the process, the question's deadline included, would fire
+     * again (#256). Once the watch returns, the fiber is cancelled and let go: whatever it still runs, a reconnect or
+     * a failover included, is nobody's to handle.
      */
     private function watchTheConnectionUntil(int $generation, Cancellation $questionTime): NoRespondersCause
     {
         $watchEnd = new DeferredCancellation();
         $readTime = new CompositeCancellation($questionTime, $watchEnd->getCancellation());
-        /** @var Future<IncomingChunkResult>|null $read */
-        $read = null;
-
-        try {
-            while (!$this->connectionLeftSince($generation)) {
-                if ($questionTime->isRequested()) {
-                    return NoRespondersCause::NoAnswer;
-                }
-
-                $read ??= $this->client->readIncomingForOperation($readTime);
+        // The reads of the socket, one after the other until the question's time is over or the watch ends.
+        $reads = async(function () use ($readTime): void {
+            while (!$readTime->isRequested()) {
+                $pause = 0.0;
                 try {
-                    $result = $read->await(new CompositeCancellation($questionTime, new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS)));
-                } catch (CancelledException) {
-                    // The look came due with the read still in flight, which goes on across the next look, or the
-                    // question's time is over, which ends the read too: look again.
-                    continue;
+                    if (!$this->client->readIncomingForOperation($readTime)->await()->consumedBytes) {
+                        // Nothing read - an idle transport whose read returns at once, or another fiber's read:
+                        // yield, so that the event loop goes on and the deadlines fire (#256).
+                        $pause = 0.001;
+                    }
                 } catch (\Throwable) {
-                    // A read that fails: the connection is gone, which the next look sees, or it stays, and a pause
-                    // keeps the watch from spinning.
-                    $read = null;
-                    delay(self::NO_RESPONDERS_LOOK_SECONDS);
-
-                    continue;
+                    // A read that fails: the connection is gone, which the look sees, or it stays, and a pause
+                    // keeps the reads from spinning. A read ended by the watch's time ends the loop.
+                    $pause = self::NO_RESPONDERS_LOOK_SECONDS;
                 }
 
-                $read = null;
-                if (!$result->consumedBytes) {
-                    // Nothing read - an idle transport whose read returns at once, or another fiber's read: yield, so
-                    // that the event loop goes on and the deadlines fire.
-                    delay(0.001);
+                if ($pause > 0.0) {
+                    try {
+                        delay($pause, cancellation: $readTime);
+                    } catch (CancelledException) {
+                        // The question's time is over, or the watch has ended.
+                    }
                 }
             }
+        });
 
-            return NoRespondersCause::ServerGoingAway;
+        try {
+            $this->awaitWhileTheConnectionStays($generation, $reads, $watchEnd);
         } finally {
             $watchEnd->cancel();
-            $read?->ignore();
+            $reads->ignore();
         }
+
+        return $this->connectionLeftSince($generation) ? NoRespondersCause::ServerGoingAway : NoRespondersCause::NoAnswer;
+    }
+
+    /**
+     * Waits for $wait to complete while the connection that was current at $generation stays, looking at the
+     * connection every 20 ms whatever $wait does: true once $wait has completed (its result or error is the caller's
+     * to read), false as soon as the connection has left, and then $stop is cancelled, which ends $wait.
+     *
+     * @param Future<mixed> $wait
+     */
+    private function awaitWhileTheConnectionStays(int $generation, Future $wait, DeferredCancellation $stop): bool
+    {
+        while (!$wait->isComplete()) {
+            if ($this->connectionLeftSince($generation)) {
+                $stop->cancel();
+
+                return false;
+            }
+
+            try {
+                $wait->await(new TimeoutCancellation(self::NO_RESPONDERS_LOOK_SECONDS));
+            } catch (\Throwable) {
+                // The look came due, or $wait ended with an error, which its caller reads: look again.
+            }
+        }
+
+        return true;
     }
 
     /**
