@@ -15,6 +15,16 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
+## [Unreleased]
+
+### Testing & CI
+
+- `[docs]` `DurableSourcingIntegrationTest`'s class docblock, its `TESTS.md` entry and the README's "Stream Mirroring
+  and Sourcing" `Verified by` line said the fixture stack ran nats-server 2.12 only, stale since #286 (#279) added the
+  second `composer test:e2e` integration stage against the `nats-214` fixture. All three now say the default `nats`
+  fixture (2.12) runs only the refusal test and the second stage (2.14+) runs the sourcing test and leaves the refusal
+  out by its name (#287).
+
 ## [2.35.0] - 2026-11-28
 
 ### Added
