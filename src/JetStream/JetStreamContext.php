@@ -2598,17 +2598,20 @@ final class JetStreamContext
      * An empty result at this deadline throws the usual JetStreamException with code 408. A pull whose publish the
      * server refuses for lack of permission (-ERR 'Permissions Violation for Publish to "$JS.API.CONSUMER.MSG.NEXT.
      * <stream>.<consumer>"') fails at once with a {@see PermissionViolationException} naming that subject, which is not
-     * a JetStreamException, instead of ending as an empty pull at the deadline (#260); messages delivered before the
-     * refusal are returned. Frames that came ahead of the -ERR and another fiber's read had not delivered yet are
-     * delivered first: their messages are returned, and a terminal status among them decides as it would without the
-     * refusal. A refusal whose subject the client cannot match to the pull's (an account's subject mapping, a name Go
-     * writes with \u escapes, #259) is not seen: the pull ends as one nothing answers, as an empty one at the deadline
-     * (the 408), or, with an `idle_heartbeat`, with the missed-heartbeat JetStreamException (code 0) once two intervals
-     * pass with nothing. A server PING that the fetch's own read brings in is answered without holding the fetch: it
-     * waits for the PONG's write only within its deadline, and a refusal another fiber's read brings ends that wait;
-     * the same holds while drain() runs, the PONG then the drain's to finish. A read without an operation of its own
-     * (processIncoming(), a serving loop's) whose chunk carries a delivery for the pull queues it ahead of the PONG it
-     * owes, so the pull's message or terminal status is not left behind that PONG when the refusal comes.
+     * a JetStreamException, instead of ending as an empty pull at the deadline (#260). A pull that has received a
+     * message is not refused: the message shows that its own publish got through, so the -ERR answered another publish
+     * to the subject, and the pull goes on to its usual end; one that has received nothing is refused, whichever
+     * publish the -ERR answers (as for requestMany(), #258). Frames that came ahead of the -ERR and another fiber's read
+     * had not delivered yet are delivered first: a message among them counts as received, and a terminal status among
+     * them decides as it would without the -ERR. A refusal whose subject the client cannot match to the pull's (an
+     * account's subject mapping, a name Go writes with \u escapes, #259) is not seen: the pull ends as one nothing
+     * answers, as an empty one at the deadline (the 408), or, with an `idle_heartbeat`, with the missed-heartbeat
+     * JetStreamException (code 0) once two intervals pass with nothing. A server PING that the fetch's own read brings
+     * in is answered without holding the fetch: it waits for the PONG's write only within its deadline, and a refusal
+     * another fiber's read brings ends that wait; the same holds while drain() runs, the PONG then the drain's to
+     * finish. A read without an operation of its own (processIncoming(), a serving loop's) whose chunk carries a
+     * delivery for the pull queues it ahead of the PONG it owes, so the pull's message or terminal status is not left
+     * behind that PONG when the refusal comes.
      *
      * The optional `$pull` array carries ADR-42 priority-group fields and general pull options:
      * `group`, `id` (pin id), `min_pending`, `min_ack_pending`, `priority` (0-9), `max_bytes`,
