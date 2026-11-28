@@ -30,8 +30,10 @@ $group = 'g1';
 
 $js = $client->jetStream();
 
-// Priority-group fields require NATS server 2.11+. If the server is older it rejects the
-// consumer config; surface that as a clear note rather than an opaque failure.
+// Priority-group fields require NATS server 2.11+ (the `prioritized` policy 2.12+). A default
+// 2.10 server drops them, and the consumer create then fails with the reply check's
+// UnsupportedFeatureException; a 2.11 server rejects a `prioritized` policy itself. Surface
+// either as a clear note rather than an opaque failure.
 $pinId = null;
 
 try {

@@ -86,4 +86,20 @@ final class AccountInfoMutationTest extends TestCase
         self::assertSame(5, $info->streams);
         self::assertSame(9, $info->consumers);
     }
+
+    /**
+     * The JetStream API level is read from `api.level` of the `$JS.API.INFO` reply (#272): as 2.11.17, 2.12.15 and
+     * 2.14.10 report it (1, 3, 4) and a level 0, while a reply without one (2.10.29 sends `api` with only its counters),
+     * without `api`, or with a level that is not a non-negative integer gives null.
+     */
+    public function testApiLevelIsReadFromTheApiObject(): void
+    {
+        foreach ([1, 3, 4, 0] as $level) {
+            self::assertSame($level, AccountInfo::fromArray(['api' => ['level' => $level, 'total' => 12, 'errors' => 0]])->apiLevel);
+        }
+
+        foreach ([['api' => ['total' => 14, 'errors' => 0]], [], ['api' => 3], ['api' => ['level' => '3']], ['api' => ['level' => -1]], ['api' => ['level' => 3.0]]] as $data) {
+            self::assertNull(AccountInfo::fromArray($data)->apiLevel, (string) json_encode($data));
+        }
+    }
 }

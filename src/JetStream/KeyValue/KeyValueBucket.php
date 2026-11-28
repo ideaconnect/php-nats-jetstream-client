@@ -12,6 +12,7 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\ApiErrCode;
 use IDCT\NATS\JetStream\DecodesApiErrors;
 use IDCT\NATS\JetStream\JetStreamApi;
@@ -1017,20 +1018,21 @@ final class KeyValueBucket
             }
 
             // Fast path (#110): one batched multi_last Direct Get (ADR-31) returns the latest record of
-            // every key in a single request/reply, instead of one Direct Get round-trip per key. Gated
-            // on server support (batched Direct Get needs NATS 2.11+); older servers take the per-subject
-            // fan-out below. The returned data, tombstone filtering, and 404/missing handling are identical.
-            if ($this->jetStream->supportsBatchedDirectGet()) {
-                try {
-                    return $this->getAllBatched(array_keys($subjects));
-                } catch (JetStreamException $e) {
-                    if ($e->getCode() !== 503) {
-                        throw $e;
-                    }
-                    // The STREAM (not the server) lacks Direct Get - allow_direct disabled / legacy
-                    // interop bucket: the server-version gate above cannot see that. Fall through to
-                    // the per-subject fan-out, whose lookups fall back to the leader STREAM.MSG.GET.
+            // every key in a single request/reply, instead of one Direct Get round-trip per key. It is always
+            // tried (#272): the reply, not the connected server's version, shows whether the server that
+            // answers serves batched Direct Get (ADR-44). The returned data, tombstone filtering, and
+            // 404/missing handling of both paths are identical.
+            try {
+                return $this->getAllBatched(array_keys($subjects));
+            } catch (UnsupportedFeatureException) {
+                // The reply shows the server does not serve batched Direct Get (before 2.11). Fall through to
+                // the per-subject fan-out, which every server with Direct Get answers.
+            } catch (JetStreamException $e) {
+                if ($e->getCode() !== 503) {
+                    throw $e;
                 }
+                // The STREAM lacks Direct Get - allow_direct disabled / legacy interop bucket. Fall through
+                // to the per-subject fan-out, whose lookups fall back to the leader STREAM.MSG.GET.
             }
 
             // Look up the latest record per key CONCURRENTLY via the Direct Get API (last_by_subj).
@@ -1095,7 +1097,8 @@ final class KeyValueBucket
      * (ADR-31) instead of a per-subject fan-out. Produces the identical `key => value` map: the same
      * candidate subjects are considered (non-key subjects skipped), DEL/PURGE tombstones are filtered
      * by the KV-Operation header, and subjects with no stored record are simply absent from the batch
-     * reply (mirroring the fan-out's 404-skip). Only reached when {@see JetStreamContext::supportsBatchedDirectGet()}.
+     * reply (mirroring the fan-out's 404-skip). Tried first by getAll(), which takes the fan-out when this
+     * throws the {@see \IDCT\NATS\Exception\UnsupportedFeatureException} of a server without batched Direct Get.
      *
      * @param list<int|string> $subjectNames STREAM.INFO subject-map keys (`$KV.<bucket>.<key>`).
      * @return array<string,string>

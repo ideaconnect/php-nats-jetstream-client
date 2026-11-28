@@ -12,9 +12,10 @@ use DateTimeZone;
  * Helper for building scheduler expressions (ADR-51) for {@see JetStreamContext::publishScheduled()}.
  *
  * Server versions: a one-off `@at` schedule ({@see at()}, {@see atTimestamp()}) needs NATS server 2.12+;
- * the recurring forms ({@see every()}, {@see cron()}, {@see predefined()}) need 2.14+. On an older server
- * `publishScheduled()` throws an {@see \IDCT\NATS\Exception\UnsupportedFeatureException} for them before
- * anything is published (#267).
+ * the recurring forms ({@see every()}, {@see cron()}, {@see predefined()}) need 2.14+ on the servers that
+ * hold the stream. `publishScheduled()` sends every schedule whatever version the connected server reports
+ * (ADR-44, #272), and the server that stores it decides: a 2.12 server answers a recurring schedule with its
+ * own 400 (`message schedules pattern is invalid`), thrown as a {@see \IDCT\NATS\Exception\JetStreamException}.
  */
 final class Schedule
 {

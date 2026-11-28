@@ -10,6 +10,7 @@ use IDCT\NATS\Exception\JetStreamException;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
+use IDCT\NATS\Tests\Support\ServerWithoutBatchedDirectGet;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -31,8 +32,9 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
         $this->releaseOwnedResources();
     }
 
-    // Pre-2.11 server: list() takes the per-subject Direct Get fan-out (the code these mutants pin);
-    // batched multi_last Direct Get requires 2.11+ and is covered separately by the #110 pins.
+    // A server without batched Direct Get (2.10): it answers list()'s batched multi_last request 408 Empty Request
+    // ({@see ServerWithoutBatchedDirectGet}, installed by the list() tests), and list() takes the per-subject Direct
+    // Get fan-out (the code these mutants pin); the batched path is covered separately by the #110 pins.
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /** URL-safe base64 (with padding), matching the Object Store meta-subject encoding. */
@@ -209,6 +211,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
             // Direct Get for the one meta subject: Nats-Sequence: 11 is present -> revision must be 11.
             $this->directMetaReply('doc.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 3, 11),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $objects = $this->connectedClient($transport)->jetStream()->objectStore('assets')->list()->await();
 
@@ -243,6 +246,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
             $this->directMetaReply('gone.txt', ['nuid' => '', 'size' => 0, 'chunks' => 0, 'digest' => '', 'deleted' => true], 3),
             $this->directMetaReply('live.txt', ['nuid' => 'n2', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $objects = $this->connectedClient($transport)->jetStream()->objectStore('assets')->list()->await();
 
@@ -448,6 +452,7 @@ final class ObjectStoreBucket_4MutationTest extends TestCase
             // Direct Get for the one unique subject.
             $this->directMetaReply('a.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 3),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $objects = $this->connectedClient($transport)->jetStream()->objectStore('assets')->list()->await();
 

@@ -354,7 +354,7 @@ final class JetStreamContext_2MutationTest extends \PHPUnit\Framework\TestCase
      */
     public function testDirectGetBatchMessageSidIsZero(): void
     {
-        $headers = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\n\r\n";
+        $headers = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\nNats-Num-Pending: 1\r\n\r\n";
         [$client] = $this->connectedClient([
             self::hmsg($headers, 'aaa'),
             self::hmsg("NATS/1.0 204 EOB\r\n\r\n"),

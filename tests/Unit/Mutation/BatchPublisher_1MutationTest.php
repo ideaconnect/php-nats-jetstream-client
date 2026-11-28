@@ -13,9 +13,9 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * Second mutation-killing chunk for {@see \IDCT\NATS\JetStream\BatchPublisher}. Each method pins the
- * exact observable behaviour that one surviving Infection mutant would change, focused on the version
- * pre-flight (#152), the reply-shape detection (#130), and the diagnostic each failure surfaces. See
- * the per-method docblocks naming the exact mutant (line + mutator) killed.
+ * exact observable behaviour that one surviving Infection mutant would change, focused on the absence of
+ * a version pre-flight (ADR-44, #272; up to 2.35.0 commit() had the #152 one), the reply-shape detection
+ * (#130), and the diagnostic each failure surfaces. See the per-method docblocks naming the exact mutant killed.
  */
 final class BatchPublisher_1MutationTest extends TestCase
 {
@@ -137,90 +137,34 @@ final class BatchPublisher_1MutationTest extends TestCase
     }
 
     // -----------------------------------------------------------------------------------------------
-    // commit() version pre-flight - major-version comparison (line 114)
+    // commit() sends the batch whatever version INFO reports (ADR-44, #272)
     // -----------------------------------------------------------------------------------------------
 
     /**
-     * Kills IncrementInteger @ 114 ($version[0] < 2  =>  $version[1] < 2). A server whose MAJOR
-     * version is below 2 (here "1.99") cannot honor batch semantics: the pre-flight must reject it
-     * before any byte is written. The mutant tests the MINOR instead - for [1, 99] that is 99 < 2
-     * (false) and the second clause needs major === 2 (false), so it would wrongly PROCEED and
-     * publish the batch. Pinned by: throws UnsupportedFeatureException naming "1.99" and NOTHING is
-     * written (even though replies are scripted for the would-be proceed path).
+     * No INFO version decides: a 1.x major, an unanchored "release-1.5", a v-prefixed "v2.12.0" and a pre-2.12
+     * "2.11.4" all get the batch on the wire, and it commits when the JetStream API that answers serves atomic
+     * batches. Up to 2.35.0 the #152 pre-flight refused the 1.x and 2.11.4 ones before any write; a pre-flight
+     * brought back (any version comparison in commit()) fails this test. Pinned by: every message is written and
+     * commit() returns the batch ack.
      */
-    public function testPreflightRejectsSubTwoMajorVersion(): void
+    public function testCommitIsSentWhateverVersionInfoReports(): void
     {
-        // Scripted replies for the mutant's (wrong) proceed path, so it completes deterministically
-        // instead of timing out - the clean pre-flight must consume none of them.
-        $client = $this->clientWithVersion('1.99', [
-            self::zeroAck(),
-            self::batchAck('b-major', 2),
-        ]);
+        foreach (['1.99', 'release-1.5', 'v2.12.0', '2.11.4'] as $version) {
+            $client = $this->clientWithVersion($version, [
+                self::zeroAck(),
+                self::batchAck('b-any', 2),
+            ]);
 
-        try {
-            $client->jetStream()->batch('b-major')
+            $ack = $client->jetStream()->batch('b-any')
                 ->add('orders.created', 'a')
                 ->add('orders.created', 'b')
                 ->commit()
                 ->await();
-            self::fail('a sub-2.0 major version must trip the pre-flight before any write');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame('1.99', $e->serverVersion);
+
+            self::assertSame(2, $ack->batchCount, $version);
+            self::assertSame('b-any', $ack->batchId, $version);
+            self::assertSame(2, self::batchWriteCount($this->transport), 'both messages are written on ' . $version);
         }
-
-        self::assertSame(0, self::batchWriteCount($this->transport), 'the pre-flight must publish nothing');
-    }
-
-    // -----------------------------------------------------------------------------------------------
-    // versionComponents() - anchored numeric prefix (line 239) and capture group (line 243)
-    // -----------------------------------------------------------------------------------------------
-
-    /**
-     * Kills PregMatchRemoveCaret @ 239 (/^v?(\d+).../  =>  /v?(\d+).../). The version regex is anchored:
-     * a string that does NOT begin with a (optionally v-prefixed) number - a proxy/custom build like
-     * "release-1.5" - has no parseable version, so the pre-flight is skipped and commit() proceeds.
-     * Without the caret the mutant scans the whole string, finds the embedded "1.5", reads it as major 1,
-     * and wrongly trips the pre-flight. Pinned by: commit() succeeds and returns the batch ack.
-     */
-    public function testUnanchoredVersionDoesNotTripPreflight(): void
-    {
-        $client = $this->clientWithVersion('release-1.5', [
-            self::zeroAck(),
-            self::batchAck('b-anchor', 2),
-        ]);
-
-        $ack = $client->jetStream()->batch('b-anchor')
-            ->add('orders.created', 'a')
-            ->add('orders.created', 'b')
-            ->commit()
-            ->await();
-
-        self::assertSame(2, $ack->batchCount);
-        self::assertSame('b-anchor', $ack->batchId);
-    }
-
-    /**
-     * Kills DecrementInteger @ 243 ((int) $match[1]  =>  (int) $match[0]). The major version is capture
-     * group 1, not the full match: for a v-prefixed "v2.12.0" the full match ($match[0]) is "v2.12",
-     * which casts to int 0 (leading 'v' is non-numeric), while the capture ($match[1]) is "2". The
-     * mutant therefore reads major 0 (< 2) and wrongly rejects a fully batch-capable 2.12 server.
-     * Pinned by: commit() proceeds and returns the batch ack.
-     */
-    public function testVPrefixedVersionUsesCaptureGroupNotFullMatch(): void
-    {
-        $client = $this->clientWithVersion('v2.12.0', [
-            self::zeroAck(),
-            self::batchAck('b-vprefix', 2),
-        ]);
-
-        $ack = $client->jetStream()->batch('b-vprefix')
-            ->add('orders.created', 'a')
-            ->add('orders.created', 'b')
-            ->commit()
-            ->await();
-
-        self::assertSame(2, $ack->batchCount);
-        self::assertSame('b-vprefix', $ack->batchId);
     }
 
     // -----------------------------------------------------------------------------------------------
@@ -255,51 +199,48 @@ final class BatchPublisher_1MutationTest extends TestCase
         }
     }
 
+
     // -----------------------------------------------------------------------------------------------
-    // atomicBatchUnsupported() - which diagnostic each failure path surfaces (lines 115, 254, 260)
+    // atomicBatchUnsupported() - the diagnostic of the reply-shape detection
     // -----------------------------------------------------------------------------------------------
 
     /**
-     * The pre-flight failure carries the "nothing was published" wording (data is intact) and names the
-     * connected server version. This pins the full message, killing several mutants at once:
-     *   - TrueValue @ 115  (preflight: true => false): flips the wording to "treated ... as plain publishes".
-     *   - Ternary  @ 260   (message branch swap): same flip on the preflight branch.
-     *   - NotIdentical @ 254 (!== null => === null) and (!== '' => === ''): drops " 2.11.4" from the message.
-     *   - LogicalAndAllSubExprNegation / LogicalAndNegation @ 254: likewise drop the version.
-     *   - Ternary @ 254 (branch swap): likewise drops the version.
+     * The reply-shape failure says the server treated the batch as plain publishes (the start message is already
+     * stored) and reports the connected server's version, which is informational only: the answering server may be
+     * another one (#272). This pins the full message on a server whose INFO reports 2.11.4, killing the mutants of
+     * the version slot (NotIdentical / LogicalAnd / Ternary on `$serverVersion !== null && $serverVersion !== ''`),
+     * which replace "2.11.4" with "unknown"; the "unknown" branch is pinned by
+     * BatchPublisherTest::testReplyShapeAbortMessageOmitsMissingServerVersionCleanly().
      */
-    public function testPreflightMessageSaysNothingPublishedAndNamesVersion(): void
+    public function testReplyShapeMessageSaysTreatedAsPlainPublishesAndReportsVersion(): void
     {
-        $client = $this->clientWithVersion('2.11.4');
+        $client = $this->clientWithVersion('2.11.4', [
+            self::msg('_INBOX.a', 1, '{"stream":"ORDERS","seq":41}'),
+        ]);
 
         try {
-            $client->jetStream()->batch('b-msg')
+            $client->jetStream()->batch('b-shape')
                 ->add('orders.created', 'a')
                 ->add('orders.created', 'b')
                 ->commit()
                 ->await();
-            self::fail('a pre-2.12 version must trip the pre-flight');
+            self::fail('a plain-PubAck start ack must abort via reply-shape detection');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame(
-                'Atomic batch publish requires NATS server 2.12+ (connected server 2.11.4; nothing was published)',
+                'Atomic batch publish requires NATS server 2.12+, and the server treated the batch as plain publishes (connected server reports 2.11.4)',
                 $e->getMessage(),
             );
+            self::assertSame('2.11.4', $e->serverVersion);
         }
 
-        self::assertSame(0, self::batchWriteCount($this->transport), 'the pre-flight must publish nothing');
+        self::assertSame(1, self::batchWriteCount($this->transport), 'only the start message reaches the wire');
     }
 
     /**
-     * Kills FalseValue @ 254... (the $preflight default) — precisely: FalseValue @ 251 (default
-     * bool $preflight = false => true). The reply-shape detection calls atomicBatchUnsupported() with
-     * NO argument, relying on the default false to produce the "treated the batch as plain publishes"
-     * wording (the start message was already stored). Flipping the default to true would mislabel this
-     * as "nothing was published", hiding that an orphan message exists (#152). Pinned by the exact
-     * reply-shape message on an unparseable-version server whose start is acked as a plain publish.
+     * The same wording for an unparseable INFO version: nothing about the string changes the outcome (#272).
      */
-    public function testReplyShapeMessageSaysTreatedAsPlainPublishes(): void
+    public function testReplyShapeMessageForUnparseableVersion(): void
     {
-        // Unparseable version => pre-flight is skipped; the plain-PubAck start ack drives reply-shape.
         $client = $this->clientWithVersion('synadia-custom', [
             self::msg('_INBOX.a', 1, '{"stream":"ORDERS","seq":41}'),
         ]);
@@ -313,7 +254,7 @@ final class BatchPublisher_1MutationTest extends TestCase
             self::fail('a plain-PubAck start ack must abort via reply-shape detection');
         } catch (UnsupportedFeatureException $e) {
             self::assertSame(
-                'Atomic batch publish requires NATS server 2.12+ (connected server synadia-custom treated the batch as plain publishes)',
+                'Atomic batch publish requires NATS server 2.12+, and the server treated the batch as plain publishes (connected server reports synadia-custom)',
                 $e->getMessage(),
             );
         }

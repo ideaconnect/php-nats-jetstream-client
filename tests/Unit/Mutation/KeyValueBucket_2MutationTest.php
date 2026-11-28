@@ -11,6 +11,7 @@ use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
+use IDCT\NATS\Tests\Support\ServerWithoutBatchedDirectGet;
 use Revolt\EventLoop;
 
 /**
@@ -24,8 +25,9 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
 {
     use OwnsTestResources;
 
-    // Pre-2.11 server: getAll() takes the per-subject Direct Get fan-out (the code these mutants pin);
-    // batched multi_last Direct Get requires 2.11+ and is covered separately by the #110 pins.
+    // A server without batched Direct Get (2.10): it answers getAll()'s batched multi_last request 408 Empty Request
+    // ({@see ServerWithoutBatchedDirectGet}, installed by connectMux()), and getAll() takes the per-subject Direct Get
+    // fan-out (the code these mutants pin); the batched path is covered separately by the #110 pins.
     private const INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
 
     /** Direct Get reply (HMSG): stored value as body with Nats-* (+ optional KV-Operation). */
@@ -111,6 +113,7 @@ final class KeyValueBucket_2MutationTest extends \PHPUnit\Framework\TestCase
     {
         $transport = new FakeTransport([self::INFO, "PONG\r\n"]);
         $this->muxReplies($transport, $muxFrames);
+        ServerWithoutBatchedDirectGet::install($transport);
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
 

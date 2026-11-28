@@ -233,55 +233,52 @@ final class ConsumerResetTest extends TestCase
     }
 
     /**
-     * A server before 2.14 does not answer the request at all, so on a server advertising such a version the call
-     * fails at once with an UnsupportedFeatureException instead of waiting for the request timeout, and nothing is
-     * written after the CONNECT + PING handshake.
+     * The reset is sent whatever version the connected server reports in INFO (ADR-44, #272): the consumer's own
+     * server answers it, and in a cluster under a rolling upgrade that may be a 2.14 server behind a connected 2.12
+     * one. With the reset answered as 2.14.10 answers it, every version gets the request once and the reply's
+     * consumer: versions before 2.14 (which 2.33.0 to 2.35.0 refused with "nothing was sent"), 2.14+ ones
+     * (pre-release tags included) and versions that do not parse. `consumer_reset` stays in the registry as
+     * documentation.
      */
-    public function testAServerBefore214IsRefusedWithNothingSent(): void
+    public function testTheResetIsSentWhateverVersionInfoReports(): void
     {
         self::assertSame('2.14', FeatureSupport::requiredVersion('consumer_reset'));
 
-        foreach (['2.12.15', '2.12.0', 'v2.11.4', '2.13.9', '1.99.0', '2'] as $version) {
-            [$client, $transport] = $this->connectedTo($version);
-
-            try {
-                $client->jetStream()->resetConsumer('ORDERS', 'PROC', 2)->await();
-                self::fail('expected an UnsupportedFeatureException on ' . $version);
-            } catch (UnsupportedFeatureException $e) {
-                self::assertSame('consumer_reset', $e->feature, $version);
-                self::assertSame('2.14', $e->requiredVersion, $version);
-                self::assertSame($version, $e->serverVersion);
-                self::assertSame(0, $e->getCode(), $version);
-                self::assertNull($e->getErrCode(), $version);
-                self::assertSame(
-                    sprintf('Consumer reset requires NATS server 2.14+; older servers do not answer it (connected server %s; nothing was sent)', $version),
-                    $e->getMessage(),
-                );
-            }
-
-            self::assertCount(2, $transport->writes, sprintf('nothing may be written on %s', $version));
-        }
-    }
-
-    /**
-     * A 2.14+ server (pre-release tags count as their version) and a version that does not parse (a proxy, a custom
-     * build, none at all) get the request; then the server decides.
-     */
-    public function testA214ServerOrAnUnparseableVersionGetsTheRequest(): void
-    {
-        foreach (['2.14.0', '2.14.0-beta.1', 'v2.14.10', '2.15.2', '3.0.0', 'custom-build', null] as $version) {
+        foreach (['2.12.15', '2.12.0', 'v2.11.4', '2.13.9', '1.99.0', '2', '2.14.0', '2.14.0-beta.1', 'v2.14.10', '2.15.2', '3.0.0', 'custom-build', null] as $version) {
             [$client, $transport] = $this->connectedTo($version, [self::resetReply(2)]);
 
             $info = $client->jetStream()->resetConsumer('ORDERS', 'PROC', 2)->await();
 
             self::assertSame(2, $info->resetSequence, (string) $version);
+            // requestBody() also asserts the reset went out exactly once.
             self::assertSame('{"seq":2}', self::requestBody($transport, self::RESET_SUBJECT), (string) $version);
         }
     }
 
     /**
+     * A server before 2.14 does not answer the reset at all: with INFO reporting such a version and nothing
+     * answering, the request is still written once and the call fails with the request timeout, not with an
+     * UnsupportedFeatureException decided from the version.
+     */
+    public function testAServerBefore214LetsTheResetTimeOut(): void
+    {
+        foreach (['2.12.15', 'v2.11.4', '2.10.29'] as $version) {
+            [$client, $transport] = $this->connectedTo($version, [], 200);
+
+            try {
+                $client->jetStream()->resetConsumer('ORDERS', 'PROC', 2)->await();
+                self::fail('expected the reset to time out on ' . $version);
+            } catch (TimeoutException $e) {
+                self::assertSame('Request timed out for subject ' . self::RESET_SUBJECT, $e->getMessage(), $version);
+            }
+
+            self::assertSame('{"seq":2}', self::requestBody($transport, self::RESET_SUBJECT), $version);
+        }
+    }
+
+    /**
      * Nothing answers when the consumer or the stream does not exist (the consumer itself answers the reset), or when
-     * an older server's version did not parse: the call fails with the request timeout, as its docblock says.
+     * the server runs a release before 2.14: the call fails with the request timeout, as its docblock says.
      */
     public function testARequestNothingAnswersTimesOut(): void
     {

@@ -24,7 +24,10 @@ namespace IDCT\NATS\Tests\Support;
  */
 final class PrefixedJetStreamServer
 {
-    /** The server version its INFO advertises unless a test asks for another one ({@see info()}). */
+    /**
+     * The server version its INFO advertises, a 2.12 leaf node's. No call is decided from it (ADR-44, #272): the
+     * consumer reset, a 2.14 API, is sent through it like every other request.
+     */
     public const VERSION = '2.12.0';
 
     private const INFO_FORMAT = 'INFO {"server_id":"S1","server_name":"leaf","version":"%s","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n";
@@ -53,13 +56,10 @@ final class PrefixedJetStreamServer
 
     public function __construct(private readonly string $apiPrefix, private readonly bool $directGet = true) {}
 
-    /**
-     * The INFO line the server greets the client with, advertising $version: a call a version check gates (the
-     * consumer reset needs 2.14) is refused before anything is sent unless the version allows it.
-     */
-    public static function info(string $version = self::VERSION): string
+    /** The INFO line the server greets the client with, advertising {@see VERSION}. */
+    public static function info(): string
     {
-        return sprintf(self::INFO_FORMAT, $version);
+        return sprintf(self::INFO_FORMAT, self::VERSION);
     }
 
     public function install(FakeTransport $transport): void

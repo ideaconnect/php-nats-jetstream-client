@@ -20,8 +20,105 @@ of the next release that names the release and the entry it corrects.
 
 ## [Unreleased]
 
+### Upgrade notes
+
+- No call is refused, changed or sent elsewhere any more because of the `version` the connected server reports in
+  INFO (#272, [ADR-44](https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-44.md) revision 4).
+  A JetStream request is answered by the meta leader or by the server that hosts the stream, which may run another
+  release than the server the client is connected to; in a cluster under a rolling upgrade, 2.31.0 to 2.35.0
+  refused calls the cluster accepts. Every request now goes out, and the server's answer decides. This replaces the
+  pre-flight parts of the 2.31.0 and 2.32.0 upgrade notes, the 2.33.0 consumer reset refusal and 2.34.0's note that
+  the version checks read the INFO of a leaf node the client is connected to (through a 2.12 leaf node
+  `resetConsumer()` was refused although a 2.14 hub would answer it). What a call on an older server returns now
+  (seen against nats-server 2.10.29, 2.11.17, 2.12.15 and 2.14.10):
+  - A recurring schedule (`@every`, cron, a predefined alias) on 2.12: the server's own 400 `message schedules
+    pattern is invalid` (err_code 10189), a `JetStreamException`; it was an `UnsupportedFeatureException` with code
+    0 and `nothing was published`. An `@at` schedule with `source:` or `rollup: true` on 2.12 is stored, and the
+    server ignores the two headers without an error (it fires as a plain `@at` schedule); it used to be refused. Use
+    them only once the servers that hold the stream run 2.14+ (API level 4, see Added).
+  - A stream or consumer create/update with a version-gated config field on a default 2.10 or a non-strict 2.11,
+    which drop the field: the reply check's `UnsupportedFeatureException` (`... exists without it ...`), after the
+    server set up the stream or consumer without the field; it was refused with `nothing was sent`. The stream or
+    consumer exists then: inspect it before you change or delete it. A strict 2.11 or a 2.12+ server rejects an
+    unknown field itself, mapped as before with code 400 (on a strict 2.11 the pre-flight of 2.32.0 to 2.35.0
+    answered first, with code 0).
+  - An atomic batch on a server before 2.12: the start message is stored as a plain publish, then the reply-shape
+    detection throws `UnsupportedFeatureException` (`allow_atomic`) before the rest of the batch is sent; it was
+    refused before any write when INFO reported an older version (#152). Its message now reads `Atomic batch
+    publish requires NATS server 2.12+, and the server treated the batch as plain publishes (connected server
+    reports X)`. A stream created with `allow_atomic` is protected already: the reply check of its create refuses a
+    server that drops the field.
+  - `directGetBatch()` and `directGetLastForSubjects()` on a server without batched Direct Get (before 2.11) fail at
+    once with `UnsupportedFeatureException` (`direct_get_batch`, 2.11). A `multi_last` request answered `408 Empty
+    Request` used to be a plain `JetStreamException` 408 (the new exception extends it and keeps the code 408); a
+    batch from a `seq` answered by one message without `Nats-Num-Pending` used to wait out the stall interval.
+  - KV `getAll()` and Object Store `list()` always try the batched Direct Get first, and fall back to the
+    per-subject fan-out on that exception: one extra request on a server without batched Direct Get.
+  - `resetConsumer()` on a server before 2.14, which does not answer `$JS.API.CONSUMER.RESET`: the request is sent,
+    and the call fails with the request timeout (a `TimeoutException`), as a reset of a consumer that does not exist
+    does on 2.14; 2.33.0 to 2.35.0 refused it with an `UnsupportedFeatureException` (`consumer_reset`,
+    `... nothing was sent`) when INFO reported a version before 2.14 (#274). A consumer hosted on a 2.14 server
+    behind a connected older one, such as a 2.14 hub behind a 2.12 leaf node, is reset now.
+- `UnsupportedFeatureException::$serverVersion` is the version the connected server reports, for information only:
+  the server that answered may run another release.
+- Removed internal API: `FeatureSupport::assertSupportedBy()` (the stream/consumer pre-flight),
+  `NatsClient::requestWithHeadersGuarded()` and `NatsConnection::requestWithHeadersGuarded()` (used only by the
+  `publishScheduled()` check), all three `@internal`.
+
+### Added
+
+- `[feature]` `AccountInfo::$apiLevel`: the JetStream API level `$JS.API.INFO` reports (`api.level`; `null` on
+  servers before 2.11, which report none; 1 on 2.11.17, 3 on 2.12.15, 4 on 2.14.10), answered by the meta leader.
+  ADR-44 has clients check this level, not the server version, where an ADR asks for a feature check (ADR-8 and
+  ADR-48 for limit markers), as nats.go does with `AccountInfo.API.Level` (#272).
+- `[feature]` The `direct_get_batch` key of `FeatureSupport::REQUIREMENTS` (2.11): `requiredVersion()` now answers for
+  every feature name an `UnsupportedFeatureException` of the library carries, and the batched Direct Get's exception
+  reads its version from there (#272). Like `consumer_reset` it is a JetStream API feature, not a config field.
+
+### Deprecated
+
+- `[docs]` `FeatureSupport::serverIsOlderThan()` and `JetStreamContext::supportsBatchedDirectGet()` (ADR-44): they
+  compare the connected server's INFO version, the library no longer calls either, and both will be removed in the
+  next major release. Read `accountInfo()->apiLevel`, or send the request and judge the reply (#272).
+
+### Fixed
+
+- `[bugfix]` Valid JetStream requests are no longer refused when the connected server is older than the server that
+  answers them (#272). In the issue's live run, a three-node cluster under a rolling upgrade (two nodes on 2.12.15,
+  the connected one on 2.11.17), `createStream()` with `allow_msg_counter` placed on an upgraded node was refused with
+  `nothing was sent` while the same request sent raw was accepted, and `publishScheduled()` with `@every` was refused
+  on a 2.12.15 node of a cluster whose stream host ran 2.14.10. Removed: the stream and consumer pre-flight (#266,
+  `FeatureSupport::assertSupportedBy()` in `createStream()`, `addStream()`, `updateStream()`,
+  `createOrUpdateStream()` and the five consumer create calls), both `publishScheduled()` checks, at the call and
+  before each write (#267), the atomic batch pre-flight in `BatchPublisher::commit()` (#152), the refusal of
+  `resetConsumer()` on an INFO version before 2.14 (#274), and the choice between
+  a batched Direct Get and the per-subject fan-out by version in KV `getAll()` and Object Store `list()` (#110),
+  which now learn it from the reply (ADR-31: `408 Empty Request` to a `multi_last` request, or a first message
+  without `Nats-Num-Pending`). Kept: the reply check of #266 (`FeatureSupport::assertHonored()`), the batch
+  reply-shape detection (#130) and the mapping of a strict server's `unknown field` rejection.
+
 ### Testing & CI
 
+- `[docs]` `JetStreamContextTest::testACallIsSentAndSucceedsWhateverServerVersionInfoReports`: 19 calls (every
+  stream and consumer call with each gated field, a recurring schedule, a schedule with `source` and with `rollup`,
+  an atomic batch commit, a consumer reset) on servers whose INFO reports 2.10.29, 2.11.17 and 2.14.10 while the
+  JetStream API answers as a newer server: each is sent once, with the same bytes whatever the version, and
+  succeeds; 15 of the 19 fail on 2.35.0. `testBatchedDirectGetLearnsFromTheReplyWhetherTheServerServesIt` pins the
+  replies that mean "no batched Direct Get" and the 2.11+ replies (408 to a batch without a start, 404 No Results)
+  that do not, as the live servers answered them. New `KeyValueBucketTest` / `ObjectStoreBucketTest` cases fall
+  back to the fan-out on a batched reply without `Nats-Num-Pending` behind a 2.14.10 INFO (both fail on 2.35.0), and
+  the fan-out tests run over `tests/Support/ServerWithoutBatchedDirectGet.php`, which answers the batched request as
+  2.10.29 does. `ConsumerResetTest::testTheResetIsSentWhateverVersionInfoReports` and
+  `testAServerBefore214LetsTheResetTimeOut` replace the two tests of the 2.33.0 refusal and fail on it, and
+  `FeatureSupportTest::testApiFeaturesAreInTheRegistryButAreNotConfigFields` pins `direct_get_batch` and
+  `consumer_reset` in the registry. `ScheduledPublishServerVersionTest`, `GatedConfigFieldServerVersionOnReconnectTest`,
+  the `BatchPublisherTest` and `BatchPublisher_1MutationTest` pre-flight cases and `FeatureSupportTest` now pin that
+  nothing is decided from the version, including across a reconnect to a server of another version. The live
+  `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders` and `ConsumerResetIntegrationTest` read
+  the expected answers, and which tests run, from the API level instead of the INFO version;
+  `DurableSourcingIntegrationTest` picks its tests that way too. `JetStreamDomainTest` sends `resetConsumer()` under
+  each prefix on the scripted leaf node's 2.12.0 INFO, as every other call; 2.34.0 and 2.35.0 refused it there, so
+  that case advertised 2.14.0.
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
   nats-server 2.12, stale since #286 (#279) added the second `composer test:e2e` integration stage against the
   `nats-214` fixture. Both now say which test runs against which fixture, as the consumer reset texts do, and the

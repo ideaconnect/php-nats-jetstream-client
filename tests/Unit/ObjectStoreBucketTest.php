@@ -13,6 +13,7 @@ use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreWatchOptions;
 use IDCT\NATS\Tests\Support\FakeTransport;
 use IDCT\NATS\Tests\Support\OwnsTestResources;
+use IDCT\NATS\Tests\Support\ServerWithoutBatchedDirectGet;
 use PHPUnit\Framework\TestCase;
 
 final class ObjectStoreBucketTest extends TestCase
@@ -1150,8 +1151,8 @@ final class ObjectStoreBucketTest extends TestCase
 
         $emptyPage = '{"state":{"subjects":{}}}';
 
-        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and list() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -1169,6 +1170,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('logo.txt', $logoExtra, 7),
             $this->directMetaReply('old.txt', $oldExtra, 8),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -1195,8 +1197,8 @@ final class ObjectStoreBucketTest extends TestCase
         $emptyPage = '{"state":{"subjects":{}}}';
         $extra = ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')];
 
-        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and list() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -1208,6 +1210,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directMetaReply('a.txt', $extra, 4),
             $this->directMetaReply('b.txt', $extra, 5),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -1253,7 +1256,7 @@ final class ObjectStoreBucketTest extends TestCase
         ], JSON_THROW_ON_ERROR);
         // One batched reply stream on a single inbox (sid 3); the last frame carries Nats-Num-Pending: 0.
         // TWO active objects so the batch result is not silently truncated to a single entry.
-        $logoHdrs = "NATS/1.0\r\nNats-Stream: OBJ_assets\r\nNats-Subject: \$O.assets.M." . $logoEnc . "\r\nNats-Sequence: 3\r\n\r\n";
+        $logoHdrs = "NATS/1.0\r\nNats-Stream: OBJ_assets\r\nNats-Subject: \$O.assets.M." . $logoEnc . "\r\nNats-Sequence: 3\r\nNats-Num-Pending: 1\r\n\r\n";
         $docHdrs = "NATS/1.0\r\nNats-Stream: OBJ_assets\r\nNats-Subject: \$O.assets.M." . $docEnc . "\r\nNats-Sequence: 4\r\nNats-Num-Pending: 0\r\n\r\n";
         $lh = strlen($logoHdrs);
         $dh = strlen($docHdrs);
@@ -1370,6 +1373,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 503, 'No Responders'),                               // Direct Get -> 503
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($meta), $meta),                    // STREAM.MSG.GET fallback
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -1422,6 +1426,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(1, 503, 'No Responders'),                               // Direct Get -> 503
             sprintf("MSG _INBOX.y 2 %d\r\n%s\r\n", strlen($envelope), $envelope),            // STREAM.MSG.GET fallback
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -2208,8 +2213,8 @@ final class ObjectStoreBucketTest extends TestCase
             'state' => ['subjects' => ['$O.assets.M.' . $this->encodeName('doc.txt') => 1]],
         ], JSON_THROW_ON_ERROR);
 
-        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and list() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -2219,6 +2224,7 @@ final class ObjectStoreBucketTest extends TestCase
             sprintf("MSG _INBOX.b 2 %d\r\n%s\r\n", strlen('{"state":{"subjects":{}}}'), '{"state":{"subjects":{}}}'), // terminator page
             $this->directStatusReply(3, 500, 'boom'),                                 // Direct Get -> non-404 error
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -2338,8 +2344,8 @@ final class ObjectStoreBucketTest extends TestCase
                 '$O.assets.M.' . $this->encodeName('logo.txt') => 1,
             ]],
         ], JSON_THROW_ON_ERROR);
-        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and list() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -2350,6 +2356,7 @@ final class ObjectStoreBucketTest extends TestCase
             $this->directStatusReply(3, 404, 'message not found'),                    // gone.txt -> 404 (skipped)
             $this->directMetaReply('logo.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4), // logo.txt -> present
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -3083,8 +3090,8 @@ final class ObjectStoreBucketTest extends TestCase
         $badBody = 'NOT_VALID_JSON';
         $badReply = sprintf("HMSG _INBOX.x 3 %d %d\r\n%s%s\r\n", $bh, $bh + strlen($badBody), $badHdrs, $badBody);
 
-        // Pre-2.11 server: list() takes the per-subject Direct Get fan-out this test scripts (batched
-        // multi_last Direct Get requires 2.11+ and is covered by the #110 batched-path tests).
+        // A server without batched Direct Get (2.10): it answers the batched multi_last request 408 Empty Request
+        // (ServerWithoutBatchedDirectGet below), and list() takes the per-subject fan-out this test scripts (#272).
         $transport = new FakeTransport([
             'INFO {"server_id":"S1","server_name":"n1","version":"2.10.0","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
             "PONG\r\n",
@@ -3095,6 +3102,7 @@ final class ObjectStoreBucketTest extends TestCase
             $badReply,                                                                  // corrupt.txt -> non-JSON body
             $this->directMetaReply('good.txt', ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')], 4),
         ]);
+        ServerWithoutBatchedDirectGet::install($transport);
 
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();
@@ -3955,5 +3963,51 @@ final class ObjectStoreBucketTest extends TestCase
             implode('', $transport->writes),
             'the fallback must query the meta record per subject',
         );
+    }
+
+    /**
+     * The reply decides, not the version (ADR-31, ADR-44, #272): the connected server reports 2.14.10, but the server
+     * that holds the bucket answers the batched multi_last request with ONE meta record and no Nats-Num-Pending
+     * header, as a server without batched Direct Get answers a batch request. list() takes the per-subject fan-out and
+     * lists both objects, instead of reading that lone record as the whole bucket.
+     */
+    public function testListFallsBackToFanOutWhenTheBatchedReplyLacksNumPending(): void
+    {
+        $logoEnc = $this->encodeName('logo.txt');
+        $readmeEnc = $this->encodeName('readme.md');
+        $streamInfo = (string) json_encode([
+            'config' => ['name' => 'OBJ_assets'],
+            'state' => ['subjects' => ['$O.assets.M.' . $logoEnc => 1, '$O.assets.M.' . $readmeEnc => 1]],
+        ], JSON_THROW_ON_ERROR);
+        $emptyPage = '{"state":{"subjects":{}}}';
+        $logo = ['nuid' => 'n1', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('hello')];
+        $readme = ['nuid' => 'n2', 'size' => 5, 'chunks' => 1, 'digest' => $this->digestOf('world')];
+
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.14.10","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+        ]);
+        // The batched request's reply on the DGET inbox (sid 2: mux SUB=1, DGET SUB=2): one record, no Nats-Num-Pending.
+        $transport->enqueueOnWriteContaining = [
+            'SUB _INBOX.JS.DGET' => [
+                str_replace('HMSG _INBOX.x ', 'HMSG _INBOX.JS.DGET.x ', $this->directMetaReply('logo.txt', $logo, 2)),
+            ],
+        ];
+        $this->muxReplies($transport, [
+            sprintf("MSG _INBOX.a 1 %d\r\n%s\r\n", strlen($streamInfo), $streamInfo),  // metaSubjects() page 1
+            sprintf("MSG _INBOX.b 1 %d\r\n%s\r\n", strlen($emptyPage), $emptyPage),     // terminator page
+            $this->directMetaReply('logo.txt', $logo, 1),
+            $this->directMetaReply('readme.md', $readme, 1),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $objects = $client->jetStream()->objectStore('assets')->list()->await();
+
+        self::assertSame(['logo.txt', 'readme.md'], array_map(static fn(ObjectInfo $info): string => $info->name, $objects));
+        $writes = implode('', $transport->writes);
+        self::assertSame(1, substr_count($writes, 'multi_last'), 'the batched request is tried once');
+        self::assertStringContainsString('"last_by_subj":"$O.assets.M.' . $readmeEnc . '"', $writes, 'the fan-out reads each object');
     }
 }

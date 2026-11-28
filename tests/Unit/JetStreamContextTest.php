@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace IDCT\NATS\Tests\Unit;
 
+use Amp\Future;
 use DateTimeImmutable;
 use DateTimeZone;
 use IDCT\NATS\Connection\Enum\ConnectionState;
@@ -1325,9 +1326,9 @@ final class JetStreamContextTest extends TestCase
      */
     public function testDirectGetBatchCollectsUntilEob(): void
     {
-        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\n\r\n";
+        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\nNats-Num-Pending: 2\r\n\r\n";
         $b1 = 'aaa';
-        $h2 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.b\r\nNats-Sequence: 6\r\n\r\n";
+        $h2 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.b\r\nNats-Sequence: 6\r\nNats-Num-Pending: 1\r\n\r\n";
         $b2 = 'bbb';
         $eob = "NATS/1.0 204 EOB\r\n\r\n";
         $h3 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.c\r\nNats-Sequence: 7\r\n\r\n";
@@ -1368,7 +1369,7 @@ final class JetStreamContextTest extends TestCase
     {
         $burst = '';
         for ($i = 0; $i < 1100; $i++) {
-            $header = sprintf("NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.s%d\r\nNats-Sequence: %d\r\n\r\n", $i, $i + 1);
+            $header = sprintf("NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.s%d\r\nNats-Sequence: %d\r\nNats-Num-Pending: %d\r\n\r\n", $i, $i + 1, 1100 - $i);
             $body = (string) $i;
             $burst .= sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($header), strlen($header) + strlen($body), $header, $body);
         }
@@ -1422,7 +1423,7 @@ final class JetStreamContextTest extends TestCase
      */
     public function testDirectGetLastForSubjects(): void
     {
-        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\n\r\n";
+        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\nNats-Num-Pending: 1\r\n\r\n";
         $b1 = 'aaa';
         $h2 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.b\r\nNats-Sequence: 6\r\nNats-Num-Pending: 0\r\n\r\n";
         $b2 = 'bbb';
@@ -1446,6 +1447,75 @@ final class JetStreamContextTest extends TestCase
         self::assertCount(2, $messages);
         self::assertStringContainsString('"multi_last":["orders.a","orders.b"]', $transport->writes[3]);
         self::assertStringContainsString('"batch":2', $transport->writes[3]);
+    }
+
+    /**
+     * How a server without batched Direct Get (2.10.29, seen live) answers each kind of batch request, and how a
+     * 2.11+ server answers the same requests when it has nothing to send (#272).
+     *
+     * @return iterable<string,array{\Closure(JetStreamContext):Future<list<NatsMessage>>,string,string|null,int|null}>
+     *         the call, the reply frame's header block and body, the feature the UnsupportedFeatureException names
+     *         (null: a plain JetStreamException), and the exception code (null: no exception, an empty result)
+     */
+    public static function batchedDirectGetReplies(): iterable
+    {
+        $multiLast = static fn(JetStreamContext $js): Future => $js->directGetLastForSubjects('ORDERS', ['orders.a', 'orders.b']);
+        $fromSeq = static fn(JetStreamContext $js): Future => $js->directGetBatch('ORDERS', ['batch' => 2, 'seq' => 1]);
+        $batchOnly = static fn(JetStreamContext $js): Future => $js->directGetBatch('ORDERS', ['batch' => 2]);
+        $single = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 1\r\n\r\n";
+
+        // 2.10 does not read multi_last, finds the request empty.
+        yield 'multi_last answered 408 Empty Request (2.10)' => [$multiLast, "NATS/1.0 408 Empty Request\r\n\r\n", 'direct_get_batch', 408];
+        // 2.10 reads seq but not batch: one message, no Nats-Num-Pending.
+        yield 'batch from a seq answered by one message without Nats-Num-Pending (2.10)' => [$fromSeq, $single, 'direct_get_batch', 0];
+        yield 'multi_last answered by one message without Nats-Num-Pending' => [$multiLast, $single, 'direct_get_batch', 0];
+        // A 2.11+ server's own answers: not a sign of a missing feature.
+        yield 'batch without a start answered 408 Empty Request (2.11+)' => [$batchOnly, "NATS/1.0 408 Empty Request\r\n\r\n", null, 408];
+        yield 'multi_last without any stored subject answered 404 No Results (2.11+)' => [$multiLast, "NATS/1.0 404 No Results\r\n\r\n", null, null];
+    }
+
+    /**
+     * Verifies that a batched Direct Get learns from the reply, never from the INFO version, whether the server that
+     * answers serves batched Direct Get (ADR-31, ADR-44, #272). The connected server reports 2.14.10 in every case:
+     * a reply of a server without batched Direct Get ends the read at once with the UnsupportedFeatureException
+     * `direct_get_batch` (KV getAll() and Object Store list() take their per-subject fan-out on it), a 2.11+ server's
+     * 408 stays the plain JetStreamException with the server's description, and its 404 the empty result.
+     *
+     * @param \Closure(JetStreamContext):Future<list<NatsMessage>> $call
+     */
+    #[DataProvider('batchedDirectGetReplies')]
+    public function testBatchedDirectGetLearnsFromTheReplyWhetherTheServerServesIt(\Closure $call, string $headers, ?string $feature, ?int $code): void
+    {
+        $body = str_starts_with($headers, "NATS/1.0\r\n") ? 'aaa' : '';
+        $transport = new FakeTransport([
+            'INFO {"server_id":"S1","server_name":"n1","version":"2.14.10","jetstream":true,"max_payload":1048576,"headers":true}' . "\r\n",
+            "PONG\r\n",
+            sprintf("HMSG _INBOX.JS.DGET.x 1 %d %d\r\n%s%s\r\n", strlen($headers), strlen($headers) + strlen($body), $headers, $body),
+        ]);
+
+        $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
+        $client->connect()->await();
+
+        $started = hrtime(true);
+        try {
+            $messages = $call($client->jetStream())->await();
+            self::assertNull($code, 'the reply must fail the batch');
+            self::assertSame([], $messages);
+        } catch (JetStreamException $e) {
+            self::assertSame($code, $e->getCode());
+            if ($feature === null) {
+                self::assertNotInstanceOf(UnsupportedFeatureException::class, $e);
+            } else {
+                self::assertInstanceOf(UnsupportedFeatureException::class, $e);
+                self::assertSame($feature, $e->feature);
+                self::assertSame('2.11', $e->requiredVersion);
+                self::assertSame('2.14.10', $e->serverVersion);
+                self::assertStringContainsString('the server answered the batch request for stream "ORDERS" with', $e->getMessage());
+                self::assertStringContainsString('(connected server reports 2.14.10)', $e->getMessage());
+            }
+        }
+        // The read ends on the reply, not on the stall interval (expires + 1 s).
+        self::assertLessThan(900_000_000, hrtime(true) - $started, 'the reply ends the read at once');
     }
 
     /**
@@ -1787,10 +1857,9 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies supportsBatchedDirectGet() gates the batched multi_last Direct Get on NATS 2.11+, the
-     * version gate KV getAll() / Object Store list() use to choose the batched path vs the per-subject
-     * fan-out fallback (#110). An unknown/unparseable version is treated as unsupported so the
-     * conservative fan-out (which works on any server) is used.
+     * Verifies supportsBatchedDirectGet() still answers from the INFO version (NATS 2.11+) for callers that use
+     * it, now that it is deprecated: KV getAll() / Object Store list() no longer call it (#110, #272). An
+     * unknown/unparseable version answers false.
      */
     public function testSupportsBatchedDirectGetGatesOnServerVersion(): void
     {
@@ -1916,9 +1985,9 @@ final class JetStreamContextTest extends TestCase
 
     /**
      * Verifies a version-gated config field rejected by a strict server surfaces as a typed
-     * UnsupportedFeatureException carrying the feature, required version, and the server's reported
-     * version (from the INFO handshake). The version is one the pre-flight cannot parse (a proxy, a
-     * custom build), so the request goes out and the server's own rejection is what is mapped.
+     * UnsupportedFeatureException carrying the feature, required version, and the version the connected
+     * server reports in INFO (for information only). The request goes out whatever that version (#272), and
+     * the server's own rejection is what is mapped.
      */
     public function testUnsupportedFeatureRaisesTypedExceptionWithServerVersion(): void
     {
@@ -1982,72 +2051,63 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * @return iterable<string,array{string,\Closure(JetStreamContext):\Amp\Future<mixed>,string,string}>
+     * One case per call that sets a version-gated field or uses a feature that came after 2.10/2.11: the stream and
+     * consumer calls with each gated config field, the scheduler features of 2.14, an atomic batch commit (2.12) and
+     * a consumer reset (2.14), each with the replies of a JetStream API that serves it, as a newer meta leader or
+     * stream host does, and the request line that must reach the server (#272).
+     *
+     * @return iterable<string,array{\Closure(JetStreamContext):\Amp\Future<mixed>,list<string>,string}>
      */
-    public static function gatedRequestsOnTooOldServers(): iterable
+    public static function callsAnsweredByANewerJetStream(): iterable
     {
-        yield 'createStream allow_msg_ttl on 2.10' => ['2.10.29', static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_msg_ttl' => true, 'subject_delete_marker_ttl' => 60_000_000_000]), 'allow_msg_ttl', '2.11'];
-        yield 'createStream subject_delete_marker_ttl on 2.10' => ['2.10.29', static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['subject_delete_marker_ttl' => 60_000_000_000]), 'subject_delete_marker_ttl', '2.11'];
-        yield 'createStream allow_msg_counter on 2.11' => ['2.11.17', static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_msg_counter' => true, 'allow_direct' => true]), 'allow_msg_counter', '2.12'];
-        yield 'createStream allow_msg_schedules on 2.11' => ['2.11.17', static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_msg_schedules' => true]), 'allow_msg_schedules', '2.12'];
-        yield 'createStream allow_atomic on 2.11' => ['2.11.17', static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_atomic' => true]), 'allow_atomic', '2.12'];
-        yield 'addStream allow_msg_ttl on 2.10' => ['2.10.29', static fn(JetStreamContext $js) => $js->addStream(StreamConfiguration::create('OLD')->subjects('old.>')->set('allow_msg_ttl', true)), 'allow_msg_ttl', '2.11'];
-        yield 'updateStream allow_msg_counter on 2.11' => ['2.11.17', static fn(JetStreamContext $js) => $js->updateStream('OLD', ['subjects' => ['old.>'], 'allow_msg_counter' => true]), 'allow_msg_counter', '2.12'];
-        yield 'createOrUpdateStream allow_msg_schedules on 2.11' => ['2.11.17', static fn(JetStreamContext $js) => $js->createOrUpdateStream('OLD', ['old.>'], ['allow_msg_schedules' => true]), 'allow_msg_schedules', '2.12'];
-        yield 'createConsumer priority_groups on 2.10' => ['2.10.29', static fn(JetStreamContext $js) => $js->createConsumer('ORDERS', 'PROC', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow']), 'priority_groups', '2.11'];
-        yield 'createConsumer filter_subjects on 2.9' => ['2.9.25', static fn(JetStreamContext $js) => $js->createConsumer('ORDERS', 'PROC', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), 'filter_subjects', '2.10'];
-        yield 'addConsumer filter_subjects on 2.9' => ['2.9.25', static fn(JetStreamContext $js) => $js->addConsumer('ORDERS', ConsumerConfiguration::create()->durable('PROC')->filterSubjects(['orders.eu.>', 'orders.us.>'])), 'filter_subjects', '2.10'];
-        yield 'createEphemeralConsumer priority_* on 2.10' => ['2.10.29', static fn(JetStreamContext $js) => $js->createEphemeralConsumer('ORDERS', null, ['priority_groups' => ['g1'], 'priority_policy' => 'pinned_client', 'priority_timeout' => 30_000_000_000]), 'priority_groups', '2.11'];
-        yield 'createPushConsumer filter_subjects on 2.9' => ['2.9.25', static fn(JetStreamContext $js) => $js->createPushConsumer('ORDERS', 'PUSH', '_INBOX.deliver', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), 'filter_subjects', '2.10'];
-        yield 'createEphemeralPushConsumer filter_subjects on 2.9' => ['2.9.25', static fn(JetStreamContext $js) => $js->createEphemeralPushConsumer('ORDERS', '_INBOX.deliver', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), 'filter_subjects', '2.10'];
+        yield 'createStream allow_msg_ttl + subject_delete_marker_ttl' => [static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_msg_ttl' => true, 'subject_delete_marker_ttl' => 60_000_000_000]), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_msg_ttl":true,"subject_delete_marker_ttl":60000000000}}'], 'PUB $JS.API.STREAM.CREATE.OLD '];
+        yield 'createStream allow_msg_counter' => [static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_msg_counter' => true, 'allow_direct' => true]), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_msg_counter":true,"allow_direct":true}}'], 'PUB $JS.API.STREAM.CREATE.OLD '];
+        yield 'createStream allow_msg_schedules' => [static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_msg_schedules' => true]), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_msg_schedules":true}}'], 'PUB $JS.API.STREAM.CREATE.OLD '];
+        yield 'createStream allow_atomic' => [static fn(JetStreamContext $js) => $js->createStream('OLD', ['old.>'], ['allow_atomic' => true]), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_atomic":true}}'], 'PUB $JS.API.STREAM.CREATE.OLD '];
+        yield 'addStream allow_msg_ttl' => [static fn(JetStreamContext $js) => $js->addStream(StreamConfiguration::create('OLD')->subjects('old.>')->set('allow_msg_ttl', true)), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_msg_ttl":true}}'], 'PUB $JS.API.STREAM.CREATE.OLD '];
+        yield 'updateStream allow_msg_counter' => [static fn(JetStreamContext $js) => $js->updateStream('OLD', ['subjects' => ['old.>'], 'allow_msg_counter' => true]), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_msg_counter":true}}'], 'PUB $JS.API.STREAM.UPDATE.OLD '];
+        yield 'createOrUpdateStream allow_msg_schedules' => [static fn(JetStreamContext $js) => $js->createOrUpdateStream('OLD', ['old.>'], ['allow_msg_schedules' => true]), ['{"config":{"name":"OLD","subjects":["old.>"],"allow_msg_schedules":true}}'], 'PUB $JS.API.STREAM.CREATE.OLD '];
+        yield 'createConsumer priority_groups + priority_policy' => [static fn(JetStreamContext $js) => $js->createConsumer('ORDERS', 'PROC', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow']), ['{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","priority_groups":["g1"],"priority_policy":"overflow"}}'], 'PUB $JS.API.CONSUMER.'];
+        yield 'createConsumer filter_subjects' => [static fn(JetStreamContext $js) => $js->createConsumer('ORDERS', 'PROC', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), ['{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","filter_subjects":["orders.eu.>","orders.us.>"]}}'], 'PUB $JS.API.CONSUMER.'];
+        yield 'addConsumer filter_subjects' => [static fn(JetStreamContext $js) => $js->addConsumer('ORDERS', ConsumerConfiguration::create()->durable('PROC')->filterSubjects(['orders.eu.>', 'orders.us.>'])), ['{"stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","filter_subjects":["orders.eu.>","orders.us.>"]}}'], 'PUB $JS.API.CONSUMER.'];
+        yield 'createEphemeralConsumer priority_* with priority_timeout' => [static fn(JetStreamContext $js) => $js->createEphemeralConsumer('ORDERS', null, ['priority_groups' => ['g1'], 'priority_policy' => 'pinned_client', 'priority_timeout' => 30_000_000_000]), ['{"stream_name":"ORDERS","name":"eph1","config":{"priority_groups":["g1"],"priority_policy":"pinned_client","priority_timeout":30000000000}}'], 'PUB $JS.API.CONSUMER.'];
+        yield 'createPushConsumer filter_subjects' => [static fn(JetStreamContext $js) => $js->createPushConsumer('ORDERS', 'PUSH', '_INBOX.deliver', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), ['{"stream_name":"ORDERS","name":"PUSH","config":{"durable_name":"PUSH","deliver_subject":"_INBOX.deliver","filter_subjects":["orders.eu.>","orders.us.>"]}}'], 'PUB $JS.API.CONSUMER.'];
+        yield 'createEphemeralPushConsumer filter_subjects' => [static fn(JetStreamContext $js) => $js->createEphemeralPushConsumer('ORDERS', '_INBOX.deliver', null, ['filter_subjects' => ['orders.eu.>', 'orders.us.>']]), ['{"stream_name":"ORDERS","name":"eph2","config":{"deliver_subject":"_INBOX.deliver","filter_subjects":["orders.eu.>","orders.us.>"]}}'], 'PUB $JS.API.CONSUMER.'];
+        yield 'publishScheduled @every' => [static fn(JetStreamContext $js) => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::every('5m')), ['{"stream":"SCHED","seq":1}'], 'HPUB schedules.tick '];
+        yield 'publishScheduled cron with a time zone' => [static fn(JetStreamContext $js) => $js->publishScheduled('schedules.tick', 'events.tick', 'p', Schedule::cron('0 0 * * * *'), timeZone: 'Europe/Warsaw'), ['{"stream":"SCHED","seq":1}'], 'HPUB schedules.tick '];
+        yield 'publishScheduled @at with a source' => [static fn(JetStreamContext $js) => $js->publishScheduled('schedules.tick', 'events.tick', 'p', '@at 2030-01-01T00:00:00Z', source: 'sensors.temperature'), ['{"stream":"SCHED","seq":1}'], 'HPUB schedules.tick '];
+        yield 'publishScheduled @at with rollup' => [static fn(JetStreamContext $js) => $js->publishScheduled('schedules.tick', 'events.tick', 'p', '@at 2030-01-01T00:00:00Z', rollup: true), ['{"stream":"SCHED","seq":1}'], 'HPUB schedules.tick '];
+        yield 'atomic batch commit' => [static fn(JetStreamContext $js) => $js->batch('b1')->add('atom.a', '1')->add('atom.b', '2')->commit(), ['', '{"stream":"ATOM","seq":2,"batch":"b1","count":2}'], 'HPUB atom.a '];
+        yield 'resetConsumer to a sequence' => [static fn(JetStreamContext $js) => $js->resetConsumer('ORDERS', 'PROC', 42), ['{"type":"io.nats.jetstream.api.v1.consumer_reset_response","stream_name":"ORDERS","name":"PROC","config":{"durable_name":"PROC","deliver_policy":"all","ack_policy":"explicit"},"reset_seq":42}'], 'PUB $JS.API.CONSUMER.RESET.ORDERS.PROC '];
     }
 
     /**
-     * Verifies a stream or consumer create/update that sets a version-gated field fails with an
-     * UnsupportedFeatureException before anything is sent when the connected server advertises a
-     * version older than the field: such a server drops the field and would set the stream or consumer
-     * up without the feature (#266).
+     * Verifies no request depends on the server version INFO reports (ADR-44 revision 4, #272): with a connected
+     * server whose INFO reports 2.10.29 or 2.11.17 while the JetStream API answers as a newer server (the meta
+     * leader or the stream's host in a cluster under a rolling upgrade), every call is sent and succeeds, and the
+     * bytes written are the same as when INFO reports 2.14.10. Up to 2.35.0 each of these calls but the four
+     * filter_subjects ones was refused before anything was sent.
      *
      * @param \Closure(JetStreamContext):\Amp\Future<mixed> $call
+     * @param list<string>                                  $replies
      */
-    #[DataProvider('gatedRequestsOnTooOldServers')]
-    public function testGatedFieldOnTooOldServerFailsBeforeAnythingIsSent(string $version, \Closure $call, string $feature, string $required): void
+    #[DataProvider('callsAnsweredByANewerJetStream')]
+    public function testACallIsSentAndSucceedsWhateverServerVersionInfoReports(\Closure $call, array $replies, string $request): void
     {
-        [$js, $transport] = $this->jetStreamOnServer($version);
+        $sent = [];
+        foreach (['2.10.29', '2.11.17', '2.14.10'] as $version) {
+            [$js, $transport] = $this->jetStreamOnServer($version, $replies);
 
-        try {
-            $call($js)->await();
-            self::fail('Expected UnsupportedFeatureException');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame($feature, $e->feature);
-            self::assertSame($required, $e->requiredVersion);
-            self::assertSame($version, $e->serverVersion);
-            self::assertStringContainsString('nothing was sent', $e->getMessage());
+            self::assertNotNull($call($js)->await(), $version);
+
+            $requests = array_values(array_filter($transport->writes, static fn(string $write): bool => str_starts_with($write, $request)));
+            self::assertCount(1, $requests, sprintf('the request went out once on %s', $version));
+            // Everything after the CONNECT + PING handshake, with the random inbox names left out.
+            $sent[$version] = preg_replace('/_INBOX\.\S+/', '_INBOX.*', array_slice($transport->writes, 2));
         }
 
-        self::assertSame([], self::jsApiWrites($transport));
-    }
-
-    /**
-     * Verifies the pre-flight names what the request would have set up.
-     */
-    public function testPreflightMessageNamesStreamOrConsumer(): void
-    {
-        [$js] = $this->jetStreamOnServer('2.10.29');
-
-        try {
-            $js->createStream('OLD', ['old.>'], ['allow_msg_ttl' => true])->await();
-            self::fail('Expected UnsupportedFeatureException');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertStringEndsWith('would set up the stream without it)', $e->getMessage());
-        }
-
-        try {
-            $js->createConsumer('ORDERS', 'PROC', null, ['priority_groups' => ['g1'], 'priority_policy' => 'overflow'])->await();
-            self::fail('Expected UnsupportedFeatureException');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertStringEndsWith('would set up the consumer without it)', $e->getMessage());
-        }
+        self::assertSame($sent['2.14.10'], $sent['2.10.29'], 'the same bytes go out whatever version INFO reports');
+        self::assertSame($sent['2.14.10'], $sent['2.11.17'], 'the same bytes go out whatever version INFO reports');
     }
 
     /**
@@ -2147,39 +2207,30 @@ final class JetStreamContextTest extends TestCase
     }
 
     /**
-     * Verifies a negative subject_delete_marker_ttl is a request for the feature, not "markers off": a
-     * 2.10 server is refused before anything is sent, and an old responder behind an unparseable
-     * version that drops it fails the reply check. Zero still asks for nothing (#266).
+     * Verifies a negative subject_delete_marker_ttl is a request for the feature, not "markers off": it is sent
+     * whatever version INFO reports (here 2.10.29, #272), and an old responder that drops it fails the reply check,
+     * as one behind an unparseable version does. Zero still asks for nothing (#266).
      */
     public function testNegativeMarkerTtlCannotSilentlyPassAnOldServer(): void
     {
-        [$js, $transport] = $this->jetStreamOnServer('2.10.29');
+        foreach (['2.10.29', 'synadia-custom'] as $version) {
+            [$js, $transport] = $this->jetStreamOnServer($version, [
+                '{"config":{"name":"NEG","subjects":["neg.>"]}}',
+                '{"config":{"name":"ZERO","subjects":["zero.>"]}}',
+            ]);
 
-        try {
-            $js->createStream('NEG', ['neg.>'], ['subject_delete_marker_ttl' => -1])->await();
-            self::fail('Expected UnsupportedFeatureException');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame('subject_delete_marker_ttl', $e->feature);
-            self::assertStringContainsString('nothing was sent', $e->getMessage());
+            try {
+                $js->createStream('NEG', ['neg.>'], ['subject_delete_marker_ttl' => -1])->await();
+                self::fail('Expected UnsupportedFeatureException on ' . $version);
+            } catch (UnsupportedFeatureException $e) {
+                self::assertSame('subject_delete_marker_ttl', $e->feature, $version);
+                self::assertStringContainsString('ignored the field: stream "NEG" exists without it', $e->getMessage(), $version);
+            }
+
+            $info = $js->createStream('ZERO', ['zero.>'], ['subject_delete_marker_ttl' => 0])->await();
+            self::assertSame('ZERO', $info->name, $version);
+            self::assertCount(2, self::jsApiWrites($transport), $version);
         }
-        self::assertSame([], self::jsApiWrites($transport));
-
-        [$js, $transport] = $this->jetStreamOnServer('synadia-custom', [
-            '{"config":{"name":"NEG","subjects":["neg.>"]}}',
-            '{"config":{"name":"ZERO","subjects":["zero.>"]}}',
-        ]);
-
-        try {
-            $js->createStream('NEG', ['neg.>'], ['subject_delete_marker_ttl' => -1])->await();
-            self::fail('Expected UnsupportedFeatureException');
-        } catch (UnsupportedFeatureException $e) {
-            self::assertSame('subject_delete_marker_ttl', $e->feature);
-            self::assertStringContainsString('ignored the field: stream "NEG" exists without it', $e->getMessage());
-        }
-
-        $info = $js->createStream('ZERO', ['zero.>'], ['subject_delete_marker_ttl' => 0])->await();
-        self::assertSame('ZERO', $info->name);
-        self::assertCount(2, self::jsApiWrites($transport));
     }
 
     /**
@@ -8400,7 +8451,7 @@ final class JetStreamContextTest extends TestCase
      */
     public function testDirectGetBatchThrowsOnTimeoutBeforeCompletion(): void
     {
-        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\n\r\n";
+        $h1 = "NATS/1.0\r\nNats-Stream: ORDERS\r\nNats-Subject: orders.a\r\nNats-Sequence: 5\r\nNats-Num-Pending: 3\r\n\r\n";
         $b1 = 'aaa';
 
         $transport = new FakeTransport([

@@ -5,27 +5,32 @@ declare(strict_types=1);
 namespace IDCT\NATS\Exception;
 
 /**
- * Thrown when a JetStream request fails because the connected NATS server is too old to support the
- * requested feature (for example creating a stream with `allow_atomic` against a pre-2.12 server).
+ * Thrown when a JetStream request fails because the NATS server that handled it is too old to support the
+ * requested feature (for example creating a stream with `allow_atomic` that a pre-2.12 server dropped).
  *
  * It is a {@see JetStreamException}, so existing `catch (JetStreamException)` handlers still catch it;
  * catch this type specifically to detect "feature not available on this server version" distinctly.
- * A server older than a version-gated stream/consumer config field drops the field unless it runs in
- * strict mode (the default from 2.12), so the stream and consumer create/update calls check the
- * INFO-advertised server version before sending (nothing was sent) and the server's reply after it.
- * A reply check failure means the request was sent: either the returned config lacks the field (the
- * stream or consumer exists without the feature, and may have existed before the call, since a create
- * returns an existing one whose config matches) or the reply carries no config (its state is unknown).
- * Inspect it before changing or deleting it (#266).
- * Atomic batch `commit()` pre-flights the version the same way, so nothing is published to a server
- * that cannot honor batch semantics (#152). A strict server's `unknown field` rejection maps here too.
+ *
+ * It is always decided from the server's answer, never from the version the connected server reports in
+ * INFO (ADR-44, #272): a JetStream request is answered by the meta leader or by the server hosting the
+ * asset, which may run another release than the connected one. $serverVersion is that INFO version, given
+ * for information only. The request has been sent by the time this is thrown:
+ *
+ * - a stream or consumer create/update whose reply config lacks a version-gated field (the stream or
+ *   consumer exists without the feature, and may have existed before the call, since a create returns an
+ *   existing one whose config matches) or carries no config (its state is unknown); inspect it before
+ *   changing or deleting it (#266);
+ * - a strict server's `unknown field` rejection of such a field (nothing was set up);
+ * - an atomic batch `commit()` whose start message the server stored as a plain publish (#130/#152);
+ * - a batched Direct Get the server does not serve (feature `direct_get_batch`, #272).
  */
 final class UnsupportedFeatureException extends JetStreamException
 {
     /**
      * @param string      $feature         The server config field / feature that is unsupported (e.g. "allow_atomic").
      * @param string      $requiredVersion The minimum NATS server version that provides it (e.g. "2.12").
-     * @param string|null $serverVersion   The version the connected server reported, if known.
+     * @param string|null $serverVersion   The version the connected server reported in INFO, if known (for information:
+     *                                     it may not be the server that handled the request).
      */
     public function __construct(
         public readonly string $feature,

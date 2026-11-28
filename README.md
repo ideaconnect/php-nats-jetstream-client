@@ -128,71 +128,75 @@ Current functionality includes:
 - Republish and subject transform configuration helpers (`Republish`, `SubjectTransform`)
 - JetStream domains and API prefixes (`jetStream(domain: 'hub')`, `jetStream(apiPrefix: '...')`): the JetStream of a hub through a leaf node, or of another account through an import - see [JetStream Domains and API Prefixes](#jetstream-domains-and-api-prefixes-leaf-nodes-account-imports)
 
-Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+). NATS 2.12 runs only one-off `@at` schedules (with an optional TTL); `@every`, cron, the aliases and the `source`, `timeZone` and `rollup` arguments of `publishScheduled()` need NATS 2.14+, and on an older server `publishScheduled()` throws an `UnsupportedFeatureException` before anything is published (see [NATS Server Version Requirements](#nats-server-version-requirements)).
+Scheduling note: scheduled messages use the NATS scheduler headers (ADR-51) and accept `@at`, `@every`, 6-field cron, and the predefined aliases (`@daily`, `@hourly`, ...). Build expressions with `IDCT\NATS\JetStream\Schedule::at(...)`, `Schedule::atTimestamp(...)`, `Schedule::every(...)`, `Schedule::cron(...)`, or `Schedule::predefined(...)`. The target stream must be created with `allow_msg_schedules` (NATS 2.12+). NATS 2.12 runs only one-off `@at` schedules (with an optional TTL); `@every`, cron, the aliases and the `source`, `timeZone` and `rollup` arguments of `publishScheduled()` need NATS 2.14+ on the servers that hold the stream. `publishScheduled()` sends every schedule whatever version the connected server reports, and the server that stores it decides (see [NATS Server Version Requirements](#nats-server-version-requirements)).
 
 ## NATS Server Version Requirements
 
 Core NATS (publish/subscribe, request/reply, headers, services) works against any server. JetStream
 consumer management requires NATS 2.9+: all consumer helpers use the named `CONSUMER.CREATE` API
 introduced in 2.9, with no fallback to the legacy `DURABLE.CREATE` form. Some features depend on
-even newer NATS server versions; the table below lists the minimum version per feature. The client
-reads the version the server advertises in its INFO handshake (no extra request), and detection
-depends on the feature:
+even newer NATS server versions; the table below lists the minimum version per feature, as guidance.
+
+The client does not decide what a request may do from the server version ([ADR-44](https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-44.md),
+revision 4). The `version` in the INFO handshake is the release of the server the client is
+connected to, while a JetStream request is answered by the meta leader or by the server that hosts
+the stream, which may run another release: in a cluster during a rolling upgrade, or behind a
+leafnode. So no call is refused, changed or sent elsewhere because of that version: every request
+goes out, and the server's answer decides. (Up to 2.35.0 the client refused some calls before sending
+them when INFO reported an older version; the CHANGELOG lists what an older server answers now.) How
+a server without a feature shows up depends on the feature:
 
 - **Version-gated stream/consumer config fields** (the `Server config` column below, for example
   creating a stream with `allow_msg_ttl` or `allow_msg_counter`): a server older than the field does
   not reject it by default. nats-server rejects unknown fields only in strict mode, which 2.10 does
   not have, 2.11 has only with `jetstream { strict: true }`, and 2.12 turns on by default. A default
   2.10 or 2.11 server drops the field and creates the stream without the feature, so the data path
-  then misbehaves silently (a `publish(..., ttl:)` message that never expires, a counter subject full
-  of plain messages, a schedule that never fires). The stream calls (`createStream()`, `addStream()`,
-  `updateStream()`, `createOrUpdateStream()`) and the consumer create calls therefore check twice,
-  for every such field set to anything but its default (`false`, `0`, `'none'`, `[]` and a missing
-  field ask for nothing; a negative `subject_delete_marker_ttl` is invalid, not off, and does ask):
-  - when the advertised version parses as older than the field's minimum, the call throws an
-    `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) before
-    anything is sent (`... nothing was sent ...`). The version is the one of the connection when the
-    call is made: a call made while the client fails over is checked against the server being
-    replaced, so a failover to a newer server can refuse it (make it again once connected), and a
-    failover to an older server is caught by the reply check below;
-  - when the server's reply does not confirm a requested field (a version the client cannot parse,
-    such as a proxy or a custom build, or a mixed-version cluster where an older server answers the
-    JetStream API), the call throws an `UnsupportedFeatureException` naming the field. The request
-    was sent by then, and the message says only what the reply shows. A returned config without the
-    field means the stream or consumer exists without it (`... stream "X" exists without it ...`).
-    That does not make it new: a create returns an existing stream or consumer whose config matches
-    the request, and the dropped field can make it match, so it may hold messages from before the
-    call. A reply without a config confirms nothing (`... the state of stream "X" is unknown ...`).
-    Either way, inspect it (`getStream()`, `getConsumer()`) before you change or delete it, and do
-    not delete it as a rollback.
+  would then misbehave silently (a `publish(..., ttl:)` message that never expires, a counter subject
+  full of plain messages, a schedule that never fires). The stream calls (`createStream()`,
+  `addStream()`, `updateStream()`, `createOrUpdateStream()`) and the consumer create calls therefore
+  check the server's reply, for every such field set to anything but its default (`false`, `0`,
+  `'none'`, `[]` and a missing field ask for nothing; a negative `subject_delete_marker_ttl` is
+  invalid, not off, and does ask). When the reply does not confirm a requested field, the call throws
+  an `IDCT\NATS\Exception\UnsupportedFeatureException` (a subclass of `JetStreamException`) naming the
+  field. The request was sent by then, and the message says only what the reply shows. A returned
+  config without the field means the stream or consumer exists without it (`... stream "X" exists
+  without it ...`). That does not make it new: a create returns an existing stream or consumer whose
+  config matches the request, and the dropped field can make it match, so it may hold messages from
+  before the call. A reply without a config confirms nothing (`... the state of stream "X" is unknown
+  ...`). Either way, inspect it (`getStream()`, `getConsumer()`) before you change or delete it, and do
+  not delete it as a rollback.
 
-  A strict server's own `unknown field "X"` rejection is mapped to the same exception. Each carries
-  the feature name, the required version, and the version the server reported.
-- **Atomic batch publish**: when the server's advertised version parses as older than 2.12,
-  `commit()` fails fast before anything reaches the wire (`... nothing was published`). When the
-  version cannot be parsed (a proxy, a custom build, or a mixed-version cluster), the old server
-  acknowledges the batch start as a plain publish; `commit()` detects that reply shape and throws
-  an `UnsupportedFeatureException` (`... treated the batch as plain publishes`) instead of silently
-  storing the batch message-by-message.
-- **Recurring schedules and the newer scheduler headers**: when the server's advertised version
-  parses as older than 2.14, `publishScheduled()` with an `@every`, cron or alias schedule, or with
-  `source` or `rollup`, fails fast before anything reaches the wire (`... nothing was published`), with
-  the feature `schedule_every`, `schedule_cron`, `schedule_source` or `schedule_rollup`. A 2.12 server
-  would answer the recurring schedules with an opaque 400 (`message schedules pattern is invalid`) and
-  store an `@at` schedule without its source or rollup. (A `timeZone` is only accepted with a cron
-  schedule, so the cron check covers it.) When the version cannot be parsed, the call is published as
-  is and the server decides. The version checked is the one of the server that takes the frame: a
-  call made while the client reconnects waits for the new connection and is checked against its
-  server's INFO, and the retry after a failed write is checked again.
-- **Consumer reset**: a server before 2.14 does not answer `$JS.API.CONSUMER.RESET` at all, so when
-  the advertised version parses as older than 2.14, `resetConsumer()` fails fast with the feature
-  `consumer_reset` before anything is sent (`... nothing was sent`) instead of waiting out the
-  request timeout. When the version cannot be parsed, the request is sent and an older server lets it
-  time out (a `TimeoutException`).
-- **Other data-path calls** (for example `publish(..., ttl:)` or `directGetBatch()`) against a server
-  or stream without the feature surface a plain `JetStreamException` built from the server's error
-  response - or the server may silently ignore an unknown header - so consult the table before
-  relying on them against older servers.
+  A strict server's own `unknown field "X"` rejection is mapped to the same exception (nothing was set
+  up then). Each carries the feature name, the required version, and the version the connected server
+  reported in INFO, for information only: it may not be the server that answered.
+- **Atomic batch publish**: a server without atomic batches (before 2.12) acknowledges the batch start
+  as a plain publish; `commit()` detects that reply shape and throws an `UnsupportedFeatureException`
+  (`... treated the batch as plain publishes ...`) instead of storing the rest of the batch
+  message-by-message. The start message is stored by then.
+- **Recurring schedules and the newer scheduler headers**: a 2.12 server answers an `@every`, cron or
+  alias schedule with its own 400 (`message schedules pattern is invalid`, err_code 10189), raised as
+  a `JetStreamException`, and stores an `@at` schedule while ignoring `source` and `rollup` without an
+  error: use those two only once the servers that hold the stream run 2.14+. (A `timeZone` is only
+  accepted with a cron schedule.)
+- **Batched Direct Get** (`directGetBatch()`, `directGetLastForSubjects()`): a server without it
+  (before 2.11) answers a `multi_last` request with `408 Empty Request`, and any other batch request
+  with a single message without the `Nats-Num-Pending` header (ADR-31). Either fails the call at once
+  with an `UnsupportedFeatureException` for the feature `direct_get_batch`. KV `getAll()` and Object
+  Store `list()` always try the batched request first, and fall back to one Direct Get per key or
+  object on that exception, as they do on a stream without `allow_direct`.
+- **Consumer reset** (`resetConsumer()`): a server before 2.14 does not answer
+  `$JS.API.CONSUMER.RESET` at all. The request is sent whatever version INFO reports, so on such a
+  server the call waits out the request timeout and fails with a `TimeoutException`, as it does on 2.14
+  for a consumer that does not exist. (2.33.0 to 2.35.0 refused the reset before sending when INFO
+  reported a version before 2.14.)
+- **Other data-path calls** (for example `publish(..., ttl:)`) against a server or stream without the
+  feature surface a plain `JetStreamException` built from the server's error response - or the server
+  may silently ignore an unknown header - so consult the table before relying on them against older
+  servers.
+- **Checking a level**: where an ADR asks a client to check that the servers support a feature
+  (ADR-8 and ADR-48 for limit markers), the check uses the JetStream API level that `$JS.API.INFO`
+  reports, which the meta leader answers: `$js->accountInfo()->await()->apiLevel` (`null` before
+  2.11; for example 1 on 2.11.17, 3 on 2.12.15 and 4 on 2.14.10).
 
 | Feature | API | Min NATS | Server config / header |
 | --- | --- | --- | --- |
@@ -214,21 +218,23 @@ depends on the feature:
 use IDCT\NATS\Exception\UnsupportedFeatureException;
 
 try {
-    $js->batch()->add('orders.created', $payload)->commit()->await();
+    $js->batch()->add('orders.created', $payload)->add('orders.created', $payload2)->commit()->await();
 } catch (UnsupportedFeatureException $e) {
-    // e.g. "Atomic batch publish requires NATS server 2.12+ (connected server 2.10.5; nothing was published)"
-    echo "{$e->feature} needs NATS {$e->requiredVersion}; server is {$e->serverVersion}\n";
+    // e.g. "Atomic batch publish requires NATS server 2.12+, and the server treated the batch as plain
+    // publishes (connected server reports 2.11.17)"
+    echo "{$e->feature} needs NATS {$e->requiredVersion}; connected server reports {$e->serverVersion}\n";
 }
 
 try {
     $js->createStream('EVENTS', ['events.>'], ['allow_msg_ttl' => true])->await();
 } catch (UnsupportedFeatureException $e) {
-    // e.g. 'The "allow_msg_ttl" feature requires NATS server 2.11+, but the connected server reports 2.10.29
-    // (nothing was sent: an older server ignores the field and would set up the stream without it)'
+    // e.g. 'The "allow_msg_ttl" feature requires NATS server 2.11+, and the server (connected server reports
+    // 2.10.29) ignored the field: stream "EVENTS" exists without it (it may have existed before this request:
+    // inspect it before changing or deleting it)'
 }
 ```
 
-You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`). `FeatureSupport::serverIsOlderThan($client->serverInfo()?->version, '2.14')` tells whether the connected server advertises an older version (an unparseable version is never older). `FeatureSupport::requestedFields($config)` lists the version-gated fields a stream or consumer config asks for (config fields only: the `schedule_*` scheduler features are never among them).
+You can also query the requirement programmatically: `IDCT\NATS\JetStream\FeatureSupport::requiredVersion('allow_atomic')` returns `"2.12"`, and `requiredVersion('schedule_every')` returns `"2.14"` (likewise `schedule_cron`, `schedule_source`, `schedule_time_zone` and `schedule_rollup`), and the API features answer too: `requiredVersion('direct_get_batch')` is `"2.11"` (the version its `UnsupportedFeatureException` names) and `requiredVersion('consumer_reset')` is `"2.14"`. `FeatureSupport::requestedFields($config)` lists the version-gated fields a stream or consumer config asks for (config fields only: the `schedule_*` scheduler features and the API features are never among them). `FeatureSupport::serverIsOlderThan()` and `JetStreamContext::supportsBatchedDirectGet()` compare the connected server's INFO version and are deprecated by ADR-44: the library no longer calls them, and they will be removed in the next major release. To check what the servers support, read `accountInfo()->apiLevel` (above).
 
 ## PHP Support Policy
 
@@ -913,7 +919,7 @@ _Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`test
 
 Distributed counters are an atomic, conflict-free (CRDT) increment subject backed by a JetStream stream. `incrementCounter()` applies a signed delta and returns the new total; `counterValue()` reads the current total via Direct Get (returning `"0"` when nothing is stored yet).
 
-Requires NATS server 2.12+, and the backing stream must be created with `allow_msg_counter: true` (and `allow_direct: true`, since `counterValue()` reads via Direct Get). On a pre-2.12 server, `createStream()` with the counter flag fails fast with an `UnsupportedFeatureException`: before the request when the server advertises its version, otherwise when the returned config shows the server dropped the flag (a default 2.10 or 2.11 server ignores the unknown field instead of rejecting it). A stream created without the flag causes the increment request to be rejected, surfaced as a `JetStreamException`.
+Requires NATS server 2.12+, and the backing stream must be created with `allow_msg_counter: true` (and `allow_direct: true`, since `counterValue()` reads via Direct Get). On a pre-2.12 server, `createStream()` with the counter flag is sent and then fails with an `UnsupportedFeatureException`: a default 2.10 or 2.11 server ignores the unknown field instead of rejecting it, so the reply check finds the flag missing from the returned config (the stream exists then, without it), and a strict 2.11 server's own `unknown field` rejection is mapped to the same exception. A stream created without the flag causes the increment request to be rejected, surfaced as a `JetStreamException`.
 
 The delta is passed as an integer **string** (e.g. `"+5"`, `"-3"`, `"10"`); a malformed delta is rejected before dispatch. Counter totals are likewise returned as **strings** so values beyond `PHP_INT_MAX` are preserved exactly rather than truncated to a float.
 
@@ -1660,14 +1666,14 @@ $client->disconnect()->await();
 
 ### Consumer Reset
 
-_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (the second `composer test:e2e` integration stage, against the `nats-214` fixture, a 2.14+ server; against the default `nats` fixture (2.12) only the pre-flight refusal runs)._
+_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (the second `composer test:e2e` integration stage, against the `nats-214` fixture, a 2.14+ server; against the default `nats` fixture (2.12) only the timeout of a server without the reset API runs)._
 
 `resetConsumer($stream, $consumer, $sequence)` resets a consumer's delivery state through `$JS.API.CONSUMER.RESET` (ADR-60, NATS 2.14+), to replay messages or to move past a range that cannot be processed without deleting and recreating the consumer: it keeps its name, its config and the clients bound to it. The pending and redelivery state is dropped and the consumer sequence starts again at 1.
 
 - Without a sequence (or with `0`) delivery goes on just above the consumer's ack floor: messages delivered but not acknowledged are delivered again.
 - With a sequence above 0 the next message delivered is the first one at or after that stream sequence, backward or forward. The server allows it only for a `deliver_policy` of `all`, `by_start_sequence` (not below `opt_start_seq`) or `by_start_time` (not before `opt_start_time`); anything else fails with a `JetStreamException` carrying code 400 and err_code 10204 (`ApiErrCode::CONSUMER_INVALID_RESET`).
 
-The call resolves to the `ConsumerInfo` the server answers with (config, `delivered`, `ack_floor` and `num_pending` in `raw`) and `resetSequence`, the stream sequence the next delivery starts from. A negative sequence or an invalid name is refused before anything is sent, and a server before 2.14 gets nothing either (see [NATS Server Version Requirements](#nats-server-version-requirements)). The consumer itself answers its reset, so a consumer or stream that does not exist gets no answer: the call fails with the request timeout, not with a "consumer not found" error.
+The call resolves to the `ConsumerInfo` the server answers with (config, `delivered`, `ack_floor` and `num_pending` in `raw`) and `resetSequence`, the stream sequence the next delivery starts from. A negative sequence or an invalid name is refused before anything is sent. Any other reset is sent whatever version the connected server reports in INFO, since the consumer's own server answers it and may run a newer release (ADR-44); a server before 2.14 does not answer it, so the call fails with the request timeout (see [NATS Server Version Requirements](#nats-server-version-requirements)). The consumer itself answers its reset, so a consumer or stream that does not exist gets no answer either: the call fails with the request timeout, not with a "consumer not found" error.
 
 ```php
 <?php
@@ -2034,8 +2040,10 @@ whose `batchId` echoes the batch id. If any consistency check fails the entire b
 nothing is stored - the failure surfaces as a `JetStreamException`.
 
 This is a NATS 2.12+ feature: the target stream must be created with `allow_atomic` enabled. On a
-pre-2.12 server `createStream(..., ['allow_atomic' => true])` fails fast with an
-`UnsupportedFeatureException` (see [NATS Server Version Requirements](#nats-server-version-requirements));
+pre-2.12 server `createStream(..., ['allow_atomic' => true])` is sent and then fails with an
+`UnsupportedFeatureException`: a default 2.10 or 2.11 server creates the stream without the field, and
+the reply check finds it missing (the stream exists then: inspect it before you change or delete it),
+while a strict 2.11 server rejects the field itself (see [NATS Server Version Requirements](#nats-server-version-requirements));
 if the stream exists without `allow_atomic`, `commit()` surfaces a `JetStreamException` (e.g. "atomic
 publish not enabled"). Pass your own batch id (1..64 characters) to `batch()`, or omit it to have one
 generated. A single batch is capped at `BatchPublisher::MAX_MESSAGES` (1000) messages.
@@ -2250,7 +2258,7 @@ _Verified by: [JetStreamInboxRejectionTest](tests/Unit/JetStreamInboxRejectionTe
 
 _Verified by: [PullConsumerIteratorTest::testHandleRePinsOnStalePin](tests/Unit/PullConsumerIteratorTest.php); [PullConsumerIteratorTest::testBuildPullIncludesAllOptionalFields](tests/Unit/PullConsumerIteratorTest.php); [JetStreamContextTest::testCreateConsumerWithPriorityGroups](tests/Unit/JetStreamContextTest.php); [JetStreamContextTest::testUnpinConsumer](tests/Unit/JetStreamContextTest.php); [JetStreamContextTest::testPinIdOf](tests/Unit/JetStreamContextTest.php); [PullConsumerPinRetentionTest](tests/Unit/PullConsumerPinRetentionTest.php); [JetStreamIntegrationTest::testJetStreamPinnedGroupKeepsItsPinWhenARunEndsBeforeItsFirstPullRetires](tests/Integration/JetStreamIntegrationTest.php)._
 
-ADR-42 priority groups let several pull clients share one consumer while the server steers delivery. Create the consumer with `priority_groups` (a non-empty array of 1..16-character group names) and a `priority_policy` - one of `overflow`, `pinned_client`, or `prioritized`. The priority-group fields require **NATS server 2.11+**; the `prioritized` policy requires **2.12+** (an older server rejects them). See [NATS Server Version Requirements](#nats-server-version-requirements).
+ADR-42 priority groups let several pull clients share one consumer while the server steers delivery. Create the consumer with `priority_groups` (a non-empty array of 1..16-character group names) and a `priority_policy` - one of `overflow`, `pinned_client`, or `prioritized`. The priority-group fields require **NATS server 2.11+**; the `prioritized` policy requires **2.12+**. A default 2.10 server drops the priority-group fields, and the consumer create call then fails with the reply check's `UnsupportedFeatureException`; a 2.11 server rejects a `prioritized` policy itself. See [NATS Server Version Requirements](#nats-server-version-requirements).
 
 Then pull under a group with the `PullConsumerIterator` setters: `setGroup()` (required for any priority policy), and as the policy needs them `setPriority()` (0-9, for `prioritized`), `setMinPending()` / `setMinAckPending()` (for `overflow`), plus the general `setMaxBytes()` and `setNoWait()`. Under the `pinned_client` policy the server pins one client at a time: the iterator automatically captures the `Nats-Pin-Id` from the messages it receives and resends it on subsequent pulls, and transparently re-pins if the pin goes stale (the server returns a 423 status). Call `JetStreamContext::pinIdOf($msg)` to read a message's pin id, and `JetStreamContext::unpinConsumer($stream, $consumer, $group)` to release the active pin so another client can take over.
 
@@ -2480,7 +2488,7 @@ $client->disconnect()->await();
 - Every JetStream API request of the context uses its prefix: streams, consumers, account info, message get and delete, Direct Get, pulls (`CONSUMER.MSG.NEXT`, from `fetchBatch()` and `pullConsumer()->handle()`), pause, unpin, reset (`resetConsumer()`), and the requests of its KV and Object Store buckets. A JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, and acks and flow-control replies to the reply subject the server gave; through an account import those reply subjects need imports of their own, see [Account imports](#account-imports) below.
 - KV writes (`put()`, `create()`, `update()`, `delete()`, `purge()`) go through the prefix, as nats.go's do: `$JS.hub.API.$KV.<bucket>.<key>`. nats-server maps `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, while a plain `$KV.` publish from a leaf node gets no responders. For an account import, import the other account's `$KV.>` under the same prefix (`to: "JS.from-a.API.$KV.>"`), and the subjects of the streams and Object Stores you publish to under their own names. The stored subjects stay `$KV.<bucket>.<key>`, so reads and watches are unchanged for a JetStream domain; through an account import they need the further entries in [Account imports](#account-imports) below.
 - The `domain` shorthand of a KV mirror or source, and `StreamSource::external()`, are independent of the context's prefix: they name where the ORIGIN stream lives. A KV mirror of a bucket in another domain writes through that origin's API, not through the context's prefix.
-- The server version checks (the version-gated stream and consumer fields, `batch()`, `publishScheduled()`, `resetConsumer()`) read the INFO of the server the client is connected to. Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests: through a 2.12 leaf node `resetConsumer()` is refused with an `UnsupportedFeatureException` before anything is sent, although a 2.14 hub would answer it.
+- No call is decided from the version in the INFO of the server the client is connected to (ADR-44, see [NATS Server Version Requirements](#nats-server-version-requirements)). Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests, and the requests go out whatever it says: through a 2.12 leaf node a 2.14 hub answers `resetConsumer()`, and the hub's reply, not the leaf node's version, decides a version-gated stream or consumer field, a `batch()` commit and a `publishScheduled()` call too. (2.34.0 and 2.35.0 read the leaf node's version and refused the reset before sending it.)
 
 #### Account imports
 
