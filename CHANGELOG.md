@@ -17,6 +17,14 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
+### Changed
+
+- Internal: `JetStreamContext::diagnoseNoResponders()`'s question wait and `watchTheConnectionUntil()`'s watch after
+  a refused question shared the same 20 ms connection look in two separate copies; they now share one helper,
+  `awaitWhileTheConnectionStays()` (#262). The watch's socket reads run one after another in a fiber of their own,
+  which the helper awaits only until the next look, the same way it already awaited the question. No public API or
+  wire-format change; behavior is unchanged.
+
 ### Testing & CI
 
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
