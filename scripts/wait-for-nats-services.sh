@@ -12,10 +12,10 @@ if ! command -v curl >/dev/null 2>&1; then
 fi
 
 # Monitoring ports from docker-compose.yml: nats, nats-token, nats-userpass, nats-tls, nats-nkey,
-# nats-jwt, nats-tls-upgrade, nats-ws, nats-hub, nats-leaf and nats-214. Keep this list in step with
-# the compose file: a server left out is not waited for, and the first tests or examples that use it
-# can start before it is up.
-services=(18222 18223 18224 18225 18226 18227 18228 18229 18230 18231 18232)
+# nats-jwt, nats-tls-upgrade, nats-ws, nats-hub, nats-leaf, nats-214 and nats-accounts. Keep this list
+# in step with the compose file: a server left out is not waited for, and the first tests or examples
+# that use it can start before it is up.
+services=(18222 18223 18224 18225 18226 18227 18228 18229 18230 18231 18232 18233)
 # The leaf node (nats-leaf) is ready once its connection to the hub (nats-hub) is up, not when its own
 # monitoring port answers: until then a client on it has no route to the hub's JetStream (#273).
 leaf_ports=(18231)

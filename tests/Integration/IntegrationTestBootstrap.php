@@ -259,6 +259,17 @@ trait IntegrationTestBootstrap
     }
 
     /**
+     * Returns the URL of the account-import fixture (nats-accounts, #284): a server with an ORIGIN
+     * account that runs JetStream and a TARGET account, with none of its own, that imports it.
+     */
+    protected function integrationAccountsServerUrl(): string
+    {
+        $url = getenv('NATS_ACCOUNTS_URL');
+
+        return is_string($url) && $url !== '' ? $url : 'nats://127.0.0.1:14233';
+    }
+
+    /**
      * Returns the configured JWT-auth NATS server URL.
      */
     protected function integrationJwtServerUrl(): string

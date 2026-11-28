@@ -22,6 +22,15 @@ of the next release that names the release and the entry it corrects.
 
 ### Testing & CI
 
+- `[docs]` New `nats-accounts` fixture (an ORIGIN account running JetStream and a TARGET account, with none of its
+  own, that imports it, port 14233) in `docker-compose.yml` (`build/nats/accounts.conf`, the README's "Account
+  imports" `accounts { }` block); `scripts/wait-for-nats-services.sh` also waits for its monitoring port. New
+  `JetStreamAccountImportIntegrationTest`, through the import: TARGET's default context gets no responders and the
+  prefix context ORIGIN's account info; `fetchBatch()` of 5 and a finite pull consume of 3; `ackSync()` and `ack()`
+  confirmed on ORIGIN's consumer; a KV bucket's `keys()`, `history()` and `getAll()`; a multi-chunk Object Store
+  object written and read back; a `watch()`, an ordered consumer and both push-consumer shapes; an ordered consumer
+  over 300 16 KB messages; a KV `put()` and a `publish()` read back by ORIGIN's client. It skips when the fixture
+  is not running. New `AccountImportConfigDocsTest` keeps the README's block and the fixture's config equal.
 - `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
   nats-server 2.12, stale since #286 (#279) added the second `composer test:e2e` integration stage against the
   `nats-214` fixture. Both now say which test runs against which fixture, as the consumer reset texts do, and the

@@ -12,6 +12,9 @@ To count the tests: `vendor/bin/phpunit --testsuite unit --list-tests` and `--te
 
 ## Unit Tests (`tests/Unit/`)
 
+### tests/Unit/AccountImportConfigDocsTest.php
+- `testReadmeAccountsBlockMatchesFixtureConfigOnceUsersAreTakenOut` - Asserts the README's "Account imports" `accounts { }` block (the first fenced block that starts with `accounts {`) equals `build/nats/accounts.conf`'s `accounts { }` block once its `users:` lines are taken out, failing with its own message when the README has no such block, the config has none, or the config names no user.
+
 ### tests/Unit/AmpSocketTransportTest.php
 - `testWriteWithoutSocketThrowsWhileReadAndCloseStaySafe` - Asserts write() without a connected socket throws TransportClosedException (a silent no-op would confirm frames that never reached any socket, #124), while readLine() still returns '' and close() stays idempotent.
 - `testUpgradeTlsIsNoOpWhenTlsNotConfigured` - Asserts upgradeTls() short-circuits (no handshake) when no socket and no TLS context are configured, leaving readLine() returning ''.
@@ -3628,6 +3631,24 @@ Durable stream sourcing of ADR-60 (#280) against a live server, set up with the 
 ### tests/Integration/HeartbeatSoakIntegrationTest.php
 - `testIdlePublisherStaysAliveViaHeartbeatSelfRead` - With a 1s ping interval and maxPingsOut=2, an idle publisher-only client that never calls processIncoming() is left idle for ~4.5s; asserts the heartbeat timer self-reads its own PONGs so the connection stays Open with 0 reconnects (no false "server unresponsive" drop), and remains usable for a follow-up publish.
 - `testConcurrentHeartbeatAndProcessIncomingDeliverAllMessages` - Runs an application processIncoming() loop concurrently with the 1s heartbeat self-read while publishing 10 messages over ~5s; asserts the readInProgress guard prevents overlapping reads (no PendingReadError/spurious reconnect), all 10 messages are delivered, the connection stays Open, and reconnects stay 0.
+
+### tests/Integration/JetStreamAccountImportIntegrationTest.php
+JetStream through an account import (#284), over the `nats-accounts` fixture (`NATS_ACCOUNTS_URL`): an ORIGIN account that runs JetStream and exports it, and a TARGET account, with none of its own, that imports it (`build/nats/accounts.conf`, the README's "Account imports" block). A client of ORIGIN creates the data, reads the state and cleans up; a client of TARGET performs the call under test through `jetStream(apiPrefix: 'JS.from-a.API')`. Skips when nothing listens on the fixture's port.
+- `testTargetsDefaultContextHasNoJetStreamButThePrefixReachesOrigin` - TARGET's default context's accountInfo() fails with JetStreamException(503); the prefix context returns ORIGIN's account info.
+- `testFetchBatchOfFiveMessagesThroughThePrefix` - fetchBatch() of 5 through the prefix returns all 5, needing `response: stream` on the `$JS.API.>` export.
+- `testPullConsumerHandleThreeMessagesThroughThePrefix` - `pullConsumer()->handle()` of 3 through the prefix handles all 3 in order.
+- `testAckSyncConfirmedThroughThePrefix` - `ackSync()` through the prefix confirms with ORIGIN, needing the `$JS.ACK.>` import.
+- `testAckReachesOriginsConsumerThroughThePrefix` - After `ack()` through the prefix, ORIGIN's consumer reaches `num_ack_pending` 0, polled for a short deadline.
+- `testKeysOfABucketThatHasKeysThroughThePrefix` - `keys()` through the prefix, of a bucket ORIGIN put two keys into, needs the `_INBOX.KV.KEYS.>` export.
+- `testHistoryOfAKeyWrittenTwiceThroughThePrefix` - `history()` through the prefix, of a key ORIGIN wrote twice, needs the `_INBOX.KV.HIST.>` export.
+- `testKeyValueGetAllOfSeveralKeysThroughThePrefix` - `getAll()` through the prefix, of 3 keys ORIGIN put, needs `response: stream` on the `$JS.API.>` export.
+- `testObjectStoreMultiChunkObjectRoundTripThroughThePrefix` - An Object Store object of several chunks is written and read back through the prefix: `put()` needs the `$O.>` export, `get()` of several chunks needs `response: stream`.
+- `testWatchReceivesAValueOriginWroteThroughThePrefix` - A `watch()` through the prefix receives a value ORIGIN wrote, needing the `_INBOX.JS.ORD.>` export.
+- `testSubscribeOrderedConsumerThroughThePrefix` - `subscribeOrderedConsumer()` through the prefix receives a message ORIGIN published, needing the `_INBOX.JS.ORD.>` export.
+- `testSubscribeEphemeralPushConsumerWithoutDeliverSubjectThroughThePrefix` - `subscribeEphemeralPushConsumer()` without a `deliverSubject` through the prefix delivers on the default `_INBOX.JS.PUSH.` literal, needing its export.
+- `testSubscribePushConsumerWithDeliverSubjectUnderDeliverReaderThroughThePrefix` - `subscribePushConsumer()` with a `deliverSubject` under `DELIVER.READER.` through the prefix needs the export of that literal.
+- `testOrderedConsumerReads300MessagesOf16KbToTheEndThroughThePrefix` - An ordered consumer through the prefix reads 300 messages of 16 KB to the end, needing the `$JS.FC.>` import for flow control; the wait also ends when nothing new arrives for a few seconds.
+- `testKeyValuePutAndPublishReadBackByOriginThroughThePrefix` - A KV `put()` (needing the `$KV.>` import) and a `publish()` (needing the `orders.>` import) through the prefix, each read back by ORIGIN's client.
 
 ### tests/Integration/JetStreamDomainIntegrationTest.php
 JetStream through a leaf node (#273), over the `nats-hub` (JetStream with `jetstream { domain: hub }`, `NATS_HUB_URL`) and `nats-leaf` (no JetStream, connected to the hub, `NATS_LEAF_URL`) fixtures. Each test first waits up to 15 s for the leaf node to route the domain's API, and skips when nothing listens on the leaf node's URL.
