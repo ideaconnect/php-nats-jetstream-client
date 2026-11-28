@@ -127,6 +127,7 @@ The application's own read - processIncoming() or readIncoming() - finding the s
 - `testStreamConfigurationDefaultsToEmptySubjects` - Asserts a freshly created StreamConfiguration('EMPTY') serializes with its name and an empty subjects array by default.
 - `testConsumerConfigurationMapsEverySetter` - Chains every ConsumerConfiguration setter and asserts toArray() maps to wire keys with ms->ns conversions for ack_wait (5000->5e9), inactive_threshold (30000->30e9), and each backoff element ([1000,2000]->[1e9,2e9]), plus filter_subjects, policies, metadata, and raw set('rate_limit_bps').
 - `testConsumerConfigurationEphemeralHasNoDurableName` - Asserts an ephemeral consumer (ackPolicy None, no durable) has null name, omits the durable_name key from toArray(), and emits ack_policy 'none'.
+- `testConsumerConfigurationCarriesTheFlowControlAckPolicy` - Asserts a durable consumer with a deliver subject and AckPolicy::FlowControl serializes to exactly durable_name, deliver_subject and ack_policy 'flow_control' (ADR-60, #280).
 
 ### tests/Unit/ConnectionEndingFrameTest.php
 - `testFatalErrWithReconnectOffClosesTheConnection` - A fatal -ERR ('Stale Connection') read by processIncoming() with reconnect off closes the connection for good, with one Closed event, and releases the socket; the read fails with the server's error ("Server sent error frame: 'Stale Connection'"), not "Reconnect is disabled". Before #171 the connection stayed Open.
@@ -3316,6 +3317,13 @@ Your own read already waiting is woken when another fiber's read stops a subscri
 - `testSourceWithExternal` - Asserts external(api, deliver) emits an external sub-array with both 'api' and 'deliver' keys.
 - `testExternalWithoutDeliver` - Asserts external(api) with no deliver emits an external sub-array containing only the 'api' key.
 - `testFullyConfiguredSource` - Asserts a source with startSeq, filterSubject, and external(api, deliver) serializes to the full expected array with all keys including the nested external map.
+- `testSourceWithConsumer` - Asserts StreamSource::source('WQ')->consumer('SRC', 'deliver.x')->toArray() is exactly name plus the `consumer` object {name, deliver_subject} (ADR-60 durable sourcing, #280).
+- `testMirrorWithConsumer` - The same for StreamSource::mirror('WQ')->consumer(...).
+- `testConsumerComesAfterExternal` - Asserts consumer() combined with external(api, deliver), called before it, serializes in the server's field order: name, external, consumer.
+- `testConsumerCannotBeCombinedWithAStartOrAFilter` - Six cases (startSeq(), startTime(), filterSubject(), each called before and after consumer()): toArray() throws a JetStreamException naming the one clashing setter and the consumer, so the order of the calls does not matter.
+- `testConsumerClashNamesEverySetterThatClashes` - A mirror with all three setters and consumer() is refused with a message naming startSeq(), startTime(), filterSubject().
+- `testConsumerNeedsAName` - consumer() with an empty name throws a JetStreamException ("A stream source consumer needs a name").
+- `testConsumerNeedsADeliverSubject` - consumer() with an empty deliver subject throws a JetStreamException ("A stream source consumer needs a deliver subject").
 
 ### tests/Unit/SubscriptionLimitExceptionTest.php
 The type of the server's subscription-limit `-ERR` (#242), over `tests/Support/SubscriptionLimitServer.php`. The errors the client builds for a reply inbox the `-ERR` dropped are pinned in `MuxInboxRejectionTest` and `JetStreamInboxRejectionTest`. Each test but the guards fails on 2.26.8, where the class does not exist.
@@ -3611,6 +3619,11 @@ drain() and drainSubscription() against a live NATS server.
 - `testDrainedQueueMemberStaysGoneAcrossAReconnectAgainstALiveServer` - After drainSubscription() of one queue-group member and a reconnect of its client, the other member receives all 20 messages published to the group and the drained one none: no leftover server-side subscription takes a share.
 - `testDrainSubscriptionIssuedDuringAReconnectWaitsForItAgainstALiveServer` - drainSubscription() of a queue-group member issued while its client's server is down (back after 0.3 s) waits for the reconnect: it resolves after at least 0.2 s with the connection Open and one reconnect, and the other member then receives all 20 messages published to the group and the drained one none.
 - `testAnAckSyncDuringTheDrainsHandOverIsConfirmedAgainstALiveServer` - A worker that has made no request before runs a pull consumer (batch 3, depth 1) on a consumer with explicit acks and a two-second ack wait, holding m-1 and m-2 when it drains its client: both ackSync() calls are confirmed while Draining, handle() returns 2, the admin connection sees num_ack_pending 0, and a fetch after the ack wait gets nothing (#213). On 2.24.3 both ackSync() calls failed with "Connection is not open".
+
+### tests/Integration/DurableSourcingIntegrationTest.php
+Durable stream sourcing of ADR-60 (#280) against a live server, set up with the typed builders (`AckPolicy::FlowControl`, `StreamSource::consumer()`). The fixture stack runs nats-server 2.12, so there only the second test runs; with NATS_URL pointing at a 2.14+ server the first runs and the second is skipped (checked against nats-server 2.14.10, 2.15.1 and 2.12.15; on 2.11.17 both skip).
+- `testAWorkQueueIsSourcedThroughANamedFlowControlConsumer` - On 2.14+: a WorkQueue stream, a durable `flow_control` push consumer on it and a stream sourcing it through that consumer; after three publishes the sourcing stream holds 3 and the work queue 0 (each waited for within 5 s), and the stored source carries the `consumer` object.
+- `testAServerBefore214RefusesTheFlowControlConsumerAndANamedConsumerSource` - On a server from 2.12 up to 2.14: the `flow_control` consumer create and the create of a stream whose source names a consumer each fail with a JetStreamException, code 400 and err_code 10025, the second containing `unknown field "consumer"`. Skipped below 2.12, where the server drops the field instead.
 
 ### tests/Integration/HeartbeatSoakIntegrationTest.php
 - `testIdlePublisherStaysAliveViaHeartbeatSelfRead` - With a 1s ping interval and maxPingsOut=2, an idle publisher-only client that never calls processIncoming() is left idle for ~4.5s; asserts the heartbeat timer self-reads its own PONGs so the connection stays Open with 0 reconnects (no false "server unresponsive" drop), and remains usable for a follow-up publish.

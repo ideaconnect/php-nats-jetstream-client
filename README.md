@@ -206,6 +206,7 @@ depends on the feature:
 | Scheduled publishing, recurring (`@every`/cron/aliases), `timeZone`, `source`, `rollup` | `publishScheduled()`, `Schedule::every/cron/predefined` | 2.14 | `allow_msg_schedules`, `Nats-Schedule-Time-Zone`, `Nats-Schedule-Source`, `Nats-Schedule-Rollup` |
 | Atomic batch publish | `batch()` -> `BatchPublisher` | 2.12 | `allow_atomic`, `Nats-Batch-*` |
 | Consumer delivery state reset (ADR-60) | `resetConsumer()` | 2.14 | `$JS.API.CONSUMER.RESET` |
+| Durable stream sourcing/mirroring through a named consumer (ADR-60) | `AckPolicy::FlowControl`, `StreamSource::consumer()` | 2.14 | `ack_policy: flow_control`, `consumer` of a source or mirror; sent as is, see [Durable sourcing](#durable-sourcing-nats-214) |
 | Distributed counter CRDT | `incrementCounter()`, `counterValue()` | 2.12 | `allow_msg_counter`, `Nats-Incr` |
 | Publish de-duplication | `publish(..., msgId:)` | 2.2 | `Nats-Msg-Id` |
 
@@ -2303,7 +2304,7 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/stream-mirroring-and-sourcing.php`](examples/stream-mirroring-and-sourcing.php)
 
-_Verified by: [StreamSourceTest](tests/Unit/StreamSourceTest.php); [features/jetstream-core/config_helpers.feature](features/jetstream-core/config_helpers.feature) (live source filtering + mirror replication)._
+_Verified by: [StreamSourceTest](tests/Unit/StreamSourceTest.php); [features/jetstream-core/config_helpers.feature](features/jetstream-core/config_helpers.feature) (live source filtering + mirror replication); [DurableSourcingIntegrationTest](tests/Integration/DurableSourcingIntegrationTest.php) (durable sourcing against a 2.14+ server, and the refusals of a 2.12 server)._
 
 Use `StreamSource` to build mirror/source configuration arrays:
 
@@ -2336,6 +2337,57 @@ $client->disconnect()->await();
 ```
 
 Use those arrays in `createStream()` or `updateStream()` options. Source configurations work with the current high-level API and are covered against the live fixture stack. Mirror-only stream configs also work through `createStream()` when you pass an empty `subjects` list together with the `mirror` configuration.
+
+#### Durable sourcing (NATS 2.14+)
+
+A 2.14+ server sources or mirrors a WorkQueue or Interest stream reliably by itself (ADR-60): give the origin as above (`StreamSource::source('JOBS')`, `StreamSource::mirror('JOBS')`) and the server creates a durable consumer with the `flow_control` ack policy on the origin, so a message leaves the origin only after the sourcing stream has stored it. It removes that consumer together with the sourcing stream. Nothing new is needed in the client's config for this.
+
+Name a consumer of your own with `StreamSource::consumer($name, $deliverSubject)` when its configuration should be yours or it should outlive the sourcing stream (deleting the sourcing stream leaves a consumer of your own in place). ADR-60 moves the start sequence, start time and filter subject onto that consumer: `toArray()` refuses `consumer()` together with `startSeq()`, `startTime()` or `filterSubject()` with a `JetStreamException` that names them (the server's own error, err_code 10215 for a source and 10213 for a mirror, names no field).
+
+Create the consumer first, on the origin, and give the source its exact deliver subject. The server checks neither when the sourcing stream is created: a stream that names a consumer that does not exist, delivers to another subject or acks explicitly is created without an error and stays empty (a consumer created later is picked up on a retry, after seconds or tens of seconds). For the consumer, a durable name, a deliver subject outside the origin's own subjects and `AckPolicy::FlowControl` are enough: the server sets `flow_control` and the 1 s idle heartbeat itself, and refuses `ack_wait`, `backoff` and a positive `max_deliver` on it.
+
+```php
+<?php
+
+declare(strict_types=1);
+
+use IDCT\NATS\Connection\NatsOptions;
+use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\JetStream\Configuration\ConsumerConfiguration;
+use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
+use IDCT\NATS\JetStream\Configuration\StreamSource;
+use IDCT\NATS\JetStream\Enum\AckPolicy;
+use IDCT\NATS\JetStream\Enum\RetentionPolicy;
+
+$client = new NatsClient(new NatsOptions());
+$client->connect()->await();
+$js = $client->jetStream();
+
+$js->addStream(StreamConfiguration::create('JOBS')->subjects('jobs.>')->retention(RetentionPolicy::WorkQueue))->await();
+
+// 1. The consumer, on the origin.
+$js->addConsumer('JOBS', ConsumerConfiguration::create()
+	->durable('JOBS_ARCHIVE')
+	->deliverSubject('deliver.jobs.archive')
+	->ackPolicy(AckPolicy::FlowControl))->await();
+
+// 2. The sourcing stream names it, with the same deliver subject.
+$js->createStream('ARCHIVE', [], [
+	'sources' => [StreamSource::source('JOBS')->consumer('JOBS_ARCHIVE', 'deliver.jobs.archive')->toArray()],
+])->await();
+
+$client->disconnect()->await();
+```
+
+The client checks the server version for neither of the two; a server before 2.14 answers:
+
+| Request | 2.10, 2.11 | 2.12 |
+| --- | --- | --- |
+| a consumer with `AckPolicy::FlowControl` | refused: 400, err_code 10025 (`invalid JSON`) | refused: 400, err_code 10025 (`invalid JSON`) |
+| a source or mirror with `consumer()` | the stream is created without `consumer` and sources the old way; the client does not notice | refused: 400, err_code 10025 (`unknown field "consumer"`) |
+| a WorkQueue origin sourced without `consumer()` | sourced the old way, which the server did not support for such an origin before 2.14: the work queue is emptied at once | as 2.10 and 2.11 |
+
+Each refusal is a plain `JetStreamException` (`getCode()` 400, `getErrCode()` 10025). With the order above, an older server already refuses step 1. When you set the source up against a server of unknown version, check the `StreamInfo` that `createStream()` returns (`raw['config']['sources']`) for the `consumer` object.
 
 ### Republish and Subject Transform
 

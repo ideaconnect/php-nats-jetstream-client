@@ -17,14 +17,6 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ## [Unreleased]
 
-### Testing & CI
-
-- `[docs]` New `nats-214` fixture in `docker-compose.yml` (nats-server 2.14, port 14232/18232) and a second
-  `composer test:e2e` integration stage against it (`composer test:integration:2.14`, `--fail-on-skipped`), so a
-  live test that needs a server newer than the other fixtures' 2.12 runs in CI instead of always skipping itself
-  (#279). A test that can pass only on a server older than 2.14 is excluded from that stage by having
-  `ServerBefore214` in its name.
-
 ### Documentation
 
 - `[docs]` The "JetStream Domains and API Prefixes" section (#273, #276) said an account import needs `$JS.API.>`
@@ -42,6 +34,29 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   it, and that a stream export covering one of the prefixes hands the importing account everything published on it,
   not only what one import's calls deliver. Measured once against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and
   2.15.3 with this client at 2.34.0; not covered by a test of this repository.
+
+## [2.35.0] - 2026-11-28
+
+### Added
+
+- `[feature]` Durable stream sourcing and mirroring (ADR-60, NATS server 2.14+) with the typed builders (#280):
+  `AckPolicy::FlowControl` (`flow_control`) is the ack policy of the durable push consumer a stream sources or
+  mirrors a WorkQueue or Interest stream through, and `StreamSource::consumer($name, $deliverSubject)` names such a
+  consumer in a source or mirror (`consumer: {name, deliver_subject}`, after `external`). `toArray()` refuses
+  `consumer()` together with `startSeq()`, `startTime()` or `filterSubject()` with a `JetStreamException` that names
+  them (they belong on the consumer, and the server's own error names no field); `consumer()` refuses an empty name
+  or deliver subject. The client checks the server version for neither: a server before 2.14 refuses the ack policy
+  (400, err_code 10025), 2.12 refuses a source that names a consumer the same way, and 2.10 and 2.11 drop the field
+  and source the old way. README "Stream Mirroring and Sourcing" says what a 2.14 server does by itself, when to
+  name a consumer of your own and what to create first.
+
+### Testing & CI
+
+- `[docs]` New `nats-214` fixture in `docker-compose.yml` (nats-server 2.14, port 14232/18232) and a second
+  `composer test:e2e` integration stage against it (`composer test:integration:2.14`, `--fail-on-skipped`), so a
+  live test that needs a server newer than the other fixtures' 2.12 runs in CI instead of always skipping itself
+  (#279). A test that can pass only on a server older than 2.14 is excluded from that stage by having
+  `ServerBefore214` in its name.
 
 ## [2.34.0] - 2026-11-26
 
