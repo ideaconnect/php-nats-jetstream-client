@@ -2432,7 +2432,7 @@ $client->disconnect()->await();
 
 ### JetStream Domains and API Prefixes (Leaf Nodes, Account Imports)
 
-_Verified by: [JetStreamDomainTest](tests/Unit/JetStreamDomainTest.php); [JetStreamDomainIntegrationTest](tests/Integration/JetStreamDomainIntegrationTest.php) (live, through the `nats-leaf` fixture: a leaf node without JetStream connected to the `nats-hub` fixture, which runs JetStream with `jetstream { domain: hub }`)._
+_Verified by: [JetStreamDomainTest](tests/Unit/JetStreamDomainTest.php); [JetStreamDomainIntegrationTest](tests/Integration/JetStreamDomainIntegrationTest.php) (live, through the `nats-leaf` fixture: a leaf node without JetStream connected to the `nats-hub` fixture, which runs JetStream with `jetstream { domain: hub }`); [JetStreamAccountImportIntegrationTest](tests/Integration/JetStreamAccountImportIntegrationTest.php) (live, through the `nats-accounts` fixture: an ORIGIN account that runs JetStream and a TARGET account, with none of its own, that imports it)._
 
 By default a JetStream context sends its API requests to `$JS.API.>`, the JetStream of the account the client is connected to. Two common deployments serve it elsewhere:
 
@@ -2484,7 +2484,7 @@ $client->disconnect()->await();
 
 #### Account imports
 
-_Measured once for #281, against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and 2.15.3 with this client at 2.34.0; not covered by a test of this repository._
+_Measured once for #281, against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and 2.15.3 with this client at 2.34.0; the config with every entry is covered live by [JetStreamAccountImportIntegrationTest](tests/Integration/JetStreamAccountImportIntegrationTest.php)._
 
 This is the account config that passed every call below, with one user added to each account for the measurement; on 2.10.29 `directGetBatch()` fails with or without an import, since batched Direct Get needs nats-server 2.11. `orders.>` stands for the subjects of the streams the importing account publishes to, and `DELIVER.READER.>` for a delivery subject the caller chose:
 
@@ -2908,6 +2908,7 @@ When you run `docker compose up -d` in this repository, additional local auth fi
 - standalone NKey auth: `nats://127.0.0.1:14226` with seed `SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY`
 - JetStream domain: a hub `nats://127.0.0.1:14230` running JetStream with `jetstream { domain: hub }`, and a leaf node `nats://127.0.0.1:14231` without JetStream connected to it (`build/nats/hub.conf`, `build/nats/leaf.conf`); `scripts/wait-for-nats-services.sh` waits until the leaf node's connection to the hub is up
 - nats-server 2.14: `nats://127.0.0.1:14232` (`nats-214`), used only by the second `composer test:e2e` integration stage (`composer test:integration:2.14`) to run the integration suite against a server newer than the other fixtures' 2.12
+- account import: `nats://127.0.0.1:14233` (`nats-accounts`), an ORIGIN account running JetStream and a TARGET account, with none of its own, that imports it for `jetStream(apiPrefix:)` (`build/nats/accounts.conf`)
 
 The integration tests use those defaults automatically. Override them with environment variables when you want to target external infrastructure instead.
 
@@ -2944,6 +2945,7 @@ composer fixture:jwt:check
 - `NATS_NKEY_SEED`: encoded user seed used by `NkeySeedSigner` for standalone NKey challenge-response auth
 - `NATS_HUB_URL`: JetStream hub with the domain `hub` used by `JetStreamDomainIntegrationTest` (default: `nats://127.0.0.1:14230`)
 - `NATS_LEAF_URL`: leaf node without JetStream connected to that hub, used by `JetStreamDomainIntegrationTest`, which skips when nothing listens there (default: `nats://127.0.0.1:14231`)
+- `NATS_ACCOUNTS_URL`: account-import fixture used by `JetStreamAccountImportIntegrationTest`, which skips when nothing listens there (default: `nats://127.0.0.1:14233`)
 
 Example overrides for external infrastructure:
 

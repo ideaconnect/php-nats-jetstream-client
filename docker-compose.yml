@@ -179,3 +179,21 @@ services:
     ports:
       - "14231:4222"
       - "18231:8222"
+
+  # Account import fixture (#284): two accounts on one server, ORIGIN with JetStream and exports
+  # toward TARGET, TARGET with the imports `jetStream(apiPrefix: 'JS.from-a.API')` needs and no
+  # JetStream of its own.
+  nats-accounts:
+    image: nats:2.12-alpine
+    command: ["--config", "/etc/nats-config/accounts.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8222/varz >/dev/null 2>&1 || exit 1"]
+      interval: 30s
+      timeout: 2s
+      retries: 4
+      start_period: 5s
+    volumes:
+      - ${NATS_PROJECT_ROOT:-.}/build/nats:/etc/nats-config:ro
+    ports:
+      - "14233:4222"
+      - "18233:8222"
