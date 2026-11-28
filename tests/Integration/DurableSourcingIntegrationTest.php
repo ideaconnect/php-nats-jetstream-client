@@ -12,7 +12,6 @@ use IDCT\NATS\JetStream\Configuration\StreamConfiguration;
 use IDCT\NATS\JetStream\Configuration\StreamSource;
 use IDCT\NATS\JetStream\Enum\AckPolicy;
 use IDCT\NATS\JetStream\Enum\RetentionPolicy;
-use IDCT\NATS\JetStream\FeatureSupport;
 use IDCT\NATS\JetStream\JetStreamContext;
 use PHPUnit\Framework\TestCase;
 
@@ -24,11 +23,18 @@ use function Amp\delay;
  * default fixture (`nats`) runs 2.12, so there only the refusals run and the sourcing test is skipped. The second
  * `composer test:e2e` integration stage runs against the `nats-214` fixture (`NATS_URL=nats://127.0.0.1:14232
  * RUN_INTEGRATION=1 composer test:integration:2.14`), which runs the sourcing test and leaves the pre-2.14 test out by
- * its name (`ServerBefore214`; it skips itself on 2.14+).
+ * its name (`ServerBefore214`; it skips itself from API level 4 on). Which tests run is decided by the API level
+ * `$JS.API.INFO` reports (ADR-44), not by the INFO version.
  */
 final class DurableSourcingIntegrationTest extends TestCase
 {
     use IntegrationTestBootstrap;
+
+    /** The JetStream API level of nats-server 2.14, the first with durable stream sourcing. */
+    private const DURABLE_SOURCING_API_LEVEL = 4;
+
+    /** The JetStream API level of nats-server 2.12.0 (2.12.15 reports 3). */
+    private const SERVER_212_API_LEVEL = 2;
 
     private ?NatsClient $client = null;
 
@@ -61,9 +67,13 @@ final class DurableSourcingIntegrationTest extends TestCase
     public function testAWorkQueueIsSourcedThroughANamedFlowControlConsumer(): void
     {
         $js = $this->jetStream();
-        $version = $this->serverVersion();
-        if (FeatureSupport::serverIsOlderThan($version, '2.14')) {
-            self::markTestSkipped(sprintf('Durable stream sourcing needs NATS server 2.14+; the server reports %s.', (string) $version));
+        $apiLevel = $js->accountInfo()->await()->apiLevel;
+        if ($apiLevel === null || $apiLevel < self::DURABLE_SOURCING_API_LEVEL) {
+            self::markTestSkipped(sprintf(
+                'Durable stream sourcing needs NATS server 2.14+ (API level %d); the server reports %s.',
+                self::DURABLE_SOURCING_API_LEVEL,
+                self::describe($apiLevel),
+            ));
         }
 
         [$queue, $aggregate, $subject, $deliverSubject] = $this->names();
@@ -95,18 +105,25 @@ final class DurableSourcingIntegrationTest extends TestCase
     }
 
     /**
-     * A server from 2.12 up to 2.14 knows neither half: it refuses the `flow_control` ack policy and a source that
-     * names a consumer, each with 400 and err_code 10025 (invalid JSON). A 2.10 or 2.11 server drops the source's
-     * `consumer` instead of refusing it, so the test is skipped there.
+     * A server from 2.12 up to 2.14 (API level 2 or 3) knows neither half: it refuses the `flow_control` ack policy
+     * and a source that names a consumer, each with 400 and err_code 10025 (invalid JSON). A 2.10 or 2.11 server
+     * drops the source's `consumer` instead of refusing it, so the test is skipped there.
      */
     public function testAServerBefore214RefusesTheFlowControlConsumerAndANamedConsumerSource(): void
     {
         $js = $this->jetStream();
-        $version = $this->serverVersion();
-        if (!FeatureSupport::serverIsOlderThan($version, '2.14') || FeatureSupport::serverIsOlderThan($version, '2.12')) {
-            self::markTestSkipped(sprintf('Only a server from 2.12 up to 2.14 refuses both; the server reports %s.', (string) $version));
+        $apiLevel = $js->accountInfo()->await()->apiLevel;
+        if ($apiLevel === null || $apiLevel < self::SERVER_212_API_LEVEL || $apiLevel >= self::DURABLE_SOURCING_API_LEVEL) {
+            self::markTestSkipped(sprintf(
+                'Only a server from 2.12 up to 2.14 (API level %d to %d) refuses both; the server reports %s.',
+                self::SERVER_212_API_LEVEL,
+                self::DURABLE_SOURCING_API_LEVEL - 1,
+                self::describe($apiLevel),
+            ));
         }
 
+        // The version only names the server in a failure message; the API level above picks the test.
+        $version = $this->serverVersion();
         [$queue, $aggregate, $subject, $deliverSubject] = $this->names();
         $js->addStream(StreamConfiguration::create($queue)->subjects($subject)->retention(RetentionPolicy::WorkQueue))->await();
         $this->streams[] = $queue;
@@ -148,6 +165,11 @@ final class DurableSourcingIntegrationTest extends TestCase
     private function serverVersion(): ?string
     {
         return $this->client?->serverInfo()?->version;
+    }
+
+    private static function describe(?int $apiLevel): string
+    {
+        return $apiLevel === null ? 'no API level' : 'API level ' . $apiLevel;
     }
 
     /**

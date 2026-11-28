@@ -97,7 +97,7 @@ final class BatchPublisherTest extends TestCase
     /**
      * No version pre-flight (ADR-44, #272): a connected server whose INFO reports 2.11.4, a two-segment "2.11" or a
      * 1.x version is not refused the batch. It goes out, and when the JetStream API that answers serves atomic batches
-     * (a newer meta leader / stream host in a cluster under a rolling upgrade) it commits. Up to 2.33.0 the pre-flight
+     * (a newer meta leader / stream host in a cluster under a rolling upgrade) it commits. Up to 2.35.0 the pre-flight
      * (#152) refused it before anything was written.
      */
     public function testCommitIsSentAndCommitsWhateverVersionInfoReports(): void
@@ -138,7 +138,7 @@ final class BatchPublisherTest extends TestCase
     /**
      * A single-message batch on a connected server whose INFO reports a two-segment "2.11" is sent, and the plain
      * PubAck of the lone message is accepted: a one-message batch is trivially atomic (#130), and no version decides
-     * (#272). Up to 2.33.0 the pre-flight refused it before any write.
+     * (#272). Up to 2.35.0 the pre-flight refused it before any write.
      */
     public function testSingleMessageBatchIsSentWhateverVersionInfoReports(): void
     {

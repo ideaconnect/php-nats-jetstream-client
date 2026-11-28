@@ -236,8 +236,9 @@ final class ConsumerResetTest extends TestCase
      * The reset is sent whatever version the connected server reports in INFO (ADR-44, #272): the consumer's own
      * server answers it, and in a cluster under a rolling upgrade that may be a 2.14 server behind a connected 2.12
      * one. With the reset answered as 2.14.10 answers it, every version gets the request once and the reply's
-     * consumer: versions before 2.14 (which 2.33.0 refused with "nothing was sent"), 2.14+ ones (pre-release tags
-     * included) and versions that do not parse. `consumer_reset` stays in the registry as documentation.
+     * consumer: versions before 2.14 (which 2.33.0 to 2.35.0 refused with "nothing was sent"), 2.14+ ones
+     * (pre-release tags included) and versions that do not parse. `consumer_reset` stays in the registry as
+     * documentation.
      */
     public function testTheResetIsSentWhateverVersionInfoReports(): void
     {

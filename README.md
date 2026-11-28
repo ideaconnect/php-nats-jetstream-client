@@ -142,7 +142,7 @@ revision 4). The `version` in the INFO handshake is the release of the server th
 connected to, while a JetStream request is answered by the meta leader or by the server that hosts
 the stream, which may run another release: in a cluster during a rolling upgrade, or behind a
 leafnode. So no call is refused, changed or sent elsewhere because of that version: every request
-goes out, and the server's answer decides. (Up to 2.33.0 the client refused some calls before sending
+goes out, and the server's answer decides. (Up to 2.35.0 the client refused some calls before sending
 them when INFO reported an older version; the CHANGELOG lists what an older server answers now.) How
 a server without a feature shows up depends on the feature:
 
@@ -187,8 +187,8 @@ a server without a feature shows up depends on the feature:
 - **Consumer reset** (`resetConsumer()`): a server before 2.14 does not answer
   `$JS.API.CONSUMER.RESET` at all. The request is sent whatever version INFO reports, so on such a
   server the call waits out the request timeout and fails with a `TimeoutException`, as it does on 2.14
-  for a consumer that does not exist. (2.33.0 refused the reset before sending when INFO reported a
-  version before 2.14.)
+  for a consumer that does not exist. (2.33.0 to 2.35.0 refused the reset before sending when INFO
+  reported a version before 2.14.)
 - **Other data-path calls** (for example `publish(..., ttl:)`) against a server or stream without the
   feature surface a plain `JetStreamException` built from the server's error response - or the server
   may silently ignore an unknown header - so consult the table before relying on them against older
@@ -2488,7 +2488,7 @@ $client->disconnect()->await();
 - Every JetStream API request of the context uses its prefix: streams, consumers, account info, message get and delete, Direct Get, pulls (`CONSUMER.MSG.NEXT`, from `fetchBatch()` and `pullConsumer()->handle()`), pause, unpin, reset (`resetConsumer()`), and the requests of its KV and Object Store buckets. A JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, and acks and flow-control replies to the reply subject the server gave; through an account import those reply subjects need imports of their own, see [Account imports](#account-imports) below.
 - KV writes (`put()`, `create()`, `update()`, `delete()`, `purge()`) go through the prefix, as nats.go's do: `$JS.hub.API.$KV.<bucket>.<key>`. nats-server maps `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, while a plain `$KV.` publish from a leaf node gets no responders. For an account import, import the other account's `$KV.>` under the same prefix (`to: "JS.from-a.API.$KV.>"`), and the subjects of the streams and Object Stores you publish to under their own names. The stored subjects stay `$KV.<bucket>.<key>`, so reads and watches are unchanged for a JetStream domain; through an account import they need the further entries in [Account imports](#account-imports) below.
 - The `domain` shorthand of a KV mirror or source, and `StreamSource::external()`, are independent of the context's prefix: they name where the ORIGIN stream lives. A KV mirror of a bucket in another domain writes through that origin's API, not through the context's prefix.
-- The server version checks (the version-gated stream and consumer fields, `batch()`, `publishScheduled()`, `resetConsumer()`) read the INFO of the server the client is connected to. Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests: through a 2.12 leaf node `resetConsumer()` is refused with an `UnsupportedFeatureException` before anything is sent, although a 2.14 hub would answer it.
+- No call is decided from the version in the INFO of the server the client is connected to (ADR-44, see [NATS Server Version Requirements](#nats-server-version-requirements)). Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests, and the requests go out whatever it says: through a 2.12 leaf node a 2.14 hub answers `resetConsumer()`, and the hub's reply, not the leaf node's version, decides a version-gated stream or consumer field, a `batch()` commit and a `publishScheduled()` call too. (2.34.0 and 2.35.0 read the leaf node's version and refused the reset before sending it.)
 
 #### Account imports
 

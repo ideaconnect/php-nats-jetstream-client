@@ -2085,7 +2085,7 @@ final class JetStreamContextTest extends TestCase
      * Verifies no request depends on the server version INFO reports (ADR-44 revision 4, #272): with a connected
      * server whose INFO reports 2.10.29 or 2.11.17 while the JetStream API answers as a newer server (the meta
      * leader or the stream's host in a cluster under a rolling upgrade), every call is sent and succeeds, and the
-     * bytes written are the same as when INFO reports 2.14.10. Up to 2.33.0 each of these calls but the four
+     * bytes written are the same as when INFO reports 2.14.10. Up to 2.35.0 each of these calls but the four
      * filter_subjects ones was refused before anything was sent.
      *
      * @param \Closure(JetStreamContext):\Amp\Future<mixed> $call

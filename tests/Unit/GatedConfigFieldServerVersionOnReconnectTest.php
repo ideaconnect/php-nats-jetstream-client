@@ -23,7 +23,7 @@ use function Amp\delay;
  * - From a newer server to an older one, the older server takes the request and drops the field: the reply check
  *   refuses its reply.
  * - From an older server to a newer one, the newer server takes the request and honors the field: the call succeeds.
- *   Up to 2.33.0 a pre-flight refused it on the INFO the replaced connection left behind, before anything was sent.
+ *   Up to 2.35.0 a pre-flight refused it on the INFO the replaced connection left behind, before anything was sent.
  */
 final class GatedConfigFieldServerVersionOnReconnectTest extends TestCase
 {

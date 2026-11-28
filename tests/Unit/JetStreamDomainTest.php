@@ -55,11 +55,11 @@ final class JetStreamDomainTest extends TestCase
     }
 
     /**
-     * Each JetStream API call, KV and Object Store calls included, with the API subject it must send (after the prefix)
-     * and, for a call a server version check gates, the version the scripted server must advertise for the call to be
-     * sent at all ({@see PrefixedJetStreamServer::VERSION} otherwise).
+     * Each JetStream API call, KV and Object Store calls included, with the API subject it must send (after the
+     * prefix). The scripted server advertises a 2.12.0 leaf node ({@see PrefixedJetStreamServer::VERSION}); no call
+     * is decided from that version (ADR-44, #272), so the consumer reset, a 2.14 API, is sent under the prefix as well.
      *
-     * @return iterable<string, array{0: \Closure(JetStreamContext): Future<mixed>, 1: string, 2?: string}>
+     * @return iterable<string, array{\Closure(JetStreamContext): Future<mixed>, string}>
      */
     public static function apiCalls(): iterable
     {
@@ -93,7 +93,7 @@ final class JetStreamDomainTest extends TestCase
         yield 'pauseConsumer' => [static fn(JetStreamContext $js): Future => $js->pauseConsumer('ORDERS', 'worker', '2030-01-01T00:00:00Z'), 'CONSUMER.PAUSE.ORDERS.worker'];
         yield 'resumeConsumer' => [static fn(JetStreamContext $js): Future => $js->resumeConsumer('ORDERS', 'worker'), 'CONSUMER.PAUSE.ORDERS.worker'];
         yield 'unpinConsumer' => [static fn(JetStreamContext $js): Future => $js->unpinConsumer('ORDERS', 'worker', 'jobs'), 'CONSUMER.UNPIN.ORDERS.worker'];
-        yield 'resetConsumer' => [static fn(JetStreamContext $js): Future => $js->resetConsumer('ORDERS', 'worker'), 'CONSUMER.RESET.ORDERS.worker', '2.14.0'];
+        yield 'resetConsumer' => [static fn(JetStreamContext $js): Future => $js->resetConsumer('ORDERS', 'worker'), 'CONSUMER.RESET.ORDERS.worker'];
         yield 'fetchBatch' => [static fn(JetStreamContext $js): Future => $js->fetchBatch('ORDERS', 'worker', 1, 300), 'CONSUMER.MSG.NEXT.ORDERS.worker'];
         yield 'pullConsumer handle' => [
             static fn(JetStreamContext $js): Future => $js->pullConsumer('ORDERS', 'worker')
@@ -118,20 +118,13 @@ final class JetStreamDomainTest extends TestCase
     }
 
     /**
-     * @return iterable<string, array{?string, ?string, string, \Closure(JetStreamContext): Future<mixed>, string, string}>
+     * @return iterable<string, array{?string, ?string, string, \Closure(JetStreamContext): Future<mixed>, string}>
      */
     public static function routedApiCalls(): iterable
     {
         foreach (self::prefixes() as $prefixLabel => [$domain, $apiPrefix, $expectedPrefix]) {
-            foreach (self::apiCalls() as $callLabel => $apiCall) {
-                yield $prefixLabel . ' / ' . $callLabel => [
-                    $domain,
-                    $apiPrefix,
-                    $expectedPrefix,
-                    $apiCall[0],
-                    $apiCall[1],
-                    $apiCall[2] ?? PrefixedJetStreamServer::VERSION,
-                ];
+            foreach (self::apiCalls() as $callLabel => [$call, $suffix]) {
+                yield $prefixLabel . ' / ' . $callLabel => [$domain, $apiPrefix, $expectedPrefix, $call, $suffix];
             }
         }
     }
@@ -150,9 +143,8 @@ final class JetStreamDomainTest extends TestCase
         string $expectedPrefix,
         \Closure $call,
         string $suffix,
-        string $serverVersion,
     ): void {
-        [$client, $server] = $this->connect($expectedPrefix, serverVersion: $serverVersion);
+        [$client, $server] = $this->connect($expectedPrefix);
 
         try {
             $call($client->jetStream($domain, $apiPrefix))->await();
@@ -433,15 +425,14 @@ final class JetStreamDomainTest extends TestCase
     }
 
     /**
-     * A client connected over a {@see FakeTransport} to a {@see PrefixedJetStreamServer} answering under $apiPrefix
-     * and advertising $serverVersion.
+     * A client connected over a {@see FakeTransport} to a {@see PrefixedJetStreamServer} answering under $apiPrefix.
      *
      * @return array{NatsClient, PrefixedJetStreamServer}
      */
-    private function connect(string $apiPrefix, bool $directGet = true, string $serverVersion = PrefixedJetStreamServer::VERSION): array
+    private function connect(string $apiPrefix, bool $directGet = true): array
     {
         $server = new PrefixedJetStreamServer($apiPrefix, $directGet);
-        $transport = new FakeTransport([PrefixedJetStreamServer::info($serverVersion)]);
+        $transport = new FakeTransport([PrefixedJetStreamServer::info()]);
         $server->install($transport);
         $client = $this->own(new NatsClient(new NatsOptions(requestTimeoutMs: 1000), $transport));
         $client->connect()->await();

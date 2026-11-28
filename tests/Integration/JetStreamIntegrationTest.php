@@ -603,11 +603,12 @@ final class JetStreamIntegrationTest extends TestCase
     /**
      * Verifies that publishScheduled() sends every schedule whatever the server's version, and that the server's
      * answer decides (ADR-44, #272). The JetStream API level ($JS.API.INFO `api.level`, read through accountInfo())
-     * says what to expect: a level-3 server (2.12, the fixture's version) rejects "@every" and cron schedules with a
-     * 400 "message schedules pattern is invalid" and stores an "@at" schedule while ignoring Nats-Schedule-Source and
-     * Nats-Schedule-Rollup; a level-4+ server (2.14+) accepts and stores all four. Each stored schedule is read back
-     * from its own schedule subject (a whole-stream count would also take in a message a schedule fired into the target
-     * subject meanwhile). Up to 2.33.0 the client refused all four calls on a 2.12 INFO version (#267).
+     * says what to expect: a level-3 server (2.12, the default `nats` fixture) rejects "@every" and cron schedules
+     * with a 400 "message schedules pattern is invalid" and stores an "@at" schedule while ignoring
+     * Nats-Schedule-Source and Nats-Schedule-Rollup; a level-4+ server (2.14+) accepts and stores all four. Each
+     * stored schedule is read back from its own schedule subject (a whole-stream count would also take in a message a
+     * schedule fired into the target subject meanwhile). Up to 2.35.0 the client refused all four calls on a 2.12 INFO
+     * version (#267).
      */
     public function testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders(): void
     {
