@@ -222,6 +222,34 @@ final class RefusedRequestTest extends TestCase
     }
 
     /**
+     * utf8BytesOfCodePoint() builds the UTF-8 bytes of a code point in each of the four length classes a decoded
+     * `\u`/`\U` escape can fall into, called by reflection since it is private. Go's %q never writes `\u` for a code
+     * point below 0x80 (such a rune is always printable ASCII), but the helper is general and this exercises that
+     * branch directly rather than leaving it reachable only in theory.
+     *
+     * @return iterable<string, array{int, string}>
+     */
+    public static function codePointsAcrossUtf8LengthClasses(): iterable
+    {
+        yield '1 byte, below 0x80' => [0x41, 'A'];
+        yield '2 bytes, NBSP U+00A0' => [0xa0, "\u{a0}"];
+        yield '2 bytes, top of the range, U+07FF' => [0x7ff, "\u{7ff}"];
+        yield '3 bytes, bottom of the range, U+0800' => [0x800, "\u{800}"];
+        yield '3 bytes, BOM U+FEFF' => [0xfeff, "\u{feff}"];
+        yield '4 bytes, bottom of the range, U+10000' => [0x10000, "\u{10000}"];
+        yield '4 bytes, max U+10FFFF' => [0x10ffff, "\u{10ffff}"];
+    }
+
+    #[DataProvider('codePointsAcrossUtf8LengthClasses')]
+    public function testUtf8BytesOfCodePointBuildsEachLengthClass(int $codePoint, string $expectedUtf8): void
+    {
+        $method = new \ReflectionMethod(NatsConnection::class, 'utf8BytesOfCodePoint');
+        $got = $method->invoke(null, $codePoint);
+
+        self::assertSame(bin2hex($expectedUtf8), bin2hex((string) $got));
+    }
+
+    /**
      * A refusal that names another subject leaves the request alone: it gets its reply. A regression that refused
      * every request on any publish refusal would fail it.
      */

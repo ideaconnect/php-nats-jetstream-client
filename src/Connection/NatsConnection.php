@@ -5564,7 +5564,9 @@ final class NatsConnection
                 $letter = $match['letter'];
                 if ($letter === null) {
                     // Unreachable: the regex matches a backslash followed by byte, bmp, full or letter, no other way.
+                    // @codeCoverageIgnoreStart
                     return '';
+                    // @codeCoverageIgnoreEnd
                 }
 
                 return match ($letter) {
