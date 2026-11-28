@@ -15,7 +15,20 @@ Each entry is tagged so the version impact is clear:
 Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 `[bugfix]`, not a real break, even though observable behavior changes.
 
-## [Unreleased]
+## [2.35.0] - 2026-11-28
+
+### Added
+
+- `[feature]` Durable stream sourcing and mirroring (ADR-60, NATS server 2.14+) with the typed builders (#280):
+  `AckPolicy::FlowControl` (`flow_control`) is the ack policy of the durable push consumer a stream sources or
+  mirrors a WorkQueue or Interest stream through, and `StreamSource::consumer($name, $deliverSubject)` names such a
+  consumer in a source or mirror (`consumer: {name, deliver_subject}`, after `external`). `toArray()` refuses
+  `consumer()` together with `startSeq()`, `startTime()` or `filterSubject()` with a `JetStreamException` that names
+  them (they belong on the consumer, and the server's own error names no field); `consumer()` refuses an empty name
+  or deliver subject. The client checks the server version for neither: a server before 2.14 refuses the ack policy
+  (400, err_code 10025), 2.12 refuses a source that names a consumer the same way, and 2.10 and 2.11 drop the field
+  and source the old way. README "Stream Mirroring and Sourcing" says what a 2.14 server does by itself, when to
+  name a consumer of your own and what to create first.
 
 ### Testing & CI
 
