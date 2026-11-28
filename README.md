@@ -2304,7 +2304,7 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/stream-mirroring-and-sourcing.php`](examples/stream-mirroring-and-sourcing.php)
 
-_Verified by: [StreamSourceTest](tests/Unit/StreamSourceTest.php); [features/jetstream-core/config_helpers.feature](features/jetstream-core/config_helpers.feature) (live source filtering + mirror replication); [DurableSourcingIntegrationTest](tests/Integration/DurableSourcingIntegrationTest.php) (durable sourcing against a 2.14+ server, and the refusals of a 2.12 server)._
+_Verified by: [StreamSourceTest](tests/Unit/StreamSourceTest.php); [features/jetstream-core/config_helpers.feature](features/jetstream-core/config_helpers.feature) (live source filtering + mirror replication); [DurableSourcingIntegrationTest](tests/Integration/DurableSourcingIntegrationTest.php) (the second `composer test:e2e` integration stage, against the `nats-214` fixture, a 2.14+ server; against the default `nats` fixture (2.12) only the refusals run)._
 
 Use `StreamSource` to build mirror/source configuration arrays:
 

@@ -21,9 +21,10 @@ use function Amp\delay;
 /**
  * Durable stream sourcing of ADR-60 (#280) against a live server: a stream that sources a WorkQueue stream through
  * a durable `flow_control` consumer of your own, set up with the typed builders. nats-server 2.14 added it; the
- * fixture stack runs 2.12, so there only the refusals run and the sourcing test is skipped. Point NATS_URL at a
- * 2.14+ server to run it (e.g. `docker run -p 24222:4222 nats:2.14-alpine -js` and
- * `NATS_URL=nats://127.0.0.1:24222`).
+ * default fixture (`nats`) runs 2.12, so there only the refusals run and the sourcing test is skipped. The second
+ * `composer test:e2e` integration stage runs against the `nats-214` fixture (`NATS_URL=nats://127.0.0.1:14232
+ * RUN_INTEGRATION=1 composer test:integration:2.14`), which runs the sourcing test and leaves the pre-2.14 test out by
+ * its name (`ServerBefore214`; it skips itself on 2.14+).
  */
 final class DurableSourcingIntegrationTest extends TestCase
 {
