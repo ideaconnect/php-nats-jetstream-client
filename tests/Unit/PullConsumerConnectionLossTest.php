@@ -31,7 +31,7 @@ use PHPUnit\Framework\TestCase;
  * writes (#197). The pipelined engine behind PullConsumerIterator::handle() buffers each message into the oldest pull
  * in flight and hands a pull's buffer to the handler only when it retires the pull: once its batch is full, a terminal
  * status came, or its deadline passed. A run whose read failed with the connection going (waiting for a reconnect
- * disabled, a lame-duck failover with waiting disabled, a reconnect that gave up, reconnect off, a fatal -ERR, which
+ * disabled, a reconnect that gave up, reconnect off, a fatal -ERR, which
  * ends a finite run whether or not the reconnect reopened the connection, and an infinite one only when the run cannot
  * go on past it, #210, see PullConsumerConnectionEndingFrameTest), or for a reason the options make the read's own
  * (handlerErrorsFailOperations, slowConsumerErrorsFailOperations), whose pull's write failed, or whose inbox the server
@@ -67,8 +67,6 @@ final class PullConsumerConnectionLossTest extends TestCase
     private const PULL_SUBJECT = '$JS.API.CONSUMER.MSG.NEXT.S.C';
     private const ACK_SUBJECT = '$JS.ACK.S.C.1.1.1.0.0';
     private const STALE_CONNECTION = "-ERR 'Stale Connection'\r\n";
-    /** A server's lame-duck INFO naming another server, so the connection has one to fail over to (#47). */
-    private const LAME_DUCK = 'INFO {"server_id":"S1","version":"2.12.0","max_payload":1048576,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n";
 
     protected function tearDown(): void
     {
@@ -78,7 +76,7 @@ final class PullConsumerConnectionLossTest extends TestCase
     /** @return iterable<string, array{string, bool}> */
     public static function failures(): iterable
     {
-        foreach (['waiting disabled', 'the reconnect gives up', 'reconnect off', 'fatal -ERR', 'lame duck, waiting disabled'] as $failure) {
+        foreach (['waiting disabled', 'the reconnect gives up', 'reconnect off', 'fatal -ERR'] as $failure) {
             // An infinite run goes on past a fatal -ERR whose reconnect reopens the connection, as past a lost connection
             // (#210, PullConsumerConnectionEndingFrameTest): it ends at one where it cannot go on, here with reconnect off.
             $infinite = $failure === 'fatal -ERR' ? 'fatal -ERR, reconnect off' : $failure;
@@ -94,8 +92,7 @@ final class PullConsumerConnectionLossTest extends TestCase
      * open", the reconnect going on in the background) or with dials refused and three attempts ("Reconnect attempts
      * exhausted"), or with reconnect off ("Reconnect is disabled"), or the server sends a fatal -ERR ("Server sent error
      * frame: 'Stale Connection'"), the reconnect reopening the connection under the finite run and reconnect off under
-     * the infinite one, which goes on past it otherwise (#210), or the server sends a lame-duck INFO with waiting
-     * disabled and the failover's dial held ("Connection is not open", the failover under way, #191). The handler gets
+     * the infinite one, which goes on past it otherwise (#210). The handler gets
      * m-1 and m-2, in order, and handle() then throws the read's error, the run having pulled once. It used to throw the
      * same error with the handler never having seen them.
      */
@@ -958,7 +955,7 @@ final class PullConsumerConnectionLossTest extends TestCase
 
     /**
      * A connected client over a watched ReconnectingTransport, closed in tearDown, with no heartbeat, so only the
-     * engine and the test read: waiting for a reconnect disabled, also for the lame duck and for a fatal -ERR whose
+     * engine and the test read: waiting for a reconnect disabled, also for a fatal -ERR whose
      * reconnect runs in the background; three reconnect attempts; reconnect off, also for a fatal -ERR that ends an
      * infinite run; or, for 'reconnect on' and 'fatal -ERR', the defaults of these tests: reconnect on, with waiting for
      * it enabled and a thousand attempts.
@@ -972,7 +969,7 @@ final class PullConsumerConnectionLossTest extends TestCase
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
         $client = $this->own(new NatsClient(match ($failure) {
-            'waiting disabled', 'lame duck, waiting disabled', 'fatal -ERR, waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, $connectionListener, 5, 20, $errorListener),
+            'waiting disabled', 'fatal -ERR, waiting disabled' => $this->options(false, 2_000, 1_000, 0, 2, $connectionListener, 5, 20, $errorListener),
             'the reconnect gives up' => $this->options(true, 2_000, 3, 0, 2, $connectionListener, 5, 20, $errorListener),
             'reconnect off', 'fatal -ERR, reconnect off' => new NatsOptions(
                 connectTimeoutMs: 500,
@@ -1063,20 +1060,12 @@ final class PullConsumerConnectionLossTest extends TestCase
     }
 
     /**
-     * Ends the connection under the engine's read as $failure says: dials refused where the reconnect must not succeed,
-     * and for the lame duck the failover's dial held, so that it is still under way when the run fails.
+     * Ends the connection under the engine's read as $failure says: dials refused where the reconnect must not succeed.
      */
     private static function endTheConnection(ReconnectingTransport $transport, string $failure): void
     {
         if ($failure === 'fatal -ERR' || $failure === 'fatal -ERR, reconnect off') {
             $transport->pushFrame(self::STALE_CONNECTION);
-
-            return;
-        }
-
-        if ($failure === 'lame duck, waiting disabled') {
-            $transport->holdNextDial();
-            $transport->pushFrame(self::LAME_DUCK);
 
             return;
         }
@@ -1095,7 +1084,7 @@ final class PullConsumerConnectionLossTest extends TestCase
     private static function readError(string $failure): array
     {
         return match ($failure) {
-            'waiting disabled', 'lame duck, waiting disabled' => ['Connection is not open', ConnectionState::Connecting],
+            'waiting disabled' => ['Connection is not open', ConnectionState::Connecting],
             'the reconnect gives up' => ['Reconnect attempts exhausted', ConnectionState::Closed],
             'reconnect off' => ['Reconnect is disabled', ConnectionState::Closed],
             'fatal -ERR, reconnect off' => ["Server sent error frame: 'Stale Connection'", ConnectionState::Closed],

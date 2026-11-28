@@ -2817,8 +2817,8 @@ final class JetStreamContext
                             // This wait segment ended (overall deadline or a heartbeat check came due);
                             // loop around to re-evaluate the deadlines against fresh activity.
                         } catch (ConnectionException $e) {
-                            // The read failed with the connection going: lost, or failed over from a server in lame duck
-                            // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended
+                            // The read failed with the connection going: lost, with waiting for a reconnect disabled
+                            // (#178), closed with reconnect off, or ended
                             // by a reconnect that gave up or by a fatal -ERR. A partial batch is still returned, as above:
                             // those messages are real, and the server counted them as delivered. So is it after a fatal
                             // -ERR whose reconnect has reopened the connection by now (#196): the failure ended the
@@ -2891,8 +2891,8 @@ final class JetStreamContext
      *    answer was read: the client closed it, is recovering it, has replaced it or is draining it, the application
      *    is closing it, or its server announced lame duck mode. Read the pull as empty, and pull again after a pause:
      *    once the server has closed the connection the next pull goes out on the connection that follows, and until
-     *    then - lame duck mode keeps it open for its grace period when the client has no other server to fail over
-     *    to - a pull gets the 503 again at once, and this answers ServerGoingAway at once, without asking.
+     *    then - lame duck mode keeps it open for its grace period, and the client stays on it (#265) - a pull gets
+     *    the 503 again at once, and this answers ServerGoingAway at once, without asking.
      *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays: a user
      *    allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful
      *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer. The
@@ -3002,16 +3002,16 @@ final class JetStreamContext
      *
      * It looks at the connection every 20 ms whatever the read does, as the question's wait does, with one read kept in
      * flight across the looks and bounded by the question's time. The read has no subscription of its own, so no
-     * wake-up, and a read without one that is the first to notice a lost connection, or the lame duck INFO of a server
-     * naming another one, runs the reconnect or the failover itself and waits for all of it
+     * wake-up, and a read without one that is the first to notice a lost connection runs the reconnect itself and waits
+     * for all of it
      * ({@see \IDCT\NATS\Connection\NatsConnection::readIncomingForOperation()}). Awaited only until the next look, it
      * goes on in its own fiber, the look sees the connection left and the cause is ServerGoingAway, while the client
      * still reconnects. Awaiting the read itself made the watch return only once the reconnect was over, past the
      * question's time (#257). A read that consumed nothing is followed by a 1 ms pause, as in the client's other wait
      * loops: on a transport whose idle read returns at once the watch would otherwise spin, and no timer of the process,
      * the question's deadline included, would fire again (#256). The read still in flight when the watch returns is
-     * let go of: its wait on the socket, or for a reconnect another fiber runs, ends with the watch, a reconnect or a
-     * failover it runs itself goes on, and what it ends with is nobody's to handle.
+     * let go of: its wait on the socket, or for a reconnect another fiber runs, ends with the watch, a reconnect it runs
+     * itself goes on, and what it ends with is nobody's to handle.
      */
     private function watchTheConnectionUntil(int $generation, Cancellation $questionTime): NoRespondersCause
     {

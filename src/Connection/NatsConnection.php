@@ -583,15 +583,6 @@ final class NatsConnection
     /** Whether a LameDuck event has already been emitted for the current server, to avoid repeats. */
     private bool $lameDuckAnnounced = false;
     /**
-     * The lame-duck failover that a read with a wake-up started in a fiber of its own (#191), with the
-     * {@see $connectionGeneration} of the connection it leaves ({@see startLameDuckFailover()}): such a read waits
-     * for it only within the operation's own wait ({@see awaitLameDuckFailoverFrom()}), and the rest of any chunk
-     * read on that connection is the leaving server's ({@see dispatchFrames()}). Cleared when the failover returns.
-     *
-     * @var array{generation: int, failover: Future<void>, ready: Future<void>}|null
-     */
-    private ?array $lameDuckFailover = null;
-    /**
      * The last set of discovered cluster endpoints, so a DiscoveredServers event fires only when the
      * advertised `connect_urls` actually change. Also merged into the reconnect server pool.
      *
@@ -4399,17 +4390,11 @@ final class NatsConnection
      *        the read slot, waiting for another fiber's read, or waiting on the socket, whose read it cancels. A
      *        transport's read that is cancelled has consumed nothing: what it had not returned is still there for the
      *        next read. Not once the read has bytes: it delivers them, as any read does. A read with a wake-up, an
-     *        operation's or a flush's for its PONG, also starts a lame-duck failover that its chunk brings in a fiber
-     *        of its own, rather than run it inline as a read without one does, and once it has delivered the chunk it
-     *        waits for that failover only within the operation's wait, unless the PONG it is for came in the chunk,
-     *        as it waits for a reconnect its failed read starts (#178, #191): the deadline ends that wait with the
-     *        caller's timeout, and the wake-up with the read returning what it read ({@see handleServerInfoUpdate()},
-     *        {@see awaitLameDuckFailoverFrom()}). So does one whose chunk fails to parse (#195): the frames ahead of
-     *        the bad bytes are dispatched the same way, a failover among them started in a fiber of its own, and the
-     *        corrupt stream is then recovered as a lost socket is ({@see recoverAfterFailedOperationRead()}): in a
-     *        fiber of its own, waited for only within the operation's wait, or not at all with waiting disabled, the
-     *        recovery joining a failover those frames started. It used to recover it inline, past the operation's
-     *        deadline and wake-up, also with waiting disabled. A read without a wake-up recovers it inline.
+     *        operation's or a flush's for its PONG, whose chunk fails to parse (#195) dispatches the frames ahead of
+     *        the bad bytes, and then recovers the corrupt stream as a lost socket is recovered
+     *        ({@see recoverAfterFailedOperationRead()}): in a fiber of its own, waited for only within the operation's
+     *        wait, or not at all with waiting disabled. It used to recover it inline, past the operation's deadline and
+     *        wake-up, also with waiting disabled. A read without a wake-up recovers it inline.
      * @return Future<IncomingChunkResult>
      *
      * @phpstan-impure Mutates connection state, like readIncoming().
@@ -4535,20 +4520,8 @@ final class NatsConnection
                 return new IncomingChunkResult(0, false);
             }
 
-            // A listener can queue this read before the failover's fiber. Do not take the leaving socket.
-            // A close takes over that socket: drain reads still flush it under close-intent (#191/#213).
-            if (
-                !$this->closing
-                && $this->lameDuckFailover !== null
-                && $this->lameDuckFailover['generation'] === $this->connectionGeneration
-            ) {
-                $this->awaitLameDuckFailoverFrom($this->connectionGeneration, $cancellation, $wake);
-
-                return new IncomingChunkResult(0, false);
-            }
-
             // Take this only after continuation, with no suspension before waiting. Keep it separate from
-            // $wake: that one also chooses operation recovery/failover semantics (#178, #191, #195).
+            // $wake: that one also chooses operation recovery semantics (#178, #195).
             $stoppedWake = $continueStoppedSubscriptions ? $this->nextStoppedSubscription() : null;
             $readWaitCancellation = self::waitWith($waitCancellation, $stoppedWake);
 
@@ -4687,9 +4660,7 @@ final class NatsConnection
                 // rethrow-after-containment) and a later one is reported rather than hiding it.
                 $dispatchError = null;
                 try {
-                    // As on the clean path, a read with a wake-up starts a lame-duck failover an INFO among them brings
-                    // in a fiber of its own (#191, #195): the recovery below joins it within the read's wait.
-                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
+                    $this->dispatchFrames($recovered, $reportOverflows, $ownSid, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
                 } catch (\Throwable $e) {
                     $dispatchError = $e;
                 }
@@ -4766,8 +4737,7 @@ final class NatsConnection
             // but still trickles data would never trip maxPingsOut and the watchdog could not escalate.
             $dispatchError = null;
             try {
-                // A read with a wake-up starts a lame-duck failover in a fiber of its own, waited for below (#191).
-                $this->dispatchFrames($frames, $reportOverflows, $ownSid, failOverInItsOwnFiber: $wake !== null, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
+                $this->dispatchFrames($frames, $reportOverflows, $ownSid, reportServerErrors: $reportServerErrors, generation: $generation, closes: $closes);
             } catch (\Throwable $e) {
                 // Held, not rethrown yet: the already-enqueued backlog must still drain (wire-order
                 // delivery, #128) before this frame error reaches the caller below, recovering the
@@ -4791,18 +4761,6 @@ final class NatsConnection
                 // which then never reaches the caller's escalation path. Route the handler failure to the
                 // error listener and let the primary exception propagate below (#158).
                 $this->emitErrorSafely($drainError);
-            }
-
-            // A lame-duck failover away from the connection this read read on, started in a fiber of its own by this
-            // read's dispatch or by another fiber's read of the same connection, is waited for once the chunk is
-            // delivered, and only within the operation's own wait, as a reconnect its failed read starts is (#178,
-            // #191): the deadline ends the wait with the caller's timeout and the wake-up with the read returning what
-            // it read, while the failover carries on. A read whose dispatch failed throws that at once instead. Not a
-            // read whose PONG came in the chunk: it has what it waits for, though its wake-up (wakeOnPong()) fires only
-            // from a queued callback, too late for the wait to see it, and with waiting disabled a flush that had its
-            // PONG failed with "Connection is not open".
-            if ($dispatchError === null && $wake !== null && !($pongSlot?->isComplete() ?? false)) {
-                $this->awaitLameDuckFailoverFrom($generation, $cancellation, $wake);
             }
 
             if ($dispatchError !== null) {
@@ -4872,23 +4830,17 @@ final class NatsConnection
      * happens to the connection, and the others are reported instead.
      *
      * The frames are the server's that the chunk was read from, and the chunk's connection can be gone before
-     * the last of them is handled (#182): a lame-duck INFO among them fails the connection over inline
-     * ({@see handleServerInfoUpdate()}), so handling it returns with the connection replaced
-     * ({@see $connectionGeneration} moved on) or ended ({@see $terminalCloses} moved on: the failover reached no
-     * server, or the LameDuck listener closed the connection itself, with a disconnect(), say, which leaves no
-     * failover to run and moves the close count alone). For a chunk that a read with a wake-up read and parsed,
-     * the INFO's dispatch starts the failover in a fiber of its own instead ($failOverInItsOwnFiber, #191) and
-     * returns before that fiber has run, the connection neither replaced nor ended yet but being left:
-     * {@see $lameDuckFailover} names it until the failover returns, and from then on the rest of the chunk, and of
-     * any chunk read on that connection by any fiber, is the leaving server's as well. The rest of the chunk is
-     * then the old server's, and is not applied to the new connection ({@see handleStaleFrame()}): its messages
-     * are still queued for their subscriptions, which the reconnect replays, though a delivery on the reply inbox
-     * no longer counts as the new server's confirmation of the replayed inbox ({@see handleFrame()}, its $stale);
-     * its PING is answered with a PONG on neither connection; its PONG completes no slot of the new connection's,
-     * though while the connection is only being left it still completes that connection's oldest slot, its own
-     * PING's; its INFO neither overwrites the new server's info nor starts a second failover; and its -ERR is
-     * reported instead of being applied to the new connection or failing the read. Checked before each frame,
-     * since the connection goes while one of them is handled; here, so that every caller gets the rule.
+     * the last of them is handled (#182): a frame's handling can suspend, in the listener of an INFO's event or in
+     * the write of a PONG, and the connection be replaced meanwhile ({@see $connectionGeneration} moved on) by a
+     * reconnect another fiber runs, or ended ({@see $terminalCloses} moved on), by a LameDuck listener that closes
+     * the connection itself, with a disconnect(), say. The rest of the chunk is then the old server's, and is not
+     * applied to the new connection ({@see handleStaleFrame()}): its messages are still queued for their
+     * subscriptions, which the reconnect replays, though a delivery on the reply inbox no longer counts as the new
+     * server's confirmation of the replayed inbox ({@see handleFrame()}, its $stale); its PING is answered with a
+     * PONG on neither connection; its PONG completes no slot of the new connection's; its INFO does not overwrite
+     * the new server's info; and its -ERR is reported instead of being applied to the new connection or failing the
+     * read. Checked before each frame, since the connection can go while one of them is handled; here, so that
+     * every caller gets the rule. A lame-duck INFO only announces the server's shutdown and moves nothing (#265).
      *
      * @param list<ProtocolFrame> $frames
      * @param int|null $generation Connection generation captured before the read; null for the current one.
@@ -4901,13 +4853,8 @@ final class NatsConnection
      * @param int|null $ownSid The caller's own subscription, whose overflow is rethrown all the same.
      * @param bool $reportServerErrors Report nonfatal server -ERR failures at their classification site,
      *        before selecting the chunk's thrown failure. Other callers keep the existing failure selection.
-     * @param bool $failOverInItsOwnFiber Start a lame-duck failover that an INFO of the chunk brings in a fiber of
-     *        its own rather than run it inline ({@see handleServerInfoUpdate()}): for a read with a wake-up, an
-     *        operation's or a flush's, which waits for it only within the operation's own wait ({@see readChunk()},
-     *        #191), also for the frames it parsed ahead of bytes that fail to parse (#195). Your own read, a serving
-     *        loop's, the heartbeat's and those of a connect or a reconnect run it inline.
      */
-    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false, ?int $generation = null, ?int $closes = null): void
+    private function dispatchFrames(array $frames, bool $reportOverflows = false, ?int $ownSid = null, bool $reportServerErrors = false, ?int $generation = null, ?int $closes = null): void
     {
         $firstError = null;
         /** @var list<array{\Throwable, string}> $reports What to report, with its log level. */
@@ -4919,15 +4866,12 @@ final class NatsConnection
         foreach ($frames as $frame) {
             // The chunk's connection is gone once a frame handled before this one has replaced or ended it.
             $replaced = $this->connectionGeneration !== $generation || $this->terminalCloses !== $closes;
-            // Or it is being left, by a lame-duck failover started in a fiber of its own that has not replaced it yet
-            // (#191): an earlier frame of this chunk started it, or another fiber's read of the same connection did.
-            $stale = $replaced || ($this->lameDuckFailover !== null && $this->lameDuckFailover['generation'] === $generation);
-            if ($stale && !$this->handleStaleFrame($frame, $reports, $replaced)) {
+            if ($replaced && !$this->handleStaleFrame($frame, $reports)) {
                 continue;
             }
 
             try {
-                $this->handleFrame($frame, $reports, $stale, $failOverInItsOwnFiber, $reportServerErrors);
+                $this->handleFrame($frame, $reports, $replaced, $reportServerErrors);
             } catch (\Throwable $e) {
                 $reportable = $reportOverflows && $e instanceof SlowConsumerException && $e->sid !== $ownSid;
                 if (!$reportable && ($firstError === null || $this->dispatchFailureRank($e) > $this->dispatchFailureRank($firstError))) {
@@ -4981,59 +4925,43 @@ final class NatsConnection
     }
 
     /**
-     * Decides what becomes of a frame read on a connection that is gone by the time the frame is handled, the
-     * frames behind a lame-duck INFO in its chunk ({@see dispatchFrames()}, #182): the old server's, read before
-     * the failover, with the connection now on another server, or ended because no server could be reached, or
-     * closed by the LameDuck listener itself (a disconnect() called from it), which leaves no failover to run.
-     * Or read on a connection that is being left: a failover started in a fiber of its own for a read with a
-     * wake-up has yet to replace it (#191), and the frames are the leaving server's just the same, the new
-     * connection about to be dialled. Returns whether {@see handleFrame()} is still to handle the frame.
+     * Decides what becomes of a frame read on a connection that is gone by the time the frame is handled
+     * ({@see dispatchFrames()}, #182): the old server's, read before the connection was replaced while an earlier
+     * frame of its chunk was handled, or ended, by a close a listener of that frame's event made itself (a
+     * disconnect() called from the LameDuck listener, say). Returns whether {@see handleFrame()} is still to handle
+     * the frame.
      *
      * - MSG and HMSG are, and so is +OK, which handleFrame() ignores. The messages are the old server's deliveries,
      *   which the reconnect does not replay, for subscriptions it replays, so they are queued as any message is,
      *   and handed to handleFrame() as stale: a late reply on the reply inbox still reaches the request waiting for
      *   it, but does not confirm the replayed inbox, since a delivery of the server the connection left says nothing
      *   about whether the new server holds the replayed SUB, no more than that server's PONG does. One for an
-     *   unknown sid is discarded, as always; after a failed failover, or a close, every sid is unknown, the close
-     *   having released them, so the old server's last messages go with the connection, as the backlog a close
-     *   discards does.
+     *   unknown sid is discarded, as always; after a close every sid is unknown, the close having released them, so
+     *   the old server's last messages go with the connection, as the backlog a close discards does.
      * - PING is dropped: a PONG written for it would go to the new server, which asked for none, and the old
-     *   server has no connection left to answer on, or, while the connection is only being left, is about to lose
-     *   it to the failover.
-     * - PONG is dropped once the connection is replaced or ended: it answers a PING of the old connection, whose
-     *   slot is gone, since the recovery fails every slot of the old connection at its first attempt
-     *   ({@see connectOnce()} calls {@see failPongWaiters()} before it dials) and a terminal close does the same
-     *   ({@see releaseRuntimeState()}). The slots queued since are the new connection's, the fence behind the
-     *   replayed reply-inbox SUB among them, and the stale PONG would complete the oldest of those: the reply inbox
-     *   would count as confirmed before the new server had answered anything. Nor does the old server's PONG say
-     *   anything about the new server, so the heartbeat's count is left alone. While the connection is only being
-     *   left, the PONG goes on to handleFrame() and completes that connection's oldest slot, the one of the PING it
-     *   answers: the slots are still that connection's until the failover's first attempt fails them, in the call
-     *   that also moves the generation. Dropped, it would leave its slot to the next PONG, every later answer one
-     *   slot off for good when the failover turns out not to run (close-intent set before its fiber ran) and the
-     *   connection stays in use, and a flush() whose PONG came behind the INFO would fail for nothing.
-     * - INFO is dropped: it describes the old server, and would overwrite {@see $serverInfo} with that, or, while
-     *   the connection is only being left, change it and the pool under the failover about to dial; a second
-     *   lame-duck INFO would start a second failover, since the new connection has its own lame-duck flag.
+     *   server has no connection left to answer on.
+     * - PONG is dropped: it answers a PING of the old connection, whose slot is gone, since the recovery fails every
+     *   slot of the old connection at its first attempt ({@see connectOnce()} calls {@see failPongWaiters()} before
+     *   it dials) and a terminal close does the same ({@see releaseRuntimeState()}). The slots queued since are the
+     *   new connection's, the fence behind the replayed reply-inbox SUB among them, and the stale PONG would
+     *   complete the oldest of those: the reply inbox would count as confirmed before the new server had answered
+     *   anything. Nor does the old server's PONG say anything about the new server, so the heartbeat's count is
+     *   left alone.
+     * - INFO is dropped: it describes the old server, and would overwrite {@see $serverInfo} with that.
      * - -ERR is reported through the error listener, as a NatsException saying the server the connection left sent
      *   it, with the server's text, and nothing else: not applied to the new connection - a 'maximum subscriptions
      *   exceeded' would drop the replayed, still unconfirmed reply inbox, a permissions violation would fire the
      *   replayed subscription's rejection handler - not marked as ending the connection, and not thrown, so the
-     *   read that brought the chunk does not fail for an -ERR of a server the connection has already left, or is
-     *   leaving.
+     *   read that brought the chunk does not fail for an -ERR of a server the connection has already left.
      *
      * @param list<array{\Throwable, string}> $reports Collects the report of an -ERR, with its log level, for
      *        dispatchFrames() to report once the whole chunk is queued.
-     * @param bool $replaced Whether the connection the frame was read on is replaced or ended, rather than only being
-     *        left by a failover that has yet to replace it.
      * @param-out list<array{\Throwable, string}> $reports
      */
-    private function handleStaleFrame(ProtocolFrame $frame, array &$reports, bool $replaced): bool
+    private function handleStaleFrame(ProtocolFrame $frame, array &$reports): bool
     {
         switch ($frame->type) {
             case ProtocolFrameType::Pong:
-                // While the connection is only being left, its slots are still its own: the PONG completes the oldest.
-                return !$replaced;
             case ProtocolFrameType::Ping:
             case ProtocolFrameType::Info:
                 return false;
@@ -5116,7 +5044,7 @@ final class NatsConnection
      *           {@see NatsOptions::$resendJetStreamPublishOnReconnect} (#249); not part of the supported API.
      *
      * Sends as {@see requestWithHeaders()} does, with the same single budget, and writes the frame once more when the
-     * connection it went out on is replaced - a reconnect, or a lame-duck failover - before the reply came: the same
+     * connection it went out on is replaced by a reconnect before the reply came: the same
      * subject, payload, headers and reply subject, on the new connection, once it is open, within that budget. The
      * reply inbox was replayed with the other subscriptions, so whichever reply comes first ends the request. At most
      * once per request: a second replacement after that write writes nothing more. Only a replacement triggers it,
@@ -5684,8 +5612,8 @@ final class NatsConnection
      * request fails without being sent; when this read brought that -ERR, it is the previous exception instead
      * of being thrown, so it fails the request once and is not reported on top. The mux is checked before each read
      * as well as after it: another fiber's read can drop it during the pause after a read that returned without
-     * reading, and a read started then would hold no fence, so no wake-up, and could fail over a lame-duck INFO inline
-     * past the budget (#204).
+     * reading, and a read started then would hold no fence, so no wake-up, and could run a reconnect inline past the
+     * budget (#204).
      *
      * @throws CancelledException When $budget fires first.
      */
@@ -6461,8 +6389,8 @@ final class NatsConnection
                     // termination conditions (stall/total) at the top.
                     continue;
                 } catch (ConnectionException $e) {
-                    // The read failed with the connection going: lost, or failed over from a server in lame duck
-                    // mode, with waiting for a reconnect disabled (#178, #191), closed with reconnect off, or ended by
+                    // The read failed with the connection going: lost, with waiting for a reconnect disabled (#178),
+                    // closed with reconnect off, or ended by
                     // a reconnect that gave up or by a fatal -ERR. What was collected is returned, as for a close
                     // above; nothing collected fails with it. So is it after a fatal -ERR whose reconnect has reopened
                     // the connection by now (#196): the failure ended the connection, whatever the reconnect did since,
@@ -6662,7 +6590,7 @@ final class NatsConnection
         // gave this epoch a fresh parser, so no cross-connection framing state can leak here.
         $this->parser->setMaxFrameSize($this->inboundFrameBound());
         // Seed the discovered-servers set from the initial INFO (without emitting a discovery event -
-        // that is reserved for subsequent async INFO changes), so failover can use the cluster peers.
+        // that is reserved for subsequent async INFO changes), so a reconnect can use the cluster peers.
         // serverInfo is non-null here: awaitServerInfo() set it above and awaitInitialPong() only ever
         // reassigns it to a non-null ServerInfo.
         if ($this->serverInfo->connectUrls !== []) {
@@ -6768,7 +6696,7 @@ final class NatsConnection
      *                             calling fiber and is not bounded by it: a caller that must keep to a
      *                             budget of its own starts the recovery in a fiber of its own instead and
      *                             waits for that ({@see recoverAfterFailedWrite()},
-     *                             {@see recoverAfterFailedOperationRead()}, {@see startLameDuckFailover()}).
+     *                             {@see recoverAfterFailedOperationRead()}).
      * @param int|null $failedGeneration The {@see $connectionGeneration} the failed read or write ran on;
      *                             a failure from a connection since replaced starts no recovery.
      * @param \Throwable|null $cause The error that ended the connection. With reconnect off it is chained to
@@ -6813,10 +6741,11 @@ final class NatsConnection
         if ($inProgress !== null) {
             // A recover requested re-entrantly from WITHIN the active recovery fiber must not await its
             // own in-progress future - that would suspend this fiber on a deferred only this fiber can
-            // complete (a deadlock). This reaches here when a lame-duck INFO is dispatched from inside
-            // the recovery fiber - coalesced behind the reconnect handshake PONG during connectOnce
-            // (#157), or read during the subscription-replay poll drainImmediateServerFrames (#166):
-            // the recovery is already underway on this very fiber, so the nested request is a no-op.
+            // complete (a deadlock). This reached here when a lame-duck INFO, which failed the connection
+            // over until #265, was dispatched from inside the recovery fiber - coalesced behind the
+            // reconnect handshake PONG during connectOnce (#157), or read during the subscription-replay
+            // poll drainImmediateServerFrames (#166): the recovery is already underway on this very
+            // fiber, so the nested request is a no-op.
             if ($this->recoveryFiber !== null && $this->recoveryFiber === \Fiber::getCurrent()) {
                 return;
             }
@@ -6988,7 +6917,7 @@ final class NatsConnection
      * Whether a lost connection is reconnected: reconnect is on and allows at least one attempt. With
      * {@see NatsOptions::$maxReconnectAttempts} at 0 it is not, as that option documents: the connection then ends
      * the way it does with reconnect off, on every path that notices the loss (a failed read or write, the
-     * heartbeat, a connection-ending frame), and a lame duck notice starts no failover (#268). The recovery used to
+     * heartbeat, a connection-ending frame) (#268). The recovery used to
      * make one attempt at 0 all the same, while the initial connect already read 0 as none. The option counts the
      * attempts of the whole pool, not of each server: at 0 no server of the pool is dialled.
      */
@@ -7719,17 +7648,13 @@ final class NatsConnection
      * @param list<array{\Throwable, string}> $reports Collects what the frame reports, with its log level,
      *        for {@see dispatchFrames()} to report once the whole chunk is queued.
      * @param bool $stale Whether the frame was read on a connection that is gone, replaced or ended while an
-     *        earlier frame of its chunk was handled ({@see handleStaleFrame()}, #182), or that a lame-duck failover
-     *        started in a fiber of its own is leaving (#191). Only a MSG, HMSG or +OK still comes here then, or a
-     *        PONG of a connection only being left, and a delivery on the reply inbox is queued without confirming
-     *        the replayed inbox.
-     * @param bool $failOverInItsOwnFiber For an INFO: whether a lame-duck failover it brings starts in a fiber of its
-     *        own ({@see handleServerInfoUpdate()}, {@see dispatchFrames()}).
+     *        earlier frame of its chunk was handled ({@see handleStaleFrame()}, #182). Only a MSG, HMSG or +OK still
+     *        comes here then, and a delivery on the reply inbox is queued without confirming the replayed inbox.
      * @param bool $reportServerErrors Queue nonfatal server -ERR exceptions for reporting, after recording
      *        any inbox rejection. Other frame failures and fatal server errors still throw.
      * @param-out list<array{\Throwable, string}> $reports
      */
-    private function handleFrame(ProtocolFrame $frame, array &$reports, bool $stale = false, bool $failOverInItsOwnFiber = false, bool $reportServerErrors = false): void
+    private function handleFrame(ProtocolFrame $frame, array &$reports, bool $stale = false, bool $reportServerErrors = false): void
     {
         if ($frame->type === ProtocolFrameType::Ping) {
             $drainDeadline = $this->drainDeadline;
@@ -7805,7 +7730,7 @@ final class NatsConnection
 
                 return;
             }
-            $this->handleServerInfoUpdate($failOverInItsOwnFiber);
+            $this->handleServerInfoUpdate();
 
             return;
         }
@@ -8838,41 +8763,26 @@ final class NatsConnection
      * Reacts to an async INFO update by emitting discovery / lame-duck lifecycle events when the
      * advertised cluster topology or shutdown state changes.
      *
-     * The lame-duck failover (#47) runs inline, in the fiber that dispatches the INFO, for your own read
-     * (processIncoming(), readIncoming()), a serving loop's, the heartbeat's, the dispatches of a connect or a
-     * reconnect, where it is a no-op ({@see recoverConnection()}), and any read's dispatch of the frames it parsed
-     * ahead of bytes that fail to parse, whose corrupt stream it recovers from inline right after: this returns
-     * with the connection on another server, or ended when no server could be reached (the failure is reported),
-     * or closed when the LameDuck listener closed it itself, which leaves no failover to run. The dispatch of a
-     * chunk that a read with a wake-up read and parsed, the read of one of the library's operations or a flush's
-     * for its PONG ($failOverInItsOwnFiber), starts it in a fiber of its own instead and returns at once
-     * ({@see startLameDuckFailover()}, #191): the read waits for it once it has delivered its chunk, and only
-     * within the operation's own wait ({@see awaitLameDuckFailoverFrom()}), so that the dials, the handshake, the
-     * replay and any backoff no longer keep the operation past its deadline. Not under close-intent: the failover
-     * would not run then, and the rest of the chunk stays the connection's own, so that a drain()'s flush still
-     * answers a PING behind the INFO on the connection it is closing. Either way the failover is for the connection
-     * the INFO came on: one that a reconnect opened while a listener of the INFO was suspended is left alone. The
-     * INFO's chunk can hold more frames behind it, the old server's, and the dispatch handles them for the
-     * connection they were read on: their messages are queued, and their PING, PONG, INFO and -ERR are not applied
-     * to the new connection ({@see dispatchFrames()}, {@see handleStaleFrame()}, #182), from the moment the
-     * failover is started when it runs in a fiber of its own.
-     *
-     * @param bool $failOverInItsOwnFiber Start the failover in a fiber of its own rather than run it inline: for the
-     *        dispatch of a chunk that a read with a wake-up read and parsed ({@see readChunk()}).
+     * A lame-duck notice (`ldm`) emits LameDuck once per connection, after DiscoveredServers when the same INFO
+     * names new peers, and starts nothing else (#265). The server keeps the connection after the notice for its
+     * grace period (10 s by default) and then closes its clients one at a time over its lame-duck duration, so
+     * the replies already on their way still arrive on this connection; the reconnect runs once the server has
+     * closed it, as for any lost connection, and dials the peers the INFO advertised. Failing over at the notice
+     * (#47) closed the socket a reply was coming on: the operation whose read brought the notice lost its reply
+     * whenever the reply came in a later read than the INFO. nats.go, nats.java, nats.js and nats.py do not
+     * reconnect on the notice either. {@see ServerInfo::$lameDuckMode} stays set for the connection, which
+     * {@see \IDCT\NATS\JetStream\JetStreamContext::diagnoseNoResponders()} reads.
      */
-    private function handleServerInfoUpdate(bool $failOverInItsOwnFiber = false): void
+    private function handleServerInfoUpdate(): void
     {
         $info = $this->serverInfo;
         if ($info === null) {
             return;
         }
 
-        // The connection the INFO came on. The listeners below can suspend, and a reconnect replace that connection
-        // meanwhile: the failover is then not for the connection the reconnect opened, which it would fail over again.
-        $generation = $this->connectionGeneration;
-
         if ($info->connectUrls !== [] && $info->connectUrls !== $this->knownConnectUrls) {
-            // Update the discovery pool first so a lame-duck failover can dial a freshly-advertised peer.
+            // Update the discovery pool first, so that the reconnect that follows the server's close can dial a
+            // freshly-advertised peer.
             $this->knownConnectUrls = $info->connectUrls;
             $this->emitEvent(ConnectionEvent::DiscoveredServers);
         }
@@ -8880,150 +8790,6 @@ final class NatsConnection
         if ($info->lameDuckMode && !$this->lameDuckAnnounced) {
             $this->lameDuckAnnounced = true;
             $this->emitEvent(ConnectionEvent::LameDuck);
-
-            // The server is draining and will close this connection; proactively fail over to another
-            // pool member now (rather than waiting for the eventual EOF) when reconnect is enabled and
-            // more than one endpoint is available to move to (#47). Not with maxReconnectAttempts 0, which
-            // allows no reconnect: the connection stays until the server closes it (#268).
-            if ($this->reconnectsAfterLoss() && count($this->serverPool()) > 1) {
-                // The read of one of the library's operations does not run it: it waits for it within the operation's
-                // own wait (#191). Not under close-intent, where the failover would not run: no mark is left for it.
-                if ($failOverInItsOwnFiber && !$this->closing) {
-                    $this->startLameDuckFailover($generation);
-
-                    return;
-                }
-
-                try {
-                    $this->recoverConnection(failedGeneration: $generation);
-                } catch (\Throwable $e) {
-                    $this->reportLameDuckFailoverFailure($e);
-                }
-            }
-        }
-    }
-
-    /**
-     * Reports a failover failure not already reported by recovery. An authentication refusal is
-     * reported by performRecovery() before it is rethrown, also to a recovery's joiners (#201).
-     * On exhaustion, recovery emits Closed with the last attempt's error; the failover reports
-     * the separate "Reconnect attempts exhausted" exception here.
-     */
-    private function reportLameDuckFailoverFailure(\Throwable $error): void
-    {
-        if ($error instanceof AuthenticationException) {
-            return;
-        }
-
-        $this->emitError($error);
-    }
-
-    /**
-     * Starts the lame-duck failover in a fiber of its own (#191), for a read with a wake-up whose chunk brought the
-     * INFO ({@see handleServerInfoUpdate()}), and marks the connection it leaves as being left
-     * ({@see $lameDuckFailover}). The failover is the reconnect the inline path runs: no cause, since a lame duck is
-     * not a failure, and its failure reported through the error listener, as the inline path reports it, so that
-     * the fiber's future never errors. A connection replaced since the INFO came, while a listener of the INFO's
-     * dispatch was suspended, is not failed over ($failedGeneration). The mark is cleared when the failover returns,
-     * unless a later failover has replaced it.
-     *
-     * The fiber runs only once the dispatching fiber suspends: until then the state is still Open and the generation
-     * unchanged, and the mark is what tells {@see dispatchFrames()} that the rest of the chunk is the leaving
-     * server's. It is the recovery fiber, as for a reconnect an operation's failed read starts
-     * ({@see recoverAfterFailedOperationRead()}): a listener called during the failover runs inside it, and an
-     * operation issued from there is refused a join ({@see awaitOpenConnection()}). The new connection is announced
-     * from it as well, once recovery is over. The bounded read waits for recovery completion, so it can resume
-     * while the Reconnected listener or replay delivery still runs (#202); the fiber continues both.
-     *
-     * @param int $generation The {@see $connectionGeneration} of the connection the INFO came on.
-     */
-    private function startLameDuckFailover(int $generation): void
-    {
-        $ready = new DeferredFuture();
-        $failover = async(function () use ($generation, $ready): void {
-            try {
-                $this->recoverConnection(failedGeneration: $generation, operationReady: $ready);
-            } catch (\Throwable $e) {
-                $this->reportLameDuckFailoverFailure($e);
-            } finally {
-                // Lame-duck failure is reported asynchronously; its read looks again at connection state.
-                if (!$ready->isComplete()) {
-                    $ready->complete();
-                }
-                if ($this->lameDuckFailover !== null && $this->lameDuckFailover['generation'] === $generation) {
-                    $this->lameDuckFailover = null;
-                }
-            }
-        });
-        $failover->ignore();
-        $this->lameDuckFailover = ['generation' => $generation, 'failover' => $failover, 'ready' => $ready->getFuture()];
-    }
-
-    /**
-     * Waits for a lame-duck failover started in a fiber of its own ({@see startLameDuckFailover()}, #191) away from
-     * the connection of $generation, for a read with a wake-up that read on that connection ({@see readChunk()}),
-     * once it has delivered its chunk. Waits for recovery completion rather than announcement/delivery completion
-     * (#202): whether its own dispatch started the failover or another fiber's read of the
-     * same connection did, that connection is being left. Also used before a queued read takes the read slot (#203),
-     * with an optional wake-up: a listener can queue that read ahead of the failover's fiber, while the connection
-     * is still Open. Returns at once when no such failover is under way.
-     *
-     * Only within the operation's own wait, as the read waits for a reconnect its failed read starts
-     * ({@see recoverAfterFailedOperationRead()}, #178): the deadline ends the wait with the caller's cancellation,
-     * so that the operation times out while the failover carries on; the wake-up ends it with the read returning,
-     * so that the operation looks again and finds what was delivered meanwhile; and a failover that ends, however it
-     * ends, ends it as well, the operation then looking again before it reads the new connection, or finding the
-     * connection closed. With waiting for a reconnect disabled the read fails at once with "Connection is not open",
-     * as every operation does while a reconnect is in flight, unless its wait has already ended: the wake-up still
-     * wins, so a reply that came in the chunk is returned. Nor once the failover has replaced the connection, which a
-     * handler of the chunk that awaited lets it do before the read gets here: the read returns, and the operation
-     * looks again, on the new connection when the failover is only announcing it. Failing here rather than at the
-     * operation's next read keeps the outcome from depending on how far the failover has got by then: a flush left
-     * to its next read would find either its PONG failed by the failover's first attempt or the connection not
-     * open, depending on how long the transport's close took, as #178 found for a read that meets a lost
-     * connection. A flush whose PONG came in the chunk does not get here ({@see readChunk()}).
-     *
-     * @param int $generation The {@see $connectionGeneration} the read read on.
-     * @param Cancellation|null $cancellation The caller's cancellation: the operation's deadline.
-     * @param Cancellation|null $wake The read's optional wake-up.
-     *
-     * @throws CancelledException When the deadline ends the wait: the caller's own exception.
-     * @throws ConnectionException At once when waiting for a reconnect is disabled, unless the wait has already ended
-     *         or the connection has been replaced.
-     */
-    private function awaitLameDuckFailoverFrom(int $generation, ?Cancellation $cancellation, ?Cancellation $wake): void
-    {
-        $started = $this->lameDuckFailover;
-        if ($started === null || $started['generation'] !== $generation) {
-            return;
-        }
-
-        $waitCancellation = self::waitWith($cancellation, $wake);
-        try {
-            if (!$this->options->waitForReconnect) {
-                // Not when the operation's wait has already ended: what it waits for came in the chunk, or its deadline
-                // passed, and the catch below tells which.
-                $waitCancellation?->throwIfRequested();
-
-                // Nor once the failover has replaced the connection this read read on, as a handler of this read's
-                // chunk that awaited lets it: the operation looks again, and runs on the new connection when the
-                // failover is only announcing it, or fails at once as any operation does while the failover is still
-                // under way.
-                if ($this->connectionGeneration === $generation) {
-                    throw new ConnectionException('Connection is not open');
-                }
-
-                return;
-            }
-
-            $started['ready']->await($waitCancellation);
-        } catch (CancelledException $cancelled) {
-            if (!self::wokenUp($wake, $cancellation)) {
-                // The caller's own exception when both fired: the wake-up's may have won inside the composite.
-                $cancellation?->throwIfRequested();
-
-                throw $cancelled;
-            }
         }
     }
 

@@ -46,9 +46,6 @@ final class DiagnoseNoRespondersTest extends TestCase
 
     private const LAME_DUCK_INFO = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true,"ldm":true}' . "\r\n";
 
-    /** Lame duck mode with another server to fail over to: a client with reconnect on moves to it. */
-    private const LAME_DUCK_INFO_WITH_ANOTHER_SERVER = 'INFO {"server_id":"S1","server_name":"n1","version":"2.12.0","jetstream":true,"max_payload":1048576,"headers":true,"ldm":true,"connect_urls":["10.0.0.2:4222"]}' . "\r\n";
-
     private const REFUSAL = "-ERR 'Permissions Violation for Publish to \"" . self::QUESTION . "\"'\r\n";
 
     protected function tearDown(): void
@@ -403,19 +400,16 @@ final class DiagnoseNoRespondersTest extends TestCase
         yield 'the server closes the connection' => [static function (ReconnectingTransport $transport): void {
             $transport->dropConnection();
         }];
-        yield 'lame duck mode, with another server to fail over to' => [static function (ReconnectingTransport $transport): void {
-            $transport->pushFrame(self::LAME_DUCK_INFO_WITH_ANOTHER_SERVER);
-        }];
     }
 
     /**
      * The same user with reconnect on, and the dial of the next server held: 150 ms after the refusal the server
-     * closes the connection, or announces lame duck mode naming another server. The watch's read meets it first and
-     * runs the reconnect, or the failover, itself, waiting for all of it; the watch goes on looking at the connection
-     * every 20 ms while that read is in flight, and the cause is ServerGoingAway while the dial is still held, the client
-     * Connecting, long before the 30 s timeout. The reconnect goes on without the watch, and the question is not asked
-     * again on the new connection. In 2.30.0 the watch awaited that read, and so returned only once the reconnect was
-     * over (#257): here only after the dial's release, which the test makes only once the diagnosis has returned.
+     * closes the connection. The watch's read meets it first and runs the reconnect itself, waiting for all of it; the
+     * watch goes on looking at the connection every 20 ms while that read is in flight, and the cause is ServerGoingAway
+     * while the dial is still held, the client Connecting, long before the 30 s timeout. The reconnect goes on without
+     * the watch, and the question is not asked again on the new connection. In 2.30.0 the watch awaited that read, and
+     * so returned only once the reconnect was over (#257): here only after the dial's release, which the test makes
+     * only once the diagnosis has returned.
      *
      * @param \Closure(ReconnectingTransport): void $goAway
      */

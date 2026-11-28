@@ -29,8 +29,8 @@ final class NatsOptions
       * @param bool $reconnectEnabled Enables automatic reconnect and subscription replay after transport loss.
       * @param int $maxReconnectAttempts Maximum reconnect attempts before failing the connection lifecycle.
       *                                  Set `0` to disable reconnect retries: a lost connection then makes no
-      *                                  attempt and closes as with {@see $reconnectEnabled} off, and a lame duck
-      *                                  notice starts no failover (#268).
+      *                                  attempt and closes as with {@see $reconnectEnabled} off (#268). A lame duck
+      *                                  notice starts no failover with any setting (#265).
       * @param int $reconnectDelayMs Base reconnect delay in milliseconds before exponential backoff and jitter.
       * @param int $reconnectMaxDelayMs Upper bound in milliseconds for reconnect backoff growth.
       * @param int $reconnectJitterMs Random jitter range in milliseconds added to reconnect delays to avoid thundering herd.
@@ -116,9 +116,8 @@ final class NatsOptions
       *        a synchronous application drive the reconnect: the reconnect only advances while something
       *        waits on the event loop, so a caller that only ever issued operations failing on the spot
       *        would starve it forever. An operation whose own read, control write or request PUB/HPUB
-      *        write is the first to notice a lost connection, or whose read brings a lame-duck INFO
-      *        that fails the connection over,
-      *        starts the reconnect and waits for it the same way, within its own timeout (#178, #191, #215).
+      *        write is the first to notice a lost connection
+      *        starts the reconnect and waits for it the same way, within its own timeout (#178, #215).
       *        Requests never enter the reconnect publish buffer; a retry checks the same budget and
       *        reply inbox, and a transport write already in progress may finish after the request ends.
       *        Batch fetch setup uses its expiry plus a second; Direct Get renews that interval on replies,
@@ -130,8 +129,8 @@ final class NatsOptions
       *        the reconnect does. To wait for the frame to go out, call flush(). Your
       *        own processIncoming()/readIncoming(), a serving loop's read and the heartbeat run the reconnect
       *        themselves and wait for all of it. Set `false` to fail fast instead (the behavior before this
-      *        option existed): an operation whose own read or write noticed the loss, or whose read brought
-      *        the lame-duck INFO, then fails at once with "Connection is not open" as well, unless what it
+      *        option existed): an operation whose own read or write noticed the loss then fails at once with
+      *        "Connection is not open" as well, unless what it
       *        waits for has come by then, and a requestMany() or a JetStream fetchBatch() returns what it
       *        has received instead; the reconnect it started advances only while something awaits on the
       *        event loop; drain() closes the connection and throws rather than leaving the reconnect to
@@ -170,7 +169,7 @@ final class NatsOptions
       *        drain()/drainSubscription() report it either way.
       * @param bool $resendJetStreamPublishOnReconnect Whether a JetStream publish() that carries a `$msgId`
       *        (`Nats-Msg-Id`) writes its frame once more on the new connection when the connection the frame went
-      *        out on is replaced - a reconnect, or a lame-duck failover - before its PubAck came (#249). Off by
+      *        out on is replaced by a reconnect before its PubAck came (#249). Off by
       *        default: such a publish then waits out the rest of its request timeout and throws a TimeoutException
       *        (outcome unknown) when the server that took the frame went down with the connection, as it always
       *        did. On, the same frame (subject, payload, headers and reply subject) goes out once per publish, on

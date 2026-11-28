@@ -154,12 +154,13 @@ final class CorruptChunkOperationReadTest extends TestCase
     }
 
     /**
-     * A lame-duck INFO and bad bytes behind it in one chunk: the INFO, dispatched ahead of the bad bytes, fails over in
-     * a fiber of its own, as from a chunk that parses (#191), and the parse error's recovery joins that failover within
-     * the poll's wait. The poll returns at its deadline, the failover's dial to the server the INFO names still held.
-     * The read used to run the failover inline, past the poll's deadline.
+     * A lame-duck INFO and bad bytes behind it in one chunk: the INFO, dispatched ahead of the bad bytes, moves nothing
+     * (#265) and adds the server it names to the pool, and the parse error's recovery runs in a fiber of its own, as
+     * for any corrupt chunk, within the poll's wait. The poll returns at its deadline, the recovery's dial to the server
+     * the INFO names still held. Up to 2.35.0 the INFO started a failover in a fiber of its own, which the recovery
+     * joined (#191, #195); before that the read ran the failover inline, past the poll's deadline.
      */
-    public function testALameDuckInfoAheadOfTheBadBytesFailsOverInAFiberOfItsOwn(): void
+    public function testALameDuckInfoAheadOfTheBadBytesLeavesOneRecoveryInAFiberOfItsOwn(): void
     {
         $transport = new ReconnectingTransport();
         $watched = new WatchedTransport($transport);
@@ -175,8 +176,8 @@ final class CorruptChunkOperationReadTest extends TestCase
         self::assertNull($error, $error === null ? '' : $error::class . ': ' . $error->getMessage());
         self::assertNull($message);
         self::assertSame(ConnectionState::Connecting, $client->state());
-        self::assertCount(2, $transport->connectCalls, 'one failover, the parse error\'s recovery joined it');
-        self::assertStringContainsString('4223', $transport->connectCalls[1], 'the failover dials the server the INFO names');
+        self::assertCount(2, $transport->connectCalls, 'one recovery, the parse error\'s');
+        self::assertStringContainsString('4223', $transport->connectCalls[1], 'the recovery dials the server the INFO names');
 
         $this->letTheRecoveryThrough($client, $transport);
         self::assertSame(1, $client->statistics()->reconnects);
