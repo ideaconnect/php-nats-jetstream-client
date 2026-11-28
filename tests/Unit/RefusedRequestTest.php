@@ -121,6 +121,135 @@ final class RefusedRequestTest extends TestCase
     }
 
     /**
+     * Every subject nats-server 2.15.3 wrote with Go's %q over 32 published subjects (an NBSP, a soft hyphen, a ZWSP,
+     * a BOM, a surrogate, an unassigned code point and more, besides the plain, apostrophe, backslash and double-quote
+     * forms already covered above), each row holding the published subject and the -ERR text as the parser hands it
+     * over (`trim(substr($line, 4))` in `src/Protocol/ProtocolParser.php`). A bin2hex() of both sides makes a mismatch
+     * readable.
+     *
+     * @return iterable<string, array{string, string}>
+     */
+    public static function subjectsGoWritesWithPercentQ(): iterable
+    {
+        yield 'plain' => ['svc.plain', "'Permissions Violation for Publish to \"svc.plain\"'"];
+        yield 'apostrophe' => ["svc.o'brien", "'Permissions Violation for Publish to \"svc.o'brien\"'"];
+        yield 'backslash' => ['svc.a\\b', "'Permissions Violation for Publish to \"svc.a\\\\b\"'"];
+        yield 'double quote' => ['svc.a"b', "'Permissions Violation for Publish to \"svc.a\\\"b\"'"];
+        yield 'e acute U+00E9' => ["svc.caf\u{e9}", "'Permissions Violation for Publish to \"svc.caf\u{e9}\"'"];
+        yield 'emoji U+1F600' => ["svc.\u{1f600}", "'Permissions Violation for Publish to \"svc.\u{1f600}\"'"];
+        yield 'combining U+0301' => ["svc.e\u{301}", "'Permissions Violation for Publish to \"svc.e\u{301}\"'"];
+        yield 'replacement U+FFFD' => ["svc.a\u{fffd}b", "'Permissions Violation for Publish to \"svc.a\u{fffd}b\"'"];
+        yield 'dollar' => ['svc.$x', "'Permissions Violation for Publish to \"svc.\$x\"'"];
+        yield 'NUL' => ["svc.a\x00b", "'Permissions Violation for Publish to \"svc.a\\x00b\"'"];
+        yield 'SOH 0x01' => ["svc.a\x01b", "'Permissions Violation for Publish to \"svc.a\\x01b\"'"];
+        yield 'BEL 0x07' => ["svc.a\x07b", "'Permissions Violation for Publish to \"svc.a\\ab\"'"];
+        yield 'BS 0x08' => ["svc.a\x08b", "'Permissions Violation for Publish to \"svc.a\\bb\"'"];
+        yield 'VT 0x0b' => ["svc.a\x0bb", "'Permissions Violation for Publish to \"svc.a\\vb\"'"];
+        yield 'FF 0x0c' => ["svc.a\x0cb", "'Permissions Violation for Publish to \"svc.a\\fb\"'"];
+        yield 'ESC 0x1b' => ["svc.a\x1bb", "'Permissions Violation for Publish to \"svc.a\\x1bb\"'"];
+        yield 'DEL 0x7f' => ["svc.a\x7fb", "'Permissions Violation for Publish to \"svc.a\\x7fb\"'"];
+        yield 'byte 0xff' => ["svc.\xffz", "'Permissions Violation for Publish to \"svc.\\xffz\"'"];
+        yield 'UTF-8 surrogate ED A0 80' => ["svc.a\xed\xa0\x80b", "'Permissions Violation for Publish to \"svc.a\\xed\\xa0\\x80b\"'"];
+        yield 'NEL U+0085' => ["svc.a\u{85}b", "'Permissions Violation for Publish to \"svc.a\\u0085b\"'"];
+        yield 'NBSP U+00A0' => ["svc.a\u{a0}b", "'Permissions Violation for Publish to \"svc.a\\u00a0b\"'"];
+        yield 'soft hyphen U+00AD' => ["svc.a\u{ad}b", "'Permissions Violation for Publish to \"svc.a\\u00adb\"'"];
+        yield 'unassigned U+0378' => ["svc.a\u{378}b", "'Permissions Violation for Publish to \"svc.a\\u0378b\"'"];
+        yield 'ZWSP U+200B' => ["svc.a\u{200b}b", "'Permissions Violation for Publish to \"svc.a\\u200bb\"'"];
+        yield 'line separator U+2028' => ["svc.a\u{2028}b", "'Permissions Violation for Publish to \"svc.a\\u2028b\"'"];
+        yield 'BOM U+FEFF' => ["svc.a\u{feff}b", "'Permissions Violation for Publish to \"svc.a\\ufeffb\"'"];
+        yield 'tag U+E0001' => ["svc.a\u{e0001}b", "'Permissions Violation for Publish to \"svc.a\\U000e0001b\"'"];
+        yield 'max U+10FFFF' => ["svc.a\u{10ffff}b", "'Permissions Violation for Publish to \"svc.a\\U0010ffffb\"'"];
+        yield 'backslash then u00a0' => ['svc.a\\u00a0b', "'Permissions Violation for Publish to \"svc.a\\\\u00a0b\"'"];
+        yield 'backslash then U000e0001' => ['svc.a\\U000e0001b', "'Permissions Violation for Publish to \"svc.a\\\\U000e0001b\"'"];
+        yield 'backslash then x41' => ['svc.a\\x41b', "'Permissions Violation for Publish to \"svc.a\\\\x41b\"'"];
+        yield 'NBSP then hex digits' => ["svc.a\u{a0}beef", "'Permissions Violation for Publish to \"svc.a\\u00a0beef\"'"];
+    }
+
+    /**
+     * subjectOfAPublishViolation() undoes Go's %q over every form it writes, called by reflection since it is
+     * private. Before the fix, stripcslashes() left `\x` escapes right but dropped the backslash of a `\u`/`\U`
+     * escape and of the C letters `\u` does not cover, so 10 of these 32 rows came back wrong.
+     */
+    #[DataProvider('subjectsGoWritesWithPercentQ')]
+    public function testSubjectOfAPublishViolationUndoesGosPercentQ(string $subject, string $error): void
+    {
+        $method = new \ReflectionMethod(NatsConnection::class, 'subjectOfAPublishViolation');
+        $got = $method->invoke(null, $error);
+
+        self::assertSame(bin2hex($subject), bin2hex((string) $got));
+    }
+
+    /**
+     * A character Go's %q writes with `\u` or `\U` is decoded, not left as literal text: the refused request fails
+     * well within its 5 s timeout, naming the subject as published, and a request in flight to what stripcslashes()
+     * used to make of that subject - a literal "u00a0" or "U000e0001" in place of the escape - still gets its reply,
+     * since nothing refused it. Both subjects end only at their 5 s timeout on the code before the fix.
+     *
+     * @return iterable<string, array{string, string, string}>
+     */
+    public static function subjectsGoWritesWithUOrCapitalU(): iterable
+    {
+        yield 'U+00A0, written with \u' => ["svc.a\u{a0}b", 'svc.a\u00a0b', 'svc.au00a0b'];
+        yield 'U+E0001, written with \U' => ["svc.a\u{e0001}b", 'svc.a\U000e0001b', 'svc.aU000e0001b'];
+    }
+
+    #[DataProvider('subjectsGoWritesWithUOrCapitalU')]
+    public function testASubjectGoWritesWithUOrCapitalUIsReadAsItsSubject(string $refused, string $measured, string $misread): void
+    {
+        $transport = self::server([]);
+        $inner = $transport->onWrite;
+        self::assertNotNull($inner);
+        $transport->onWrite = static function (string $bytes) use ($inner, $refused, $measured): array {
+            if (str_starts_with($bytes, 'PUB ' . $refused . ' ')) {
+                return ["-ERR 'Permissions Violation for Publish to \"" . $measured . "\"'\r\n"];
+            }
+
+            return $inner($bytes);
+        };
+        $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5_000), $transport));
+        $connection->connect()->await();
+
+        $other = $connection->request($misread, 'x');
+        $other->ignore();
+        $start = hrtime(true);
+        $failure = self::failureOf($connection->request($refused, 'x'));
+
+        self::assertInstanceOf(PermissionViolationException::class, $failure, self::describe($failure));
+        self::assertSame($refused, $failure->getSubject());
+        self::assertLessThan(2.5, (hrtime(true) - $start) / 1e9, 'the refused request failed well before its 5 s timeout');
+        self::assertSame('ok', $other->await()->payload);
+        self::assertNoRequestStateLeft($connection);
+    }
+
+    /**
+     * utf8BytesOfCodePoint() builds the UTF-8 bytes of a code point in each of the four length classes a decoded
+     * `\u`/`\U` escape can fall into, called by reflection since it is private. Go's %q never writes `\u` for a code
+     * point below 0x80 (such a rune is always printable ASCII), but the helper is general and this exercises that
+     * branch directly rather than leaving it reachable only in theory.
+     *
+     * @return iterable<string, array{int, string}>
+     */
+    public static function codePointsAcrossUtf8LengthClasses(): iterable
+    {
+        yield '1 byte, below 0x80' => [0x41, 'A'];
+        yield '2 bytes, NBSP U+00A0' => [0xa0, "\u{a0}"];
+        yield '2 bytes, top of the range, U+07FF' => [0x7ff, "\u{7ff}"];
+        yield '3 bytes, bottom of the range, U+0800' => [0x800, "\u{800}"];
+        yield '3 bytes, BOM U+FEFF' => [0xfeff, "\u{feff}"];
+        yield '4 bytes, bottom of the range, U+10000' => [0x10000, "\u{10000}"];
+        yield '4 bytes, max U+10FFFF' => [0x10ffff, "\u{10ffff}"];
+    }
+
+    #[DataProvider('codePointsAcrossUtf8LengthClasses')]
+    public function testUtf8BytesOfCodePointBuildsEachLengthClass(int $codePoint, string $expectedUtf8): void
+    {
+        $method = new \ReflectionMethod(NatsConnection::class, 'utf8BytesOfCodePoint');
+        $got = $method->invoke(null, $codePoint);
+
+        self::assertSame(bin2hex($expectedUtf8), bin2hex((string) $got));
+    }
+
+    /**
      * A refusal that names another subject leaves the request alone: it gets its reply. A regression that refused
      * every request on any publish refusal would fail it.
      */
