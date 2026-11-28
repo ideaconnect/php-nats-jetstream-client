@@ -31,7 +31,9 @@ enum NoRespondersCause: string
     /**
      * Nothing answered, and the connection the pull came on left the client's use meanwhile: the client closed it,
      * is recovering it, has replaced it or is draining it, the application is closing it, or its server announced lame
-     * duck mode. The pull met a server that is going away, which stops its consumers before it closes the connection.
+     * duck mode. The pull met a server that is going away, which stops its consumers before it closes the connection
+     * (a server released before nats-server 2.14.10 and 2.15.3: those close the client connections first, and their
+     * pulls get no 503 from the stop).
      * Once the server has closed it, the next pull goes out on the connection that follows; until then (lame duck mode
      * keeps it open for its grace period when there is no other server to fail over to) a pull gets the 503 again at
      * once, so a loop pauses before it pulls again.
@@ -42,7 +44,8 @@ enum NoRespondersCause: string
      * Nothing answered within the timeout, on a connection that stays: a user allowed to pull but not to ask for
      * consumer info (the server refuses the question with a permissions violation, and the connection is watched until
      * the timeout all the same), a server too busy to answer, or a server whose graceful stop takes longer than the
-     * timeout, as it closes the connections only once it has stopped every consumer.
+     * timeout, as one released before nats-server 2.14.10 and 2.15.3 closes the connections only once it has stopped
+     * every consumer.
      */
     case NoAnswer = 'no_answer';
 }

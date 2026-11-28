@@ -2878,10 +2878,17 @@ final class JetStreamContext
      * drops every JetStream API reply from then on, before it stops the first consumer, and closes the connection
      * after the last; lame duck mode stops JetStream, whose API then answers nothing, before it tells the clients it is
      * going away (INFO `ldm`) and closes their connections over its lame duck duration. Measured on nats-server 2.15.2
-     * with 48 consumers on a file stream: after SIGTERM, pulls got 503 from about 100 ms on and every CONSUMER.INFO sent
-     * from then on went unanswered until the close, about 570 ms in; after SIGUSR2 (lame duck mode), pulls got 503 from
+     * with 48 consumers on a file stream, pulling from one of them: after SIGTERM, CONSUMER.INFO went unanswered from
+     * about 110 ms until the close, about 570 ms in, and the pulls got 503 between about 300 and 550 ms, at a different
+     * moment in each round, always after the API had gone silent; after SIGUSR2 (lame duck mode), pulls got 503 from
      * 50 ms on, CONSUMER.INFO went unanswered from 45 ms on, and the client read the lame duck INFO about 515 ms in,
-     * the connection staying open. The causes:
+     * the connection staying open. nats-server 2.14.10 and 2.15.3 changed both: a graceful stop closes the client
+     * connections before it stops JetStream, and lame duck mode keeps JetStream running until it has closed them, so
+     * a client of such a server sees its connection close and its pulls get no 503 from the stop. Measured on both
+     * with 48 consumers on a file stream: after SIGTERM the connection closed within 0.5 ms in 11 of 12 rounds and at
+     * 50 ms in one, before any 503; after SIGUSR2 the lame duck INFO came within 1 ms, and pulls and CONSUMER.INFO
+     * were answered as before. Releases before them, 2.15.0 to 2.15.2 and 2.12.15 among them, stop in the order
+     * described above. The causes:
      *
      *  - {@see NoRespondersCause::ConsumerNotFound} or {@see NoRespondersCause::StreamNotFound}: the 404 (err_code
      *    10014 or 10059; a 404 without err_code is taken for the consumer's).
@@ -2895,10 +2902,11 @@ final class JetStreamContext
      *    to - a pull gets the 503 again at once, and this answers ServerGoingAway at once, without asking.
      *  - {@see NoRespondersCause::NoAnswer}: nothing answered within the timeout, on a connection that stays: a user
      *    allowed to pull but not to ask for consumer info, a server too busy to answer, or a server whose graceful
-     *    stop takes longer than the timeout, as it closes the connections only once it has stopped every consumer. The
-     *    server refuses the question of such a user at once, with a permissions violation (read as soon as it comes
-     *    since client 2.30.0), and the connection is then watched until the timeout all the same, as a server going
-     *    away refuses it too: that user still tells a server going away from one that stays.
+     *    stop takes longer than the timeout, as one released before 2.14.10 and 2.15.3 closes the connections only
+     *    once it has stopped every consumer. The server refuses the question of such a user at once, with a
+     *    permissions violation (read as soon as it comes since client 2.30.0), and the connection is then watched
+     *    until the timeout all the same, as a server going away refuses it too: that user still tells a server going
+     *    away from one that stays.
      *
      * The question waits for its answer only while that connection stays. The client keeps a request waiting for its
      * reply across a reconnect, up to its timeout, but the server that would have answered this one is gone, and an

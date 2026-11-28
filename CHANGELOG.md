@@ -26,6 +26,21 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 
 ### Documentation
 
+- `[docs]` `diagnoseNoResponders()`: two corrections to what its docs and the 2.29.0 entry say about a server
+  going away (#254). The 2.29.0 section stays as released.
+  - After SIGTERM, pulls did not get 503 "from about 100 ms on": that was the figure of another run, with 16
+    consumers and a pull on every consumer in turn (ideaconnect/symfony-nats-messenger#108). In the runs the entry
+    describes, on nats-server 2.15.2 with 48 consumers on a file stream, pulling from one of them, CONSUMER.INFO went
+    unanswered from about 110 ms until the server closed the connection, about 570 ms in, and the pulls got 503
+    between about 300 and 550 ms, at a different moment in each round, always after the API had gone silent.
+  - nats-server 2.14.10 and 2.15.3 changed the order the entry describes: a graceful stop closes the client
+    connections before it stops JetStream, and lame duck mode keeps JetStream running until it has closed them, so a
+    client of such a server sees its connection close and its pulls get no 503 from the stop. Measured on both with
+    48 consumers on a file stream: after SIGTERM the connection closed within 0.5 ms in 11 of 12 rounds and at 50 ms
+    in one, before any 503; after SIGUSR2 the lame duck INFO came within 1 ms, and pulls and CONSUMER.INFO were
+    answered for the 1.5 s watched. Releases before them, 2.15.0 to 2.15.2 and 2.12.15 among them, stop in the order
+    the entry describes. The method's docblock, `NoRespondersCause` and the README's "Fetch Batch" notes now say which
+    releases they describe.
 - `[docs]` The "JetStream Domains and API Prefixes" section (#273, #276) said an account import needs `$JS.API.>`
   under a prefix, `$KV.>` under the same prefix, and the subjects published to, and that reads and watches stay
   unchanged; that last sentence holds for a JetStream domain only (#281). An import also needs `response: stream` on
