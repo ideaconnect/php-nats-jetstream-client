@@ -218,31 +218,125 @@ final class RefusedRequestTest extends TestCase
     }
 
     /**
-     * A requestMany() that has collected a reply returns it when a refusal of its subject arrives after the reply, as one
-     * of a plain publish to the same subject would: the reply answered a publish the server let through. Before the
-     * fix it waited out its timeout and returned the same reply.
+     * A requestMany() that has collected a reply is no longer ended by a later -ERR for its subject (#258): the
+     * reply is proof that this request's own single publish got through, so the -ERR answered a different one - a
+     * plain publish() to the same subject, as here. The collection goes on and gets a second reply, sent only once
+     * the error listener has reported the -ERR, never after a wait, so a regression that drops the wake-up too soon
+     * would stall rather than pass by luck. Before the fix the first -ERR for the subject ended the collection at
+     * once, with only the first reply.
+     *
+     * Two data sets differ only in when the -ERR is read relative to the first reply: behind it, in a read of its
+     * own once the request's own publish is out, or ahead of it, parsed from the same chunk. Both leave the request
+     * able to collect its second reply, through different halves of the fix: the first because the waiter drops
+     * this token from the set `refuseRequestsTo()` matches by subject at the first reply, so the later -ERR never
+     * marks it; the second because the mark the -ERR sets, read first from the same chunk, is dropped moments later
+     * by the first reply's own dispatch within that chunk, before the loop ever looks at it.
      */
-    public function testARequestManyWithRepliesCollectedReturnsThemWhenItsSubjectIsRefusedLater(): void
+    #[DataProvider('errSameChunkAsTheFirstReply')]
+    public function testARequestManyThatHasCollectedAReplyGoesOnPastALaterRefusalOfItsSubject(bool $sameChunk): void
     {
         $transport = self::server([]);
-        $inner = $transport->onWrite;
-        self::assertNotNull($inner);
-        $transport->onWrite = static function (string $bytes) use ($inner): array {
-            $frames = $inner($bytes);
-            if (str_starts_with($bytes, 'PUB svc.scatter ')) {
-                $frames[] = "-ERR 'Permissions Violation for Publish to \"svc.scatter\"'\r\n";
+        /** @var string|null $replyTo */
+        $replyTo = null;
+        $sid = 1;
+        $err = "-ERR 'Permissions Violation for Publish to \"svc.scatter\"'\r\n";
+        $transport->onWrite = static function (string $bytes) use (&$replyTo, &$sid, $sameChunk, $err): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
             }
 
-            return $frames;
+            $parts = explode(' ', $head);
+            if ($parts[0] === 'SUB') {
+                $sid = (int) ($parts[2] ?? 1);
+
+                return [];
+            }
+            if ($parts[0] !== 'PUB' || ($parts[1] ?? '') !== 'svc.scatter') {
+                return [];
+            }
+
+            $replyTo = $parts[2] ?? '';
+            $first = sprintf("MSG %s %d 5\r\nfirst\r\n", $replyTo, $sid);
+
+            // (a) the -ERR behind the first reply: two reads, the reply's own and then the -ERR's.
+            // (b) the -ERR ahead of the first reply, in one chunk: a single read carrying both, -ERR first.
+            return $sameChunk ? [$err . $first] : [$first, $err];
+        };
+        /** @var list<string> $reported */
+        $reported = [];
+        $connection = $this->own(new NatsConnection(new NatsOptions(
+            requestTimeoutMs: 5_000,
+            errorListener: function (\Throwable $e) use (&$reported, $transport, &$replyTo, &$sid): void {
+                $reported[] = $e->getMessage();
+                $transport->pushReadChunk(sprintf("MSG %s %d 6\r\nsecond\r\n", $replyTo, $sid));
+            },
+        ), $transport));
+        $connection->connect()->await();
+
+        $start = hrtime(true);
+        $replies = $connection->requestMany('svc.scatter', 'x', null, 2, 5_000)->await();
+        $elapsed = (hrtime(true) - $start) / 1e9;
+
+        self::assertSame(['first', 'second'], array_map(static fn(NatsMessage $message): string => $message->payload, $replies));
+        self::assertCount(1, $reported, 'the -ERR reached the error listener exactly once');
+        self::assertStringContainsString('Permissions Violation for Publish to "svc.scatter"', $reported[0]);
+        self::assertLessThan(2.5, $elapsed, sprintf('returned at the second reply, well before the 5 s timeout (%.3f s)', $elapsed));
+        self::assertSame(ConnectionState::Open, $connection->state(), 'a refusal of another publish leaves the connection open');
+        self::assertNoRequestStateLeft($connection);
+    }
+
+    /** @return iterable<string, array{bool}> */
+    public static function errSameChunkAsTheFirstReply(): iterable
+    {
+        yield 'the -ERR behind the first reply' => [false];
+        yield 'the -ERR ahead of the first reply, in one chunk' => [true];
+    }
+
+    /**
+     * A 503 (no responders) for a requestMany() that has collected nothing yet, read behind an -ERR for its subject
+     * in the same chunk: the 503 is itself proof that the request's publish got through, so the mark the -ERR set a
+     * moment earlier in the same chunk is gone by the time the loop looks. The collection ends the way any
+     * no-responders scatter does - with whatever it has collected, nothing here - rather than with the
+     * PermissionViolationException the mark would otherwise have produced.
+     */
+    public function testARequestManyWithNoRespondersBehindARefusalOfItsSubjectReturnsEmptyWithoutThrowing(): void
+    {
+        $transport = self::server([]);
+        $sid = 1;
+        $transport->onWrite = static function (string $bytes) use (&$sid): array {
+            $head = strtok($bytes, "\r\n");
+            if ($head === false) {
+                return [];
+            }
+
+            $parts = explode(' ', $head);
+            if ($parts[0] === 'SUB') {
+                $sid = (int) ($parts[2] ?? 1);
+
+                return [];
+            }
+            if ($parts[0] !== 'PUB' || ($parts[1] ?? '') !== 'svc.scatter') {
+                return [];
+            }
+
+            $replyTo = $parts[2] ?? '';
+            $status = "NATS/1.0 503\r\n\r\n";
+            $noResponders = sprintf('HMSG %s %d %d %d', $replyTo, $sid, strlen($status), strlen($status)) . "\r\n" . $status . "\r\n";
+            $err = "-ERR 'Permissions Violation for Publish to \"svc.scatter\"'\r\n";
+
+            return [$err . $noResponders];
         };
         $connection = $this->own(new NatsConnection(new NatsOptions(requestTimeoutMs: 5_000), $transport));
         $connection->connect()->await();
 
         $start = hrtime(true);
-        $replies = $connection->requestMany('svc.scatter', 'x', null, 5, 5_000)->await();
+        $replies = $connection->requestMany('svc.scatter', 'x', null, 2, 5_000)->await();
+        $elapsed = (hrtime(true) - $start) / 1e9;
 
-        self::assertSame(['ok'], array_map(static fn(NatsMessage $message): string => $message->payload, $replies));
-        self::assertLessThan(2.5, (hrtime(true) - $start) / 1e9, 'returned at the refusal, well before the 5 s timeout');
+        self::assertSame([], $replies);
+        self::assertLessThan(2.5, $elapsed, sprintf('ended at the 503, well before the 5 s timeout (%.3f s)', $elapsed));
+        self::assertSame(ConnectionState::Open, $connection->state());
         self::assertNoRequestStateLeft($connection);
     }
 

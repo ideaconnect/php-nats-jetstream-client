@@ -203,7 +203,9 @@ final class NatsConnection
     /**
      * The subject each in-flight request is sent to, keyed like {@see $muxWaiters}. A permissions violation for a
      * publish names the subject alone, so every request to it is refused by it ({@see refuseRequestsTo()}).
-     * Registered and removed with the waiter.
+     * Registered with the waiter; removed with it, and also by requestMany()'s waiter at its first reply (#258), a
+     * message on the inbox being proof that this request's own publish got through, so it can no longer be the one
+     * an -ERR for the subject answers.
      *
      * @var array<string, string>
      */
@@ -5502,7 +5504,9 @@ final class NatsConnection
      * The -ERR names the subject and not the request, and the server sends one for each refused publish, in order. The
      * permissions are the user's, so a request to that subject is refused whichever publish the -ERR answers, a plain
      * publish() to it included: every request in flight to it is refused, and a later -ERR finds none to refuse. A
-     * request to another subject is left alone. Called from the dispatch of the -ERR, so it must not suspend.
+     * request to another subject is left alone. "In flight" leaves out a requestMany() that has already collected a
+     * reply on its inbox (#258): that reply is proof its own publish got through, so it stops being tracked here at
+     * its first reply, well before this is called. Called from the dispatch of the -ERR, so it must not suspend.
      */
     private function refuseRequestsTo(string $subject, string $error): void
     {
@@ -6326,6 +6330,12 @@ final class NatsConnection
         // Registered by token on the shared mux inbox instead of a fresh per-request SUB (#118); the
         // collector body (incl. the #160 cap and #135 tick rotation) is unchanged.
         $this->registerMuxWaiter($token, function (NatsMessage $message) use (&$messages, &$lastAt, &$noResponders, &$replyTick, &$replyWake, $maxResponses, $token): void {
+            // Any message on this request's inbox, a 503 included, is proof that its one publish got through: an
+            // -ERR for the subject names a publish, and this one was not refused, so it answered another. Drop the
+            // subject refuseRequestsTo() matches against, so a later -ERR for it cannot mark this token any more, and
+            // any mark already set by an -ERR read ahead of this message in the same chunk (#258).
+            unset($this->muxSubjects[$token], $this->muxRefusals[$token]);
+
             if ($this->isNoRespondersStatus($message)) {
                 // The server's 503 sentinel: no service is listening. Stop immediately with whatever
                 // (typically nothing) was collected.
@@ -6366,13 +6376,11 @@ final class NatsConnection
                     throw new ConnectionException('Connection is not open');
                 }
 
-                // The server refused the request's publish for lack of permission ({@see refuseRequestsTo()}). Replies
-                // collected by then answered a publish the server let through, and are returned.
+                // The server refused the request's publish for lack of permission ({@see refuseRequestsTo()}). The
+                // waiter above removes this token from $muxSubjects at its first reply (#258), so this mark can only
+                // be set while nothing has been collected yet; unlike the close/rejection checks around it, this one
+                // never returns what was collected.
                 if (isset($this->muxRefusals[$token])) {
-                    if ($messages !== []) {
-                        break;
-                    }
-
                     throw $this->requestRefusedException($subject, $this->muxRefusals[$token]);
                 }
 
