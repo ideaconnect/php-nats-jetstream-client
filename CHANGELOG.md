@@ -64,6 +64,325 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
   `JetStreamException`. Code that catches `JetStreamException` around a pull to tell an empty pull (408) from other
   outcomes no longer sees the refusal there: catch `PermissionViolationException`, or `NatsException`, as well.
 
+### Testing & CI
+
+- `[docs]` `DurableSourcingIntegrationTest`'s class docblock and its `TESTS.md` entry said the fixture stack ran
+  nats-server 2.12, stale since #286 (#279) added the second `composer test:e2e` integration stage against the
+  `nats-214` fixture. Both now say which test runs against which fixture, as the consumer reset texts do, and the
+  README's "Stream Mirroring and Sourcing" `Verified by` line names the second stage (#287).
+
+### Documentation
+
+- `[docs]` The "JetStream Domains and API Prefixes" section (#273, #276) said an account import needs `$JS.API.>`
+  under a prefix, `$KV.>` under the same prefix, and the subjects published to, and that reads and watches stay
+  unchanged; that last sentence holds for a JetStream domain only (#281). An import also needs `response: stream` on
+  the export of `$JS.API.>` for every call with several replies (`fetchBatch()` above 1, `pullConsumer()->handle()`,
+  `directGetBatch()`, on nats-server 2.11 and later also `getAll()` and Object Store `list()`, a multi-chunk object
+  `get()`), an import of `$JS.ACK.>` for `ack()`, `nak()`, `term()`, `inProgress()`, `ackSync()` and, by reading,
+  `nakWithDelay()`, an import of `$JS.FC.>` for an ordered consumer and its `watch()`es (without it delivery stops
+  after 2 MB with no error), and a stream export covering this client's four fixed push-delivery prefixes
+  (`_INBOX.JS.ORD.`, `_INBOX.KV.KEYS.`, `_INBOX.KV.HIST.`, `_INBOX.JS.PUSH.`) for `subscribeOrderedConsumer()`,
+  KeyValue/Object Store `watch()`, `keys()`, `history()` and a push subscription without its own `deliverSubject`.
+  New "Account imports" subsection: the full account config that was measured, what already works with only the
+  three entries the section already described, a table of what each further entry is for and what happens without
+  it, and that a stream export covering one of the prefixes hands the importing account everything published on it,
+  not only what one import's calls deliver. Measured once against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and
+  2.15.3 with this client at 2.34.0; not covered by a test of this repository.
+
+## [2.35.0] - 2026-11-28
+
+### Added
+
+- `[feature]` Durable stream sourcing and mirroring (ADR-60, NATS server 2.14+) with the typed builders (#280):
+  `AckPolicy::FlowControl` (`flow_control`) is the ack policy of the durable push consumer a stream sources or
+  mirrors a WorkQueue or Interest stream through, and `StreamSource::consumer($name, $deliverSubject)` names such a
+  consumer in a source or mirror (`consumer: {name, deliver_subject}`, after `external`). `toArray()` refuses
+  `consumer()` together with `startSeq()`, `startTime()` or `filterSubject()` with a `JetStreamException` that names
+  them (they belong on the consumer, and the server's own error names no field); `consumer()` refuses an empty name
+  or deliver subject. The client checks the server version for neither: a server before 2.14 refuses the ack policy
+  (400, err_code 10025), 2.12 refuses a source that names a consumer the same way, and 2.10 and 2.11 drop the field
+  and source the old way. README "Stream Mirroring and Sourcing" says what a 2.14 server does by itself, when to
+  name a consumer of your own and what to create first.
+
+### Testing & CI
+
+- `[docs]` New `nats-214` fixture in `docker-compose.yml` (nats-server 2.14, port 14232/18232) and a second
+  `composer test:e2e` integration stage against it (`composer test:integration:2.14`, `--fail-on-skipped`), so a
+  live test that needs a server newer than the other fixtures' 2.12 runs in CI instead of always skipping itself
+  (#279). A test that can pass only on a server older than 2.14 is excluded from that stage by having
+  `ServerBefore214` in its name.
+
+## [2.34.0] - 2026-11-26
+
+### Added
+
+- `[feature]` JetStream domains and API prefixes (#273): `NatsClient::jetStream(domain: 'hub')` returns a context
+  whose JetStream API requests go to `$JS.hub.API.` instead of `$JS.API.` (nats.go `jetstream.NewWithDomain()`), and
+  `jetStream(apiPrefix: 'JS.from-a.API')` one whose requests go to the prefix an account imports another account's
+  JetStream API under (nats.go `jetstream.NewWithAPIPrefix()`; a trailing `.` is added when missing). A client
+  connected to a leaf node can now use the hub's JetStream: before, every JetStream, KV and Object Store call went to
+  `$JS.API.`, which a leaf node without JetStream answers with no responders. Every API request of the context uses
+  its prefix (streams, consumers, account info, message get/delete, Direct Get, pulls from `fetchBatch()` and
+  `pullConsumer()->handle()`, pause/unpin, `resetConsumer()`, and the requests of its KV and Object Store buckets); a
+  JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, acks and flow-control
+  replies to the server's reply subject. KV writes go through the prefix
+  (`$JS.hub.API.$KV.<bucket>.<key>`, nats.go useJSPfx parity): nats-server maps it back to `$KV.<bucket>.<key>`, while
+  a plain `$KV.` publish from a leaf node gets no responders. A KV mirror of a bucket in another domain keeps writing
+  through that origin's API. An invalid domain (empty, or with `.`, `*`, `>`, whitespace or a control character), an
+  invalid prefix (empty, an empty token, a wildcard or whitespace) and a domain together with a prefix throw a
+  `JetStreamException` before any request (the last is this client's own rule: nats.go's legacy options and nats.java
+  let the last one set win). One context is kept per prefix, and `jetStream()` without arguments is unchanged. The
+  server version checks still read the INFO of the server the client is connected to, so through a 2.12 leaf node
+  `resetConsumer()` is refused before anything is sent, although a 2.14 hub would answer it. Also new:
+  `JetStreamContext::apiPrefix()`, `JetStreamContext::apiSubject()`, the `domain` and `apiPrefix` constructor
+  arguments of `JetStreamContext`, and `JetStreamApi::DEFAULT_PREFIX`, `resolvePrefix()` and `withPrefix()`.
+
+### Testing & CI
+
+- `[docs]` New `JetStreamDomainTest` over `tests/Support/PrefixedJetStreamServer.php`, a scripted server that answers
+  the JetStream API under one prefix only, maps a prefixed KV write to its `$KV.` subject and gives the no-responders
+  status to every other `$JS.` subject, as a leaf node of another domain does: every API call (47 of them, KV and
+  Object Store included, `resetConsumer()` against a scripted 2.14 INFO) sends its request under the context's prefix
+  for the default prefix, the domain `hub` and the prefix `$JS.from-a.API`, and none elsewhere; a stream create, a
+  consumer create, a JetStream publish, a pull with its ack, a pull consume, a KV put/get (and its STREAM.MSG.GET
+  fallback) and an Object Store put work through each prefix; a KV handle bound with `bind()` writes through the
+  prefix; KV mirror writes; the validation of domains and prefixes; one context per prefix.
+- `[docs]` New `nats-hub` (JetStream with `jetstream { domain: hub }`, port 14230) and `nats-leaf` (no JetStream,
+  connected to the hub, port 14231) fixtures in `docker-compose.yml` (`build/nats/hub.conf`, `build/nats/leaf.conf`);
+  `scripts/wait-for-nats-services.sh` also waits until the leaf node's connection to the hub is up. New
+  `JetStreamDomainIntegrationTest`, through the leaf node: the default context gets no responders and the domain
+  context the hub's account info; a stream and a consumer used end to end (publish, pull, ackSync, a pull consume); a
+  KV bucket (put, get, update, delete, keys, read back on the hub; a plain `$KV.` write from the leaf node gets no
+  responders); a multi-chunk Object Store object written and read back. It skips when the leaf node is not running.
+
+## [2.33.0] - 2026-11-26
+
+### Added
+
+- `[feature]` `JetStreamContext::resetConsumer($stream, $consumer, ?int $sequence = null)` resets a consumer's delivery
+  state through `$JS.API.CONSUMER.RESET` (ADR-60, NATS server 2.14+; nats.go `ResetConsumer()` /
+  `ResetConsumerToSequence()`), so a durable consumer can replay messages or move past a range that cannot be
+  processed without being deleted and recreated (#274). Without a sequence (or with 0) delivery goes on just above the
+  consumer's ack floor; with one it goes on from the first message at or after that stream sequence. The consumer
+  sequence starts again at 1. It resolves to the `ConsumerInfo` of the server's reply, whose new `resetSequence`
+  property is the stream sequence the next delivery starts from (`reset_seq`; null on every other reply). A sequence
+  the consumer's config does not allow (`deliver_policy` other than `all`, `by_start_sequence` or `by_start_time`, or
+  one before the consumer's start) fails with a `JetStreamException` carrying code 400 and err_code 10204, the new
+  `ApiErrCode::CONSUMER_INVALID_RESET`. A negative sequence (`InvalidArgumentException`) and an invalid name are
+  refused before anything is sent. Also new: `JetStreamApi::CONSUMER_RESET_PREFIX`, and the `consumer_reset` key of
+  `FeatureSupport::REQUIREMENTS` (2.14).
+- A server before 2.14 does not answer the reset at all: on a server advertising such a version `resetConsumer()`
+  fails at once with an `UnsupportedFeatureException` (`consumer_reset`, `... nothing was sent`) instead of waiting
+  out the request timeout. The consumer itself answers its reset, so a consumer or stream that does not exist gets no
+  answer either, on 2.14 too: the call fails with the request timeout, not with "consumer not found".
+
+### Fixed
+
+- `[bugfix]` An ordered consumer (and so a KV or Object Store watch) whose consumer another client resets while it
+  is idle, forward past the stream's tail (a `$JS.API.CONSUMER.RESET` with a sequence, on a 2.14 server), held every
+  new message back until the stream reached the reset sequence, possibly for good (#274). Its idle heartbeat checked
+  only for a `Nats-Last-Consumer` above what it had delivered; one below it, which a reset produces, now
+  recreates the consumer from the last in-order message as well. A reset backward, or one followed by a delivery, was
+  already recovered by the delivery's consumer sequence going back to 1.
+
+### Changed
+
+- The push consumer's sequence-regression report now reads `... the consumer appears to have been replaced or reset
+  (sequence regressed) ...` (was `... replaced (sequence regressed) ...`): a reset by another client, the CLI for
+  example, restarts the consumer sequence at 1 too (#274). It is still reported once per episode through the error
+  listener, and delivery goes on.
+
+## [2.32.0] - 2026-11-25
+
+### Upgrade notes
+
+- A stream or consumer create/update that sets a version-gated config field (the config fields of
+  `FeatureSupport::REQUIREMENTS`; `FeatureSupport::requestedFields()` lists the ones a config asks for) against a
+  server too old for it now throws an `UnsupportedFeatureException` (#266). Code that set such a field "just in
+  case" against a 2.10 or 2.11 server used to get the stream or consumer without the feature; set the field only
+  when the servers support it, or catch the exception. Only the default turns a field off (`false`, `0`, `'none'`,
+  `[]`, or leaving it out). A negative `subject_delete_marker_ttl` is not "off" but invalid (a 2.11+ server rejects
+  it), so it counts as a request for the feature; a negative `priority_timeout` still asks for nothing, since a
+  2.12+ server treats it as unset.
+- When the exception comes from the reply check (its message says `... exists without it ...` or `... the state of
+  ... is unknown ...`, not `nothing was sent`), the request reached the server. Do not treat the stream or consumer
+  as one this call created, and do not delete it as a rollback: a create returns an existing stream or consumer
+  whose config matches the request, and the dropped field can make it match, so it may hold messages from before
+  the call. Inspect it first (`getStream()`, `getConsumer()`), then decide whether to update, keep or delete it.
+- On a 2.11 server in strict mode the pre-flight now answers before the server's own `unknown field` rejection, so
+  that exception's code is 0 (was 400) and its message is the pre-flight's.
+
+### Added
+
+- `[feature]` `FeatureSupport::requestedFields($config)` lists the version-gated config fields a stream or consumer
+  config asks for, in `REQUIREMENTS` order (#266): each such field set to anything but its default (`null`, `false`,
+  `0`, `''`, `'none'`, `[]` and a missing field ask for nothing; a negative `subject_delete_marker_ttl` asks). These
+  are the fields the stream and consumer calls check, so code can tell before a request which fields, and with
+  `requiredVersion()` which server version, a config needs. Only config fields are listed, never the `schedule_*`
+  scheduler features. The two checks themselves, `FeatureSupport::assertSupportedBy()` and
+  `FeatureSupport::assertHonored()`, are public for `JetStreamContext` and marked `@internal`: not part of the
+  supported API.
+
+### Fixed
+
+- `[bugfix]` A stream or consumer that sets a version-gated config field (the config fields of
+  `FeatureSupport::REQUIREMENTS`: `allow_msg_ttl`, `subject_delete_marker_ttl`, `allow_msg_counter`,
+  `allow_msg_schedules`, `allow_atomic`, `filter_subjects`, `priority_groups`, `priority_policy`, `priority_timeout`;
+  not the `schedule_*` scheduler features) on a server older than the field now fails with the documented
+  `UnsupportedFeatureException` instead of succeeding without the feature (#266). The
+  README and `FeatureSupport` said such a server rejects the unknown field, but nats-server rejects unknown fields
+  only in strict mode: 2.10 never does, 2.11 only with `jetstream { strict: true }`, and 2.12 is the first line where
+  strict is the default. A default 2.10 or 2.11 server dropped the field, `createStream()` returned a normal
+  `StreamInfo`, and the data path then misbehaved without a word: a `publish(..., ttl:)` message never expired,
+  `incrementCounter()` stored a plain message and then failed with `Counter response did not include a value`, and
+  `publishScheduled()` stored a message no scheduler would fire. `createStream()`, `addStream()`, `updateStream()`,
+  `createOrUpdateStream()` and the five consumer create calls now check twice, for each such field set to anything
+  but its default (`false`, `0`, `'none'`, `[]` and a missing field ask for nothing; a negative
+  `subject_delete_marker_ttl` asks). Before the request, when the server's INFO version parses as older than the
+  field's minimum, the call fails and nothing is sent. After it, when the server's reply does not confirm a
+  requested field (a version the client cannot parse, or a mixed-version cluster where an older server answers the
+  JetStream API), the call fails naming the field and saying only what the reply shows: a returned config without
+  the field means the stream or consumer exists without it, and a reply without a config (missing, null or empty)
+  leaves its state unknown. `createOrUpdateStream()` does not retry such a failure as an update. A strict server's
+  own `unknown field` rejection is still mapped as before; on a 2.11 strict server the pre-flight now answers
+  first, so that exception's code is 0 and its message the pre-flight's.
+- `[bugfix]` A strict server's `unknown field "schedule_every"` rejection (or one naming another `schedule_*` key) is
+  no longer turned into an `UnsupportedFeatureException` that asks for NATS 2.14 (#266). Since 2.31.0 these keys are
+  in `FeatureSupport::REQUIREMENTS` as scheduler features of `publishScheduled()`, not config fields: a strict server
+  rejects a stream or consumer config carrying one whatever its version, so the rejection is now the ordinary
+  `JetStreamException` with the server's description. `requiredVersion()` still reports 2.14 for these keys.
+
+### Testing & CI
+
+- `[docs]` New cases in `FeatureSupportTest` (which values ask for a feature, a negative marker TTL included; the
+  pre-flight over the version forms INFO advertises, with a two-segment, a `v`-prefixed, a pre-release and a 3.0
+  version; the reply check over a missing field, a field echoed as its default, a dropped negative marker TTL, and
+  replies without a config: missing, null, empty, a list or a scalar) and in `JetStreamContextTest` (every
+  stream and consumer create/update call refused on a too-old server with no JetStream API request on the wire; the
+  reply check on `createStream()`, `addStream()`, `updateStream()`, `createOrUpdateStream()`, `createConsumer()` and
+  `createEphemeralConsumer()`, for a config without the field and for a reply without a config; a negative
+  `subject_delete_marker_ttl` on 2.10 and behind an old responder; a new enough server that echoes the fields,
+  fields at their defaults on 2.10, and a request for no gated feature that still accepts a reply without a
+  config). The fake replies of seven existing tests that send a gated field now echo it, as nats-server does, and
+  `testUnsupportedFeatureRaisesTypedExceptionWithServerVersion` maps a strict server's rejection behind an
+  unparseable version, the case where that path still runs. `testScheduleFeaturesAreNotConfigFields` checks that
+  the `schedule_*` keys are never read as config fields, by `requestedFields()`, the two checks or the mapping of a
+  strict server's rejection.
+- `[docs]` New `GatedConfigFieldServerVersionOnReconnectTest`: over `tests/Support/ReconnectingTransport.php`, a
+  `createStream()` with `allow_msg_ttl` made while the client fails over from 2.11.0 to 2.10.29 passes the
+  pre-flight, goes to the 2.10.29 server once and is refused by the reply check, reporting 2.10.29; made while it
+  fails over from 2.10.29 to 2.11.0 it is refused by the pre-flight on the replaced connection's version, and no
+  create reaches either server. The pre-flight reads the INFO when the call is made, unlike `publishScheduled()`'s
+  check in the step that writes the frame (#267); the `requestStreamChange()` docblock and the README say so.
+
+## [2.31.1] - 2026-11-25
+
+### Upgrade notes
+
+- With `reconnectEnabled: true`, `maxReconnectAttempts: 0` now makes no reconnect attempt after a lost connection, as
+  documented (#268): the connection closes instead of dialling once more. Code that relied on that single retry should
+  set `maxReconnectAttempts: 1`, which makes exactly one attempt.
+
+### Fixed
+
+- `[bugfix]` `maxReconnectAttempts: 0` disables reconnect retries after a lost connection too, as its docblock says
+  (#268). The initial connect already read 0 as no attempt, but the recovery after a lost connection ran
+  `max(1, maxReconnectAttempts)` attempts: with `reconnectEnabled: true, maxReconnectAttempts: 0` a dropped connection
+  waited out one backoff, dialled once more and, when that dial succeeded, carried on with its subscriptions
+  replayed, possibly on another server of the pool, and a lame duck notice naming another server started a failover.
+  A worker that a supervisor should restart on connection loss, or a CLI tool that sets 0 to fail fast, got one more
+  dial after every drop instead. At 0 the connection now ends as it does with reconnect off, on every path that
+  notices the loss (a failed read or write, missed pings, a connection-ending frame): Closed, the `Closed` event
+  carrying the cause, and `Reconnect is disabled` with the cause as its previous for the operation that noticed it
+  (the server's own error for a fatal `-ERR`). A plain publish whose write fails then fails, as with reconnect off,
+  instead of resolving into a reconnect buffer; an operation whose read notices the loss with
+  `waitForReconnect: false` fails once the connection is Closed, with `Reconnect is disabled` rather than
+  `Connection is not open`. A lame duck notice starts no failover: the connection stays until the server closes it.
+  The count is global, for the whole server pool: at 0 no server of the pool is dialled. Strictly a `[bc-break]` for
+  code that relied on the one attempt (see the upgrade note), flagged `[bugfix]` per the note above: it corrects a
+  documented contract. `maxReconnectAttempts: 1` still makes exactly one attempt.
+- `[bugfix]` A heartbeat that gives up on a server that stopped answering its PINGs announces the close once. With
+  reconnect off, and so at `maxReconnectAttempts: 0` once that ended the same way (#268), the previous tick's PONG read,
+  still waiting when the tick that gave up closed the socket, then failed with the EOF of that close and closed the
+  connection a second time: the listener heard `Closed` twice, first with `The server did not answer the last PING`,
+  then with `Socket closed by peer (EOF)`. It showed with a `pingIntervalSeconds` below 2 s, where that read waits as
+  long as the interval (50 ms at least), so the next tick comes while it still waits. A heartbeat PING write that fails
+  after another read has ended the connection does not close it again either. A heartbeat read or write that fails on
+  a connection opened since still ends that one.
+
+### Testing & CI
+
+- `[docs]` New `ZeroReconnectAttemptsTest` (#268): over the scripted server, which accepts every dial, a failed read,
+  a failed publish, a failed SUB, a lame duck notice naming another server, and a request's read meeting a lost
+  connection or a fatal `-ERR` with `waitForReconnect: false`, each with reconnect off and with reconnect on at 0
+  attempts, the same outcome expected: no dial, Closed, one `Closed` event with the cause. These 6 cases fail on 2.31.0
+  at 0 attempts; two more pin exactly one dial at 1 attempt, for a lost connection and for a lame duck failover. The
+  heartbeat cases, run the same two ways, keep the previous tick's PONG read waiting across the close made for missed
+  pings, run directly and on the heartbeat's own 20 ms timer, and stall a PING write across a close another read makes:
+  one `Closed`, with the first cause, and no dial once that read or write has failed. These three fail on 2.31.0 with
+  reconnect off too. Two more check that a heartbeat read or write that finds a connection opened since lost still
+  ends it.
+  `NatsConnection_3MutationTest::testPerformRecoveryMakesAtLeastOneAttemptWhenMaxIsZero`, which pinned the one
+  attempt, is now `testPerformRecoveryMakesNoAttemptWhenMaxIsZero`.
+
+## [2.31.0] - 2026-11-25
+
+### Added
+
+- `[feature]` `FeatureSupport::requiredVersion()` reports 2.14 for `schedule_every`, `schedule_cron`,
+  `schedule_source`, `schedule_time_zone` and `schedule_rollup`, and `FeatureSupport::serverIsOlderThan()` compares an
+  INFO-advertised version with a required `major.minor` the way the atomic batch pre-flight does (numeric prefix,
+  pre-release tags ignored, an unparseable version is never older).
+
+### Fixed
+
+- `[bugfix]` `publishScheduled()` refuses what the connected server cannot schedule, before anything is published
+  (#267). The README's version table and the docblocks said that `@every`, 6-field cron and the predefined aliases
+  need NATS 2.12, but the 2.12 scheduler runs only one-off `@at` schedules: the recurring patterns arrived in
+  nats-server 2.14.0, together with the `Nats-Schedule-Source`, `Nats-Schedule-Time-Zone` and `Nats-Schedule-Rollup`
+  headers (ADR-51 revisions 3 to 7). On 2.12 a `Schedule::every()`, `Schedule::cron()` or `Schedule::predefined()`
+  schedule failed with an opaque `JetStreamException (code 400): message schedules pattern is invalid`, and the
+  `source` and `rollup` arguments of an `@at` schedule were sent and dropped by the server without an error. When the
+  INFO-advertised server version parses as older than 2.14, these calls now throw an `UnsupportedFeatureException`
+  (a `JetStreamException`, so existing handlers still catch it) with the feature `schedule_every`, `schedule_cron`,
+  `schedule_source` or `schedule_rollup`, required version 2.14 and the server's version, and nothing is written. A
+  time zone is only accepted with a cron schedule, so the cron check covers it. A plain `@at` schedule (with or
+  without a TTL) is still published on 2.12, and every call is published as before on 2.14+ or when the version does
+  not parse (a proxy, a custom build). Behavior change: an `@at` schedule with `source` or `rollup` on a pre-2.14
+  server used to be stored without them and now fails; it never did what it asked for. The version checked is the
+  one of the server that takes the frame: on an open connection the call is checked at once, and it is checked again
+  in the step that writes the frame (`NatsClient::requestWithHeadersGuarded()`, `@internal`), once a reconnect the
+  call waited for is over and before the retry that follows a failed write. A call made while the client fails over
+  from a 2.14 server to a 2.12 one is refused there instead of being stored without its source or rollup, and one
+  made while it fails over from 2.12 to 2.14 is published there instead of being refused by the INFO of the
+  connection being replaced.
+
+### Testing & CI
+
+- New `ScheduledPublishServerVersionTest`: every call that needs 2.14 is refused before any write on servers
+  advertising 2.12.15, 2.12.0, v2.12.0, 2.11.4, 1.99.0, 2.13.9 and "2", and published on 2.14.0, 2.14.0-beta.1,
+  v2.14.10, 2.15.3, 3.0.0, an unparseable version or none; a plain `@at` schedule is still published on 2.12; a time
+  zone on an `@at` schedule and a malformed expression keep their own errors; the refusal messages are pinned. Over
+  `tests/Support/ReconnectingTransport.php`, whose sessions can now greet with different versions
+  (`$infoByEpoch`): each of those calls made while the client reconnects from 2.14 to 2.12 is refused by the 2.12
+  session and no schedule reaches either server, each made while it reconnects from 2.12 to 2.14 is published once
+  on the 2.14 session, and a schedule whose write fails on 2.14 and whose recovery lands on 2.12 is refused before
+  the retry. All 17 of these cases fail on the first version of the check, which read the INFO before the reconnect;
+  an invalid schedule subject on that guarded path is still refused before any write.
+  `FeatureSupportTest` covers the new registry entries and the version comparison, and the integration test
+  `testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders` checks the pre-flight against the live
+  fixture server (on 2.14+ it reads each schedule back from its own subject, so a schedule firing into the target
+  subject during the test cannot change the count). The unit tests that sent `@every`, cron or alias schedules to a
+  fake 2.12 server now advertise 2.14, or send an `@at` schedule where the schedule kind was not the point.
+
+### Documentation
+
+- `[docs]` The README's scheduling note, the version table (one row for `@at` at 2.12, one for the recurring
+  schedules, `timeZone`, `source` and `rollup` at 2.14), the `publishScheduled()` docblock and the `Schedule`
+  builders' docblocks state the right versions. The `$rollup` docblock described `Nats-Schedule-Rollup: sub` as "one
+  active schedule per subject"; ADR-51 defines it as a rollup on the message the schedule produces (one schedule per
+  schedule subject is the scheduler's own rule), and the `$source` docblock now says what the header does.
+
 ## [2.30.1] - 2026-11-21
 
 ### Fixed

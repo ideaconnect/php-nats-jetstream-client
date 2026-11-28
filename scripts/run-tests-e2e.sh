@@ -7,7 +7,8 @@
 #   3. Wait for all NATS fixture services to become ready
 #   4. Run unit tests (unless SKIP_UNIT_TESTS is set)
 #   5. Run integration tests with RUN_INTEGRATION=1 enabled
-#   6. Run Behat feature tests against the same fixture stack
+#   6. Run the integration suite again against the 2.14 server (nats-214), failing on any skipped test
+#   7. Run Behat feature tests against the same fixture stack
 #
 # Usage:
 #   bash scripts/run-tests-e2e.sh
@@ -87,6 +88,9 @@ fi
 
 echo "[test:e2e] running integration tests"
 RUN_INTEGRATION=1 composer test:integration
+
+echo "[test:e2e] running integration tests against the 2.14 server (a skipped test fails this stage)"
+NATS_URL=nats://127.0.0.1:14232 RUN_INTEGRATION=1 composer test:integration:2.14
 
 echo "[test:e2e] running Behat"
 if [[ -n "$behat_suite" ]]; then

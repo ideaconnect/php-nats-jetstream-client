@@ -14,12 +14,15 @@ use IDCT\NATS\Core\NatsClient;
 use IDCT\NATS\Core\NatsHeaders;
 use IDCT\NATS\Core\NatsMessage;
 use IDCT\NATS\Exception\JetStreamException;
+use IDCT\NATS\Exception\UnsupportedFeatureException;
 use IDCT\NATS\JetStream\Enum\NoRespondersCause;
+use IDCT\NATS\JetStream\FeatureSupport;
 use IDCT\NATS\JetStream\JetStreamContext;
 use IDCT\NATS\JetStream\KeyValue\KeyValueEntry;
 use IDCT\NATS\JetStream\KeyValue\KeyWatchOptions;
 use IDCT\NATS\JetStream\ObjectStore\ObjectData;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
+use IDCT\NATS\JetStream\Schedule;
 use IDCT\NATS\Tests\Support\DroppingTransport;
 use IDCT\NATS\Tests\Support\FrameAtATimeTransport;
 use IDCT\NATS\Tests\Support\GatedDialTransport;
@@ -592,6 +595,85 @@ final class JetStreamIntegrationTest extends TestCase
             // @at / @every / cron / predefined aliases are accepted; a malformed expression is rejected
             // client-side before any round-trip.
             self::assertStringContainsString('Unsupported schedule expression', $e->getMessage());
+        }
+
+        $js->deleteStream($stream)->await();
+        $client->disconnect()->await();
+    }
+
+    /**
+     * Verifies the 2.14 pre-flight of publishScheduled() against the live server (#267). nats-server 2.12 (the
+     * fixture's version) rejects "@every" and cron schedules with an opaque 400 and stores an "@at" schedule while
+     * ignoring Nats-Schedule-Source and Nats-Schedule-Rollup: the client refuses all four calls before anything is
+     * stored. A 2.14+ server accepts and stores all four, so the test follows the version the server advertises: on
+     * 2.14+ each schedule is read back from its own schedule subject (a whole-stream count would also take in a message
+     * a schedule fired into the target subject meanwhile).
+     */
+    public function testJetStreamScheduledPublishNeeds214ForRecurringSchedulesAndNewHeaders(): void
+    {
+        $this->requireIntegrationEnabled();
+
+        $stream = 'IT_' . strtoupper(bin2hex(random_bytes(3)));
+        $prefix = 'schedules.' . strtolower($stream) . '.';
+        $targetSubject = 'events.' . strtolower($stream) . '.scheduled';
+        // A 2.14 server wants the source inside the stream and apart from the target and the schedule subject.
+        $readingSubject = 'sensors.' . strtolower($stream) . '.reading';
+
+        $client = new NatsClient(new NatsOptions(servers: [$this->integrationServerUrl()]));
+        $client->connect()->await();
+
+        $js = $client->jetStream();
+        $js->createStream(
+            $stream,
+            [$prefix . '*', $targetSubject, $readingSubject],
+            ['allow_msg_schedules' => true],
+        )->await();
+
+        $version = $client->serverInfo()?->version;
+        $older = FeatureSupport::serverIsOlderThan($version, '2.14');
+        $later = Schedule::atTimestamp(time() + 3600);
+        // Each call's schedule subject and payload: on a 2.14 server each schedule is looked up on its own subject,
+        // since a schedule may fire into the target subject while the test runs (the cron one at 03:00 Warsaw time).
+        $calls = [
+            'schedule_every' => [$prefix . 'every', '{"event":"tick"}', static fn(string $subject, string $payload): Future => $js->publishScheduled($subject, $targetSubject, $payload, Schedule::every('1h'))],
+            'schedule_cron' => [$prefix . 'cron', '{"event":"report"}', static fn(string $subject, string $payload): Future => $js->publishScheduled(
+                $subject,
+                $targetSubject,
+                $payload,
+                Schedule::cron('0 0 3 * * *'),
+                timeZone: 'Europe/Warsaw',
+            )],
+            'schedule_source' => [$prefix . 'source', '{"event":"sampled"}', static fn(string $subject, string $payload): Future => $js->publishScheduled(
+                $subject,
+                $targetSubject,
+                $payload,
+                $later,
+                source: $readingSubject,
+            )],
+            'schedule_rollup' => [$prefix . 'rollup', '{"event":"latest"}', static fn(string $subject, string $payload): Future => $js->publishScheduled($subject, $targetSubject, $payload, $later, rollup: true)],
+        ];
+
+        foreach ($calls as $feature => [$subject, $payload, $call]) {
+            try {
+                $ack = $call($subject, $payload)->await();
+                self::assertFalse($older, sprintf('%s must be refused on server %s', $feature, (string) $version));
+                self::assertSame($stream, $ack->stream);
+            } catch (UnsupportedFeatureException $e) {
+                self::assertTrue($older, sprintf('%s must be published on server %s', $feature, (string) $version));
+                self::assertSame($feature, $e->feature);
+                self::assertSame('2.14', $e->requiredVersion);
+                self::assertSame($version, $e->serverVersion);
+            }
+        }
+
+        if ($older) {
+            $state = $js->getStream($stream)->await()->raw['state'] ?? [];
+            $messages = is_array($state) ? (int) ($state['messages'] ?? -1) : -1;
+            self::assertSame(0, $messages, 'a refused schedule must leave nothing in the stream');
+        } else {
+            foreach ($calls as $feature => [$subject, $payload]) {
+                self::assertSame($payload, $js->getLastMessageForSubject($stream, $subject)->await()->payload, sprintf('%s is stored on %s', $feature, $subject));
+            }
         }
 
         $js->deleteStream($stream)->await();
