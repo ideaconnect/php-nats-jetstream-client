@@ -1659,7 +1659,7 @@ $client->disconnect()->await();
 
 ### Consumer Reset
 
-_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (a 2.14+ server; against the 2.12 fixture stack only the pre-flight refusal runs)._
+_Verified by: [ConsumerResetTest](tests/Unit/ConsumerResetTest.php); [ConsumerResetIntegrationTest](tests/Integration/ConsumerResetIntegrationTest.php) (the second `composer test:e2e` integration stage, against the `nats-214` fixture, a 2.14+ server; against the default `nats` fixture (2.12) only the pre-flight refusal runs)._
 
 `resetConsumer($stream, $consumer, $sequence)` resets a consumer's delivery state through `$JS.API.CONSUMER.RESET` (ADR-60, NATS 2.14+), to replay messages or to move past a range that cannot be processed without deleting and recreating the consumer: it keeps its name, its config and the clients bound to it. The pending and redelivery state is dropped and the consumer sequence starts again at 1.
 
@@ -2823,6 +2823,7 @@ Additional useful commands:
 ```bash
 composer test
 RUN_INTEGRATION=1 composer test:integration
+NATS_URL=nats://127.0.0.1:14232 RUN_INTEGRATION=1 composer test:integration:2.14
 composer test:bdd
 BEHAT_SUITE=core composer test:bdd
 composer test:integration:repeat
@@ -2836,7 +2837,7 @@ composer infection
 
 Infection requires **PHP 8.3+** and is intentionally **not** in `require-dev` (so the library stays installable on PHP 8.2). The CI `mutation` job installs it on the fly; to run mutation testing locally, add it first: `composer require --dev infection/infection:^0.33`.
 
-`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs integration tests, runs the Behat feature suite, and tears the stack down again. `SKIP_UNIT_TESTS=1 composer test:e2e` leaves out the unit stage; CI sets it, because its coverage step and the Unit + Static jobs already run the unit suite.
+`composer test:e2e` is the preferred compose-backed validation path. It checks the committed JWT fixtures, starts the local NATS stack, waits for readiness, runs unit tests, runs the integration suite twice (against the `nats` fixture, 2.12, then against `nats-214`, 2.14, failing the second run on any skipped test), runs the Behat feature suite, and tears the stack down again. `SKIP_UNIT_TESTS=1 composer test:e2e` leaves out the unit stage; CI sets it, because its coverage step and the Unit + Static jobs already run the unit suite.
 
 The compose servers run without debug or trace logging. To trace one while debugging, add `"-DV"` to its `command` in `docker-compose.yml` and recreate it with `docker compose up -d --force-recreate <name>`.
 
@@ -2854,6 +2855,7 @@ When you run `docker compose up -d` in this repository, additional local auth fi
 - JWT auth: `nats://127.0.0.1:14227` using the generated operator/account resolver chain under `build/nats/jwt/`
 - standalone NKey auth: `nats://127.0.0.1:14226` with seed `SUACSSL3UAHUDXKFSNVUZRF5UHPMWZ6BFDTJ7M6USDXIEDNPPQYYYCU3VY`
 - JetStream domain: a hub `nats://127.0.0.1:14230` running JetStream with `jetstream { domain: hub }`, and a leaf node `nats://127.0.0.1:14231` without JetStream connected to it (`build/nats/hub.conf`, `build/nats/leaf.conf`); `scripts/wait-for-nats-services.sh` waits until the leaf node's connection to the hub is up
+- nats-server 2.14: `nats://127.0.0.1:14232` (`nats-214`), used only by the second `composer test:e2e` integration stage (`composer test:integration:2.14`) to run the integration suite against a server newer than the other fixtures' 2.12
 
 The integration tests use those defaults automatically. Override them with environment variables when you want to target external infrastructure instead.
 
