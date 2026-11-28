@@ -40,6 +40,7 @@ use IDCT\NATS\JetStream\Models\AccountInfo;
 use IDCT\NATS\JetStream\Models\ConsumerInfo;
 use IDCT\NATS\JetStream\Models\JsMessageMetadata;
 use IDCT\NATS\JetStream\Models\PubAck;
+use IDCT\NATS\JetStream\Models\StoredMessage;
 use IDCT\NATS\JetStream\Models\StreamInfo;
 use IDCT\NATS\JetStream\ObjectStore\ObjectStoreBucket;
 use Revolt\EventLoop;
@@ -565,6 +566,55 @@ final class JetStreamContext
             );
 
             return $this->streamMessageFromResponse($response);
+        });
+    }
+
+    /**
+     * Fetches the FIRST message stored on a subject at or after a stream sequence via the leader
+     * STREAM.MSG.GET API (`next_by_subj`, plus `seq` when `$startSequence` is above 0). Works on any
+     * stream, without `allow_direct`. Mirrors nats.go `Stream.GetMsg(ctx, seq, WithGetMsgSubject(subject))`
+     * and nats.java `getNextMessage(stream, seq, subject)`; the "next" half of #36 (#15).
+     *
+     * The start sequence itself counts: a message stored at `$startSequence` is returned. The result
+     * carries the stored sequence, so a subject is walked by asking again from `$message->sequence + 1`
+     * until the server answers 404 (no message found). Unlike {@see getLastMessageForSubject()}, a
+     * wildcard subject (`orders.*`, `orders.>`) is accepted. An empty subject is refused before sending
+     * (the server would ignore it and answer with the message at the start sequence on any subject), and
+     * so is a negative start sequence.
+     *
+     * @return Future<StoredMessage>
+     */
+    public function getNextMessageForSubject(string $stream, string $subject, int $startSequence = 0): Future
+    {
+        self::assertValidJsName($stream, 'stream');
+
+        return async(function () use ($stream, $subject, $startSequence): StoredMessage {
+            if ($subject === '') {
+                throw new JetStreamException('getNextMessageForSubject requires a non-empty subject');
+            }
+
+            if ($startSequence < 0) {
+                throw new JetStreamException('getNextMessageForSubject requires a start sequence of 0 or more, got ' . $startSequence);
+            }
+
+            $body = ['next_by_subj' => $subject];
+            if ($startSequence > 0) {
+                $body['seq'] = $startSequence;
+            }
+
+            $response = $this->requestJson($this->apiSubject(JetStreamApi::STREAM_MSG_GET_PREFIX) . $stream, $body);
+            $message = $this->streamMessageFromResponse($response);
+
+            /** @var array<string,mixed> $stored */
+            $stored = is_array($response['message'] ?? null) ? $response['message'] : [];
+
+            return new StoredMessage(
+                subject: $message->subject,
+                sequence: (int) ($stored['seq'] ?? 0),
+                time: (string) ($stored['time'] ?? ''),
+                payload: $message->payload,
+                rawHeaders: $message->rawHeaders,
+            );
         });
     }
 

@@ -18,7 +18,23 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 A released section is not rewritten: it records what that release shipped. A correction to one is a `[docs]` entry
 of the next release that names the release and the entry it corrects.
 
-## [Unreleased]
+## [2.36.0] - 2026-11-28
+
+### Added
+
+- `[feature]` `JetStreamContext::getNextMessageForSubject($stream, $subject, $startSequence = 0)` reads the first
+  message stored on a subject at or after a stream sequence over the leader `$JS.API.STREAM.MSG.GET` API
+  (`next_by_subj`, with `seq` when the start is above 0), so it works on a stream without `allow_direct`: nats.go
+  `Stream.GetMsg(ctx, seq, WithGetMsgSubject(subject))`, nats.java `getNextMessage(stream, seq, subject)`. This is
+  the "next" half of #36, which shipped only `getLastMessageForSubject()` (#15). The subject may be a wildcard. It
+  returns the new `Models\StoredMessage` (`subject`, `sequence`, `time` as the server's RFC 3339 string, `payload`,
+  `rawHeaders`, decoded as `getStreamMessage()` decodes them), so a subject is walked by asking again from
+  `sequence + 1` until the server's 404 (err_code 10037, "no message found"). An empty subject (which the server
+  would ignore, answering with the message at the start sequence on any subject) and a negative start sequence
+  are refused with a `JetStreamException` before anything is sent. Measured against nats-server 2.10.29, 2.11.17,
+  2.12.15, 2.14.10 and 2.15.3, which answer it alike, so there is no version check; the live test runs against the
+  2.12 and 2.14 fixtures. README "Stream Message Get" now documents both `getLastMessageForSubject()` and the new
+  call, and `examples/stream-message-get.php` walks a subject.
 
 ### Testing & CI
 

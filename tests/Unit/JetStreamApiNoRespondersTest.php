@@ -55,6 +55,7 @@ final class JetStreamApiNoRespondersTest extends TestCase
         yield 'consumerNames' => [static fn(JetStreamContext $js): Future => $js->consumerNames('ORDERS')];
         yield 'getStreamMessage' => [static fn(JetStreamContext $js): Future => $js->getStreamMessage('ORDERS', 1)];
         yield 'getLastMessageForSubject' => [static fn(JetStreamContext $js): Future => $js->getLastMessageForSubject('ORDERS', 'orders.created')];
+        yield 'getNextMessageForSubject' => [static fn(JetStreamContext $js): Future => $js->getNextMessageForSubject('ORDERS', 'orders.created', 1)];
         yield 'deleteMessage' => [static fn(JetStreamContext $js): Future => $js->deleteMessage('ORDERS', 1)];
         yield 'createConsumer' => [static fn(JetStreamContext $js): Future => $js->createConsumer('ORDERS', 'worker')];
         yield 'addConsumer' => [static fn(JetStreamContext $js): Future => $js->addConsumer('ORDERS', ConsumerConfiguration::create()->durable('worker'))];

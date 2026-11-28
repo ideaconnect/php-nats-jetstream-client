@@ -105,7 +105,7 @@ Current functionality includes:
 - JetStream consumer pause/resume
 - JetStream consumer delivery state reset (`resetConsumer()`, ADR-60, NATS 2.14+), and consumes that carry on when another client resets their consumer
 - JetStream publish ACK
-- JetStream stream message get by sequence - both the regular `STREAM.MSG.GET` request and the Direct Get API (`directGetStreamMessage()` / `directGetLastMessageForSubject()`)
+- JetStream stream message get by sequence - both the regular `STREAM.MSG.GET` request and the Direct Get API (`directGetStreamMessage()` / `directGetLastMessageForSubject()`) - and by subject over `STREAM.MSG.GET` (`getLastMessageForSubject()`, and `getNextMessageForSubject()` to walk a subject by sequence)
 - JetStream atomic (all-or-nothing) batch publish (`batch()` -> `BatchPublisher`, ADR-50; requires `allow_atomic`, NATS 2.12+)
 - Scheduled publish (`@at` support)
 - Distributed counter CRDT (atomic `incrementCounter()` / `counterValue()`, arbitrary-precision values)
@@ -1873,11 +1873,26 @@ $client->disconnect()->await();
 
 > 📄 **Runnable example:** [`examples/stream-message-get.php`](examples/stream-message-get.php)
 
-_Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testGetStreamMessage`, `testGetStreamMessagePreservesZeroPayload`, `testGetStreamMessageDecodesHeaders`); [JetStreamIntegrationTest](tests/Integration/JetStreamIntegrationTest.php) (`testJetStreamGetStreamMessage`, `testJetStreamGetStreamMessagePreservesZeroAndHeaders`)._
+_Verified by: [JetStreamContextTest](tests/Unit/JetStreamContextTest.php) (`testGetStreamMessage`, `testGetStreamMessagePreservesZeroPayload`, `testGetStreamMessageDecodesHeaders`, `testGetLastMessageForSubject`, `testGetNextMessageForSubjectSendsNextBySubj`, `testGetNextMessageForSubjectParsesTheStoredMessage`, `testGetNextMessageForSubjectSurfacesNoMessageFoundAs404`); [JetStreamIntegrationTest](tests/Integration/JetStreamIntegrationTest.php) (`testJetStreamGetStreamMessage`, `testJetStreamGetStreamMessagePreservesZeroAndHeaders`); [ClientParityIntegrationTest](tests/Integration/ClientParityIntegrationTest.php) (`testGetLastMessageForSubjectLive`, `testGetNextMessageForSubjectWalksASubjectLive`)._
 
 `getStreamMessage()` fetches a stored message by sequence using the standard JetStream
 `$JS.API.STREAM.MSG.GET` API. The returned `NatsMessage` preserves the stored subject, payload
 (including a body that is exactly `"0"`), and any stored headers on `rawHeaders`.
+
+The same API, served by the stream leader, also reads by subject, on any stream (no `allow_direct`
+needed):
+
+- `getLastMessageForSubject($stream, $subject)` returns the last message stored on a subject as a
+  `NatsMessage` (`last_by_subj`; nats.go `GetLastMsgForSubject`, nats.java `getLastMessage`). The subject must be
+  concrete: a wildcard is refused. A subject with no message fails with a `JetStreamException` with code 404.
+- `getNextMessageForSubject($stream, $subject, $startSequence = 0)` returns the first message stored on
+  the subject at or after `$startSequence` (`next_by_subj`; nats.go `GetMsg` with `WithGetMsgSubject`,
+  nats.java `getNextMessage`). The subject may be a wildcard (`events.*`, `events.>`). The result is a
+  `StoredMessage` with `subject`, `sequence`, `time` (the server's RFC 3339 store time, as sent),
+  `payload` and `rawHeaders` (the stored headers), so a subject is walked by asking again from
+  `sequence + 1`. When nothing is stored there at or after the start, the call fails with a
+  `JetStreamException` with code 404 (err_code 10037, "no message found"). An empty subject and a negative
+  start sequence are refused before anything is sent.
 
 ```php
 <?php
@@ -1886,6 +1901,7 @@ declare(strict_types=1);
 
 use IDCT\NATS\Connection\NatsOptions;
 use IDCT\NATS\Core\NatsClient;
+use IDCT\NATS\Exception\JetStreamException;
 
 $client = new NatsClient(new NatsOptions());
 $client->connect()->await();
@@ -1893,10 +1909,30 @@ $client->connect()->await();
 $js = $client->jetStream();
 $js->createStream('EVENTS', ['events.>'])->await();
 $js->publish('events.order', '{"id":1}')->await();
+$js->publish('events.invoice', '{"id":2}')->await();
+$js->publish('events.order', '{"id":3}')->await();
 
 // Fetch message by stream sequence number.
 $message = $js->getStreamMessage('EVENTS', 1)->await();
 echo $message->payload . PHP_EOL;
+
+// The last message stored on a subject.
+$last = $js->getLastMessageForSubject('EVENTS', 'events.order')->await();
+echo $last->payload . PHP_EOL; // {"id":3}
+
+// Walk a subject: every answer carries its stream sequence, and a 404 ends the walk.
+$next = 0;
+try {
+    while (true) {
+        $stored = $js->getNextMessageForSubject('EVENTS', 'events.order', $next)->await();
+        echo $stored->sequence . ' ' . $stored->payload . PHP_EOL; // 1 {"id":1}, then 3 {"id":3}
+        $next = $stored->sequence + 1;
+    }
+} catch (JetStreamException $e) {
+    if ($e->getCode() !== 404) {
+        throw $e;
+    }
+}
 
 $js->deleteStream('EVENTS')->await();
 $client->disconnect()->await();

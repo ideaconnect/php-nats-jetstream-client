@@ -77,6 +77,7 @@ final class JetStreamDomainTest extends TestCase
         yield 'consumerNames' => [static fn(JetStreamContext $js): Future => $js->consumerNames('ORDERS'), 'CONSUMER.NAMES.ORDERS'];
         yield 'getStreamMessage' => [static fn(JetStreamContext $js): Future => $js->getStreamMessage('ORDERS', 1), 'STREAM.MSG.GET.ORDERS'];
         yield 'getLastMessageForSubject' => [static fn(JetStreamContext $js): Future => $js->getLastMessageForSubject('ORDERS', 'orders.created'), 'STREAM.MSG.GET.ORDERS'];
+        yield 'getNextMessageForSubject' => [static fn(JetStreamContext $js): Future => $js->getNextMessageForSubject('ORDERS', 'orders.created', 1), 'STREAM.MSG.GET.ORDERS'];
         yield 'deleteMessage' => [static fn(JetStreamContext $js): Future => $js->deleteMessage('ORDERS', 1), 'STREAM.MSG.DELETE.ORDERS'];
         yield 'directGetStreamMessage' => [static fn(JetStreamContext $js): Future => $js->directGetStreamMessage('ORDERS', 1), 'DIRECT.GET.ORDERS'];
         yield 'directGetLastMessageForSubject' => [static fn(JetStreamContext $js): Future => $js->directGetLastMessageForSubject('ORDERS', 'orders.created'), 'DIRECT.GET.ORDERS'];
