@@ -18,7 +18,7 @@ Note on flags: a `[bc-break]` that only corrects an evident bug is treated as a
 A released section is not rewritten: it records what that release shipped. A correction to one is a `[docs]` entry
 of the next release that names the release and the entry it corrects.
 
-## [Unreleased]
+## [2.36.0] - 2026-11-28
 
 ### Added
 
