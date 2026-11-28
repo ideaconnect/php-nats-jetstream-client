@@ -2437,7 +2437,7 @@ _Verified by: [JetStreamDomainTest](tests/Unit/JetStreamDomainTest.php); [JetStr
 By default a JetStream context sends its API requests to `$JS.API.>`, the JetStream of the account the client is connected to. Two common deployments serve it elsewhere:
 
 - **A JetStream domain.** A client connected to a leaf node reaches the hub's JetStream (or the hub a leaf node's) under the domain, on `$JS.<domain>.API.>`. A leaf node without JetStream of its own answers `$JS.API.>` with no responders, so the default context fails there with a `JetStreamException` (503).
-- **An API prefix.** An account that imports another account's JetStream API (an import of `$JS.API.>` with `to: "JS.from-a.API.>"`) reaches it under that prefix.
+- **An API prefix.** An account that imports another account's JetStream API (an import of `$JS.API.>` with `to: "JS.from-a.API.>"`) reaches it under that prefix. The export needs `response: stream`, and the import needs more than `$JS.API.>` alone; see [Account imports](#account-imports) below.
 
 Pass the domain or the prefix to `jetStream()`, as nats.go does with `jetstream.NewWithDomain()` / `jetstream.NewWithAPIPrefix()` and nats.java with `JetStreamOptions.domain()` / `prefix()`:
 
@@ -2477,10 +2477,69 @@ $client->disconnect()->await();
 
 - `jetStream()` without arguments is unchanged and returns the same context every time. Each domain or prefix gets a context of its own, kept the same way; a domain and the equivalent prefix (`domain: 'hub'`, `apiPrefix: '$JS.hub.API'`) share one. `new JetStreamContext($client, domain: 'hub')` works too.
 - A domain is a single subject token: an empty domain, or one with `.`, `*`, `>`, whitespace or a control character, is refused with a `JetStreamException`, and so are an empty prefix, a prefix with an empty token (`JS..API`), a wildcard or whitespace, and a domain together with a prefix (this client's own rule: nats.go's `jetstream` package has a constructor for each, while its legacy `nats.Domain()` / `nats.APIPrefix()` options and nats.java's `JetStreamOptions` let the last one set win). A trailing `.` is added to a prefix without one. Nothing is sent for a refused domain or prefix.
-- Every JetStream API request of the context uses its prefix: streams, consumers, account info, message get and delete, Direct Get, pulls (`CONSUMER.MSG.NEXT`, from `fetchBatch()` and `pullConsumer()->handle()`), pause, unpin, reset (`resetConsumer()`), and the requests of its KV and Object Store buckets. A JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, and acks and flow-control replies to the reply subject the server gave.
-- KV writes (`put()`, `create()`, `update()`, `delete()`, `purge()`) go through the prefix, as nats.go's do: `$JS.hub.API.$KV.<bucket>.<key>`. nats-server maps `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, while a plain `$KV.` publish from a leaf node gets no responders. For an account import, import the other account's `$KV.>` under the same prefix (`to: "JS.from-a.API.$KV.>"`), and the subjects of the streams and Object Stores you publish to under their own names. The stored subjects stay `$KV.<bucket>.<key>`, so reads and watches are unchanged.
+- Every JetStream API request of the context uses its prefix: streams, consumers, account info, message get and delete, Direct Get, pulls (`CONSUMER.MSG.NEXT`, from `fetchBatch()` and `pullConsumer()->handle()`), pause, unpin, reset (`resetConsumer()`), and the requests of its KV and Object Store buckets. A JetStream publish and the Object Store's chunk and meta publishes go to their own subjects, and acks and flow-control replies to the reply subject the server gave; through an account import those reply subjects need imports of their own, see [Account imports](#account-imports) below.
+- KV writes (`put()`, `create()`, `update()`, `delete()`, `purge()`) go through the prefix, as nats.go's do: `$JS.hub.API.$KV.<bucket>.<key>`. nats-server maps `$JS.<domain>.API.$KV.>` back to `$KV.>` in the domain's account, while a plain `$KV.` publish from a leaf node gets no responders. For an account import, import the other account's `$KV.>` under the same prefix (`to: "JS.from-a.API.$KV.>"`), and the subjects of the streams and Object Stores you publish to under their own names. The stored subjects stay `$KV.<bucket>.<key>`, so reads and watches are unchanged for a JetStream domain; through an account import they need the further entries in [Account imports](#account-imports) below.
 - The `domain` shorthand of a KV mirror or source, and `StreamSource::external()`, are independent of the context's prefix: they name where the ORIGIN stream lives. A KV mirror of a bucket in another domain writes through that origin's API, not through the context's prefix.
 - The server version checks (the version-gated stream and consumer fields, `batch()`, `publishScheduled()`, `resetConsumer()`) read the INFO of the server the client is connected to. Through a leaf node that is the leaf node's version, not the version of the hub that answers the JetStream requests: through a 2.12 leaf node `resetConsumer()` is refused with an `UnsupportedFeatureException` before anything is sent, although a 2.14 hub would answer it.
+
+#### Account imports
+
+_Measured once for #281, against nats-server 2.10.29, 2.11.17, 2.12.15, 2.14.10 and 2.15.3 with this client at 2.34.0; not covered by a test of this repository._
+
+This is the account config that passed every call below, with one user added to each account for the measurement; on 2.10.29 `directGetBatch()` fails with or without an import, since batched Direct Get needs nats-server 2.11. `orders.>` stands for the subjects of the streams the importing account publishes to, and `DELIVER.READER.>` for a delivery subject the caller chose:
+
+```
+accounts {
+  ORIGIN {
+    jetstream: enabled
+    exports [
+      { service: "$JS.API.>", response: stream, accounts: [TARGET] }
+      { service: "$KV.>", accounts: [TARGET] }
+      { service: "orders.>", accounts: [TARGET] }
+      { service: "$O.>", accounts: [TARGET] }
+      { service: "$JS.ACK.>", accounts: [TARGET] }
+      { service: "$JS.FC.>", accounts: [TARGET] }
+      { stream: "_INBOX.JS.ORD.>", accounts: [TARGET] }
+      { stream: "_INBOX.JS.PUSH.>", accounts: [TARGET] }
+      { stream: "_INBOX.KV.KEYS.>", accounts: [TARGET] }
+      { stream: "_INBOX.KV.HIST.>", accounts: [TARGET] }
+      { stream: "DELIVER.READER.>", accounts: [TARGET] }
+    ]
+  }
+  TARGET {
+    imports [
+      { service: { account: ORIGIN, subject: "$JS.API.>" }, to: "JS.from-a.API.>" }
+      { service: { account: ORIGIN, subject: "$KV.>" }, to: "JS.from-a.API.$KV.>" }
+      { service: { account: ORIGIN, subject: "orders.>" } }
+      { service: { account: ORIGIN, subject: "$O.>" } }
+      { service: { account: ORIGIN, subject: "$JS.ACK.>" } }
+      { service: { account: ORIGIN, subject: "$JS.FC.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.JS.ORD.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.JS.PUSH.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.KV.KEYS.>" } }
+      { stream: { account: ORIGIN, subject: "_INBOX.KV.HIST.>" } }
+      { stream: { account: ORIGIN, subject: "DELIVER.READER.>" } }
+    ]
+  }
+}
+```
+
+With only the imports the bullets above already describe (`$JS.API.>` under a prefix, `$KV.>` under the same prefix, and the subjects you publish to under their own names), these already work: `accountInfo()`, creating and deleting streams, consumers and buckets, `publish()`, a pull of one message (`fetchBatch()` with a batch of 1), KV `put()`, `get()`, `update()`, `delete()` and Object Store `put()`. `fetchNext()` and the `get()` of a one-chunk object pass the same way too.
+
+The calls in this table need one of the four further entries in the config above as well. Without it some of them throw, and others return as if they had worked or receive nothing; the last column says which:
+
+| Entry | Calls that need it | Without it |
+| --- | --- | --- |
+| `response: stream` on the export of `$JS.API.>` | every call with several replies to one request: `fetchBatch()` above 1, `pullConsumer()->handle()`, `directGetBatch()`; on nats-server 2.11 and later also `getAll()` and Object Store `list()`; the `get()` of an object of several chunks | Only the first reply arrives. `fetchBatch()` of 5 returned 1 after 3.0 s (its expiry was 2 s), although the server had delivered all 5 and left 4 pending for nobody. `handle()` handled 1 of 3. `directGetBatch()`, `getAll()` (3 keys) and `list()` (3 objects) threw `JetStreamException` "Direct Get batch for stream "..." stalled: no progress for 6000 ms (received 1 message(s), no end-of-batch marker)" (3000 ms for `directGetBatch()`, whose expiry was 2 s). `get()` of 3 chunks threw `JetStreamException` (503) "JetStream pull request ended with status 503" after 11 s. |
+| import of `$JS.ACK.>` | `ack()`, `nak()`, `term()`, `inProgress()`, `ackSync()`; `nakWithDelay()` by reading (it publishes the same way, `src/JetStream/JetStreamContext.php:4668`) | `ack()`, `nak()`, `term()` and `inProgress()` returned without an error and reached nobody: ORIGIN read 1, 2, 3 and 4 pending acks after the four calls and an ack floor of 0 (with the import: 0, 1, 0, 1 and an ack floor of 3), and a message acked with `ack()` came again after its 1 s ack wait. `ackSync()` failed at once with `NatsException` "No responders for subject $JS.ACK....". |
+| a stream export that covers the delivery subject | `subscribeOrderedConsumer()` and the `watch()` of KeyValue and Object Store (`_INBOX.JS.ORD.`), `keys()` (`_INBOX.KV.KEYS.`), `history()` (`_INBOX.KV.HIST.`), `subscribePushConsumer()` and `subscribeEphemeralPushConsumer()` (`_INBOX.JS.PUSH.`, or the caller's own `deliverSubject`) | Subscriptions and watches received nothing, and nothing reached the error listener in the 12 s watched. `keys()` and `history()` threw `JetStreamException` "Key enumeration stalled: no progress for 2.000 s (collected 0 key(s), replay not caught up)" and "Key history for "theme" stalled: ..." once their progress timeout was over (2 s in the measurement, 5 s by default). |
+| import of `$JS.FC.>` | everything on an ordered consumer: `subscribeOrderedConsumer()`, both `watch()`; a push consumer created with `flow_control`, by reading | Delivery stopped after 2.0 MB with no error: 128 of 300 16 KB messages on a replay, and 128 of 200 when they were published one by one while the consumer read. With the import: 300 of 300 and 200 of 200. |
+
+The push side of this client always delivers on one of four fixed literals: `_INBOX.JS.ORD.` for an ordered consumer, ridden by `subscribeOrderedConsumer()` and the `watch()` of KeyValue and Object Store; `_INBOX.KV.KEYS.` for `keys()`; `_INBOX.KV.HIST.` for `history()`; and `_INBOX.JS.PUSH.` for a push subscription without its own delivery subject (`subscribePushConsumer()`, `subscribeEphemeralPushConsumer()`). `NatsOptions::inboxPrefix` (default `_INBOX`, see [Configuration Option Mapping](#configuration-option-mapping)) is only the prefix of the request inbox and does not change any of these. A stream export covering one of them hands the importing account everything published on it, not only what one import's own calls deliver: while a client of ORIGIN watched a bucket of its own, a client of TARGET subscribed directly to `_INBOX.JS.ORD.>` received the same two values as that watch, and none of them without the export. `accounts: [...]` on an export only limits which account may import it, not what that account receives once it does. A push subscription is kept to itself with a `deliverSubject:` of its own, exported to that account alone instead of the whole `_INBOX.JS.PUSH.>`: `subscribePushConsumer(deliverSubject: 'DELIVER.READER.one')` worked with a stream export of `DELIVER.READER.>` alone, and `subscribeEphemeralPushConsumer()` takes the same argument (by reading). `watch()`, `keys()`, `history()` and `subscribeOrderedConsumer()` have no such argument.
+
+The export's response threshold (`threshold` on a service export, default 2 minutes, [`server/const.go:237` at nats-server v2.12.15](https://github.com/nats-io/nats-server/blob/v2.12.15/server/const.go#L237)) is how long after a request a reply still reaches the importing account. With `threshold: "2s"`, a `fetchBatch()` of one message with an expiry of 6 s, whose message was published after 4 s, ended with `JetStreamException` (408) "No messages received within timeout" although the message was there. This client's default waits are shorter than the default threshold (a pull waits 3 s, an Object Store download 10 s); a pull given an `expiresMs` above 2 minutes needs a longer threshold (by reading: the 2-minute default was not run).
+
+See the NATS documentation, [Cross-account subjects, "Consumers driven from another account"](https://docs.nats.io/reference/2.14/jetstream/cross-account-subjects), for the `response: stream`, `$JS.ACK.>` and delivery-subject entries above. `$JS.FC.>` is this measurement's own finding: that page lists `$JS.FC` for sourcing, not in its config for a client.
 
 ## Compatibility Mapping
 
